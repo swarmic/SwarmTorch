@@ -7,6 +7,19 @@ Thank you for your interest in contributing to SwarmTorch!
 - **Code of Conduct:** [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct)
 - **Security Issues:** See [SECURITY.md](SECURITY.md) — do not open public issues
 
+## Canonical Docs (No Drift)
+
+SwarmTorch uses a strict document hierarchy to prevent context drift:
+
+- `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` (system model + conformance)
+- `ADRs.md` (architecture decisions)
+- crate source (`swarm-torch-*`) (implementation truth)
+
+If you add or change a **normative** requirement (MUST/SHOULD/MAY), you must either:
+
+1. Update the relevant ADR, or
+2. Update the white paper and include an `Evidence:` pointer to ADR/code/tests.
+
 ## Development Setup
 
 ```bash

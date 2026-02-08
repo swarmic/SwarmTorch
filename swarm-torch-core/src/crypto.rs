@@ -174,7 +174,7 @@ impl GradientValidator {
 
         // Check L2 norm
         let norm_sq: f32 = gradients.iter().map(|g| g * g).sum();
-        let norm = norm_sq.sqrt();
+        let norm = sqrt_f32(norm_sq);
         if norm > self.max_gradient_norm {
             return Err(GradientValidationError::NormTooLarge {
                 norm,
@@ -183,6 +183,27 @@ impl GradientValidator {
         }
 
         Ok(())
+    }
+}
+
+#[inline]
+fn sqrt_f32(x: f32) -> f32 {
+    #[cfg(feature = "std")]
+    {
+        x.sqrt()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // Newton-Raphson iterations: good enough for validation thresholds.
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let mut y = x;
+        // Fixed iteration count for determinism.
+        for _ in 0..8 {
+            y = 0.5 * (y + (x / y));
+        }
+        y
     }
 }
 

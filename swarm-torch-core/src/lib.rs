@@ -7,6 +7,8 @@
 //! - Robust aggregation (Krum, Bulyan, Trimmed Mean)
 //! - Core traits and abstractions
 //! - Gradient compression utilities
+//! - Offline-first observability IDs + span/event/metric record schemas
+//! - Executable run graph schema (`graph.json`) + deterministic node hashing helpers
 //!
 //! ## Feature Flags
 //!
@@ -17,6 +19,7 @@
 //! - `defmt`: Enable defmt logging for embedded
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -26,7 +29,14 @@ pub mod algorithms;
 pub mod compression;
 pub mod consensus;
 pub mod crypto;
+#[cfg(feature = "alloc")]
+pub mod dataops;
+#[cfg(feature = "alloc")]
+pub mod execution;
 pub mod identity;
+pub mod observe;
+#[cfg(feature = "alloc")]
+pub mod run_graph;
 pub mod traits;
 
 #[cfg(feature = "telemetry")]
@@ -36,6 +46,19 @@ pub mod telemetry;
 pub mod prelude {
     pub use crate::aggregation::*;
     pub use crate::algorithms::*;
+    #[cfg(feature = "alloc")]
+    pub use crate::dataops::{
+        dataset_entry_v1, dataset_fingerprint_v0, recipe_hash_v0, schema_hash_v0,
+        source_fingerprint_v0, DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
+        MaterializationRecordV1, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
+    };
+    #[cfg(feature = "alloc")]
+    pub use crate::execution::{AssetInstanceV1, ExecutionPolicy, OpRunner, PolicyDecision};
+    #[cfg(feature = "alloc")]
+    pub use crate::observe::{AttrMap, AttrValue, EventRecord, MetricRecord, SpanRecord};
+    pub use crate::observe::{RunId, SpanId, TraceId};
+    #[cfg(feature = "alloc")]
+    pub use crate::run_graph::{GraphV1, NodeId, NodeV1, OpKind};
     pub use crate::traits::*;
 }
 

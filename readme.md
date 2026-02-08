@@ -9,6 +9,13 @@
 
 SwarmTorch is a distributed machine learning framework designed for real-world edge deployments where devices are resource-constrained, connections are unreliable, and trust cannot be assumed. Built in Rust from the ground up, it brings swarm intelligence and federated learning primitives to environments where PyTorch and TensorFlow cannot operate: embedded microcontrollers, intermittent networks, and adversarial conditions.
 
+## Canonical Docs
+
+- [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
+- [`ADRs.md`](ADRs.md) (architecture decisions)
+- [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) (document hierarchy; drift controls)
+- [`SECURITY.md`](SECURITY.md) (security policy + supply chain gates)
+
 -----
 
 ## Why SwarmTorch?

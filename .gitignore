@@ -5,14 +5,12 @@
 # -----------------------------------------------------------------------------
 # Internal Documentation (not for public exposure)
 # -----------------------------------------------------------------------------
+#
+# NOTE: Canonical SwarmTorch docs (e.g., `ADRs.md`, `SECURITY.md`, the SwarmTorch WP)
+# must remain versioned. Do not ignore them here.
 
 docs/adr/
 docs/internal/
-Evcxr.md
-SWARMIC_NETWORK_WHITE_PAPER_v12.2.md
-CONTEXT_SOURCES.md
-ROADMAP.md
-SECURITY.md
 # -----------------------------------------------------------------------------
 # Rust Build Artifacts
 # -----------------------------------------------------------------------------
@@ -113,12 +111,16 @@ probe-rs.log
 # -----------------------------------------------------------------------------
 /doc/
 book/book/
-ADRs.md
-adr-with-updates.md
-evcxr.md
+ROADMAP.md
+SECURITY.md
+SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
+SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
 SWARMIC_NETWORK_WHITE_PAPER_v12.2.md
 SWARMIC_NETWORK_WHITE_PAPER_v12.4.md
-
+Evcxr.md
+CONTEXT_SOURCES.md
+ADRs.md
+adr-with-updates.md
 
 # -----------------------------------------------------------------------------
 # Temporary Files

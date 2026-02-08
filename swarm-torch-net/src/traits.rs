@@ -2,8 +2,8 @@
 //!
 //! This module defines the core transport abstraction.
 
-use swarm_torch_core::traits::PeerId;
 use crate::Result;
+use swarm_torch_core::traits::PeerId;
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;

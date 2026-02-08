@@ -92,7 +92,12 @@ impl CompressedGradient {
                 }
             }
             CompressionMethod::TopK { k_ratio } => {
-                let k = ((gradients.len() as f32) * k_ratio).ceil() as usize;
+                // Avoid `f32::ceil()` so `no_std + alloc` builds don't require libm.
+                let raw = (gradients.len() as f32) * k_ratio;
+                let mut k = raw as usize;
+                if (k as f32) < raw {
+                    k = k.saturating_add(1);
+                }
                 let k = k.max(1).min(gradients.len());
 
                 // Find top-k by absolute value

@@ -12,6 +12,7 @@ notice = "warn"
 [licenses]
 unlicensed = "deny"
 allow = [
+    "MPL-2.0",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -22,7 +23,22 @@ allow = [
     "CC0-1.0",
     "Unicode-DFS-2016",
 ]
-copyleft = "deny"
+# The project is MPL-2.0 (file-level copyleft). We still disallow strong copyleft
+# dependencies by default.
+deny = [
+    # Strong copyleft (deny by default).
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+]
+copyleft = "warn"
 confidence-threshold = 0.8
 
 [bans]

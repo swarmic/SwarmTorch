@@ -12,6 +12,7 @@
 //! - `embassy`: Use Embassy runtime for embedded
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 use core::future::Future;
 use core::time::Duration;
@@ -130,10 +131,8 @@ pub mod mock_runtime {
         /// Advance the mock clock
         pub fn advance(&self, duration: Duration) {
             use core::sync::atomic::Ordering;
-            self.current_time_ms.fetch_add(
-                duration.as_millis() as u64,
-                Ordering::SeqCst,
-            );
+            self.current_time_ms
+                .fetch_add(duration.as_millis() as u64, Ordering::SeqCst);
         }
     }
 

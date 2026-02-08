@@ -46,6 +46,7 @@
 //! - [`swarm_torch_models`]: Model utilities and backend integrations
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 // Re-export sub-crates
 pub use swarm_torch_core as core;
@@ -65,6 +66,14 @@ pub use swarm_torch_net::{
     protocol::{MessageEnvelope, MessageType},
     traits::{SwarmTransport, TransportCapabilities},
 };
+
+/// Artifact bundle writing/validation (std-only).
+#[cfg(feature = "std")]
+pub mod artifacts;
+
+/// Standalone report generator (std-only).
+#[cfg(feature = "std")]
+pub mod report;
 
 /// Prelude module for convenient imports
 ///

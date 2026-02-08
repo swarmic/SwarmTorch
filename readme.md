@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/swarm-torch.svg)](https://crates.io/crates/swarm-torch)
 [![Documentation](https://docs.rs/swarm-torch/badge.svg)](https://docs.rs/swarm-torch)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 [![CI](https://github.com/swarm-torch/swarm-torch/workflows/CI/badge.svg)](https://github.com/swarm-torch/swarm-torch/actions)
 
 **Mission-grade swarm learning for heterogeneous fleets—Rust-native, `no_std`-ready, Byzantine-resilient.**
@@ -500,7 +500,7 @@ Run `cargo bench` for methodology and reproduction scripts.
 
 ## Contributing
 
-SwarmTorch is open-source (MIT license) and welcomes contributions. We especially need help with:
+SwarmTorch is open-source (MPL-2.0 license) and welcomes contributions. We especially need help with:
 
 - 🦀 **Embedded drivers** - BLE, LoRa, ESP-NOW implementations
 - 🤖 **Robotics integrations** - ROS2 bridge improvements, real robot testing
@@ -569,14 +569,14 @@ See [ADRs.md](ADRs.md) for full technical references.
 
 ## License
 
-SwarmTorch is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+SwarmTorch is licensed under the **Mozilla Public License 2.0 (MPL-2.0)**. See [LICENSE](LICENSE) for details.
 
-**Why MIT?** We want maximum adoption across academia, industry, and open-source. MIT allows:
+**Why MPL-2.0?** File-level copyleft balances openness with protection:
 
-- Commercial use without restrictions
-- Modification and redistribution
-- Private use
-- Patent grant (implicit)
+- Modifications to MPL-covered files must be shared
+- Can be combined with proprietary code in a "Larger Work"
+- Widely adopted in Rust ecosystem (e.g., Servo, many Mozilla projects)
+- Compatible with Apache-2.0 and MIT for integration
 
 -----
 

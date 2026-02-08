@@ -63,4 +63,4 @@ docs: update ADR-0002 embedded profiles
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under MIT.
+By contributing, you agree that your contributions will be licensed under MPL-2.0.

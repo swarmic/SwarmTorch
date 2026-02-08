@@ -1,0 +1,78 @@
+[package]
+name = "swarm-torch"
+description = "Mission-grade swarm learning for heterogeneous fleets - Rust-native, no_std-ready, Byzantine-resilient"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[lib]
+name = "swarm_torch"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "tokio-runtime", "burn-backend", "robust-aggregation"]
+
+# Core features
+std = [
+    "swarm-torch-core/std",
+    "swarm-torch-net/std",
+    "swarm-torch-runtime/std",
+    "swarm-torch-models/std",
+]
+alloc = [
+    "swarm-torch-core/alloc",
+    "swarm-torch-net/alloc",
+    "swarm-torch-models/alloc",
+]
+
+# Runtime selection
+tokio-runtime = ["swarm-torch-runtime/tokio"]
+embassy-runtime = ["swarm-torch-runtime/embassy"]
+
+# Backend selection
+burn-backend = ["swarm-torch-models/burn"]
+tch-backend = ["swarm-torch-models/tch"]
+
+# Transport selection
+tcp-transport = ["swarm-torch-net/tcp-transport"]
+udp-transport = ["swarm-torch-net/udp-transport"]
+ble-transport = ["swarm-torch-net/ble-transport"]
+lora-transport = ["swarm-torch-net/lora-transport"]
+
+# Aggregation algorithms
+robust-aggregation = ["swarm-torch-core/robust-aggregation"]
+
+# Telemetry
+telemetry = ["swarm-torch-core/telemetry"]
+
+# Python bindings (separate build)
+python = []
+
+[dependencies]
+swarm-torch-core = { workspace = true }
+swarm-torch-net = { workspace = true }
+swarm-torch-runtime = { workspace = true }
+swarm-torch-models = { workspace = true }
+
+# Re-export async-trait for users
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion = { workspace = true }
+
+[[example]]
+name = "hello_swarm"
+required-features = ["std", "tokio-runtime"]
+
+[[bench]]
+name = "swarm_bench"
+harness = false

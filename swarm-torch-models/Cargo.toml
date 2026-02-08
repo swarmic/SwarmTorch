@@ -1,0 +1,34 @@
+[package]
+name = "swarm-torch-models"
+description = "Model utilities and backend integrations for SwarmTorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["machine-learning", "models", "burn", "pytorch"]
+categories = ["science", "machine-learning"]
+
+[lib]
+name = "swarm_torch_models"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "burn"]
+std = ["swarm-torch-core/std"]
+alloc = ["swarm-torch-core/alloc"]
+
+# Backend integrations
+burn = ["dep:burn", "dep:burn-ndarray"]
+tch = []  # tch-rs integration (optional, requires libtorch)
+
+[dependencies]
+swarm-torch-core = { workspace = true }
+serde = { workspace = true }
+
+# Burn ML framework
+burn = { workspace = true, optional = true }
+burn-ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]

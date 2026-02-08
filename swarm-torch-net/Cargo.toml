@@ -1,0 +1,44 @@
+[package]
+name = "swarm-torch-net"
+description = "Network transport abstractions for SwarmTorch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["networking", "transport", "embedded", "iot"]
+categories = ["network-programming", "embedded", "asynchronous"]
+
+[lib]
+name = "swarm_torch_net"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "tcp-transport"]
+std = ["swarm-torch-core/std", "tokio"]
+alloc = ["swarm-torch-core/alloc"]
+
+# Transport implementations
+tcp-transport = ["std"]
+udp-transport = ["std"]
+ble-transport = []
+lora-transport = []
+wifi-transport = []
+
+[dependencies]
+swarm-torch-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+postcard = { workspace = true }
+
+# Async trait for transport trait
+async-trait = "0.1"
+
+# Async runtime (optional, for std builds)
+tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
+
+# For embedded transports
+embassy-time = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

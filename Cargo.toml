@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "swarm-torch-core",
+    "swarm-torch-net",
+    "swarm-torch-runtime",
+    "swarm-torch-models",
+    "swarm-torch",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["SwarmTorch Contributors"]
+license = "MIT"
+repository = "https://github.com/swarmic/swarm-torch"
+homepage = "https://swarmtorch.dev"
+documentation = "https://docs.rs/swarm-torch"
+keywords = ["machine-learning", "distributed", "swarm", "federated-learning", "embedded"]
+categories = ["science", "embedded", "asynchronous", "network-programming"]
+
+[workspace.dependencies]
+# Core dependencies
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# Async runtimes
+tokio = { version = "1.35", features = ["full"] }
+embassy-executor = { version = "0.5", default-features = false }
+embassy-time = { version = "0.3", default-features = false }
+
+# ML backends
+burn = { version = "0.14", default-features = false }
+burn-ndarray = { version = "0.14" }
+
+# Cryptography
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+
+# Logging and telemetry
+tracing = { version = "0.1", default-features = false }
+defmt = "0.3"
+
+# Error handling
+thiserror = "1.0"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Internal crates
+swarm-torch-core = { path = "swarm-torch-core", version = "0.1.0" }
+swarm-torch-net = { path = "swarm-torch-net", version = "0.1.0" }
+swarm-torch-runtime = { path = "swarm-torch-runtime", version = "0.1.0" }
+swarm-torch-models = { path = "swarm-torch-models", version = "0.1.0" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.embedded]
+inherits = "release"
+opt-level = "s"
+debug = false

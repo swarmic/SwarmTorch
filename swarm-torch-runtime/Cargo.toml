@@ -1,0 +1,32 @@
+[package]
+name = "swarm-torch-runtime"
+description = "Async runtime abstractions for SwarmTorch (Tokio/Embassy)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["async", "runtime", "embedded", "tokio", "embassy"]
+categories = ["asynchronous", "embedded", "no-std"]
+
+[lib]
+name = "swarm_torch_runtime"
+path = "src/lib.rs"
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "std"]
+embassy = ["dep:embassy-executor", "dep:embassy-time"]
+std = []
+
+[dependencies]
+# Tokio runtime (for std builds)
+tokio = { workspace = true, optional = true }
+
+# Embassy runtime (for embedded builds)
+embassy-executor = { workspace = true, optional = true }
+embassy-time = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

@@ -148,8 +148,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use swarm_torch_core::dataops::{
-    dataset_fingerprint_v0, recipe_hash_v0, schema_hash_v0, source_fingerprint_v0, DatasetEntryV1,
-    LineageEdgeV1, SchemaDescriptorV0, SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
+    dataset_fingerprint_v0, derived_source_fingerprint_v0, no_schema_hash_v0, recipe_hash_v0,
+    schema_hash_v0, source_fingerprint_v0, DatasetEntryV1, LineageEdgeV1, SchemaDescriptorV0,
+    SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
 };
 use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
 
@@ -218,7 +219,7 @@ impl DataOpsSession {
         let schema_fp = schema
             .as_ref()
             .map(schema_hash_v0)
-            .unwrap_or_else(|| sha256_string("no_schema"));
+            .unwrap_or_else(no_schema_hash_v0);
 
         // recipe_hash for source = hash(ingest_node_def, [])
         let recipe = recipe_hash_v0(ingest_node, &[]);
@@ -291,17 +292,16 @@ impl DataOpsSession {
         let node_hash = hex_lower(&node_def_hash_v1(node));
 
         // 4. For each output: compute dataset_fingerprint_v0, insert entry
-        //    NOTE: We salt source_fp with asset_key to differentiate multi-output nodes
-        //    that would otherwise get identical fingerprints (same schema + recipe).
+        //    Uses canonical helpers from dataops.rs for consistent fingerprint rules.
         for output in outputs {
             let schema_fp = output
                 .schema
                 .as_ref()
                 .map(schema_hash_v0)
-                .unwrap_or_else(|| sha256_string("no_schema"));
+                .unwrap_or_else(no_schema_hash_v0);
 
-            // Salt derived source_fp with asset_key to prevent collision
-            let source_fp = sha256_string(&format!("derived:{}", output.asset_key));
+            // Use canonical derived source fingerprint (salted with asset_key)
+            let source_fp = derived_source_fingerprint_v0(&output.asset_key);
 
             let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
             let fp_hex = hex_lower(&dataset_fp);
@@ -389,14 +389,6 @@ impl DataOpsSession {
     pub fn sink(&self) -> &Arc<RunArtifactSink> {
         &self.sink
     }
-}
-
-fn sha256_string(s: &str) -> [u8; 32] {
-    use sha2::Digest;
-    let digest = Sha256::digest(s.as_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..]);
-    out
 }
 
 fn hex_to_bytes(hex: &str) -> Option<[u8; 32]> {

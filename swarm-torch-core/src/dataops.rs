@@ -286,7 +286,30 @@ pub fn dataset_fingerprint_v0(
     sha256_postcard(&canonical)
 }
 
+// ---------------------------------------------------------------------------
+// Canonical placeholder helpers (single source of truth for fingerprint rules)
+// ---------------------------------------------------------------------------
+
+/// Placeholder schema hash when schema descriptor is absent.
+///
+/// **ADR-0017:** `sha256(postcard("no_schema_v0"))`
+pub fn no_schema_hash_v0() -> [u8; 32] {
+    sha256_postcard(&"no_schema_v0")
+}
+
+/// Placeholder source fingerprint for derived (non-source) datasets.
+///
+/// Salted with `asset_key` to differentiate multi-output nodes.
+///
+/// **ADR-0017:** `sha256(postcard("derived_v0:{asset_key}"))`
+pub fn derived_source_fingerprint_v0(asset_key: &str) -> [u8; 32] {
+    sha256_postcard(&format!("derived_v0:{}", asset_key))
+}
+
 /// Convenience: build a registry entry (v1) from the provided descriptors.
+///
+/// **Warning:** For derived outputs (source = None), use `derived_dataset_entry_v1()` instead
+/// to ensure proper asset_key salting in source_fingerprint.
 pub fn dataset_entry_v1(
     asset_key: impl Into<String>,
     trust: TrustClass,
@@ -296,26 +319,63 @@ pub fn dataset_entry_v1(
 ) -> DatasetEntryV1 {
     let asset_key = asset_key.into();
 
+    // Use canonical helper for missing schema
+    let schema_fp = schema
+        .as_ref()
+        .map(schema_hash_v0)
+        .unwrap_or_else(no_schema_hash_v0);
+
+    // For source: if None, this function uses a non-salted placeholder
+    // which is ONLY correct for root sources without upstream.
+    // For derived outputs, callers SHOULD use derived_dataset_entry_v1().
     let source_fp = source
         .as_ref()
         .map(source_fingerprint_v0)
-        .unwrap_or_else(|| sha256_postcard(&"no_source"));
+        .unwrap_or_else(|| sha256_postcard(&"root_source_v0"));
 
-    let schema_hash = schema
-        .as_ref()
-        .map(schema_hash_v0)
-        .unwrap_or_else(|| sha256_postcard(&"no_schema"));
-
-    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_hash, recipe_hash);
+    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash);
 
     DatasetEntryV1 {
         asset_key,
         fingerprint_v0: hex_lower(&dataset_fp),
         source_fingerprint_v0: hex_lower(&source_fp),
-        schema_hash_v0: hex_lower(&schema_hash),
+        schema_hash_v0: hex_lower(&schema_fp),
         recipe_hash_v0: hex_lower(&recipe_hash),
         trust,
         source,
+        schema,
+        license_flags: Vec::new(),
+        pii_tags: Vec::new(),
+    }
+}
+
+/// Build a registry entry for a derived (non-source) dataset.
+///
+/// Uses `derived_source_fingerprint_v0(asset_key)` to salt the source fingerprint,
+/// preventing collision when multiple outputs share the same schema.
+pub fn derived_dataset_entry_v1(
+    asset_key: impl Into<String>,
+    trust: TrustClass,
+    schema: Option<SchemaDescriptorV0>,
+    recipe_hash: [u8; 32],
+) -> DatasetEntryV1 {
+    let asset_key = asset_key.into();
+
+    let source_fp = derived_source_fingerprint_v0(&asset_key);
+    let schema_fp = schema
+        .as_ref()
+        .map(schema_hash_v0)
+        .unwrap_or_else(no_schema_hash_v0);
+    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash);
+
+    DatasetEntryV1 {
+        asset_key,
+        fingerprint_v0: hex_lower(&dataset_fp),
+        source_fingerprint_v0: hex_lower(&source_fp),
+        schema_hash_v0: hex_lower(&schema_fp),
+        recipe_hash_v0: hex_lower(&recipe_hash),
+        trust,
+        source: None,
         schema,
         license_flags: Vec::new(),
         pii_tags: Vec::new(),
@@ -389,5 +449,41 @@ mod tests {
         assert_eq!(a.fingerprint_v0, b.fingerprint_v0);
         assert_eq!(a.schema_hash_v0, b.schema_hash_v0);
         assert_eq!(a.source_fingerprint_v0, b.source_fingerprint_v0);
+    }
+
+    #[test]
+    fn canonical_placeholder_no_schema_is_deterministic() {
+        let a = no_schema_hash_v0();
+        let b = no_schema_hash_v0();
+        assert_eq!(a, b, "no_schema_hash_v0 must be deterministic");
+        // Must be 32 bytes
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn canonical_placeholder_derived_is_salted() {
+        let a = derived_source_fingerprint_v0("dataset://ns/left");
+        let b = derived_source_fingerprint_v0("dataset://ns/right");
+        assert_ne!(
+            a, b,
+            "different asset_keys must produce different fingerprints"
+        );
+        // Same asset_key is deterministic
+        let a2 = derived_source_fingerprint_v0("dataset://ns/left");
+        assert_eq!(a, a2, "same asset_key must produce same fingerprint");
+    }
+
+    #[test]
+    fn derived_dataset_entry_uses_canonical_helpers() {
+        let recipe = [42u8; 32];
+        let entry = derived_dataset_entry_v1("dataset://ns/out", TrustClass::Trusted, None, recipe);
+
+        // Check that source_fingerprint uses derived_source_fingerprint_v0
+        let expected_source_fp = derived_source_fingerprint_v0("dataset://ns/out");
+        assert_eq!(entry.source_fingerprint_v0, hex_lower(&expected_source_fp));
+
+        // Check that schema_hash uses no_schema_hash_v0
+        let expected_schema_hash = no_schema_hash_v0();
+        assert_eq!(entry.schema_hash_v0, hex_lower(&expected_schema_hash));
     }
 }

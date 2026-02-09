@@ -7,6 +7,8 @@
 //! - swap native vs sandboxed runners later without changing `graph.json` semantics
 
 #[cfg(feature = "alloc")]
+use alloc::format;
+#[cfg(feature = "alloc")]
 use alloc::string::String;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;

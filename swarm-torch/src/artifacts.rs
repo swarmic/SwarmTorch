@@ -167,6 +167,11 @@ pub struct OutputSpec {
 /// **Limitation (v0.1):** Single-process writer per run directory.
 /// The `RunArtifactSink` mutex is in-process only; concurrent processes writing to the
 /// same bundle will corrupt NDJSON files.
+///
+/// **Manifest gap:** `flush_snapshots()` writes registry.json/lineage.json after each
+/// materialization but does NOT update manifest.json. Call `finalize()` before reading
+/// the bundle with report tools (which validate manifest hashes). After a crash mid-session,
+/// the manifest will be stale and report generation will fail until `finalize()` is called.
 #[derive(Debug)]
 pub struct DataOpsSession {
     sink: Arc<RunArtifactSink>,
@@ -286,6 +291,8 @@ impl DataOpsSession {
         let node_hash = hex_lower(&node_def_hash_v1(node));
 
         // 4. For each output: compute dataset_fingerprint_v0, insert entry
+        //    NOTE: We salt source_fp with asset_key to differentiate multi-output nodes
+        //    that would otherwise get identical fingerprints (same schema + recipe).
         for output in outputs {
             let schema_fp = output
                 .schema
@@ -293,17 +300,16 @@ impl DataOpsSession {
                 .map(schema_hash_v0)
                 .unwrap_or_else(|| sha256_string("no_schema"));
 
-            let dataset_fp = dataset_fingerprint_v0(
-                sha256_string("derived"), // derived outputs have no source
-                schema_fp,
-                recipe,
-            );
+            // Salt derived source_fp with asset_key to prevent collision
+            let source_fp = sha256_string(&format!("derived:{}", output.asset_key));
+
+            let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
             let fp_hex = hex_lower(&dataset_fp);
 
             let entry = DatasetEntryV1 {
                 asset_key: output.asset_key.clone(),
                 fingerprint_v0: fp_hex.clone(),
-                source_fingerprint_v0: hex_lower(&sha256_string("derived")),
+                source_fingerprint_v0: hex_lower(&source_fp),
                 schema_hash_v0: hex_lower(&schema_fp),
                 recipe_hash_v0: hex_lower(&recipe),
                 trust: output_trust,
@@ -1129,6 +1135,81 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn multi_output_fingerprints_unique() {
+        let base = temp_dir("multi_output_fp_unique");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([25u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Single node producing TWO outputs with SAME schema (None)
+        let transform = make_transform_node(
+            "transform/split",
+            &["dataset://ns/raw"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[
+                    OutputSpec {
+                        asset_key: "dataset://ns/left".to_string(),
+                        schema: None,
+                        rows: Some(50),
+                        bytes: Some(500),
+                    },
+                    OutputSpec {
+                        asset_key: "dataset://ns/right".to_string(),
+                        schema: None,
+                        rows: Some(50),
+                        bytes: Some(500),
+                    },
+                ],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+
+        let fp_left = session
+            .fingerprint("dataset://ns/left")
+            .unwrap()
+            .to_string();
+        let fp_right = session
+            .fingerprint("dataset://ns/right")
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            fp_left, fp_right,
+            "multi-output fingerprints should be unique even with same schema"
+        );
+        assert_eq!(fp_left.len(), 64, "fingerprint should be 64-char hex");
+        assert_eq!(fp_right.len(), 64, "fingerprint should be 64-char hex");
+
+        let _ = fs::remove_dir_all(&base);
+    }
     #[test]
     fn lineage_dedupes_repeated_edges() {
         let base = temp_dir("lineage_dedupe");

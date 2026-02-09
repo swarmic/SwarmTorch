@@ -17,6 +17,7 @@ New contributors should read these in order:
 2. [`v0.1.0-alpha.2.md`](v0.1.0-alpha.2.md) — Observability primitives and artifact bundle
 3. [`v0.1.0-alpha.3.md`](v0.1.0-alpha.3.md) — Documentation framework, security guardrails, license migration
 4. [`v0.1.0-alpha.4.md`](v0.1.0-alpha.4.md) — Technical whitepaper, release notes system, current state
+5. [`v0.1.0-alpha.5.md`](v0.1.0-alpha.5.md) — DataOps wiring, ExecutionPolicy, trust propagation
 
 ## Versioning
 

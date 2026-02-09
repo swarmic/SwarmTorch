@@ -16,8 +16,10 @@ use swarm_torch_core::run_graph::{GraphV1, NodeId};
 
 use crate::artifacts::RunArtifactBundle;
 
-#[derive(Debug)]
+/// Report data loaded from a run artifact bundle.
+#[derive(Debug, serde::Serialize)]
 pub struct Report {
+    #[serde(serialize_with = "serialize_path")]
     pub run_dir: PathBuf,
     pub graph: GraphV1,
     pub registry: DatasetRegistryV1,
@@ -26,6 +28,10 @@ pub struct Report {
     pub spans: Vec<SpanRecord>,
     pub events: Vec<EventRecord>,
     pub metrics: Vec<MetricRecord>,
+}
+
+fn serialize_path<S: serde::Serializer>(path: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&path.display().to_string())
 }
 
 pub fn load_report(run_dir: impl AsRef<Path>) -> io::Result<Report> {
@@ -66,6 +72,27 @@ pub fn generate_report_html(
     let report = load_report(run_dir)?;
     let html = render_html(&report);
     fs::write(out_path, html)
+}
+
+/// Generate report with optional JSON output.
+///
+/// If `json_out` is Some, writes pretty-printed JSON alongside HTML.
+pub fn generate_report(
+    run_dir: impl AsRef<Path>,
+    html_out: impl AsRef<Path>,
+    json_out: Option<impl AsRef<Path>>,
+) -> io::Result<()> {
+    let report = load_report(&run_dir)?;
+    let html = render_html(&report);
+    fs::write(&html_out, html)?;
+
+    if let Some(json_path) = json_out {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(json_path, json)?;
+    }
+
+    Ok(())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> io::Result<T> {

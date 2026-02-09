@@ -140,6 +140,281 @@ impl RunArtifactSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DataOpsSession: single derivation point for fingerprints/lineage/materializations
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use swarm_torch_core::dataops::{
+    dataset_fingerprint_v0, recipe_hash_v0, schema_hash_v0, source_fingerprint_v0, DatasetEntryV1,
+    LineageEdgeV1, SchemaDescriptorV0, SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
+};
+use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
+
+/// Output specification for `materialize_node_outputs`.
+#[derive(Debug, Clone)]
+pub struct OutputSpec {
+    pub asset_key: String,
+    pub schema: Option<SchemaDescriptorV0>,
+    pub rows: Option<u64>,
+    pub bytes: Option<u64>,
+}
+
+/// DataOps session: manages registry/lineage with trust propagation and crash-safe persistence.
+///
+/// **Limitation (v0.1):** Single-process writer per run directory.
+/// The `RunArtifactSink` mutex is in-process only; concurrent processes writing to the
+/// same bundle will corrupt NDJSON files.
+#[derive(Debug)]
+pub struct DataOpsSession {
+    sink: Arc<RunArtifactSink>,
+    /// asset_key -> DatasetEntryV1 (uniqueness enforced)
+    registry: BTreeMap<String, DatasetEntryV1>,
+    /// (input_fp, output_fp, node_id_str) -> LineageEdgeV1 (dedupe key)
+    lineage: BTreeMap<(String, String, String), LineageEdgeV1>,
+}
+
+impl DataOpsSession {
+    /// Create a new session wrapping an artifact sink.
+    pub fn new(sink: Arc<RunArtifactSink>) -> Self {
+        Self {
+            sink,
+            registry: BTreeMap::new(),
+            lineage: BTreeMap::new(),
+        }
+    }
+
+    /// Look up fingerprint (64-char hex) for an asset_key.
+    pub fn fingerprint(&self, asset_key: &str) -> Option<&str> {
+        self.registry
+            .get(asset_key)
+            .map(|e| e.fingerprint_v0.as_str())
+    }
+
+    /// Look up fingerprint bytes for an asset_key.
+    pub fn fingerprint_bytes(&self, asset_key: &str) -> Option<[u8; 32]> {
+        self.registry
+            .get(asset_key)
+            .and_then(|e| hex_to_bytes(&e.fingerprint_v0))
+    }
+
+    /// Register a source dataset (no upstream; uses ingest_node for recipe_hash).
+    pub fn register_source(
+        &mut self,
+        asset_key: &str,
+        trust: TrustClass,
+        source: SourceDescriptorV0,
+        schema: Option<SchemaDescriptorV0>,
+        ingest_node: &NodeV1,
+    ) -> io::Result<()> {
+        let source_fp = source_fingerprint_v0(&source);
+        let schema_fp = schema
+            .as_ref()
+            .map(schema_hash_v0)
+            .unwrap_or_else(|| sha256_string("no_schema"));
+
+        // recipe_hash for source = hash(ingest_node_def, [])
+        let recipe = recipe_hash_v0(ingest_node, &[]);
+
+        let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
+
+        let entry = DatasetEntryV1 {
+            asset_key: asset_key.to_string(),
+            fingerprint_v0: hex_lower(&dataset_fp),
+            source_fingerprint_v0: hex_lower(&source_fp),
+            schema_hash_v0: hex_lower(&schema_fp),
+            recipe_hash_v0: hex_lower(&recipe),
+            trust,
+            source: Some(source),
+            schema,
+            license_flags: Vec::new(),
+            pii_tags: Vec::new(),
+        };
+
+        self.registry.insert(asset_key.to_string(), entry);
+        self.flush_snapshots()
+    }
+
+    /// Materialize node outputs: derives fingerprints, propagates trust, emits records, flushes.
+    ///
+    /// Sets `unsafe_surface = true` if:
+    /// - `node.execution_trust != Core`, OR
+    /// - any input has `trust = Untrusted`
+    pub fn materialize_node_outputs(
+        &mut self,
+        node: &NodeV1,
+        outputs: &[OutputSpec],
+        ts_unix_nanos: u64,
+        cache_hit: bool,
+        duration_ms: u64,
+    ) -> io::Result<()> {
+        // 1. Lookup upstream fingerprints from registry
+        let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
+        let mut any_untrusted_input = false;
+
+        for input in &node.inputs {
+            if let Some(entry) = self.registry.get(&input.asset_key) {
+                if let Some(fp_bytes) = hex_to_bytes(&entry.fingerprint_v0) {
+                    upstream_fps.push(fp_bytes);
+                }
+                if matches!(entry.trust, TrustClass::Untrusted) {
+                    any_untrusted_input = true;
+                }
+            }
+        }
+
+        // 2. Compute recipe_hash_v0(node, upstream_fps)
+        let recipe = recipe_hash_v0(node, &upstream_fps);
+
+        // 3. Determine output trust: Untrusted if any input untrusted OR execution_trust != Core
+        let output_trust =
+            if any_untrusted_input || !matches!(node.execution_trust, ExecutionTrust::Core) {
+                TrustClass::Untrusted
+            } else {
+                TrustClass::Trusted
+            };
+
+        let unsafe_surface = matches!(output_trust, TrustClass::Untrusted);
+
+        // Derive node_id
+        let node_id = node
+            .node_id
+            .unwrap_or_else(|| node_id_from_key(&node.node_key));
+        let node_id_str = node_id.to_string();
+        let node_hash = hex_lower(&node_def_hash_v1(node));
+
+        // 4. For each output: compute dataset_fingerprint_v0, insert entry
+        for output in outputs {
+            let schema_fp = output
+                .schema
+                .as_ref()
+                .map(schema_hash_v0)
+                .unwrap_or_else(|| sha256_string("no_schema"));
+
+            let dataset_fp = dataset_fingerprint_v0(
+                sha256_string("derived"), // derived outputs have no source
+                schema_fp,
+                recipe,
+            );
+            let fp_hex = hex_lower(&dataset_fp);
+
+            let entry = DatasetEntryV1 {
+                asset_key: output.asset_key.clone(),
+                fingerprint_v0: fp_hex.clone(),
+                source_fingerprint_v0: hex_lower(&sha256_string("derived")),
+                schema_hash_v0: hex_lower(&schema_fp),
+                recipe_hash_v0: hex_lower(&recipe),
+                trust: output_trust,
+                source: None,
+                schema: output.schema.clone(),
+                license_flags: Vec::new(),
+                pii_tags: Vec::new(),
+            };
+            self.registry.insert(output.asset_key.clone(), entry);
+
+            // 5. Insert lineage edges (dedupe by key)
+            for input in &node.inputs {
+                if let Some(in_fp) = self
+                    .registry
+                    .get(&input.asset_key)
+                    .map(|e| e.fingerprint_v0.clone())
+                {
+                    let edge_key = (in_fp.clone(), fp_hex.clone(), node_id_str.clone());
+                    let edge = LineageEdgeV1 {
+                        input_fingerprint_v0: in_fp,
+                        output_fingerprint_v0: fp_hex.clone(),
+                        node_id,
+                        op_kind: node.op_kind,
+                    };
+                    self.lineage.insert(edge_key, edge);
+                }
+            }
+
+            // 6. Append MaterializationRecordV1
+            let mat = MaterializationRecordV1 {
+                schema_version: DATAOPS_SCHEMA_V1,
+                ts_unix_nanos,
+                asset_key: output.asset_key.clone(),
+                fingerprint_v0: fp_hex,
+                node_id,
+                node_def_hash: node_hash.clone(),
+                rows: output.rows,
+                bytes: output.bytes,
+                cache_hit: Some(cache_hit),
+                duration_ms: Some(duration_ms),
+                quality_flags: None,
+                unsafe_surface,
+            };
+            self.sink.append_materialization(&mat)?;
+        }
+
+        // 7. flush_snapshots()
+        self.flush_snapshots()
+    }
+
+    /// Flush registry.json + lineage.json atomically (crash-safe).
+    fn flush_snapshots(&self) -> io::Result<()> {
+        // Registry: sorted by asset_key (BTreeMap iteration is already sorted)
+        let registry = DatasetRegistryV1 {
+            schema_version: DATAOPS_SCHEMA_V1,
+            datasets: self.registry.values().cloned().collect(),
+        };
+        self.sink.write_dataset_registry(&registry)?;
+
+        // Lineage: sorted by key (BTreeMap iteration is already sorted)
+        let lineage = DatasetLineageV1 {
+            schema_version: DATAOPS_SCHEMA_V1,
+            edges: self.lineage.values().cloned().collect(),
+        };
+        self.sink.write_dataset_lineage(&lineage)?;
+
+        Ok(())
+    }
+
+    /// Finalize session: writes final snapshots and manifest.
+    pub fn finalize(&self) -> io::Result<()> {
+        self.flush_snapshots()?;
+        self.sink.finalize_manifest()
+    }
+
+    /// Get a reference to the underlying sink for span/event/metric emission.
+    pub fn sink(&self) -> &Arc<RunArtifactSink> {
+        &self.sink
+    }
+}
+
+fn sha256_string(s: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..]);
+    out
+}
+
+fn hex_to_bytes(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let high = hex_digit(chunk[0])?;
+        let low = hex_digit(chunk[1])?;
+        out[i] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl RunArtifactBundle {
     /// Open an existing bundle directory (`runs/<run_id>/...`) by reading `run.json`.
     pub fn open(run_dir: impl AsRef<Path>) -> io::Result<Self> {
@@ -531,8 +806,8 @@ mod tests {
     use swarm_torch_core::dataops::MaterializationRecordV1;
     use swarm_torch_core::observe::{AttrMap, SpanId, TraceId};
     use swarm_torch_core::run_graph::{
-        node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, ExecutionTrust, GraphV1,
-        NodeV1, OpKind,
+        node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, ExecutionTrust,
+        GraphV1, NodeV1, OpKind,
     };
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -640,6 +915,517 @@ mod tests {
         let digest = node_def_hash_v1(node);
         let expected_hash = hex_lower(&digest);
         assert_eq!(node.node_def_hash.as_ref().unwrap(), &expected_hash);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // -------------------------------------------------------------------------
+    // DataOpsSession invariant tests
+    // -------------------------------------------------------------------------
+
+    fn make_source_node(key: &str) -> NodeV1 {
+        NodeV1 {
+            node_key: key.to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "ingest".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: Some("test@0.1.0".to_string()),
+            unsafe_surface: false,
+            execution_trust: ExecutionTrust::Core,
+            node_def_hash: None,
+        }
+    }
+
+    fn make_transform_node(key: &str, input_keys: &[&str], trust: ExecutionTrust) -> NodeV1 {
+        NodeV1 {
+            node_key: key.to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "transform".to_string(),
+            inputs: input_keys
+                .iter()
+                .map(|k| AssetRefV1 {
+                    asset_key: k.to_string(),
+                    fingerprint: None,
+                })
+                .collect(),
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: Some("test@0.1.0".to_string()),
+            unsafe_surface: false,
+            execution_trust: trust,
+            node_def_hash: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_changes_when_node_def_changes() {
+        let base = temp_dir("fp_changes_node_def");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([10u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest1 = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source.clone(),
+                None,
+                &ingest1,
+            )
+            .unwrap();
+        let fp1 = session.fingerprint("dataset://ns/raw").unwrap().to_string();
+
+        // Register same source with different ingest node (different params)
+        let mut ingest2 = make_source_node("ingest/v2");
+        ingest2
+            .params
+            .insert("delimiter".to_string(), CanonValue::Str(",".to_string()));
+
+        // Create new session to simulate different parse options
+        let bundle2 = RunArtifactBundle::create(
+            temp_dir("fp_changes_node_def2"),
+            RunId::from_bytes([11u8; 16]),
+        )
+        .unwrap();
+        let sink2 = Arc::new(RunArtifactSink::new(bundle2));
+        let mut session2 = DataOpsSession::new(Arc::clone(&sink2));
+        session2
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest2,
+            )
+            .unwrap();
+        let fp2 = session2
+            .fingerprint("dataset://ns/raw")
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            fp1, fp2,
+            "fingerprint should change when ingest node changes"
+        );
+        assert_eq!(fp1.len(), 64, "fingerprint should be 64-char hex");
+        assert_eq!(fp2.len(), 64, "fingerprint should be 64-char hex");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_upstream_changes() {
+        let base = temp_dir("fp_changes_upstream");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([20u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register two different sources
+        let source1 = SourceDescriptorV0 {
+            uri: "s3://bucket/data1".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let source2 = SourceDescriptorV0 {
+            uri: "s3://bucket/data2".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw1",
+                TrustClass::Trusted,
+                source1,
+                None,
+                &ingest,
+            )
+            .unwrap();
+        session
+            .register_source(
+                "dataset://ns/raw2",
+                TrustClass::Trusted,
+                source2,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Transform with raw1 as input
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw1"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean_a".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+        let fp_a = session
+            .fingerprint("dataset://ns/clean_a")
+            .unwrap()
+            .to_string();
+
+        // Transform with raw2 as input (same transform node, different upstream)
+        let transform2 = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw2"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform2,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean_b".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1001,
+                false,
+                50,
+            )
+            .unwrap();
+        let fp_b = session
+            .fingerprint("dataset://ns/clean_b")
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            fp_a, fp_b,
+            "fingerprint should change when upstream changes"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_dedupes_repeated_edges() {
+        let base = temp_dir("lineage_dedupe");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([30u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Materialize same output twice
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                2000,
+                true,
+                10,
+            )
+            .unwrap();
+
+        // Read lineage.json and check edge count
+        let lineage_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("lineage.json");
+        let lineage: DatasetLineageV1 = read_json(&lineage_path).unwrap();
+
+        // Should have exactly one edge (deduped)
+        assert_eq!(
+            lineage.edges.len(),
+            1,
+            "lineage should dedupe repeated edges"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn snapshot_determinism() {
+        let base = temp_dir("snapshot_determinism");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([40u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source and transform
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+
+        // Read registry.json contents
+        let registry_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("registry.json");
+        let content1 = fs::read_to_string(&registry_path).unwrap();
+
+        // Flush again (no state change)
+        session.finalize().unwrap();
+        let content2 = fs::read_to_string(&registry_path).unwrap();
+
+        assert_eq!(
+            content1, content2,
+            "registry.json should be byte-identical on repeated flush"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn trust_propagates_from_untrusted_input() {
+        let base = temp_dir("trust_untrusted_input");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([50u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register UNTRUSTED source
+        let source = SourceDescriptorV0 {
+            uri: "http://external/data".to_string(),
+            content_type: "application/json".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/external");
+        session
+            .register_source(
+                "dataset://ns/external",
+                TrustClass::Untrusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Core node reading untrusted input -> output should be Untrusted
+        let transform = make_transform_node(
+            "transform/process",
+            &["dataset://ns/external"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/processed".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        // Read registry and check output trust
+        let registry_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("registry.json");
+        let registry: DatasetRegistryV1 = read_json(&registry_path).unwrap();
+
+        let output = registry
+            .datasets
+            .iter()
+            .find(|d| d.asset_key == "dataset://ns/processed")
+            .unwrap();
+        assert!(
+            matches!(output.trust, TrustClass::Untrusted),
+            "output should be Untrusted when input is Untrusted"
+        );
+
+        // Check materialization unsafe_surface
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        assert!(
+            content.contains("\"unsafe_surface\":true"),
+            "materialization should have unsafe_surface=true"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn trust_propagates_from_unsafe_extension() {
+        let base = temp_dir("trust_unsafe_extension");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([60u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register TRUSTED source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/s3");
+        session
+            .register_source(
+                "dataset://ns/trusted",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // UnsafeExtension node -> output should be Untrusted
+        let transform = make_transform_node(
+            "transform/custom",
+            &["dataset://ns/trusted"],
+            ExecutionTrust::UnsafeExtension,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/custom_out".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        // Read registry and check output trust
+        let registry_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("registry.json");
+        let registry: DatasetRegistryV1 = read_json(&registry_path).unwrap();
+
+        let output = registry
+            .datasets
+            .iter()
+            .find(|d| d.asset_key == "dataset://ns/custom_out")
+            .unwrap();
+        assert!(
+            matches!(output.trust, TrustClass::Untrusted),
+            "output should be Untrusted when execution_trust is UnsafeExtension"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

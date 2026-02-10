@@ -24,7 +24,7 @@ If you add or change a **normative** requirement (MUST/SHOULD/MAY), you must eit
 
 ```bash
 # Clone and build
-git clone https://github.com/swarmic/swarm-torch
+git clone https://github.com/swarmic/SwarmTorch
 cd swarm-torch
 cargo build
 

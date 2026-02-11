@@ -1,0 +1,59 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.75"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      - name: Test
+        run: cargo test --workspace --verbose
+
+      - name: Format (stable only)
+        if: matrix.rust == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Lint (stable only)
+        if: matrix.rust == 'stable'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Docs (stable only)
+        if: matrix.rust == 'stable'
+        run: cargo doc --workspace --no-deps
+
+      - name: no_std+alloc core gate (stable only)
+        if: matrix.rust == 'stable'
+        run: cargo build -p swarm-torch-core --no-default-features --features alloc
+
+      - name: Artifact pipeline example (stable only)
+        if: matrix.rust == 'stable'
+        run: cargo run -p swarm-torch --example artifact_pipeline

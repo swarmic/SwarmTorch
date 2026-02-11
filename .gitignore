@@ -18,7 +18,7 @@ docs/internal/
 **/target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Keep Cargo.lock versioned for reproducible MSRV CI resolution.
 
 # -----------------------------------------------------------------------------
 # IDE and Editor Files

@@ -32,11 +32,21 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --workspace --verbose
+      - name: Build (stable workspace)
+        if: matrix.rust == 'stable'
+        run: cargo build --workspace --verbose --locked
 
-      - name: Test
-        run: cargo test --workspace --verbose
+      - name: Test (stable workspace)
+        if: matrix.rust == 'stable'
+        run: cargo test --workspace --verbose --locked
+
+      - name: Build (MSRV core std)
+        if: matrix.rust == '1.75'
+        run: cargo build -p swarm-torch-core --lib --verbose --locked
+
+      - name: Build (MSRV core no_std+alloc)
+        if: matrix.rust == '1.75'
+        run: cargo build -p swarm-torch-core --no-default-features --features alloc --verbose --locked
 
       - name: Format (stable only)
         if: matrix.rust == 'stable'
@@ -44,16 +54,16 @@ jobs:
 
       - name: Lint (stable only)
         if: matrix.rust == 'stable'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Docs (stable only)
         if: matrix.rust == 'stable'
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
       - name: no_std+alloc core gate (stable only)
         if: matrix.rust == 'stable'
-        run: cargo build -p swarm-torch-core --no-default-features --features alloc
+        run: cargo build -p swarm-torch-core --no-default-features --features alloc --locked
 
       - name: Artifact pipeline example (stable only)
         if: matrix.rust == 'stable'
-        run: cargo run -p swarm-torch --example artifact_pipeline
+        run: cargo run -p swarm-torch --example artifact_pipeline --locked

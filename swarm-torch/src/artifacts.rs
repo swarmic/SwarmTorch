@@ -262,6 +262,7 @@ impl DataOpsSession {
     /// - Returns `Err` if any `node.inputs[].asset_key` is missing from registry (fail closed)
     /// - Returns `Err` if any input fingerprint is invalid hex
     /// - Returns `Err` if any `OutputSpec.asset_key` is not declared in `node.outputs[]`
+    /// - Returns `Err` if any declared `node.outputs[]` asset key is missing from `outputs`
     /// - Returns `Err` if `outputs` contains duplicate `asset_key` values
     /// - Lineage edges reference pre-mutation input fingerprints (not post-insert state)
     ///
@@ -278,11 +279,11 @@ impl DataOpsSession {
     ) -> io::Result<()> {
         // ── PRE-VALIDATION ──────────────────────────────────────────────
 
-        // 1. Reject duplicate output keys
+        // 1. Reject duplicate output keys, and capture provided output set.
+        let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
-            let mut seen = std::collections::HashSet::new();
             for output in outputs {
-                if !seen.insert(&output.asset_key) {
+                if !provided.insert(output.asset_key.clone()) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("duplicate output asset_key: {}", output.asset_key),
@@ -291,17 +292,30 @@ impl DataOpsSession {
             }
         }
 
-        // 2. Enforce output contract: every OutputSpec must be declared in node.outputs[]
+        // 2. Enforce output contract:
+        //    - every provided OutputSpec must be declared in node.outputs[]
+        //    - every declared node output must be present in outputs
         {
-            let declared: std::collections::HashSet<&str> =
-                node.outputs.iter().map(|o| o.asset_key.as_str()).collect();
-            for output in outputs {
-                if !declared.contains(output.asset_key.as_str()) {
+            let declared: std::collections::HashSet<String> =
+                node.outputs.iter().map(|o| o.asset_key.clone()).collect();
+            for output_key in &provided {
+                if !declared.contains(output_key) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "output {} not declared in node.outputs for node {}",
-                            output.asset_key, node.node_key,
+                            output_key, node.node_key,
+                        ),
+                    ));
+                }
+            }
+            for declared_key in declared {
+                if !provided.contains(&declared_key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "missing declared node output {} for node {}",
+                            declared_key, node.node_key,
                         ),
                     ));
                 }
@@ -1672,14 +1686,80 @@ mod tests {
     }
 
     #[test]
-    fn lineage_in_place_uses_pre_mutation_fingerprint() {
+    fn materialize_fails_on_invalid_input_fingerprint_hex() {
+        let base = temp_dir("invalid_input_fingerprint");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([71u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source, then intentionally corrupt fingerprint.
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+        session
+            .registry
+            .get_mut("dataset://ns/raw")
+            .expect("test setup must register dataset://ns/raw")
+            .fingerprint_v0 = "zzzz".to_string();
+
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[OutputSpec {
+                asset_key: "dataset://ns/clean".to_string(),
+                schema: None,
+                rows: Some(100),
+                bytes: Some(1000),
+            }],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(result.is_err(), "should fail on invalid input fingerprint");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid fingerprint"),
+            "error should mention invalid fingerprint: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("dataset://ns/raw"),
+            "error should name the invalid input asset: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_uses_pre_mutation_input_fingerprint_for_in_place_transform() {
         // Verify that lineage edges reference the INPUT fingerprint from BEFORE
         // the output was inserted into the registry. This prevents corruption
         // when an output asset_key matches an input asset_key (re-materialization).
         let base = temp_dir("lineage_premutation");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        let run_id = RunId::from_bytes([71u8; 16]);
+        let run_id = RunId::from_bytes([72u8; 16]);
         let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
         let sink = Arc::new(RunArtifactSink::new(bundle));
         let mut session = DataOpsSession::new(Arc::clone(&sink));
@@ -1705,18 +1785,18 @@ mod tests {
         // Capture the source fingerprint BEFORE transform
         let source_fp = session.fingerprint("dataset://ns/raw").unwrap().to_string();
 
-        // Transform: raw → clean
+        // In-place transform: raw -> raw
         let transform = make_transform_node(
-            "transform/clean",
+            "transform/recompute_raw",
             &["dataset://ns/raw"],
-            &["dataset://ns/clean"],
+            &["dataset://ns/raw"],
             ExecutionTrust::Core,
         );
         session
             .materialize_node_outputs(
                 &transform,
                 &[OutputSpec {
-                    asset_key: "dataset://ns/clean".to_string(),
+                    asset_key: "dataset://ns/raw".to_string(),
                     schema: None,
                     rows: Some(100),
                     bytes: Some(1000),
@@ -1740,6 +1820,10 @@ mod tests {
             lineage.edges[0].input_fingerprint_v0, source_fp,
             "lineage input fingerprint must reference pre-mutation state"
         );
+        assert_ne!(
+            lineage.edges[0].output_fingerprint_v0, source_fp,
+            "in-place transform output fingerprint should reflect new materialization state"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1749,7 +1833,7 @@ mod tests {
         let base = temp_dir("undeclared_output");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        let run_id = RunId::from_bytes([72u8; 16]);
+        let run_id = RunId::from_bytes([73u8; 16]);
         let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
         let sink = Arc::new(RunArtifactSink::new(bundle));
         let mut session = DataOpsSession::new(Arc::clone(&sink));
@@ -1807,11 +1891,76 @@ mod tests {
     }
 
     #[test]
+    fn materialize_rejects_missing_declared_node_output() {
+        let base = temp_dir("missing_declared_output");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([74u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Node declares two outputs; materialization provides only one.
+        let transform = make_transform_node(
+            "transform/split",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out_a", "dataset://ns/out_b"],
+            ExecutionTrust::Core,
+        );
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[OutputSpec {
+                asset_key: "dataset://ns/out_a".to_string(),
+                schema: None,
+                rows: Some(10),
+                bytes: Some(100),
+            }],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject missing declared node output"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing declared node output"),
+            "error should mention missing declared output: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("dataset://ns/out_b"),
+            "error should identify missing output key: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn materialize_rejects_duplicate_output_asset_keys() {
         let base = temp_dir("duplicate_output");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        let run_id = RunId::from_bytes([73u8; 16]);
+        let run_id = RunId::from_bytes([75u8; 16]);
         let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
         let sink = Arc::new(RunArtifactSink::new(bundle));
         let mut session = DataOpsSession::new(Arc::clone(&sink));

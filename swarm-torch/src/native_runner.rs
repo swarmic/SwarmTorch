@@ -120,8 +120,6 @@ impl NativeOpRunner {
         Ok(outputs)
     }
 
-    // ── Op implementations ──────────────────────────────────────────
-
     /// Passthrough: returns inputs as-is, unchanged.
     fn op_passthrough(inputs: &[AssetInstanceV1]) -> Vec<AssetInstanceV1> {
         inputs.to_vec()

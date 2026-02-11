@@ -241,6 +241,13 @@ struct TimelineRow {
 
 fn render_timeline(report: &Report) -> String {
     let mut rows: Vec<TimelineRow> = Vec::new();
+    let mut node_unsafe_by_id: std::collections::HashMap<NodeId, bool> =
+        std::collections::HashMap::new();
+    for node in &report.graph.nodes {
+        if let Some(node_id) = node.node_id {
+            node_unsafe_by_id.insert(node_id, is_node_unsafe(node, &report.registry));
+        }
+    }
 
     for e in &report.events {
         rows.push(TimelineRow {
@@ -272,6 +279,7 @@ fn render_timeline(report: &Report) -> String {
         });
     }
     for m in &report.materializations {
+        let derived_unsafe = node_unsafe_by_id.get(&m.node_id).copied().unwrap_or(true);
         rows.push(TimelineRow {
             ts: m.ts_unix_nanos,
             kind: "materialization",
@@ -287,7 +295,7 @@ fn render_timeline(report: &Report) -> String {
                 m.cache_hit
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
-                m.unsafe_surface,
+                derived_unsafe,
                 m.node_id,
                 &m.node_def_hash
             ),
@@ -418,7 +426,7 @@ fn render_html(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarm_torch_core::dataops::{DatasetEntryV1, TrustClass};
+    use swarm_torch_core::dataops::{DatasetEntryV1, DatasetLineageV1, TrustClass};
     use swarm_torch_core::observe::TraceId;
     use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind};
 
@@ -517,6 +525,13 @@ mod tests {
     #[test]
     fn timeline_materialization_includes_node_id_and_node_def_hash() {
         let node_id = TraceId::from_bytes([1u8; 16]);
+        let mut node = make_node(
+            "transform/clean",
+            ExecutionTrust::Core,
+            &["dataset://ns/missing"],
+        );
+        node.node_id = Some(node_id);
+
         let mat = MaterializationRecordV1 {
             schema_version: 1,
             ts_unix_nanos: 1000,
@@ -529,37 +544,47 @@ mod tests {
             cache_hit: Some(false),
             duration_ms: Some(50),
             quality_flags: None,
-            unsafe_surface: false,
+            unsafe_surface: false, // intentionally false: timeline should derive from node+registry.
         };
 
-        // Build the detail string the same way the timeline renderer does
-        let detail = format!(
-            "rows={} bytes={} cache_hit={} unsafe={} node_id={} node_def_hash={}",
-            mat.rows
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-            mat.bytes
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-            mat.cache_hit
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-            mat.unsafe_surface,
-            mat.node_id,
-            &mat.node_def_hash
-        );
+        let report = Report {
+            run_dir: PathBuf::from("/tmp/test"),
+            graph: GraphV1 {
+                schema_version: 1,
+                graph_id: None,
+                nodes: vec![node],
+                edges: vec![],
+            },
+            registry: DatasetRegistryV1 {
+                schema_version: 1,
+                datasets: vec![], // missing input => derived unsafe=true
+            },
+            lineage: DatasetLineageV1 {
+                schema_version: 1,
+                edges: vec![],
+            },
+            materializations: vec![mat],
+            spans: vec![],
+            events: vec![],
+            metrics: vec![],
+        };
+        let timeline_html = render_timeline(&report);
 
         assert!(
-            detail.contains("node_id="),
-            "timeline detail should include node_id: {detail}"
+            timeline_html.contains("node_id="),
+            "timeline detail should include node_id: {timeline_html}"
         );
         assert!(
-            detail.contains("node_def_hash="),
-            "timeline detail should include node_def_hash: {detail}"
+            timeline_html.contains("node_def_hash="),
+            "timeline detail should include node_def_hash: {timeline_html}"
         );
         assert!(
-            detail.contains(&"h".repeat(64)),
-            "timeline detail should include full node_def_hash value: {detail}"
+            timeline_html.contains(&"h".repeat(64)),
+            "timeline detail should include full node_def_hash value: {timeline_html}"
+        );
+        assert!(
+            timeline_html.contains("unsafe=true"),
+            "timeline unsafe should be derived from node+registry, not materialization flag: {timeline_html}"
         );
     }
 }

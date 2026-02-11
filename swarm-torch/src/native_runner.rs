@@ -3,7 +3,7 @@
 //! Implements three metadata-only ops:
 //! - `passthrough`: forwards inputs unchanged
 //! - `filter_rows`: filters rows (metadata-only; rows/bytes = None)
-//! - `union`: unions multiple inputs (metadata-only; rows/bytes = None)
+//! - `union`: forwards input metadata for union-style stages; materialization computes outputs
 //!
 //! All ops emit a deterministic span:
 //! - `trace_id = run_id` (16 bytes → TraceId)
@@ -46,7 +46,7 @@ fn deterministic_span_id(node_id_bytes: &[u8; 16], ts_nanos: u64) -> SpanId {
 /// Supports three op_types:
 /// - `"passthrough"` — returns inputs as-is
 /// - `"filter_rows"` — returns inputs with metadata indicating filter applied
-/// - `"union"` — returns a single output combining all input asset_keys
+/// - `"union"` — returns input metadata unchanged (output derivation happens at materialization)
 pub struct NativeOpRunner;
 
 impl NativeOpRunner {
@@ -135,11 +135,11 @@ impl NativeOpRunner {
         inputs.to_vec()
     }
 
-    /// Union: combines all inputs into a single merged asset list.
-    /// This is metadata-only; actual merging would happen in a real runner.
+    /// Union: metadata-only pass-through for union stages.
+    /// Actual union output derivation happens during materialization.
     fn op_union(inputs: &[AssetInstanceV1], _node: &NodeV1) -> Vec<AssetInstanceV1> {
-        // For metadata-only: return all inputs (the orchestrator uses
-        // materialize_node_outputs to create the actual output fingerprint).
+        // For metadata-only: return all inputs unchanged. The orchestrator uses
+        // materialize_node_outputs to derive canonical output fingerprints.
         inputs.to_vec()
     }
 }
@@ -291,6 +291,25 @@ mod tests {
         let spans = emitter.spans.read().unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "op/filter_rows");
+    }
+
+    #[test]
+    fn union_metadata_only_forwards_inputs() {
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let runner = NativeOpRunner;
+        let node = test_node("union");
+        let inputs = test_inputs();
+
+        let outputs = runner
+            .run_with_context(&ctx, &node, &inputs, &emitter)
+            .unwrap();
+
+        assert_eq!(outputs, inputs);
+
+        let spans = emitter.spans.read().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "op/union");
     }
 
     #[test]

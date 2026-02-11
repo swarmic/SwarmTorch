@@ -165,6 +165,8 @@ pub enum PredictError {
     MissingInput(String),
     /// An input's fingerprint in the registry is not valid hex.
     InvalidFingerprint(String),
+    /// Prediction output list violated node output contract.
+    OutputContract(String),
 }
 
 /// Output specification for `materialize_node_outputs`.
@@ -263,6 +265,7 @@ impl DataOpsSession {
     /// - Returns `Err` if any input fingerprint is invalid hex
     /// - Returns `Err` if any `OutputSpec.asset_key` is not declared in `node.outputs[]`
     /// - Returns `Err` if any declared `node.outputs[]` asset key is missing from `outputs`
+    /// - Returns `Err` if `node.outputs[]` itself contains duplicate `asset_key` values
     /// - Returns `Err` if `outputs` contains duplicate `asset_key` values
     /// - Lineage edges reference pre-mutation input fingerprints (not post-insert state)
     ///
@@ -296,8 +299,18 @@ impl DataOpsSession {
         //    - every provided OutputSpec must be declared in node.outputs[]
         //    - every declared node output must be present in outputs
         {
-            let declared: std::collections::HashSet<String> =
-                node.outputs.iter().map(|o| o.asset_key.clone()).collect();
+            let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for node_output in &node.outputs {
+                if !declared.insert(node_output.asset_key.clone()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicate node output asset_key {} for node {}",
+                            node_output.asset_key, node.node_key,
+                        ),
+                    ));
+                }
+            }
             for output_key in &provided {
                 if !declared.contains(output_key) {
                     return Err(io::Error::new(
@@ -475,12 +488,53 @@ impl DataOpsSession {
     /// **Fail closed:** returns `Err(PredictError::MissingInput)` if any
     /// `node.inputs[].asset_key` is absent from the registry, and
     /// `Err(PredictError::InvalidFingerprint)` if a registered fingerprint
-    /// is malformed. The orchestrator must treat errors as "no cache optimization".
+    /// is malformed.
+    ///
+    /// **Output contract enforcement:** returns `Err(PredictError::OutputContract)` if
+    /// `outputs` violates node output declarations (undeclared/missing/duplicate keys).
+    ///
+    /// The orchestrator must treat errors as "no cache optimization".
     pub fn predict(
         &self,
         node: &NodeV1,
         outputs: &[OutputSpecCore],
     ) -> Result<Vec<PredictedOutput>, PredictError> {
+        let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for output in outputs {
+            if !provided.insert(output.asset_key.clone()) {
+                return Err(PredictError::OutputContract(format!(
+                    "duplicate output asset_key {}",
+                    output.asset_key
+                )));
+            }
+        }
+
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for node_output in &node.outputs {
+            if !declared.insert(node_output.asset_key.clone()) {
+                return Err(PredictError::OutputContract(format!(
+                    "duplicate node output asset_key {} for node {}",
+                    node_output.asset_key, node.node_key,
+                )));
+            }
+        }
+        for output_key in &provided {
+            if !declared.contains(output_key) {
+                return Err(PredictError::OutputContract(format!(
+                    "output {} not declared in node.outputs for node {}",
+                    output_key, node.node_key,
+                )));
+            }
+        }
+        for declared_key in declared {
+            if !provided.contains(&declared_key) {
+                return Err(PredictError::OutputContract(format!(
+                    "missing declared node output {} for node {}",
+                    declared_key, node.node_key,
+                )));
+            }
+        }
+
         let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
 
         for input in &node.inputs {
@@ -2021,6 +2075,74 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn materialize_rejects_duplicate_declared_node_outputs() {
+        let base = temp_dir("duplicate_declared_output");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([76u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Node declares duplicate output keys.
+        let mut transform = make_transform_node(
+            "transform/dup_declared",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        transform
+            .outputs
+            .push(swarm_torch_core::run_graph::AssetRefV1 {
+                asset_key: "dataset://ns/out".to_string(),
+                fingerprint: None,
+            });
+
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[OutputSpec {
+                asset_key: "dataset://ns/out".to_string(),
+                schema: None,
+                rows: Some(10),
+                bytes: Some(100),
+            }],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject duplicate declared output keys in node.outputs"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate node output asset_key"),
+            "error should mention duplicate declared outputs: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // ── Phase 3: Cache-Hit Detection tests ──────────────────────────
 
     #[test]
@@ -2054,6 +2176,70 @@ mod tests {
                 assert_eq!(key, "dataset://ns/missing");
             }
             other => panic!("expected MissingInput, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn predict_err_on_output_contract_violation() {
+        let base = temp_dir("predict_output_contract");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([83u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Node declares output out_a, but prediction asks for out_b.
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out_a"],
+            ExecutionTrust::Core,
+        );
+        let result = session.predict(
+            &node,
+            &[OutputSpecCore {
+                asset_key: "dataset://ns/out_b".to_string(),
+                schema: None,
+            }],
+        );
+
+        assert!(
+            result.is_err(),
+            "predict should fail on output contract violation"
+        );
+        match result.unwrap_err() {
+            PredictError::OutputContract(msg) => {
+                assert!(
+                    msg.contains("not declared"),
+                    "error should mention undeclared output: {msg}"
+                );
+                assert!(
+                    msg.contains("dataset://ns/out_b"),
+                    "error should include output key: {msg}"
+                );
+            }
+            other => panic!("expected OutputContract, got {:?}", other),
         }
 
         let _ = fs::remove_dir_all(&base);

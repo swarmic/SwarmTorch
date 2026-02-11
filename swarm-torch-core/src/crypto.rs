@@ -3,13 +3,15 @@
 //! This module provides Ed25519 signatures and message authentication.
 
 use crate::traits::PeerId;
+use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 /// Key pair for signing messages
 #[derive(Clone)]
 pub struct KeyPair {
-    /// Secret key bytes (32 bytes)
-    secret: [u8; 32],
-    /// Public key bytes (32 bytes)
+    /// Secret signing key
+    secret: SigningKey,
+    /// Public key bytes (32 bytes) - kept for API compatibility
     pub public: [u8; 32],
 }
 
@@ -19,17 +21,9 @@ impl KeyPair {
     /// # Safety
     /// The caller must ensure the seed is cryptographically random
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        // In a real implementation, this would use ed25519-dalek
-        // For now, we just store the seed as secret and derive public key
-        let mut public = [0u8; 32];
-        // Simple derivation for placeholder (NOT SECURE - use ed25519-dalek in production)
-        for (i, &b) in seed.iter().enumerate() {
-            public[i] = b.wrapping_add(i as u8);
-        }
-        Self {
-            secret: seed,
-            public,
-        }
+        let secret = SigningKey::from_bytes(&seed);
+        let public = secret.verifying_key().to_bytes();
+        Self { secret, public }
     }
 
     /// Get the peer ID derived from this key pair
@@ -54,7 +48,7 @@ impl KeyPair {
 }
 
 /// Signature bytes (64 bytes for Ed25519)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signature(pub [u8; 64]);
 
 impl Signature {
@@ -67,6 +61,22 @@ impl Signature {
     pub const fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }
+
+    /// Convert to internal Dalek signature
+    pub fn to_dalek(&self) -> Result<DalekSignature, VerifyError> {
+        DalekSignature::from_slice(&self.0).map_err(|_| VerifyError::InvalidSignatureEncoding)
+    }
+}
+
+/// Errors that can occur during verification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyError {
+    /// malformed signature bytes
+    InvalidSignatureEncoding,
+    /// malformed public key
+    InvalidPublicKey,
+    /// signature verification failed
+    VerificationFailed,
 }
 
 /// Message authentication helper
@@ -80,28 +90,75 @@ impl MessageAuth {
         Self { key_pair }
     }
 
-    /// Sign a message
-    pub fn sign(&self, message: &[u8]) -> Signature {
-        // Placeholder - in production use ed25519-dalek
-        let mut sig = [0u8; 64];
-        for (i, &b) in message.iter().take(32).enumerate() {
-            sig[i] = b ^ self.key_pair.secret[i % 32];
-        }
-        Signature(sig)
+    /// Sign a message envelope's components
+    ///
+    /// Binds the signature to the protocol version, metadata, and payload
+    pub fn sign(
+        &self,
+        version: (u8, u8),
+        message_type: u8,
+        sequence: u64,
+        timestamp: u32,
+        payload: &[u8],
+    ) -> Signature {
+        // Domain separation tag
+        let tag = b"swarmtorch.envelope.v0";
+
+        // 1. Hash the payload first
+        let payload_hash = Sha256::digest(payload);
+
+        // 2. Construct canonical preimage
+        let mut hasher = Sha256::new();
+        hasher.update(tag);
+        hasher.update([version.0, version.1]);
+        hasher.update(self.key_pair.public); // Bind to sender (self)
+        hasher.update(sequence.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        hasher.update([message_type]);
+        hasher.update(payload_hash);
+
+        let canonical = hasher.finalize();
+
+        // 3. Sign the canonical hash
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
     }
 
-    /// Verify a signature
-    pub fn verify(public_key: &[u8; 32], message: &[u8], signature: &Signature) -> bool {
-        // Placeholder verification - in production use ed25519-dalek
-        let expected = {
-            let mut sig = [0u8; 64];
-            for (i, &b) in message.iter().take(32).enumerate() {
-                sig[i] = b ^ public_key[i % 32].wrapping_add(i as u8);
-            }
-            sig
-        };
-        // This is NOT a real verification - just a placeholder structure
-        signature.0[0..8] == expected[0..8]
+    /// Verify a signature against envelope components
+    pub fn verify(
+        public_key: &[u8; 32],
+        version: (u8, u8),
+        message_type: u8,
+        sequence: u64,
+        timestamp: u32,
+        payload: &[u8],
+        signature: &Signature,
+    ) -> Result<(), VerifyError> {
+        // Parse public key
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| VerifyError::InvalidPublicKey)?;
+
+        // Parse signature
+        let sig = signature.to_dalek()?;
+
+        // Reconstruct canonical preimage
+        let tag = b"swarmtorch.envelope.v0";
+        let payload_hash = Sha256::digest(payload);
+
+        let mut hasher = Sha256::new();
+        hasher.update(tag);
+        hasher.update([version.0, version.1]);
+        hasher.update(public_key);
+        hasher.update(sequence.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        hasher.update([message_type]);
+        hasher.update(payload_hash);
+
+        let canonical = hasher.finalize();
+
+        // Strict verification
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| VerifyError::VerificationFailed)
     }
 
     /// Get the key pair
@@ -218,4 +275,261 @@ pub enum GradientValidationError {
     CoordinateTooLarge { index: usize, value: f32, max: f32 },
     /// Gradient norm too large
     NormTooLarge { norm: f32, max: f32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to change one byte in a slice
+    fn tamper(bytes: &mut [u8]) {
+        bytes[0] ^= 0xFF;
+    }
+
+    #[test]
+    fn signature_verification_succeeds_for_valid_keypair() {
+        let seed = [1u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test payload";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        assert!(
+            MessageAuth::verify(&pair.public, version, msg_type, seq, ts, payload, &sig).is_ok()
+        );
+    }
+
+    #[test]
+    fn signature_verification_fails_for_tampered_payload() {
+        let seed = [2u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test payload";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Tamper payload
+        let mut bad_payload = payload.to_vec();
+        tamper(&mut bad_payload);
+
+        let result =
+            MessageAuth::verify(&pair.public, version, msg_type, seq, ts, &bad_payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn signature_verification_fails_for_wrong_key() {
+        let seed1 = [3u8; 32];
+        let pair1 = KeyPair::from_seed(seed1);
+        let auth1 = MessageAuth::new(pair1);
+
+        let seed2 = [4u8; 32];
+        let pair2 = KeyPair::from_seed(seed2);
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test payload";
+
+        // Sign with key1
+        let sig = auth1.sign(version, msg_type, seq, ts, payload);
+
+        // Verify with key2
+        let result = MessageAuth::verify(&pair2.public, version, msg_type, seq, ts, payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn signature_is_deterministic_for_fixed_seed_and_message() {
+        let seed = [5u8; 32];
+        let pair1 = KeyPair::from_seed(seed);
+        let auth1 = MessageAuth::new(pair1);
+
+        // Recreate same keypair
+        let pair2 = KeyPair::from_seed(seed);
+        let auth2 = MessageAuth::new(pair2);
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"variable payload";
+
+        let sig1 = auth1.sign(version, msg_type, seq, ts, payload);
+        let sig2 = auth2.sign(version, msg_type, seq, ts, payload);
+
+        assert_eq!(sig1.0, sig2.0);
+    }
+
+    #[test]
+    fn verification_fails_on_modified_sequence() {
+        let seed = [6u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Modify sequence
+        let result =
+            MessageAuth::verify(&pair.public, version, msg_type, seq + 1, ts, payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn verification_fails_on_modified_timestamp() {
+        let seed = [7u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Modify timestamp
+        let result =
+            MessageAuth::verify(&pair.public, version, msg_type, seq, ts + 1, payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn verification_fails_on_modified_sender() {
+        let seed = [8u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Modify sender (use wrong public key)
+        let mut wrong_public = pair.public;
+        tamper(&mut wrong_public);
+
+        // This might fail as InvalidPublicKey if we tamper too much, or VerificationFailed
+        // if the key is structurally valid but wrong.
+        // Compressed points must be on curve. A random bit flip likely makes it off-curve.
+        // Let's expect either InvalidPublicKey OR VerificationFailed, or check specifically.
+        // Ideally we want to test "valid key but wrong one" (authentication failure)
+        // versus "invalid key bytes" (parsing failure).
+        // Let's generate a valid DIFFERENT key for authentication failure test (already done above).
+        // This test is specifically modifying the bytes to be potentially invalid.
+
+        let result = MessageAuth::verify(&wrong_public, version, msg_type, seq, ts, payload, &sig);
+        // It's likely InvalidPublicKey, but could be failed verification.
+        // Let's assert it is an Error.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verification_fails_on_modified_message_type() {
+        let seed = [9u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        let result =
+            MessageAuth::verify(&pair.public, version, msg_type + 1, seq, ts, payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn verification_fails_on_modified_version() {
+        let seed = [10u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Modify version
+        let result = MessageAuth::verify(&pair.public, (1, 1), msg_type, seq, ts, payload, &sig);
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    #[test]
+    fn verification_fails_on_invalid_public_key_bytes() {
+        let seed = [11u8; 32];
+        let pair = KeyPair::from_seed(seed);
+        let auth = MessageAuth::new(pair.clone());
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+        let sig = auth.sign(version, msg_type, seq, ts, payload);
+
+        // Use obviously invalid public key
+        // [0xFF; 32] was seemingly accepted by from_bytes (likely interpreted as valid Y)
+        // but rejected by verify_strict.
+        // We accept either InvalidPublicKey OR VerificationFailed as acceptable fail-closed behavior.
+        // Fail-closed is what matters.
+        let invalid_key = [0xFFu8; 32];
+
+        let result = MessageAuth::verify(&invalid_key, version, msg_type, seq, ts, payload, &sig);
+        // Either error means we rejected it.
+        assert!(matches!(
+            result,
+            Err(VerifyError::InvalidPublicKey) | Err(VerifyError::VerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn invalid_signature_encoding_rejected() {
+        let seed = [12u8; 32];
+        let pair = KeyPair::from_seed(seed);
+
+        let version = (0, 1);
+        let msg_type = 1;
+        let seq = 100;
+        let ts = 1234567890;
+        let payload = b"test";
+
+        // Create a signature with invalid encoding logic (s >= L)
+        // This is caught by verify_strict, returning VerificationFailed (SignatureError).
+        let bad_sig = Signature([0xFF; 64]);
+
+        let result =
+            MessageAuth::verify(&pair.public, version, msg_type, seq, ts, payload, &bad_sig);
+        // VerificationFailed is the correct error for s >= L, as from_bytes is infallible for [u8; 64]
+        assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
 }

@@ -35,7 +35,7 @@ burn = { version = "0.14", default-features = false }
 burn-ndarray = { version = "0.14" }
 
 # Cryptography
-ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 
 # Logging and telemetry

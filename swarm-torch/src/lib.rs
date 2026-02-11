@@ -75,6 +75,10 @@ pub mod artifacts;
 #[cfg(feature = "std")]
 pub mod report;
 
+/// Minimal native OpRunner (std-only).
+#[cfg(feature = "std")]
+pub mod native_runner;
+
 /// Prelude module for convenient imports
 ///
 /// ```rust,ignore

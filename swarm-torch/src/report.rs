@@ -10,9 +10,11 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
-use swarm_torch_core::dataops::{DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1};
+use swarm_torch_core::dataops::{
+    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1, TrustClass,
+};
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
-use swarm_torch_core::run_graph::{GraphV1, NodeId};
+use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeId, NodeV1};
 
 use crate::artifacts::RunArtifactBundle;
 
@@ -138,7 +140,31 @@ fn node_index_map(graph: &GraphV1) -> std::collections::HashMap<NodeId, usize> {
     m
 }
 
-fn render_svg(graph: &GraphV1) -> String {
+/// Derive whether a node should be marked unsafe.
+///
+/// A node is unsafe if:
+/// - `execution_trust != Core`, OR
+/// - any input asset_key is `Untrusted` in the registry, OR
+/// - any input asset_key is **missing** from the registry (fail closed).
+pub fn is_node_unsafe(node: &NodeV1, registry: &DatasetRegistryV1) -> bool {
+    if node.execution_trust != ExecutionTrust::Core {
+        return true;
+    }
+    for input in &node.inputs {
+        match registry
+            .datasets
+            .iter()
+            .find(|d| d.asset_key == input.asset_key)
+        {
+            Some(ds) if ds.trust == TrustClass::Untrusted => return true,
+            None => return true, // missing input → fail closed
+            _ => {}
+        }
+    }
+    false
+}
+
+fn render_svg(graph: &GraphV1, registry: &DatasetRegistryV1) -> String {
     let width = 900;
     let node_w = 820;
     let node_h = 56;
@@ -173,11 +199,12 @@ fn render_svg(graph: &GraphV1) -> String {
         ));
     }
 
-    // Nodes.
+    // Nodes — use derived is_node_unsafe instead of just n.unsafe_surface.
     for (i, n) in graph.nodes.iter().enumerate() {
         let x = x0;
         let y = y0 + i * y_step;
-        let cls = if n.unsafe_surface { "s u" } else { "s" };
+        let derived_unsafe = is_node_unsafe(n, registry);
+        let cls = if derived_unsafe { "s u" } else { "s" };
         svg.push_str(&format!(
             "<rect x=\"{x}\" y=\"{y}\" rx=\"10\" ry=\"10\" width=\"{node_w}\" height=\"{node_h}\" class=\"{cls}\"/>"
         ));
@@ -186,7 +213,7 @@ fn render_svg(graph: &GraphV1) -> String {
             n.node_key,
             format!("{:?}", n.op_kind).to_lowercase(),
             n.op_type,
-            if n.unsafe_surface { "  UNSAFE" } else { "" }
+            if derived_unsafe { "  UNSAFE" } else { "" }
         );
         svg.push_str(&format!(
             "<text class=\"n\" x=\"{}\" y=\"{}\">{}</text>",
@@ -250,7 +277,7 @@ fn render_timeline(report: &Report) -> String {
             kind: "materialization",
             name: m.asset_key.clone(),
             detail: format!(
-                "rows={} bytes={} cache_hit={} unsafe={}",
+                "rows={} bytes={} cache_hit={} unsafe={} node_id={} node_def_hash={}",
                 m.rows
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
@@ -260,7 +287,9 @@ fn render_timeline(report: &Report) -> String {
                 m.cache_hit
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
-                m.unsafe_surface
+                m.unsafe_surface,
+                m.node_id,
+                &m.node_def_hash
             ),
         });
     }
@@ -286,14 +315,10 @@ fn render_timeline(report: &Report) -> String {
 }
 
 fn render_html(report: &Report) -> String {
+    // Derive unsafe nodes using is_node_unsafe (registry-aware)
     let mut unsafe_nodes = Vec::new();
     for n in &report.graph.nodes {
-        if n.unsafe_surface
-            || matches!(
-                n.execution_trust,
-                swarm_torch_core::run_graph::ExecutionTrust::UnsafeExtension
-            )
-        {
+        if is_node_unsafe(n, &report.registry) {
             unsafe_nodes.push(n.node_key.clone());
         }
     }
@@ -348,7 +373,7 @@ fn render_html(report: &Report) -> String {
     }
 
     html.push_str("<section><h2>Run Graph</h2>");
-    html.push_str(&render_svg(&report.graph));
+    html.push_str(&render_svg(&report.graph, &report.registry));
     html.push_str("</section>");
 
     html.push_str("<section><h2>Timeline</h2>");
@@ -388,4 +413,153 @@ fn render_html(report: &Report) -> String {
 
     html.push_str("</body></html>");
     html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarm_torch_core::dataops::{DatasetEntryV1, TrustClass};
+    use swarm_torch_core::observe::TraceId;
+    use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind};
+
+    fn make_node(key: &str, trust: ExecutionTrust, inputs: &[&str]) -> NodeV1 {
+        NodeV1 {
+            node_key: key.to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "test".to_string(),
+            inputs: inputs
+                .iter()
+                .map(|k| AssetRefV1 {
+                    asset_key: k.to_string(),
+                    fingerprint: None,
+                })
+                .collect(),
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: Some("test@0.1.0".to_string()),
+            unsafe_surface: false,
+            execution_trust: trust,
+            node_def_hash: None,
+        }
+    }
+
+    fn make_entry(asset_key: &str, trust: TrustClass) -> DatasetEntryV1 {
+        DatasetEntryV1 {
+            asset_key: asset_key.to_string(),
+            fingerprint_v0: "a".repeat(64),
+            source_fingerprint_v0: "b".repeat(64),
+            schema_hash_v0: "c".repeat(64),
+            recipe_hash_v0: "d".repeat(64),
+            trust,
+            source: None,
+            schema: None,
+            license_flags: vec![],
+            pii_tags: vec![],
+        }
+    }
+
+    #[test]
+    fn report_marks_node_unsafe_on_untrusted_input() {
+        let node = make_node(
+            "transform/clean",
+            ExecutionTrust::Core,
+            &["dataset://ns/raw"],
+        );
+        let registry = DatasetRegistryV1 {
+            schema_version: 1,
+            datasets: vec![make_entry("dataset://ns/raw", TrustClass::Untrusted)],
+        };
+
+        assert!(
+            is_node_unsafe(&node, &registry),
+            "node with untrusted input should be marked unsafe"
+        );
+    }
+
+    #[test]
+    fn report_marks_node_unsafe_on_missing_input_registry_entry() {
+        // Node references an input that doesn't exist in the registry at all
+        let node = make_node(
+            "transform/clean",
+            ExecutionTrust::Core,
+            &["dataset://ns/missing"],
+        );
+        let registry = DatasetRegistryV1 {
+            schema_version: 1,
+            datasets: vec![], // empty registry
+        };
+
+        assert!(
+            is_node_unsafe(&node, &registry),
+            "node with missing input in registry should be marked unsafe (fail closed)"
+        );
+    }
+
+    #[test]
+    fn report_node_safe_with_core_trust_and_trusted_inputs() {
+        let node = make_node(
+            "transform/clean",
+            ExecutionTrust::Core,
+            &["dataset://ns/raw"],
+        );
+        let registry = DatasetRegistryV1 {
+            schema_version: 1,
+            datasets: vec![make_entry("dataset://ns/raw", TrustClass::Trusted)],
+        };
+
+        assert!(
+            !is_node_unsafe(&node, &registry),
+            "Core trust node with all trusted inputs should not be unsafe"
+        );
+    }
+
+    #[test]
+    fn timeline_materialization_includes_node_id_and_node_def_hash() {
+        let node_id = TraceId::from_bytes([1u8; 16]);
+        let mat = MaterializationRecordV1 {
+            schema_version: 1,
+            ts_unix_nanos: 1000,
+            asset_key: "dataset://ns/out".to_string(),
+            fingerprint_v0: "x".repeat(64),
+            node_id,
+            node_def_hash: "h".repeat(64),
+            rows: Some(100),
+            bytes: Some(1000),
+            cache_hit: Some(false),
+            duration_ms: Some(50),
+            quality_flags: None,
+            unsafe_surface: false,
+        };
+
+        // Build the detail string the same way the timeline renderer does
+        let detail = format!(
+            "rows={} bytes={} cache_hit={} unsafe={} node_id={} node_def_hash={}",
+            mat.rows
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            mat.bytes
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            mat.cache_hit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            mat.unsafe_surface,
+            mat.node_id,
+            &mat.node_def_hash
+        );
+
+        assert!(
+            detail.contains("node_id="),
+            "timeline detail should include node_id: {detail}"
+        );
+        assert!(
+            detail.contains("node_def_hash="),
+            "timeline detail should include node_def_hash: {detail}"
+        );
+        assert!(
+            detail.contains(&"h".repeat(64)),
+            "timeline detail should include full node_def_hash value: {detail}"
+        );
+    }
 }

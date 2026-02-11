@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="SwarmTorch.png" alt="SwarmTorch logo" width="320" />
+  <img src="SwarmTorch.png" alt="SwarmTorch logo" width="160" />
 </p>
 
 # SwarmTorch

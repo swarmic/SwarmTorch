@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use swarm_torch_core::dataops::{DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1};
+use swarm_torch_core::dataops::{
+    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1, MaterializationRecordV2,
+};
 use swarm_torch_core::observe::{EventRecord, MetricRecord, RunId, SpanRecord};
 use swarm_torch_core::run_graph::GraphV1;
 
@@ -119,6 +121,11 @@ impl RunArtifactSink {
         self.bundle.append_materialization(m)
     }
 
+    pub fn append_materialization_v2(&self, m: &MaterializationRecordV2) -> io::Result<()> {
+        let _g = self.guard()?;
+        self.bundle.append_materialization_v2(m)
+    }
+
     pub fn write_dataset_registry(&self, r: &DatasetRegistryV1) -> io::Result<()> {
         let _g = self.guard()?;
         self.bundle.write_dataset_registry(r)
@@ -148,10 +155,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use swarm_torch_core::dataops::{
-    dataset_fingerprint_v0, derived_source_fingerprint_v0, no_schema_hash_v0,
-    predict_output_fingerprints, recipe_hash_v0, schema_hash_v0, source_fingerprint_v0,
-    DatasetEntryV1, LineageEdgeV1, OutputSpecCore, PredictedOutput, SchemaDescriptorV0,
-    SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
+    cache_hit_from_decision, cache_key_v0, dataset_fingerprint_v0, derived_source_fingerprint_v0,
+    no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, schema_hash_v0,
+    source_fingerprint_v0, CacheDecisionV0, DatasetEntryV1, LineageEdgeV1, MaterializationStatusV0,
+    OutputSpecCore, PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
+    DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
 };
 use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
 
@@ -195,6 +203,8 @@ pub struct DataOpsSession {
     registry: BTreeMap<String, DatasetEntryV1>,
     /// (input_fp, output_fp, node_id_str) -> LineageEdgeV1 (dedupe key)
     lineage: BTreeMap<(String, String, String), LineageEdgeV1>,
+    /// Monotonic materialization record sequence number.
+    next_record_seq: u64,
 }
 
 impl DataOpsSession {
@@ -204,6 +214,7 @@ impl DataOpsSession {
             sink,
             registry: BTreeMap::new(),
             lineage: BTreeMap::new(),
+            next_record_seq: 1,
         }
     }
 
@@ -383,6 +394,17 @@ impl DataOpsSession {
             };
 
         let unsafe_surface = matches!(output_trust, TrustClass::Untrusted);
+        let cache_decision = if cache_hit {
+            CacheDecisionV0::Hit
+        } else {
+            CacheDecisionV0::Miss
+        };
+        let execution_profile = match node.execution_trust {
+            ExecutionTrust::Core => "core",
+            ExecutionTrust::SandboxedExtension => "sandboxed_extension",
+            ExecutionTrust::UnsafeExtension => "unsafe_extension",
+        };
+        let cache_key = cache_key_v0(node, &upstream_fps, execution_profile);
 
         // Derive node_id
         let node_id = node
@@ -390,6 +412,12 @@ impl DataOpsSession {
             .unwrap_or_else(|| node_id_from_key(&node.node_key));
         let node_id_str = node_id.to_string();
         let node_hash = hex_lower(&node_def_hash_v1(node));
+        let input_asset_keys: Vec<String> = input_snapshots
+            .iter()
+            .map(|(asset_key, _)| asset_key.clone())
+            .collect();
+        let input_fingerprints_v0: Vec<String> =
+            input_snapshots.iter().map(|(_, fp)| fp.clone()).collect();
 
         // 6. For each output: compute fingerprint, insert entry, create lineage, emit record
         for output in outputs {
@@ -429,22 +457,32 @@ impl DataOpsSession {
                 self.lineage.insert(edge_key, edge);
             }
 
-            // 8. Append MaterializationRecordV1
-            let mat = MaterializationRecordV1 {
-                schema_version: DATAOPS_SCHEMA_V1,
+            // 8. Append MaterializationRecordV2
+            let mat = MaterializationRecordV2 {
+                schema_version: MATERIALIZATION_SCHEMA_V2,
+                record_seq: self.next_record_seq,
                 ts_unix_nanos,
                 asset_key: output.asset_key.clone(),
                 fingerprint_v0: fp_hex,
                 node_id,
                 node_def_hash: node_hash.clone(),
+                op_type: node.op_type.clone(),
+                input_asset_keys: input_asset_keys.clone(),
+                input_fingerprints_v0: input_fingerprints_v0.clone(),
                 rows: output.rows,
                 bytes: output.bytes,
-                cache_hit: Some(cache_hit),
+                cache_decision,
+                cache_reason: None,
+                cache_key_v0: Some(cache_key.clone()),
+                cache_hit: cache_hit_from_decision(cache_decision),
                 duration_ms: Some(duration_ms),
-                quality_flags: None,
                 unsafe_surface,
+                status: MaterializationStatusV0::Ok,
+                error_code: None,
+                quality: None,
             };
-            self.sink.append_materialization(&mat)?;
+            self.sink.append_materialization_v2(&mat)?;
+            self.next_record_seq = self.next_record_seq.saturating_add(1);
         }
 
         // 9. flush_snapshots()
@@ -694,6 +732,19 @@ impl RunArtifactBundle {
     pub fn append_materialization(
         &self,
         materialization: &MaterializationRecordV1,
+    ) -> io::Result<()> {
+        append_ndjson(
+            &self
+                .run_dir
+                .join("datasets")
+                .join("materializations.ndjson"),
+            materialization,
+        )
+    }
+
+    pub fn append_materialization_v2(
+        &self,
+        materialization: &MaterializationRecordV2,
     ) -> io::Result<()> {
         append_ndjson(
             &self
@@ -973,7 +1024,10 @@ fn is_required_path_v1(p: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarm_torch_core::dataops::MaterializationRecordV1;
+    use swarm_torch_core::dataops::{
+        cache_key_v0, CacheDecisionV0, MaterializationRecordCompat, MaterializationRecordV1,
+        MaterializationStatusV0, MATERIALIZATION_SCHEMA_V2,
+    };
     use swarm_torch_core::observe::{AttrMap, SpanId, TraceId};
     use swarm_torch_core::run_graph::{
         node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, ExecutionTrust,
@@ -2404,5 +2458,202 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn materialization_v2_includes_input_provenance() {
+        let base = temp_dir("mat_v2_input_provenance");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([90u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+        let in_fp = session.fingerprint("dataset://ns/raw").unwrap().to_string();
+
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(12),
+                    bytes: Some(345),
+                }],
+                1000,
+                false,
+                25,
+            )
+            .unwrap();
+
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        let rows: Vec<MaterializationRecordCompat> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 1, "expected one materialization row");
+        let row_v2 = rows[0].clone().into_v2();
+        assert_eq!(row_v2.schema_version, MATERIALIZATION_SCHEMA_V2);
+        assert_eq!(
+            row_v2.input_asset_keys,
+            vec!["dataset://ns/raw".to_string()],
+            "v2 row must include input asset keys"
+        );
+        assert_eq!(
+            row_v2.input_fingerprints_v0,
+            vec![in_fp],
+            "v2 row must include input fingerprints"
+        );
+        assert_eq!(row_v2.op_type, "transform");
+        assert_eq!(row_v2.status, MaterializationStatusV0::Ok);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_hit_is_derived_from_cache_decision() {
+        let base = temp_dir("cache_hit_derived_from_decision");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([91u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let node = make_transform_node(
+            "transform/cache",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out_a", "dataset://ns/out_b"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[
+                    OutputSpec {
+                        asset_key: "dataset://ns/out_a".to_string(),
+                        schema: None,
+                        rows: Some(1),
+                        bytes: Some(1),
+                    },
+                    OutputSpec {
+                        asset_key: "dataset://ns/out_b".to_string(),
+                        schema: None,
+                        rows: Some(1),
+                        bytes: Some(1),
+                    },
+                ],
+                1000,
+                true,
+                5,
+            )
+            .unwrap();
+
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        let rows: Vec<_> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str::<MaterializationRecordCompat>(line)
+                    .unwrap()
+                    .into_v2()
+            })
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.cache_decision, CacheDecisionV0::Hit);
+            assert_eq!(row.cache_hit, Some(true));
+            assert!(
+                row.cache_key_v0.as_ref().is_some_and(|v| v.len() == 64),
+                "cache_key_v0 should be a 64-char hex digest"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_key_v0_stable_for_same_inputs() {
+        let node = make_transform_node(
+            "transform/cache_key",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        let upstream = vec![[7u8; 32], [11u8; 32]];
+        let k1 = cache_key_v0(&node, &upstream, "core");
+        let k2 = cache_key_v0(&node, &upstream, "core");
+        assert_eq!(k1, k2, "cache_key_v0 must be deterministic");
+    }
+
+    #[test]
+    fn cache_key_v0_changes_when_input_fingerprint_changes() {
+        let node = make_transform_node(
+            "transform/cache_key_change",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        let a = vec![[7u8; 32], [11u8; 32]];
+        let b = vec![[8u8; 32], [11u8; 32]];
+        let k1 = cache_key_v0(&node, &a, "core");
+        let k2 = cache_key_v0(&node, &b, "core");
+        assert_ne!(
+            k1, k2,
+            "cache_key_v0 must change when upstream fingerprints change"
+        );
     }
 }

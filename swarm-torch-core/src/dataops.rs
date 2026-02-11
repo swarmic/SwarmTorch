@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::run_graph::{node_def_hash_v1, NodeId, NodeV1, OpKind};
 
 pub const DATAOPS_SCHEMA_V1: u32 = 1;
+pub const MATERIALIZATION_SCHEMA_V2: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +165,124 @@ pub struct MaterializationRecordV1 {
 
     #[serde(default)]
     pub unsafe_surface: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDecisionV0 {
+    Hit,
+    Miss,
+    Bypass,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializationStatusV0 {
+    Ok,
+    Error,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QualitySummaryV0 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_count_delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_changed: Option<bool>,
+}
+
+/// One materialization record per node output (NDJSON line schema v2).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MaterializationRecordV2 {
+    pub schema_version: u32, // = 2
+    pub record_seq: u64,     // monotonic per run
+    pub ts_unix_nanos: u64,
+
+    pub asset_key: String,
+    pub fingerprint_v0: String,
+    pub node_id: NodeId,
+    pub node_def_hash: String,
+    pub op_type: String,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_asset_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_fingerprints_v0: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+
+    pub cache_decision: CacheDecisionV0,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_key_v0: Option<String>,
+
+    /// Compatibility convenience: derived from `cache_decision`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+
+    pub unsafe_surface: bool,
+
+    pub status: MaterializationStatusV0,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<QualitySummaryV0>,
+}
+
+/// Compatibility reader for `datasets/materializations.ndjson`.
+///
+/// Ordering is important: V2 MUST come first so V2 rows are not down-cast to V1.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum MaterializationRecordCompat {
+    V2(MaterializationRecordV2),
+    V1(MaterializationRecordV1),
+}
+
+impl MaterializationRecordCompat {
+    /// Normalize compatibility records into the v2 in-memory shape.
+    pub fn into_v2(self) -> MaterializationRecordV2 {
+        match self {
+            Self::V2(v2) => v2,
+            Self::V1(v1) => MaterializationRecordV2 {
+                schema_version: MATERIALIZATION_SCHEMA_V2,
+                record_seq: 0,
+                ts_unix_nanos: v1.ts_unix_nanos,
+                asset_key: v1.asset_key,
+                fingerprint_v0: v1.fingerprint_v0,
+                node_id: v1.node_id,
+                node_def_hash: v1.node_def_hash,
+                op_type: "unknown".to_string(),
+                input_asset_keys: Vec::new(),
+                input_fingerprints_v0: Vec::new(),
+                rows: v1.rows,
+                bytes: v1.bytes,
+                duration_ms: v1.duration_ms,
+                cache_decision: match v1.cache_hit {
+                    Some(true) => CacheDecisionV0::Hit,
+                    Some(false) => CacheDecisionV0::Miss,
+                    None => CacheDecisionV0::Unknown,
+                },
+                cache_reason: None,
+                cache_key_v0: None,
+                cache_hit: v1.cache_hit,
+                unsafe_surface: v1.unsafe_surface,
+                status: MaterializationStatusV0::Ok,
+                error_code: None,
+                quality: None,
+            },
+        }
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -437,6 +556,32 @@ pub fn predict_output_fingerprints(
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CacheKeyCanonicalV0 {
+    node_def_hash: [u8; 32],
+    upstream_fingerprints: Vec<[u8; 32]>,
+    execution_profile: String,
+}
+
+/// Deterministic cache key for materialization reuse checks.
+pub fn cache_key_v0(node: &NodeV1, upstream_fps: &[[u8; 32]], execution_profile: &str) -> String {
+    let canonical = CacheKeyCanonicalV0 {
+        node_def_hash: node_def_hash_v1(node),
+        upstream_fingerprints: upstream_fps.to_vec(),
+        execution_profile: normalize_lower(execution_profile),
+    };
+    hex_lower(&sha256_postcard(&canonical))
+}
+
+/// Compatibility helper for deriving `cache_hit` from a decision enum.
+pub fn cache_hit_from_decision(decision: CacheDecisionV0) -> Option<bool> {
+    match decision {
+        CacheDecisionV0::Hit => Some(true),
+        CacheDecisionV0::Miss => Some(false),
+        CacheDecisionV0::Bypass | CacheDecisionV0::Unknown => None,
+    }
+}
+
 /// Minimal canonical params helper (BTreeMap ordering is deterministic).
 pub fn canon_params_from_pairs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
@@ -540,5 +685,41 @@ mod tests {
         // Check that schema_hash uses no_schema_hash_v0
         let expected_schema_hash = no_schema_hash_v0();
         assert_eq!(entry.schema_hash_v0, hex_lower(&expected_schema_hash));
+    }
+
+    #[test]
+    fn materialization_v2_serialization_roundtrip() {
+        let node_id = NodeId::from_bytes([9u8; 16]);
+        let row = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 17,
+            ts_unix_nanos: 1_234_567,
+            asset_key: "dataset://ns/out".to_string(),
+            fingerprint_v0: "a".repeat(64),
+            node_id,
+            node_def_hash: "b".repeat(64),
+            op_type: "filter_rows".to_string(),
+            input_asset_keys: vec!["dataset://ns/in".to_string()],
+            input_fingerprints_v0: vec!["c".repeat(64)],
+            rows: Some(10),
+            bytes: Some(20),
+            duration_ms: Some(5),
+            cache_decision: CacheDecisionV0::Hit,
+            cache_reason: Some("cache key match".to_string()),
+            cache_key_v0: Some("d".repeat(64)),
+            cache_hit: cache_hit_from_decision(CacheDecisionV0::Hit),
+            unsafe_surface: false,
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: Some(QualitySummaryV0 {
+                null_rate: Some(0.0),
+                row_count_delta: Some(0),
+                schema_changed: Some(false),
+            }),
+        };
+
+        let json = serde_json::to_string(&row).expect("serialize v2");
+        let decoded: MaterializationRecordV2 = serde_json::from_str(&json).expect("deserialize v2");
+        assert_eq!(decoded, row);
     }
 }

@@ -11,7 +11,8 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use swarm_torch_core::dataops::{
-    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1, TrustClass,
+    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordCompat, MaterializationRecordV2,
+    TrustClass,
 };
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeId, NodeV1};
@@ -26,7 +27,7 @@ pub struct Report {
     pub graph: GraphV1,
     pub registry: DatasetRegistryV1,
     pub lineage: DatasetLineageV1,
-    pub materializations: Vec<MaterializationRecordV1>,
+    pub materializations: Vec<MaterializationRecordV2>,
     pub spans: Vec<SpanRecord>,
     pub events: Vec<EventRecord>,
     pub metrics: Vec<MetricRecord>,
@@ -52,8 +53,20 @@ pub fn load_report(run_dir: impl AsRef<Path>) -> io::Result<Report> {
     let spans: Vec<SpanRecord> = read_ndjson(run_dir.join("spans.ndjson"))?;
     let events: Vec<EventRecord> = read_ndjson(run_dir.join("events.ndjson"))?;
     let metrics: Vec<MetricRecord> = read_ndjson(run_dir.join("metrics.ndjson"))?;
-    let materializations: Vec<MaterializationRecordV1> =
+    let materializations_raw: Vec<MaterializationRecordCompat> =
         read_ndjson(run_dir.join("datasets").join("materializations.ndjson"))?;
+    let mut materializations: Vec<MaterializationRecordV2> = materializations_raw
+        .into_iter()
+        .enumerate()
+        .map(|(idx, record)| {
+            let mut normalized = record.into_v2();
+            if normalized.record_seq == 0 {
+                normalized.record_seq = (idx as u64) + 1;
+            }
+            normalized
+        })
+        .collect();
+    materializations.sort_by_key(|m| (m.ts_unix_nanos, m.record_seq));
 
     Ok(Report {
         run_dir,
@@ -425,9 +438,25 @@ fn render_html(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarm_torch_core::dataops::{DatasetEntryV1, DatasetLineageV1, TrustClass};
-    use swarm_torch_core::observe::TraceId;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use swarm_torch_core::dataops::{
+        DatasetEntryV1, DatasetLineageV1, MaterializationRecordV1, MaterializationRecordV2,
+        MaterializationStatusV0, TrustClass, MATERIALIZATION_SCHEMA_V2,
+    };
+    use swarm_torch_core::observe::{RunId, TraceId};
     use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("swarmtorch_report_{prefix}_{pid}_{nanos}"));
+        dir
+    }
 
     fn make_node(key: &str, trust: ExecutionTrust, inputs: &[&str]) -> NodeV1 {
         NodeV1 {
@@ -531,19 +560,28 @@ mod tests {
         );
         node.node_id = Some(node_id);
 
-        let mat = MaterializationRecordV1 {
-            schema_version: 1,
+        let mat = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 1,
             ts_unix_nanos: 1000,
             asset_key: "dataset://ns/out".to_string(),
             fingerprint_v0: "x".repeat(64),
             node_id,
             node_def_hash: "h".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec!["dataset://ns/missing".to_string()],
+            input_fingerprints_v0: vec!["y".repeat(64)],
             rows: Some(100),
             bytes: Some(1000),
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Miss,
+            cache_reason: None,
+            cache_key_v0: None,
             cache_hit: Some(false),
             duration_ms: Some(50),
-            quality_flags: None,
             unsafe_surface: false, // intentionally false: timeline should derive from node+registry.
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
         };
 
         let report = Report {
@@ -585,5 +623,71 @@ mod tests {
             timeline_html.contains("unsafe=true"),
             "timeline unsafe should be derived from node+registry, not materialization flag: {timeline_html}"
         );
+    }
+
+    #[test]
+    fn report_loads_materialization_v1_and_v2() {
+        let base = temp_dir("compat_v1_v2");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([77u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+        let node_id = TraceId::from_bytes([2u8; 16]);
+
+        let v1 = MaterializationRecordV1 {
+            schema_version: 1,
+            ts_unix_nanos: 1000,
+            asset_key: "dataset://ns/v1".to_string(),
+            fingerprint_v0: "a".repeat(64),
+            node_id,
+            node_def_hash: "b".repeat(64),
+            rows: Some(1),
+            bytes: Some(2),
+            cache_hit: Some(false),
+            duration_ms: Some(3),
+            quality_flags: None,
+            unsafe_surface: false,
+        };
+        bundle.append_materialization(&v1).unwrap();
+
+        let v2 = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 10,
+            ts_unix_nanos: 2000,
+            asset_key: "dataset://ns/v2".to_string(),
+            fingerprint_v0: "c".repeat(64),
+            node_id,
+            node_def_hash: "d".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec!["dataset://ns/in".to_string()],
+            input_fingerprints_v0: vec!["e".repeat(64)],
+            rows: Some(4),
+            bytes: Some(5),
+            duration_ms: Some(6),
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Hit,
+            cache_reason: Some("test".to_string()),
+            cache_key_v0: Some("f".repeat(64)),
+            cache_hit: Some(true),
+            unsafe_surface: true,
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
+        };
+        bundle.append_materialization_v2(&v2).unwrap();
+        bundle.finalize_manifest().unwrap();
+
+        let report = load_report(bundle.run_dir()).unwrap();
+        assert_eq!(report.materializations.len(), 2);
+        assert_eq!(
+            report.materializations[0].schema_version,
+            MATERIALIZATION_SCHEMA_V2
+        );
+        assert_eq!(
+            report.materializations[1].schema_version,
+            MATERIALIZATION_SCHEMA_V2
+        );
+        assert_eq!(report.materializations[0].asset_key, "dataset://ns/v1");
+        assert_eq!(report.materializations[1].asset_key, "dataset://ns/v2");
     }
 }

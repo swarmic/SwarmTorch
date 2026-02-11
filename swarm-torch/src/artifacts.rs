@@ -91,7 +91,7 @@ impl RunArtifactSink {
     fn guard(&self) -> io::Result<std::sync::MutexGuard<'_, ()>> {
         self.lock
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "artifact sink mutex poisoned"))
+            .map_err(|_| io::Error::other("artifact sink mutex poisoned"))
     }
 
     pub fn write_graph(&self, graph: &GraphV1) -> io::Result<()> {
@@ -632,8 +632,10 @@ impl RunArtifactBundle {
         };
         write_json_pretty_atomic(&run_dir.join("run.json"), &run_file)?;
 
-        let mut graph = GraphV1::default();
-        graph.graph_id = Some(run_id.to_string());
+        let graph = GraphV1 {
+            graph_id: Some(run_id.to_string()),
+            ..GraphV1::default()
+        };
         write_json_pretty_atomic(&run_dir.join("graph.json"), &graph)?;
 
         // DataOps baselines (ADR-0016).
@@ -839,15 +841,14 @@ fn ensure_file(path: &Path) -> io::Result<()> {
 }
 
 fn write_json_pretty_atomic<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    let json =
-        serde_json::to_vec_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
 
     atomic_write(path, &json)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     let file = File::open(path)?;
-    serde_json::from_reader(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    serde_json::from_reader(file).map_err(io::Error::other)
 }
 
 fn append_ndjson<T: serde::Serialize>(path: &Path, record: &T) -> io::Result<()> {
@@ -855,8 +856,7 @@ fn append_ndjson<T: serde::Serialize>(path: &Path, record: &T) -> io::Result<()>
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line =
-        serde_json::to_string(record).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let line = serde_json::to_string(record).map_err(io::Error::other)?;
     let mut buf = line.into_bytes();
     buf.push(b'\n');
     file.write_all(&buf)?;
@@ -967,7 +967,7 @@ fn required_paths_v1() -> &'static [&'static str] {
 }
 
 fn is_required_path_v1(p: &str) -> bool {
-    required_paths_v1().iter().any(|rp| *rp == p)
+    required_paths_v1().contains(&p)
 }
 
 #[cfg(test)]

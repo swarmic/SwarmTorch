@@ -6,23 +6,18 @@ use crate::crypto::KeyPair;
 use crate::traits::PeerId;
 
 /// Role of a node in the swarm
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
 pub enum NodeRole {
     /// Full participant: trains, aggregates, coordinates
     Coordinator,
     /// Contributor: trains locally, sends updates
+    #[default]
     Contributor,
     /// Observer: receives model, doesn't contribute
     Observer,
     /// Gateway: bridges networks (e.g., LoRa ↔ WiFi)
     Gateway,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self {
-        Self::Contributor
-    }
 }
 
 /// Node identity containing keys and role

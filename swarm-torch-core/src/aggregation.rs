@@ -9,6 +9,25 @@ use alloc::vec::Vec;
 use crate::traits::GradientUpdate;
 use crate::Result;
 
+fn validate_gradient_shapes(updates: &[GradientUpdate]) -> Result<usize> {
+    if updates.is_empty() {
+        return Err(crate::Error::InsufficientUpdates);
+    }
+
+    let dim = updates[0].gradients.len();
+    if dim == 0 {
+        return Err(crate::Error::InvalidGradient);
+    }
+
+    for update in updates.iter().skip(1) {
+        if update.gradients.len() != dim {
+            return Err(crate::Error::InvalidGradient);
+        }
+    }
+
+    Ok(dim)
+}
+
 /// Trait for robust aggregation algorithms
 pub trait RobustAggregator: Send + Sync {
     /// Aggregate multiple gradient updates into one
@@ -38,19 +57,15 @@ pub struct FedAvg;
 
 impl RobustAggregator for FedAvg {
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        if updates.is_empty() {
-            return Err(crate::Error::InsufficientUpdates);
-        }
-
         #[cfg(feature = "alloc")]
         {
+            let dim = validate_gradient_shapes(updates)?;
             let n = updates.len() as f32;
-            let dim = updates[0].gradients.len();
             let mut result = alloc::vec![0.0f32; dim];
 
             for update in updates {
-                for (i, &g) in update.gradients.iter().enumerate() {
-                    result[i] += g / n;
+                for (slot, &gradient) in result.iter_mut().zip(update.gradients.iter()) {
+                    *slot += gradient / n;
                 }
             }
 
@@ -94,12 +109,9 @@ impl Default for TrimmedMean {
 
 impl RobustAggregator for TrimmedMean {
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        if updates.is_empty() {
-            return Err(crate::Error::InsufficientUpdates);
-        }
-
         #[cfg(feature = "alloc")]
         {
+            let dim = validate_gradient_shapes(updates)?;
             let n = updates.len();
             let trim_count = ((n as f32) * self.trim_ratio) as usize;
 
@@ -107,18 +119,17 @@ impl RobustAggregator for TrimmedMean {
                 return Err(crate::Error::InsufficientUpdates);
             }
 
-            let dim = updates[0].gradients.len();
             let mut result = alloc::vec![0.0f32; dim];
 
             // For each coordinate, sort values and compute trimmed mean
-            for i in 0..dim {
+            for (i, slot) in result.iter_mut().enumerate().take(dim) {
                 let mut values: Vec<f32> = updates.iter().map(|u| u.gradients[i]).collect();
                 values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
 
                 // Trim and average
                 let trimmed = &values[trim_count..n - trim_count];
                 let sum: f32 = trimmed.iter().sum();
-                result[i] = sum / (trimmed.len() as f32);
+                *slot = sum / (trimmed.len() as f32);
             }
 
             Ok(result)
@@ -143,22 +154,18 @@ pub struct CoordinateMedian;
 
 impl RobustAggregator for CoordinateMedian {
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        if updates.is_empty() {
-            return Err(crate::Error::InsufficientUpdates);
-        }
-
         #[cfg(feature = "alloc")]
         {
+            let dim = validate_gradient_shapes(updates)?;
             let n = updates.len();
-            let dim = updates[0].gradients.len();
             let mut result = alloc::vec![0.0f32; dim];
 
-            for i in 0..dim {
+            for (i, slot) in result.iter_mut().enumerate().take(dim) {
                 let mut values: Vec<f32> = updates.iter().map(|u| u.gradients[i]).collect();
                 values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
 
                 // Compute median
-                result[i] = if n % 2 == 0 {
+                *slot = if n % 2 == 0 {
                     (values[n / 2 - 1] + values[n / 2]) / 2.0
                 } else {
                     values[n / 2]
@@ -205,12 +212,9 @@ impl Krum {
 #[cfg(feature = "krum")]
 impl RobustAggregator for Krum {
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        if updates.is_empty() {
-            return Err(crate::Error::InsufficientUpdates);
-        }
-
         #[cfg(feature = "alloc")]
         {
+            let _ = validate_gradient_shapes(updates)?;
             let n = updates.len();
             let f = self.num_byzantine;
 
@@ -281,5 +285,40 @@ pub enum RobustAggregation {
 impl Default for RobustAggregation {
     fn default() -> Self {
         Self::TrimmedMean { trim_ratio: 0.2 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update(gradients: Vec<f32>) -> GradientUpdate {
+        GradientUpdate {
+            sender: [0u8; 32],
+            sequence: 0,
+            gradients,
+            round_id: 0,
+        }
+    }
+
+    #[test]
+    fn fedavg_rejects_mismatched_gradient_dimensions() {
+        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0])];
+        let result = FedAvg.aggregate(&updates);
+        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
+    }
+
+    #[test]
+    fn trimmed_mean_rejects_mismatched_gradient_dimensions() {
+        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0])];
+        let result = TrimmedMean::new(0.2).aggregate(&updates);
+        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
+    }
+
+    #[test]
+    fn coordinate_median_rejects_empty_gradient_vectors() {
+        let updates = vec![update(vec![]), update(vec![])];
+        let result = CoordinateMedian.aggregate(&updates);
+        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
     }
 }

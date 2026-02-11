@@ -26,34 +26,24 @@ use crate::run_graph::{node_def_hash_v1, NodeId, NodeV1, OpKind};
 
 pub const DATAOPS_SCHEMA_V1: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustClass {
+    #[default]
     Trusted,
     Untrusted,
 }
 
-impl Default for TrustClass {
-    fn default() -> Self {
-        Self::Trusted
-    }
-}
-
 /// Authentication mode marker (DO NOT put secrets here).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthModeMarker {
+    #[default]
     None,
     BearerToken,
     Basic,
     Mtls,
     Custom(String),
-}
-
-impl Default for AuthModeMarker {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Dataset source descriptor used for source fingerprinting.
@@ -187,7 +177,15 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn sha256_postcard<T: serde::Serialize>(value: &T) -> [u8; 32] {
-    let bytes = postcard::to_allocvec(value).expect("postcard serialization must succeed");
+    let bytes = match postcard::to_allocvec(value) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let digest = Sha256::digest(b"swarmtorch.sha256_postcard.serialization_error");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest[..]);
+            return out;
+        }
+    };
     let digest = Sha256::digest(&bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..]);

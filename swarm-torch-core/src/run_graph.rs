@@ -11,8 +11,6 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-#[allow(unused_imports)]
-use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
@@ -39,18 +37,13 @@ pub enum OpKind {
 }
 
 /// Execution trust classification (ADR-0017 / ADR-0018).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionTrust {
+    #[default]
     Core,
     SandboxedExtension,
     UnsafeExtension,
-}
-
-impl Default for ExecutionTrust {
-    fn default() -> Self {
-        Self::Core
-    }
 }
 
 /// A canonical JSON-like value that is stable for hashing and deterministic for serialization.
@@ -191,7 +184,18 @@ pub fn node_def_hash_v1(node: &NodeV1) -> [u8; 32] {
 
     // Postcard provides a deterministic binary encoding when the input types are deterministic
     // (notably: BTreeMap for maps).
-    let bytes = postcard::to_allocvec(&canonical).expect("postcard serialization must succeed");
+    let bytes = match postcard::to_allocvec(&canonical) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"swarmtorch.node_def_hash_v1.postcard_error");
+            hasher.update(node.op_type.as_bytes());
+            let digest = hasher.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest[..]);
+            return out;
+        }
+    };
     let digest = Sha256::digest(&bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..]);

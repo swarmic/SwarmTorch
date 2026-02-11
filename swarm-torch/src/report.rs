@@ -32,7 +32,7 @@ pub struct Report {
     pub metrics: Vec<MetricRecord>,
 }
 
-fn serialize_path<S: serde::Serializer>(path: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+fn serialize_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&path.display().to_string())
 }
 
@@ -89,8 +89,7 @@ pub fn generate_report(
     fs::write(&html_out, html)?;
 
     if let Some(json_path) = json_out {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
         fs::write(json_path, json)?;
     }
 

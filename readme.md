@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="SwarmTorch.png" alt="SwarmTorch logo" width="320" />
+</p>
+
 # SwarmTorch
 
 [![Crates.io](https://img.shields.io/crates/v/swarm-torch.svg)](https://crates.io/crates/swarm-torch)

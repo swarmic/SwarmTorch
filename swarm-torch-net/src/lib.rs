@@ -27,6 +27,8 @@ pub mod traits;
 // pub mod udp;
 
 mod mock;
+#[cfg(feature = "alloc")]
+pub use mock::MockNetwork;
 pub use mock::MockTransport;
 
 /// Prelude for convenient imports

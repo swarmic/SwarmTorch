@@ -82,6 +82,12 @@ pub mod embassy_runtime {
         _private: (),
     }
 
+    impl Default for EmbassyRuntime {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl EmbassyRuntime {
         /// Create a new Embassy runtime wrapper
         pub fn new() -> Self {

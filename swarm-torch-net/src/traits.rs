@@ -103,20 +103,15 @@ impl Priority {
 }
 
 /// Fallback policy for multi-transport
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FallbackPolicy {
     /// Prefer the transport with lowest latency
     PreferLowLatency,
     /// Prefer the transport with highest reliability
     PreferReliability,
     /// Try all transports in priority order
+    #[default]
     PriorityOrder,
     /// Try the transport with best battery efficiency
     PreferPowerEfficient,
-}
-
-impl Default for FallbackPolicy {
-    fn default() -> Self {
-        Self::PriorityOrder
-    }
 }

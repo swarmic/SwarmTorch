@@ -9,9 +9,10 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Compression method for gradients
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum CompressionMethod {
     /// No compression (full gradient)
+    #[default]
     None,
     /// Top-K sparsification (send only top K% of gradient values)
     TopK {
@@ -37,12 +38,6 @@ pub enum CompressionMethod {
         /// Scale factor for dequantization
         scale: f32,
     },
-}
-
-impl Default for CompressionMethod {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Compressed gradient data
@@ -157,7 +152,10 @@ impl CompressedGradient {
                 let mut result = alloc::vec![0.0f32; self.num_elements];
                 for (idx, chunk) in indices.iter().zip(values.chunks_exact(4)) {
                     let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    result[*idx as usize] = value;
+                    let idx = *idx as usize;
+                    if idx < result.len() {
+                        result[idx] = value;
+                    }
                 }
                 result
             }
@@ -176,6 +174,39 @@ impl CompressedGradient {
     /// Get the compression ratio
     pub fn compression_ratio(&self) -> f32 {
         let original_size = self.num_elements * 4; // f32 = 4 bytes
-        original_size as f32 / self.compressed_size() as f32
+        let compressed_size = self.compressed_size();
+        if original_size == 0 || compressed_size == 0 {
+            return 1.0;
+        }
+        original_size as f32 / compressed_size as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decompress_sparse_ignores_out_of_bounds_indices() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::TopK { k_ratio: 0.5 },
+            shape: vec![2],
+            num_elements: 2,
+            data: CompressedData::Sparse {
+                indices: vec![0, 99],
+                values: vec![
+                    1, 0, 0, 0, // 1.4e-45-ish placeholder bytes
+                    2, 0, 0, 0, // would be OOB if applied at idx 99
+                ],
+            },
+        };
+        let decompressed = compressed.decompress();
+        assert_eq!(decompressed.len(), 2);
+    }
+
+    #[test]
+    fn compression_ratio_is_well_defined_for_empty_input() {
+        let compressed = CompressedGradient::compress(&[], CompressionMethod::None);
+        assert_eq!(compressed.compression_ratio(), 1.0);
     }
 }

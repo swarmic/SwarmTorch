@@ -26,6 +26,7 @@ tch = []  # tch-rs integration (optional, requires libtorch)
 [dependencies]
 swarm-torch-core = { workspace = true }
 serde = { workspace = true }
+postcard = { workspace = true }
 
 # Burn ML framework
 burn = { workspace = true, optional = true }

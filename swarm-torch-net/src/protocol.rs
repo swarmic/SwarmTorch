@@ -9,6 +9,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "alloc")]
+use swarm_torch_core::traits::PeerId;
 
 /// Message envelope for all swarm communications
 #[derive(Debug, Clone, Serialize, Deserialize)]

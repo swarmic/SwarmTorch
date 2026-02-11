@@ -61,10 +61,7 @@ impl SwarmModel for LinearModel {
     type Input = ();
     type Output = ();
 
-    fn forward(&self, _input: Self::Input) -> Self::Output {
-        // Placeholder - real implementation would do matrix multiply
-        ()
-    }
+    fn forward(&self, _input: Self::Input) -> Self::Output {}
 
     fn parameters(&self) -> &[f32] {
         // Return weights as slice (bias handled separately for simplicity)

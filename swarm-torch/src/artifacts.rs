@@ -148,11 +148,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use swarm_torch_core::dataops::{
-    dataset_fingerprint_v0, derived_source_fingerprint_v0, no_schema_hash_v0, recipe_hash_v0,
-    schema_hash_v0, source_fingerprint_v0, DatasetEntryV1, LineageEdgeV1, SchemaDescriptorV0,
+    dataset_fingerprint_v0, derived_source_fingerprint_v0, no_schema_hash_v0,
+    predict_output_fingerprints, recipe_hash_v0, schema_hash_v0, source_fingerprint_v0,
+    DatasetEntryV1, LineageEdgeV1, OutputSpecCore, PredictedOutput, SchemaDescriptorV0,
     SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
 };
 use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
+
+/// Error type for `DataOpsSession::predict()`.
+///
+/// Returned when prediction cannot proceed due to missing/invalid inputs.
+/// Both variants include the asset_key for auditability.
+#[derive(Debug)]
+pub enum PredictError {
+    /// An input asset_key declared by the node is not in the registry.
+    MissingInput(String),
+    /// An input's fingerprint in the registry is not valid hex.
+    InvalidFingerprint(String),
+}
 
 /// Output specification for `materialize_node_outputs`.
 #[derive(Debug, Clone)]
@@ -439,6 +452,46 @@ impl DataOpsSession {
     /// Get a reference to the underlying sink for span/event/metric emission.
     pub fn sink(&self) -> &Arc<RunArtifactSink> {
         &self.sink
+    }
+
+    // ── Cache-hit prediction (alpha.6+) ─────────────────────────────
+
+    /// Predict output fingerprints for a node before execution.
+    ///
+    /// **Fail closed:** returns `Err(PredictError::MissingInput)` if any
+    /// `node.inputs[].asset_key` is absent from the registry, and
+    /// `Err(PredictError::InvalidFingerprint)` if a registered fingerprint
+    /// is malformed. The orchestrator must treat errors as "no cache optimization".
+    pub fn predict(
+        &self,
+        node: &NodeV1,
+        outputs: &[OutputSpecCore],
+    ) -> Result<Vec<PredictedOutput>, PredictError> {
+        let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
+
+        for input in &node.inputs {
+            let entry = self
+                .registry
+                .get(&input.asset_key)
+                .ok_or_else(|| PredictError::MissingInput(input.asset_key.clone()))?;
+            let fp_bytes = hex_to_bytes(&entry.fingerprint_v0)
+                .ok_or_else(|| PredictError::InvalidFingerprint(input.asset_key.clone()))?;
+            upstream_fps.push(fp_bytes);
+        }
+
+        Ok(predict_output_fingerprints(node, outputs, &upstream_fps))
+    }
+
+    /// Asset-key scoped cache hit check.
+    ///
+    /// Returns `true` iff `asset_key` exists in the registry **and** its
+    /// current fingerprint matches `predicted_fp`. This prevents false positives
+    /// from fingerprint collisions across different asset keys.
+    pub fn is_cache_hit(&self, asset_key: &str, predicted_fp: &str) -> bool {
+        self.registry
+            .get(asset_key)
+            .map(|e| e.fingerprint_v0 == predicted_fp)
+            .unwrap_or(false)
     }
 }
 
@@ -1814,6 +1867,205 @@ mod tests {
         assert!(
             err_msg.contains("duplicate"),
             "error should mention duplicate: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Phase 3: Cache-Hit Detection tests ──────────────────────────
+
+    #[test]
+    fn predict_err_on_missing_input() {
+        let base = temp_dir("predict_missing");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([80u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Node has an input that isn't registered
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/missing"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        let result = session.predict(
+            &node,
+            &[OutputSpecCore {
+                asset_key: "dataset://ns/clean".to_string(),
+                schema: None,
+            }],
+        );
+
+        assert!(result.is_err(), "predict should fail on missing input");
+        match result.unwrap_err() {
+            PredictError::MissingInput(key) => {
+                assert_eq!(key, "dataset://ns/missing");
+            }
+            other => panic!("expected MissingInput, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn schema_aware_prediction_matches_materialization() {
+        // Predict fingerprints then materialize — they must agree.
+        let base = temp_dir("predict_matches_mat");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([81u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+
+        // Predict (schema=None)
+        let predicted = session
+            .predict(
+                &node,
+                &[OutputSpecCore {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(predicted.len(), 1);
+        let predicted_fp = &predicted[0].fingerprint_v0;
+
+        // Before materialization: no cache hit
+        assert!(
+            !session.is_cache_hit("dataset://ns/clean", predicted_fp),
+            "should not be a cache hit before materialization"
+        );
+
+        // Materialize with the same node + outputs (schema=None)
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+
+        // After materialization: fingerprints must match
+        let actual_fp = session
+            .fingerprint("dataset://ns/clean")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            *predicted_fp, actual_fp,
+            "predicted fingerprint must match materialized fingerprint"
+        );
+
+        // Now it IS a cache hit
+        assert!(
+            session.is_cache_hit("dataset://ns/clean", predicted_fp),
+            "should be a cache hit after materialization"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_hit_is_asset_key_scoped() {
+        let base = temp_dir("cache_hit_scoped");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([82u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Materialize output A
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out_a"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/out_a".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+
+        let fp_a = session
+            .fingerprint("dataset://ns/out_a")
+            .unwrap()
+            .to_string();
+
+        // Asset A's fingerprint is NOT a cache hit for asset B
+        assert!(
+            !session.is_cache_hit("dataset://ns/out_b", &fp_a),
+            "cache hit must be scoped by asset_key, not just fingerprint"
+        );
+
+        // But it IS for asset A
+        assert!(
+            session.is_cache_hit("dataset://ns/out_a", &fp_a),
+            "same asset_key + same fingerprint should be a cache hit"
         );
 
         let _ = fs::remove_dir_all(&base);

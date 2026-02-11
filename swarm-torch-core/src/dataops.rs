@@ -382,6 +382,63 @@ pub fn derived_dataset_entry_v1(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cache-hit prediction (pure, deterministic — no registry awareness)
+// ---------------------------------------------------------------------------
+
+/// Output specification for fingerprint prediction (alpha.6+).
+///
+/// Accepts optional schema so prediction is exact when schema is known,
+/// and falls back to `no_schema_hash_v0()` when it is not.
+#[derive(Debug, Clone)]
+pub struct OutputSpecCore {
+    pub asset_key: String,
+    pub schema: Option<SchemaDescriptorV0>,
+}
+
+/// Predicted output fingerprint (result of `predict_output_fingerprints`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictedOutput {
+    pub asset_key: String,
+    pub fingerprint_v0: String,
+}
+
+/// Predict output fingerprints from node definition + upstream fingerprints.
+///
+/// This is a **pure, deterministic** function with no registry awareness.
+/// The caller (e.g. `DataOpsSession::predict`) is responsible for gathering
+/// upstream fingerprints from the registry and failing closed on missing inputs.
+///
+/// For each output:
+/// - `source_fp` = `derived_source_fingerprint_v0(asset_key)`
+/// - `schema_fp` = `schema.map(schema_hash_v0).unwrap_or(no_schema_hash_v0())`
+/// - `recipe` = `recipe_hash_v0(node, upstream_fps)`
+/// - `fingerprint` = `dataset_fingerprint_v0(source_fp, schema_fp, recipe)`
+pub fn predict_output_fingerprints(
+    node: &NodeV1,
+    outputs: &[OutputSpecCore],
+    upstream_fps: &[[u8; 32]],
+) -> Vec<PredictedOutput> {
+    let recipe = recipe_hash_v0(node, upstream_fps);
+
+    outputs
+        .iter()
+        .map(|out| {
+            let source_fp = derived_source_fingerprint_v0(&out.asset_key);
+            let schema_fp = out
+                .schema
+                .as_ref()
+                .map(schema_hash_v0)
+                .unwrap_or_else(no_schema_hash_v0);
+            let fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
+            PredictedOutput {
+                asset_key: out.asset_key.clone(),
+                fingerprint_v0: hex_lower(&fp),
+            }
+        })
+        .collect()
+}
+
 /// Minimal canonical params helper (BTreeMap ordering is deterministic).
 pub fn canon_params_from_pairs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();

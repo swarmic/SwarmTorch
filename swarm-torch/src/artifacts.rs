@@ -245,6 +245,13 @@ impl DataOpsSession {
 
     /// Materialize node outputs: derives fingerprints, propagates trust, emits records, flushes.
     ///
+    /// **Correctness guarantees (alpha.6+):**
+    /// - Returns `Err` if any `node.inputs[].asset_key` is missing from registry (fail closed)
+    /// - Returns `Err` if any input fingerprint is invalid hex
+    /// - Returns `Err` if any `OutputSpec.asset_key` is not declared in `node.outputs[]`
+    /// - Returns `Err` if `outputs` contains duplicate `asset_key` values
+    /// - Lineage edges reference pre-mutation input fingerprints (not post-insert state)
+    ///
     /// Sets `unsafe_surface = true` if:
     /// - `node.execution_trust != Core`, OR
     /// - any input has `trust = Untrusted`
@@ -256,25 +263,78 @@ impl DataOpsSession {
         cache_hit: bool,
         duration_ms: u64,
     ) -> io::Result<()> {
-        // 1. Lookup upstream fingerprints from registry
-        let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
-        let mut any_untrusted_input = false;
+        // ── PRE-VALIDATION ──────────────────────────────────────────────
 
-        for input in &node.inputs {
-            if let Some(entry) = self.registry.get(&input.asset_key) {
-                if let Some(fp_bytes) = hex_to_bytes(&entry.fingerprint_v0) {
-                    upstream_fps.push(fp_bytes);
-                }
-                if matches!(entry.trust, TrustClass::Untrusted) {
-                    any_untrusted_input = true;
+        // 1. Reject duplicate output keys
+        {
+            let mut seen = std::collections::HashSet::new();
+            for output in outputs {
+                if !seen.insert(&output.asset_key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("duplicate output asset_key: {}", output.asset_key),
+                    ));
                 }
             }
         }
 
-        // 2. Compute recipe_hash_v0(node, upstream_fps)
+        // 2. Enforce output contract: every OutputSpec must be declared in node.outputs[]
+        {
+            let declared: std::collections::HashSet<&str> =
+                node.outputs.iter().map(|o| o.asset_key.as_str()).collect();
+            for output in outputs {
+                if !declared.contains(output.asset_key.as_str()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "output {} not declared in node.outputs for node {}",
+                            output.asset_key, node.node_key,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // ── SNAPSHOT INPUTS (pre-mutation) ───────────────────────────────
+
+        // 3. Fail closed: every declared input MUST exist with a valid fingerprint.
+        //    Capture snapshots before any registry mutation.
+        let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
+        let mut any_untrusted_input = false;
+        let mut input_snapshots: Vec<(String, String)> = Vec::new(); // (asset_key, fp_hex)
+
+        for input in &node.inputs {
+            let entry = self.registry.get(&input.asset_key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "missing input asset {} for node {}",
+                        input.asset_key, node.node_key,
+                    ),
+                )
+            })?;
+            let fp_bytes = hex_to_bytes(&entry.fingerprint_v0).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid fingerprint for input asset {}: {}",
+                        input.asset_key, entry.fingerprint_v0,
+                    ),
+                )
+            })?;
+            upstream_fps.push(fp_bytes);
+            input_snapshots.push((input.asset_key.clone(), entry.fingerprint_v0.clone()));
+            if matches!(entry.trust, TrustClass::Untrusted) {
+                any_untrusted_input = true;
+            }
+        }
+
+        // ── DERIVE + EMIT ───────────────────────────────────────────────
+
+        // 4. Compute recipe_hash_v0(node, upstream_fps)
         let recipe = recipe_hash_v0(node, &upstream_fps);
 
-        // 3. Determine output trust: Untrusted if any input untrusted OR execution_trust != Core
+        // 5. Determine output trust
         let output_trust =
             if any_untrusted_input || !matches!(node.execution_trust, ExecutionTrust::Core) {
                 TrustClass::Untrusted
@@ -291,8 +351,7 @@ impl DataOpsSession {
         let node_id_str = node_id.to_string();
         let node_hash = hex_lower(&node_def_hash_v1(node));
 
-        // 4. For each output: compute dataset_fingerprint_v0, insert entry
-        //    Uses canonical helpers from dataops.rs for consistent fingerprint rules.
+        // 6. For each output: compute fingerprint, insert entry, create lineage, emit record
         for output in outputs {
             let schema_fp = output
                 .schema
@@ -300,9 +359,7 @@ impl DataOpsSession {
                 .map(schema_hash_v0)
                 .unwrap_or_else(no_schema_hash_v0);
 
-            // Use canonical derived source fingerprint (salted with asset_key)
             let source_fp = derived_source_fingerprint_v0(&output.asset_key);
-
             let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
             let fp_hex = hex_lower(&dataset_fp);
 
@@ -320,25 +377,19 @@ impl DataOpsSession {
             };
             self.registry.insert(output.asset_key.clone(), entry);
 
-            // 5. Insert lineage edges (dedupe by key)
-            for input in &node.inputs {
-                if let Some(in_fp) = self
-                    .registry
-                    .get(&input.asset_key)
-                    .map(|e| e.fingerprint_v0.clone())
-                {
-                    let edge_key = (in_fp.clone(), fp_hex.clone(), node_id_str.clone());
-                    let edge = LineageEdgeV1 {
-                        input_fingerprint_v0: in_fp,
-                        output_fingerprint_v0: fp_hex.clone(),
-                        node_id,
-                        op_kind: node.op_kind,
-                    };
-                    self.lineage.insert(edge_key, edge);
-                }
+            // 7. Lineage edges from pre-mutation input snapshots (not live registry)
+            for (_, in_fp) in &input_snapshots {
+                let edge_key = (in_fp.clone(), fp_hex.clone(), node_id_str.clone());
+                let edge = LineageEdgeV1 {
+                    input_fingerprint_v0: in_fp.clone(),
+                    output_fingerprint_v0: fp_hex.clone(),
+                    node_id,
+                    op_kind: node.op_kind,
+                };
+                self.lineage.insert(edge_key, edge);
             }
 
-            // 6. Append MaterializationRecordV1
+            // 8. Append MaterializationRecordV1
             let mat = MaterializationRecordV1 {
                 schema_version: DATAOPS_SCHEMA_V1,
                 ts_unix_nanos,
@@ -356,7 +407,7 @@ impl DataOpsSession {
             self.sink.append_materialization(&mat)?;
         }
 
-        // 7. flush_snapshots()
+        // 9. flush_snapshots()
         self.flush_snapshots()
     }
 
@@ -937,7 +988,12 @@ mod tests {
         }
     }
 
-    fn make_transform_node(key: &str, input_keys: &[&str], trust: ExecutionTrust) -> NodeV1 {
+    fn make_transform_node(
+        key: &str,
+        input_keys: &[&str],
+        output_keys: &[&str],
+        trust: ExecutionTrust,
+    ) -> NodeV1 {
         NodeV1 {
             node_key: key.to_string(),
             node_id: None,
@@ -950,7 +1006,13 @@ mod tests {
                     fingerprint: None,
                 })
                 .collect(),
-            outputs: vec![],
+            outputs: output_keys
+                .iter()
+                .map(|k| AssetRefV1 {
+                    asset_key: k.to_string(),
+                    fingerprint: None,
+                })
+                .collect(),
             params: CanonParams::new(),
             code_ref: Some("test@0.1.0".to_string()),
             unsafe_surface: false,
@@ -1073,6 +1135,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/clean",
             &["dataset://ns/raw1"],
+            &["dataset://ns/clean_a"],
             ExecutionTrust::Core,
         );
         session
@@ -1098,6 +1161,7 @@ mod tests {
         let transform2 = make_transform_node(
             "transform/clean",
             &["dataset://ns/raw2"],
+            &["dataset://ns/clean_b"],
             ExecutionTrust::Core,
         );
         session
@@ -1159,6 +1223,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/split",
             &["dataset://ns/raw"],
+            &["dataset://ns/left", "dataset://ns/right"],
             ExecutionTrust::Core,
         );
         session
@@ -1234,6 +1299,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/clean",
             &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
             ExecutionTrust::Core,
         );
         session
@@ -1314,6 +1380,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/clean",
             &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
             ExecutionTrust::Core,
         );
         session
@@ -1383,6 +1450,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/process",
             &["dataset://ns/external"],
+            &["dataset://ns/processed"],
             ExecutionTrust::Core,
         );
         session
@@ -1465,6 +1533,7 @@ mod tests {
         let transform = make_transform_node(
             "transform/custom",
             &["dataset://ns/trusted"],
+            &["dataset://ns/custom_out"],
             ExecutionTrust::UnsafeExtension,
         );
         session
@@ -1498,6 +1567,253 @@ mod tests {
         assert!(
             matches!(output.trust, TrustClass::Untrusted),
             "output should be Untrusted when execution_trust is UnsafeExtension"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Phase 3A: Emitter Correctness Gate tests ────────────────────
+
+    #[test]
+    fn materialize_fails_on_missing_input_asset() {
+        let base = temp_dir("missing_input");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([70u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Do NOT register "dataset://ns/raw" — it's missing from registry
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[OutputSpec {
+                asset_key: "dataset://ns/clean".to_string(),
+                schema: None,
+                rows: Some(100),
+                bytes: Some(1000),
+            }],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(result.is_err(), "should fail on missing input asset");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing input asset"),
+            "error should mention missing input: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("dataset://ns/raw"),
+            "error should name the missing asset: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_in_place_uses_pre_mutation_fingerprint() {
+        // Verify that lineage edges reference the INPUT fingerprint from BEFORE
+        // the output was inserted into the registry. This prevents corruption
+        // when an output asset_key matches an input asset_key (re-materialization).
+        let base = temp_dir("lineage_premutation");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([71u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Capture the source fingerprint BEFORE transform
+        let source_fp = session.fingerprint("dataset://ns/raw").unwrap().to_string();
+
+        // Transform: raw → clean
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(100),
+                    bytes: Some(1000),
+                }],
+                1000,
+                false,
+                50,
+            )
+            .unwrap();
+
+        // Read lineage and verify input fingerprint matches the pre-mutation source fp
+        let lineage_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("lineage.json");
+        let lineage: DatasetLineageV1 = read_json(&lineage_path).unwrap();
+
+        assert_eq!(lineage.edges.len(), 1, "should have exactly one edge");
+        assert_eq!(
+            lineage.edges[0].input_fingerprint_v0, source_fp,
+            "lineage input fingerprint must reference pre-mutation state"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn materialize_rejects_output_not_declared_in_node() {
+        let base = temp_dir("undeclared_output");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([72u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Node declares output "dataset://ns/clean" but we try to materialize "dataset://ns/WRONG"
+        let transform = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[OutputSpec {
+                asset_key: "dataset://ns/WRONG".to_string(),
+                schema: None,
+                rows: Some(10),
+                bytes: Some(100),
+            }],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(result.is_err(), "should reject undeclared output");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not declared"),
+            "error should mention not declared: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("dataset://ns/WRONG"),
+            "error should name the undeclared output: {err_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn materialize_rejects_duplicate_output_asset_keys() {
+        let base = temp_dir("duplicate_output");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([73u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        // Register source
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        // Node declares output A, but OutputSpec has A twice (duplicate)
+        let transform = make_transform_node(
+            "transform/dup",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        let result = session.materialize_node_outputs(
+            &transform,
+            &[
+                OutputSpec {
+                    asset_key: "dataset://ns/out".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                },
+                OutputSpec {
+                    asset_key: "dataset://ns/out".to_string(),
+                    schema: None,
+                    rows: Some(20),
+                    bytes: Some(200),
+                },
+            ],
+            1000,
+            false,
+            50,
+        );
+
+        assert!(result.is_err(), "should reject duplicate output keys");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate"),
+            "error should mention duplicate: {err_msg}"
         );
 
         let _ = fs::remove_dir_all(&base);

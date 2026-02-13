@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/swarm-torch.svg)](https://crates.io/crates/swarm-torch)
 [![Documentation](https://docs.rs/swarm-torch/badge.svg)](https://docs.rs/swarm-torch)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
-[![CI](https://github.com/swarm-torch/swarm-torch/workflows/CI/badge.svg)](https://github.com/swarm-torch/swarm-torch/actions)
+[![CI](https://github.com/swarmic/SwarmTorch/actions/workflows/rust.yml/badge.svg)](https://github.com/swarmic/SwarmTorch/actions/workflows/rust.yml)
 
 **Mission-grade swarm learning for heterogeneous fleets—Rust-native, `no_std`-ready, Byzantine-resilient.**
 
@@ -475,37 +475,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to help address these limitations
 
 -----
 
-## Benchmarks
+## Benchmarks (Pre-Release Status)
 
-SwarmTorch aims for transparency in performance claims. All benchmarks are reproducible via `cargo bench`.
+Benchmark rigor is a release gate for SwarmTorch. Cross-framework benchmark claims are temporarily withheld until a reproducible suite is published with pinned environments, scripts, and raw artifacts.
 
-### Training Throughput (MNIST, 10 nodes, WiFi simulation)
+Current status:
 
-|Framework     |Samples/sec|Memory/node|Convergence (rounds)|
-|--------------|-----------|-----------|--------------------|
-|**SwarmTorch**|12,400     |45 MB      |87                  |
-|PyTorch DDP   |18,200     |520 MB     |92                  |
-|TF Federated  |8,900      |680 MB     |103                 |
-
-### Embedded Gradient Computation (STM32H7, 64KB model)
-
-|Operation           |SwarmTorch|TFLite Micro|
-|--------------------|----------|------------|
-|Forward pass        |23 ms     |31 ms       |
-|Backward pass       |67 ms     |N/A         |
-|Update serialization|8 ms      |N/A         |
-|**Total round time**|**98 ms** |**N/A**     |
-
-### Byzantine Attack Resilience (Label-flipping attack, 30% malicious)
-
-|Aggregator            |Final Accuracy|Rounds to Converge|
-|----------------------|--------------|------------------|
-|**Trimmed Mean (20%)**|91.2%         |147               |
-|**Krum**              |93.1%         |132               |
-|**Bulyan**            |94.3%         |156               |
-|Naive Average         |37.8%         |DNF               |
-
-Run `cargo bench` for methodology and reproduction scripts.
+- `cargo bench` covers internal crate-level performance checks.
+- Cross-framework comparisons (for example PyTorch DDP, TensorFlow Federated) are in progress and not yet published as canonical results.
+- Until the benchmark suite is published, treat performance numbers as target goals, not authoritative claims.
 
 -----
 
@@ -522,7 +500,7 @@ SwarmTorch is open-source (MPL-2.0 license) and welcomes contributions. We espec
 **Before contributing:**
 
 1. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-1. Check [open issues](https://github.com/swarm-torch/swarm-torch/issues)
+1. Check [open issues](https://github.com/swarmic/SwarmTorch/issues)
 1. Review [ADRs](ADRs.md) to understand design decisions
 
 **Code of Conduct:** We follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
@@ -563,7 +541,7 @@ If you use SwarmTorch in research, please cite:
   title = {SwarmTorch: Mission-Grade Swarm Learning for Heterogeneous Fleets},
   author = {SwarmTorch Contributors},
   year = {2025},
-  url = {https://github.com/swarm-torch/swarm-torch},
+  url = {https://github.com/swarmic/SwarmTorch},
   version = {0.1.0}
 }
 ```
@@ -593,10 +571,10 @@ SwarmTorch is licensed under the **Mozilla Public License 2.0 (MPL-2.0)**. See [
 
 ## Community & Support
 
-- 💬 **Discord:** [discord.gg/swarmtorch](https://discord.gg/swarmtorch)
-- 🐦 **Twitter/X:** [@swarmtorch](https://twitter.com/swarmtorch)
-- 📧 **Mailing List:** [swarmtorch-dev](https://groups.google.com/g/swarmtorch-dev)
-- 📝 **Blog:** [swarmtorch.dev/blog](https://swarmtorch.dev/blog)
+Public community channels are being prepared and will be linked here once live.
+
+- 🐞 **Issues:** [github.com/swarmic/SwarmTorch/issues](https://github.com/swarmic/SwarmTorch/issues)
+- 🔐 **Security Reports:** [security@swarmtorch.dev](mailto:security@swarmtorch.dev)
 
 **Commercial Support:** Enterprise licensing, training, and consulting available via [support@swarmtorch.dev](mailto:support@swarmtorch.dev)
 

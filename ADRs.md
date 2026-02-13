@@ -3375,9 +3375,19 @@ cuda = ["cudarc", "burn/cuda"]
 
 ## ADR-0016: Run Artifacts and Visualization Surface
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-02-08  
 **Deciders:** Core Team
+
+**Implementation Status (2026-02-13):** Partial (artifact contract baseline implemented; higher-level tooling/extensions remain planned)
+
+### Conformance Hooks (Current)
+
+- `cargo test -p swarm-torch artifacts::tests::bundle_manifest_roundtrip`
+- `cargo test -p swarm-torch artifacts::tests::graph_write_normalizes_ids_and_hashes`
+- `cargo test -p swarm-torch artifacts::tests::strict_profile_updates_manifest_on_each_write`
+- `cargo test -p swarm-torch artifacts::tests::streaming_profile_defers_snapshot_rewrite_until_interval`
+- `cargo test -p swarm-torch report::tests::mid_run_report_succeeds_with_manifest_always_policy`
 
 ### Context
 
@@ -3553,9 +3563,19 @@ runs/<run_id>/
 
 ## ADR-0017: Data Pipeline DSL and Asset Model
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-02-08  
 **Deciders:** Core Team
+
+**Implementation Status (2026-02-13):** Partial (graph/fingerprint/materialization contract implemented; full execution engine remains planned)
+
+### Conformance Hooks (Current)
+
+- `cargo test -p swarm-torch-core dataops::tests::dataset_fingerprint_is_deterministic`
+- `cargo test -p swarm-torch-core dataops::tests::source_descriptor_redacts_userinfo_in_uri`
+- `cargo test -p swarm-torch materialization_v2_includes_input_provenance`
+- `cargo test -p swarm-torch materialize_rejects_output_not_declared_in_node`
+- `cargo test -p swarm-torch materialize_fails_on_missing_input_asset`
 
 ### Context
 
@@ -3730,9 +3750,18 @@ These placeholders are implemented in `swarm-torch-core::dataops` and MUST be us
 
 ## ADR-0018: Extension and Execution Policy
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-02-08  
 **Deciders:** Core Team
+
+**Implementation Status (2026-02-13):** Partial (execution trust/policy + unsafe-surface artifacting implemented; sandbox host/runtime enforcement remains planned)
+
+### Conformance Hooks (Current)
+
+- `cargo test -p swarm-torch-core execution::tests::policy_denies_unsafe_extension`
+- `cargo test -p swarm-torch-core execution::tests::policy_denies_sandboxed_extension`
+- `cargo test -p swarm-torch unsafe_reasons`
+- `cargo test -p swarm-torch report::tests::report_warning_lists_unsafe_materialization_reasons`
 
 ### Context
 

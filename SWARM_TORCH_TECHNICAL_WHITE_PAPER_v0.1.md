@@ -64,7 +64,7 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Coordination | Gossip coordination + quorum rounds | Evidence: ADR-0006A, swarm-torch-core/src/consensus.rs | Planned | Current crate has structs only; protocol implementation pending |
 | Topology | Topology as a first-class config | Evidence: swarm-torch-core/src/algorithms.rs, ADR-0004A | Partial | Enum exists; adaptive policies/rewiring not implemented |
 | Staleness | Bounded async + staleness-aware policy | Evidence: ADR-0004B | Planned | `staleness.rs` not implemented yet |
-| Runtime | Tokio/Embassy runtime abstraction | Evidence: swarm-torch-runtime/src/lib.rs | Partial | Tokio wrapper works; Embassy remains placeholder and is not yet a production-gated embedded runtime path |
+| Runtime | Tokio/Embassy runtime abstraction | Evidence: swarm-torch-runtime/src/lib.rs | Partial | Tokio wrapper works and is Rust 1.75-gated; Embassy remains placeholder and outside the Rust 1.75 conformance gate |
 | Models | Reference models + backend integration | Evidence: swarm-torch-models/src/simple.rs | Partial | Burn integration is placeholder |
 | Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs, swarm-torch-core/Cargo.toml | Partial | Core `no_std + alloc` and minimal `no_std` build gates compile; embedded runtime/transport and end-to-end examples remain planned |
 | GPU | WGPU-first; CUDA optional backend | Evidence: ADR-0015 | Planned | Backend wiring pending |
@@ -74,6 +74,7 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 MSRV policy is currently tiered by crate:
 - `swarm-torch-core` security-critical path is validated on Rust 1.75.
 - top-level/model crates have a higher compiler floor due backend dependency constraints.
+- `swarm-torch-runtime` Tokio path is validated on Rust 1.75; Embassy feature path is experimental and not in the Rust 1.75 gate.
 
 ## Abstract
 
@@ -321,7 +322,7 @@ Grounding: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#Cargo-Features, SWA
 SwarmTorch defines a `SwarmRuntime` trait and feature-gated implementations:
 
 - `tokio` runtime wrapper (usable today)
-- `embassy` runtime wrapper (placeholder; not yet complete)
+- `embassy` runtime wrapper (placeholder; not yet complete and not part of Rust 1.75 conformance)
 
 Evidence: swarm-torch-runtime/src/lib.rs
 

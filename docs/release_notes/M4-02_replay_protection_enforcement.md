@@ -295,10 +295,10 @@ envelope.verify_authenticated(&mut replay_guard, now)?;
 3. **Identity Provider Integration:** Sybil resistance hooks (ADR-0008A implementation).
 4. **Byzantine Attack Harness:** Simulation testing under adversarial conditions (ADR-0007A).
 
-**White Paper Update Required:**
+**White Paper Update Status (completed):**
 
-- Update line 60: "Replay protection: Partial" → "Replay protection: Implemented"
-- Add caveat: "Memory-only cache (non-persistent across restarts)"
+- [x] Update line 60: "Replay protection: Partial" → "Replay protection: Implemented"
+- [x] Add caveat: "Memory-only cache (non-persistent across restarts)"
 
 ---
 

@@ -36,7 +36,7 @@ The Rust ML ecosystem has excellent tools for specific problems:
 
 |Feature                        |SwarmTorch               |PyTorch Distributed |TensorFlow Federated    |
 |-------------------------------|-------------------------|--------------------|------------------------|
-|**Embedded targets** (`no_std`)|✅ First-class            |❌ Not supported     |❌ Not supported         |
+|**Embedded targets** (`no_std`)|⚠️ Partial (`no_std + alloc`); `embedded_min` planned|❌ Not supported     |❌ Not supported         |
 |**Asynchronous participation** |✅ Core design            |⚠️ Limited           |⚠️ Experimental          |
 |**Byzantine robustness**       |✅ Pluggable aggregators  |❌ No defense        |⚠️ Research only         |
 |**Heterogeneous networks**     |✅ LoRa/BLE/WiFi/Ethernet |❌ Assumes datacenter|❌ Assumes reliable links|
@@ -169,7 +169,7 @@ async fn main(spawner: Spawner) {
 
 ## Supported Targets & Embedded Profiles
 
-SwarmTorch defines three explicit **embedded profiles** as first-class build targets (see [ADR-0002](ADRs.md#adr-0002-crate-topology-feature-flag-policy-and-embedded-profiles)):
+SwarmTorch defines three explicit **embedded profiles** as portability targets (see [ADR-0002](ADRs.md#adr-0002-crate-topology-feature-flag-policy-and-embedded-profiles)). Current status: `embedded_alloc` is experimental; `embedded_min` remains planned.
 
 |Profile                        |Feature Flags            |Allocator |Types Available                      |Examples                 |
 |-------------------------------|-------------------------|----------|-------------------------------------|-------------------------|
@@ -185,7 +185,7 @@ SwarmTorch defines three explicit **embedded profiles** as first-class build tar
 |**Edge Gateways**              |Raspberry Pi, Jetson Nano|✅ Full support         |`edge_std`        |
 |**Embedded (std)**             |OpenWRT routers          |✅ Full support         |`edge_std`        |
 |**Embedded (no_std + alloc)**  |ESP32, STM32H7           |⚠️ Experimental         |`embedded_alloc`  |
-|**Embedded (no_std, no alloc)**|Cortex-M0+               |⚠️ Participant mode only|`embedded_min`    |
+|**Embedded (no_std, no alloc)**|Cortex-M0+               |🧭 Planned (no-alloc profile)|`embedded_min`    |
 
 ### Cross-Compilation Setup
 

@@ -6,10 +6,14 @@
 //! - **Tokio**: Implemented for server/edge deployments (std)
 //! - **Embassy**: Placeholder adapter for embedded microcontrollers (no_std path is partial)
 //!
+//! Current conformance posture:
+//! - Tokio path is validated on Rust 1.75.
+//! - Embassy path is experimental and not part of the Rust 1.75 conformance gate.
+//!
 //! ## Feature Flags
 //!
 //! - `tokio` (default): Use Tokio runtime
-//! - `embassy`: Enable embassy placeholder runtime adapter
+//! - `embassy`: Enable embassy placeholder runtime adapter (experimental)
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

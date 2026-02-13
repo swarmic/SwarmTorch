@@ -37,7 +37,7 @@
 //!
 //! - `std` (default): Standard library support
 //! - `tokio-runtime` (default): Use Tokio for async
-//! - `embassy-runtime`: Use Embassy for embedded async
+//! - `embassy-runtime`: Enable Embassy placeholder adapter (experimental; not in Rust 1.75 conformance gate)
 //! - `burn-backend` (default): Burn ML framework integration
 //! - `robust-aggregation` (default): Byzantine-resilient aggregators
 //!

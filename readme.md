@@ -229,16 +229,19 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |--------------------|-----------------------------------------|------------|
 |`std`               |Enable standard library support          |✅ Yes       |
 |`alloc`             |Enable allocator for dynamic memory      |✅ (with std)|
-|`tokio-runtime`     |Use Tokio for async runtime (server/edge)|✅ Yes       |
-|`embassy-runtime`   |Embassy runtime adapter (placeholder/experimental)|❌ No  |
-|`burn-backend`      |Use Burn for autodiff/training           |✅ Yes       |
-|`tch-backend`       |Use LibTorch via tch-rs                  |❌ No        |
-|`python-bindings`   |Build PyO3 bindings for Python           |❌ No        |
-|`robust-aggregation`|Byzantine-resilient aggregators          |✅ Yes       |
-|`lora-transport`    |LoRa networking support                  |❌ No        |
-|`ble-transport`     |Bluetooth Low Energy support             |❌ No        |
-|`wgpu-backend`      |GPU acceleration via WGPU (portable)     |❌ No        |
-|`cuda`              |NVIDIA CUDA acceleration (optional)      |❌ No        |
+|`tokio-runtime`     |Use Tokio runtime adapter                |✅ Yes       |
+|`embassy-runtime`   |Enable Embassy placeholder adapter (experimental; not in Rust 1.75 conformance gate)|❌ No|
+|`burn-backend`      |Use Burn backend integration scaffold    |✅ Yes       |
+|`tch-backend`       |Use LibTorch (`tch-rs`) integration scaffold|❌ No    |
+|`robust-aggregation`|Enable robust aggregation strategies     |✅ Yes       |
+|`tcp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
+|`udp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
+|`ble-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
+|`lora-transport`    |Transport feature flag surface (backend implementation planned)|❌ No|
+|`telemetry`         |Core telemetry module re-exports         |❌ No        |
+|`python`            |Reserved marker for future Python boundary work|❌ No   |
+
+Roadmap-only items from ADRs (for example WGPU/CUDA backend wiring and PyO3 bindings) are not yet exposed as active Cargo features in `swarm-torch`.
 
 **Embedded profile presets:**
 
@@ -295,25 +298,24 @@ The diagram mixes implemented components and roadmap targets.
 1. **Explicit Trust Model:** Byzantine robustness is opt-in with clear guarantees
 1. **Incremental Adoption:** Works alongside existing Rust ML tools (Burn, tch-rs, tract)
 
-### GPU Acceleration Strategy
+### GPU Acceleration Strategy (Roadmap)
 
-SwarmTorch uses **WGPU as the primary GPU backend** for portable acceleration across vendors, with **CUDA as an optional feature** for maximum NVIDIA performance. See [ADR-0015](ADRs.md#adr-0015-gpu-acceleration-strategy-wgpu-first-cuda-optional).
+GPU backend policy is defined in [ADR-0015](ADRs.md#adr-0015-gpu-acceleration-strategy-wgpu-first-cuda-optional), but current crate wiring remains CPU-only.
 
-|Backend |Portability         |Performance    |Feature Flag     |
-|--------|-------------------|---------------|-----------------|
-|**CPU** |✅ Universal        |Baseline       |Default          |
-|**WGPU**|✅ Vulkan/Metal/DX12|Good           |`wgpu-backend`   |
-|**CUDA**|❌ NVIDIA only      |Highest        |`cuda`           |
+|Backend |Current State       |Planned Direction |
+|--------|--------------------|------------------|
+|**CPU** |✅ Implemented       |Baseline path     |
+|**WGPU**|🧭 Planned           |Portable GPU path |
+|**CUDA**|🧭 Planned           |Optional NVIDIA path |
 
 ```rust,ignore
-// GPU backend selection
+// Design-target pseudocode (not current API surface)
 let config = SwarmConfig::builder()
-    .gpu_backend(GpuBackend::Wgpu)  // Portable default
-    // .gpu_backend(GpuBackend::Cuda)  // NVIDIA acceleration
+    .gpu_backend(GpuBackend::Wgpu)
     .build();
 ```
 
-**CUDA policy:** CUDA is never in `swarm-torch-core` (must remain no_std compatible). CUDA acceleration is opt-in and uses dynamic loading (user provides CUDA libs).
+**Policy remains unchanged:** GPU acceleration must stay out of `swarm-torch-core` and behind explicit opt-in features once wired.
 
 -----
 
@@ -432,7 +434,7 @@ cargo run -p swarm-torch --example artifact_pipeline
 
 - ⚠️ Core algorithm configuration/types (full execution engine is in progress)
 - ❌ TCP/UDP concrete transports (planned; trait + mock currently implemented)
-- ✅ Basic robust aggregators (Median, Trimmed Mean)
+- ✅ Basic robust aggregators (Median, Trimmed Mean, Krum)
 - ❌ Burn backend integration (placeholder wrapper currently)
 - ⏳ ROS2 bridge (beta)
 - ⏳ 5 reference robotics examples
@@ -448,7 +450,7 @@ cargo run -p swarm-torch --example artifact_pipeline
 ### v0.3.0 - Production Hardening
 
 - ⏳ LoRa transport with duty-cycle management
-- ⏳ Advanced Byzantine defense (Krum, Bulyan, Multi-Krum)
+- ⏳ Advanced Byzantine defense (Bulyan, Multi-Krum)
 - ⏳ Attack simulation harness
 - ⏳ tch-rs backend for PyTorch model compatibility (model zoo only)
 - ⏳ ONNX export for inference interchange (import for inference, NOT training)

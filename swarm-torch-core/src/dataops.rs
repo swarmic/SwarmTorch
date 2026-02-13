@@ -18,6 +18,8 @@ use alloc::format;
 #[cfg(feature = "alloc")]
 use alloc::string::{String, ToString};
 #[cfg(feature = "alloc")]
+use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
@@ -26,6 +28,8 @@ use crate::run_graph::{node_def_hash_v1, NodeId, NodeV1, OpKind};
 
 pub const DATAOPS_SCHEMA_V1: u32 = 1;
 pub const MATERIALIZATION_SCHEMA_V2: u32 = 2;
+pub const MAX_SOURCE_URI_LEN: usize = 2048;
+pub const MAX_ETAG_OR_VERSION_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +188,40 @@ pub enum MaterializationStatusV0 {
     Skipped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsafeReasonV0 {
+    UntrustedInput,
+    UnsafeExtension,
+    MissingProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDescriptorError {
+    UriTooLong { len: usize, max: usize },
+    EtagOrVersionTooLong { len: usize, max: usize },
+}
+
+impl core::fmt::Display for SourceDescriptorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UriTooLong { len, max } => {
+                write!(f, "source descriptor uri too long: {} > {}", len, max)
+            }
+            Self::EtagOrVersionTooLong { len, max } => {
+                write!(
+                    f,
+                    "source descriptor etag_or_version too long: {} > {}",
+                    len, max
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SourceDescriptorError {}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QualitySummaryV0 {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +268,8 @@ pub struct MaterializationRecordV2 {
     pub cache_hit: Option<bool>,
 
     pub unsafe_surface: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_reasons: Vec<UnsafeReasonV0>,
 
     pub status: MaterializationStatusV0,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,7 +316,8 @@ impl MaterializationRecordCompat {
                 cache_reason: None,
                 cache_key_v0: None,
                 cache_hit: v1.cache_hit,
-                unsafe_surface: v1.unsafe_surface,
+                unsafe_surface: true,
+                unsafe_reasons: vec![UnsafeReasonV0::MissingProvenance],
                 status: MaterializationStatusV0::Ok,
                 error_code: None,
                 quality: None,
@@ -320,6 +361,73 @@ fn normalize_trim(s: &str) -> String {
     s.trim().to_string()
 }
 
+fn redact_uri_userinfo(uri: &str) -> String {
+    let Some(scheme_sep) = uri.find("://") else {
+        return uri.to_string();
+    };
+
+    let authority_start = scheme_sep + 3;
+    let after_scheme = &uri[authority_start..];
+
+    let mut authority_end = after_scheme.len();
+    for delim in ['/', '?', '#'] {
+        if let Some(idx) = after_scheme.find(delim) {
+            authority_end = authority_end.min(idx);
+        }
+    }
+
+    let authority = &after_scheme[..authority_end];
+    let Some((_, host_part)) = authority.rsplit_once('@') else {
+        return uri.to_string();
+    };
+
+    let mut out = String::with_capacity(uri.len());
+    out.push_str(&uri[..authority_start]);
+    out.push_str("<redacted>@");
+    out.push_str(host_part);
+    out.push_str(&after_scheme[authority_end..]);
+    out
+}
+
+fn normalize_and_redact_source_descriptor(source: &SourceDescriptorV0) -> SourceDescriptorV0 {
+    SourceDescriptorV0 {
+        uri: redact_uri_userinfo(&normalize_trim(&source.uri)),
+        content_type: normalize_lower(&source.content_type),
+        auth_mode: source.auth_mode.clone(),
+        etag_or_version: source.etag_or_version.as_ref().map(|v| normalize_trim(v)),
+    }
+}
+
+/// Sanitize a source descriptor before persistence/hashing.
+///
+/// Guarantees:
+/// - URI userinfo is redacted (`user[:pass]@` -> `<redacted>@`)
+/// - normalized whitespace/casing rules match fingerprint canonicalization
+/// - oversized URI / etag_or_version values are rejected
+pub fn sanitize_source_descriptor_v0(
+    source: &SourceDescriptorV0,
+) -> core::result::Result<SourceDescriptorV0, SourceDescriptorError> {
+    let sanitized = normalize_and_redact_source_descriptor(source);
+
+    if sanitized.uri.len() > MAX_SOURCE_URI_LEN {
+        return Err(SourceDescriptorError::UriTooLong {
+            len: sanitized.uri.len(),
+            max: MAX_SOURCE_URI_LEN,
+        });
+    }
+
+    if let Some(etag_or_version) = sanitized.etag_or_version.as_ref() {
+        if etag_or_version.len() > MAX_ETAG_OR_VERSION_LEN {
+            return Err(SourceDescriptorError::EtagOrVersionTooLong {
+                len: etag_or_version.len(),
+                max: MAX_ETAG_OR_VERSION_LEN,
+            });
+        }
+    }
+
+    Ok(sanitized)
+}
+
 fn auth_mode_marker_str(m: &AuthModeMarker) -> String {
     match m {
         AuthModeMarker::None => "none".to_string(),
@@ -340,11 +448,12 @@ struct SourceFingerprintCanonicalV0 {
 
 /// Compute `source_fingerprint` (v0) from a normalized source descriptor.
 pub fn source_fingerprint_v0(source: &SourceDescriptorV0) -> [u8; 32] {
+    let source = normalize_and_redact_source_descriptor(source);
     let canonical = SourceFingerprintCanonicalV0 {
-        uri: normalize_trim(&source.uri),
+        uri: source.uri,
         content_type: normalize_lower(&source.content_type),
         auth_mode: auth_mode_marker_str(&source.auth_mode),
-        etag_or_version: source.etag_or_version.as_ref().map(|v| normalize_trim(v)),
+        etag_or_version: source.etag_or_version,
     };
     sha256_postcard(&canonical)
 }
@@ -709,6 +818,7 @@ mod tests {
             cache_key_v0: Some("d".repeat(64)),
             cache_hit: cache_hit_from_decision(CacheDecisionV0::Hit),
             unsafe_surface: false,
+            unsafe_reasons: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: Some(QualitySummaryV0 {
@@ -721,5 +831,96 @@ mod tests {
         let json = serde_json::to_string(&row).expect("serialize v2");
         let decoded: MaterializationRecordV2 = serde_json::from_str(&json).expect("deserialize v2");
         assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn source_descriptor_redacts_userinfo_in_uri() {
+        let source_a = SourceDescriptorV0 {
+            uri: "s3://alice:secret@bucket/path/file.parquet?part=1".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::BearerToken,
+            etag_or_version: Some("v1".to_string()),
+        };
+        let source_b = SourceDescriptorV0 {
+            uri: "s3://bob:other-secret@bucket/path/file.parquet?part=1".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::BearerToken,
+            etag_or_version: Some("v1".to_string()),
+        };
+
+        let sanitized = sanitize_source_descriptor_v0(&source_a).expect("sanitize should succeed");
+        assert_eq!(
+            sanitized.uri,
+            "s3://<redacted>@bucket/path/file.parquet?part=1"
+        );
+
+        // Fingerprints must ignore differing credentials after redaction.
+        assert_eq!(
+            source_fingerprint_v0(&source_a),
+            source_fingerprint_v0(&source_b),
+            "userinfo changes should not affect source fingerprint"
+        );
+    }
+
+    #[test]
+    fn source_descriptor_rejects_oversized_uri() {
+        let source = SourceDescriptorV0 {
+            uri: format!("s3://bucket/{}", "a".repeat(MAX_SOURCE_URI_LEN + 1)),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+
+        let result = sanitize_source_descriptor_v0(&source);
+        assert!(matches!(
+            result,
+            Err(SourceDescriptorError::UriTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn source_descriptor_rejects_oversized_etag_or_version() {
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/path".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: Some("e".repeat(MAX_ETAG_OR_VERSION_LEN + 1)),
+        };
+
+        let result = sanitize_source_descriptor_v0(&source);
+        assert!(matches!(
+            result,
+            Err(SourceDescriptorError::EtagOrVersionTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn unsafe_reasons_include_missing_provenance() {
+        let legacy = MaterializationRecordV1 {
+            schema_version: 1,
+            ts_unix_nanos: 42,
+            asset_key: "dataset://ns/v1".to_string(),
+            fingerprint_v0: "a".repeat(64),
+            node_id: NodeId::from_bytes([1u8; 16]),
+            node_def_hash: "b".repeat(64),
+            rows: Some(1),
+            bytes: Some(2),
+            cache_hit: Some(true),
+            duration_ms: Some(3),
+            quality_flags: None,
+            unsafe_surface: false,
+        };
+
+        let normalized = MaterializationRecordCompat::V1(legacy).into_v2();
+        assert!(
+            normalized
+                .unsafe_reasons
+                .contains(&UnsafeReasonV0::MissingProvenance),
+            "legacy compatibility normalization should mark missing provenance"
+        );
+        assert!(
+            normalized.unsafe_surface,
+            "missing provenance reason should mark record unsafe"
+        );
     }
 }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use swarm_torch_core::dataops::{
     DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
-    MaterializationRecordCompat, MaterializationRecordV2, TrustClass,
+    MaterializationRecordCompat, MaterializationRecordV2, TrustClass, UnsafeReasonV0,
 };
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeId, NodeV1};
@@ -240,6 +240,25 @@ pub fn is_node_unsafe(node: &NodeV1, registry: &DatasetRegistryV1) -> bool {
     false
 }
 
+fn unsafe_reason_label(reason: UnsafeReasonV0) -> &'static str {
+    match reason {
+        UnsafeReasonV0::UntrustedInput => "untrusted_input",
+        UnsafeReasonV0::UnsafeExtension => "unsafe_extension",
+        UnsafeReasonV0::MissingProvenance => "missing_provenance",
+    }
+}
+
+fn format_unsafe_reasons(reasons: &[UnsafeReasonV0]) -> String {
+    if reasons.is_empty() {
+        return "none".to_string();
+    }
+    reasons
+        .iter()
+        .map(|reason| unsafe_reason_label(*reason))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn render_svg(graph: &GraphV1, registry: &DatasetRegistryV1) -> String {
     let width = 900;
     let node_w = 820;
@@ -356,12 +375,13 @@ fn render_timeline(report: &Report) -> String {
     }
     for m in &report.materializations {
         let derived_unsafe = node_unsafe_by_id.get(&m.node_id).copied().unwrap_or(true);
+        let unsafe_reasons = format_unsafe_reasons(&m.unsafe_reasons);
         rows.push(TimelineRow {
             ts: m.ts_unix_nanos,
             kind: "materialization",
             name: m.asset_key.clone(),
             detail: format!(
-                "rows={} bytes={} cache_hit={} unsafe={} node_id={} node_def_hash={}",
+                "rows={} bytes={} cache_hit={} unsafe={} unsafe_reasons={} node_id={} node_def_hash={}",
                 m.rows
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
@@ -372,6 +392,7 @@ fn render_timeline(report: &Report) -> String {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
                 derived_unsafe,
+                unsafe_reasons,
                 m.node_id,
                 &m.node_def_hash
             ),
@@ -417,7 +438,10 @@ fn render_html(report: &Report) -> String {
     let mut unsafe_materializations = Vec::new();
     for m in &report.materializations {
         if m.unsafe_surface {
-            unsafe_materializations.push(m.asset_key.clone());
+            unsafe_materializations.push((
+                m.asset_key.clone(),
+                format_unsafe_reasons(&m.unsafe_reasons),
+            ));
         }
     }
 
@@ -447,10 +471,11 @@ fn render_html(report: &Report) -> String {
                 escape_html(&d)
             ));
         }
-        for m in unsafe_materializations {
+        for (asset_key, reasons) in unsafe_materializations {
             html.push_str(&format!(
-                "<li>unsafe materialization: <code>{}</code></li>",
-                escape_html(&m)
+                "<li>unsafe materialization: <code>{}</code> reasons=<code>{}</code></li>",
+                escape_html(&asset_key),
+                escape_html(&reasons)
             ));
         }
         html.push_str("</ul></div>");
@@ -510,7 +535,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use swarm_torch_core::dataops::{
         DatasetEntryV1, DatasetLineageV1, MaterializationRecordV1, MaterializationRecordV2,
-        MaterializationStatusV0, SourceDescriptorV0, TrustClass, MATERIALIZATION_SCHEMA_V2,
+        MaterializationStatusV0, SourceDescriptorV0, TrustClass, UnsafeReasonV0,
+        MATERIALIZATION_SCHEMA_V2,
     };
     use swarm_torch_core::observe::{RunId, TraceId};
     use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind};
@@ -647,6 +673,7 @@ mod tests {
             cache_hit: Some(false),
             duration_ms: Some(50),
             unsafe_surface: false, // intentionally false: timeline should derive from node+registry.
+            unsafe_reasons: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,
@@ -690,6 +717,135 @@ mod tests {
         assert!(
             timeline_html.contains("unsafe=true"),
             "timeline unsafe should be derived from node+registry, not materialization flag: {timeline_html}"
+        );
+        assert!(
+            timeline_html.contains("unsafe_reasons=none"),
+            "timeline detail should include unsafe_reasons for explainability: {timeline_html}"
+        );
+    }
+
+    #[test]
+    fn timeline_materialization_includes_unsafe_reasons_when_present() {
+        let node_id = TraceId::from_bytes([9u8; 16]);
+        let mat = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 1,
+            ts_unix_nanos: 1234,
+            asset_key: "dataset://ns/out".to_string(),
+            fingerprint_v0: "x".repeat(64),
+            node_id,
+            node_def_hash: "h".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec!["dataset://ns/in".to_string()],
+            input_fingerprints_v0: vec!["y".repeat(64)],
+            rows: Some(1),
+            bytes: Some(2),
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Miss,
+            cache_reason: None,
+            cache_key_v0: None,
+            cache_hit: Some(false),
+            duration_ms: Some(3),
+            unsafe_surface: true,
+            unsafe_reasons: vec![
+                UnsafeReasonV0::UntrustedInput,
+                UnsafeReasonV0::UnsafeExtension,
+            ],
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
+        };
+
+        let report = Report {
+            run_dir: PathBuf::from("/tmp/test"),
+            graph: GraphV1 {
+                schema_version: 1,
+                graph_id: None,
+                nodes: vec![],
+                edges: vec![],
+            },
+            registry: DatasetRegistryV1 {
+                schema_version: 1,
+                datasets: vec![],
+            },
+            lineage: DatasetLineageV1 {
+                schema_version: 1,
+                edges: vec![],
+            },
+            materializations: vec![mat],
+            spans: vec![],
+            events: vec![],
+            metrics: vec![],
+        };
+
+        let timeline_html = render_timeline(&report);
+        assert!(
+            timeline_html.contains("unsafe_reasons=untrusted_input,unsafe_extension"),
+            "timeline should render serialized unsafe reason labels: {timeline_html}"
+        );
+    }
+
+    #[test]
+    fn report_warning_lists_unsafe_materialization_reasons() {
+        let node_id = TraceId::from_bytes([10u8; 16]);
+        let mat = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 1,
+            ts_unix_nanos: 1234,
+            asset_key: "dataset://ns/out".to_string(),
+            fingerprint_v0: "x".repeat(64),
+            node_id,
+            node_def_hash: "h".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec!["dataset://ns/in".to_string()],
+            input_fingerprints_v0: vec!["y".repeat(64)],
+            rows: Some(1),
+            bytes: Some(2),
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Miss,
+            cache_reason: None,
+            cache_key_v0: None,
+            cache_hit: Some(false),
+            duration_ms: Some(3),
+            unsafe_surface: true,
+            unsafe_reasons: vec![UnsafeReasonV0::MissingProvenance],
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
+        };
+
+        let report = Report {
+            run_dir: PathBuf::from("/tmp/test"),
+            graph: GraphV1 {
+                schema_version: 1,
+                graph_id: None,
+                nodes: vec![],
+                edges: vec![],
+            },
+            registry: DatasetRegistryV1 {
+                schema_version: 1,
+                datasets: vec![],
+            },
+            lineage: DatasetLineageV1 {
+                schema_version: 1,
+                edges: vec![],
+            },
+            materializations: vec![mat],
+            spans: vec![],
+            events: vec![],
+            metrics: vec![],
+        };
+
+        let html = render_html(&report);
+        assert!(
+            html.contains("unsafe materialization"),
+            "report warning banner should list unsafe materializations: {html}"
+        );
+        assert!(
+            html.contains("reasons="),
+            "report warning banner should show reason labels: {html}"
+        );
+        assert!(
+            html.contains("missing_provenance"),
+            "report warning banner should render missing_provenance label: {html}"
         );
     }
 
@@ -738,6 +894,7 @@ mod tests {
             cache_key_v0: Some("f".repeat(64)),
             cache_hit: Some(true),
             unsafe_surface: true,
+            unsafe_reasons: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,

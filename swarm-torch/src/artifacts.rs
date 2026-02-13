@@ -265,10 +265,10 @@ use std::sync::Arc;
 
 use swarm_torch_core::dataops::{
     cache_hit_from_decision, cache_key_v0, dataset_fingerprint_v0, derived_source_fingerprint_v0,
-    no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, schema_hash_v0,
-    source_fingerprint_v0, CacheDecisionV0, MaterializationStatusV0, OutputSpecCore,
-    PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
-    MATERIALIZATION_SCHEMA_V2,
+    no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, sanitize_source_descriptor_v0,
+    schema_hash_v0, source_fingerprint_v0, CacheDecisionV0, MaterializationStatusV0,
+    OutputSpecCore, PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
+    UnsafeReasonV0, DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
 };
 use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
 
@@ -362,6 +362,8 @@ impl DataOpsSession {
         schema: Option<SchemaDescriptorV0>,
         ingest_node: &NodeV1,
     ) -> io::Result<()> {
+        let source = sanitize_source_descriptor_v0(&source)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let source_fp = source_fingerprint_v0(&source);
         let schema_fp = schema
             .as_ref()
@@ -402,9 +404,10 @@ impl DataOpsSession {
     /// - Returns `Err` if `outputs` contains duplicate `asset_key` values
     /// - Lineage edges reference pre-mutation input fingerprints (not post-insert state)
     ///
-    /// Sets `unsafe_surface = true` if:
-    /// - `node.execution_trust != Core`, OR
-    /// - any input has `trust = Untrusted`
+    /// Safety taxonomy:
+    /// - `unsafe_reasons` includes `UntrustedInput` when any input trust is untrusted.
+    /// - `unsafe_reasons` includes `UnsafeExtension` when `execution_trust != Core`.
+    /// - `unsafe_surface` is derived from reasons (`!unsafe_reasons.is_empty()`).
     pub fn materialize_node_outputs(
         &mut self,
         node: &NodeV1,
@@ -507,15 +510,20 @@ impl DataOpsSession {
         // 4. Compute recipe_hash_v0(node, upstream_fps)
         let recipe = recipe_hash_v0(node, &upstream_fps);
 
-        // 5. Determine output trust
-        let output_trust =
-            if any_untrusted_input || !matches!(node.execution_trust, ExecutionTrust::Core) {
-                TrustClass::Untrusted
-            } else {
-                TrustClass::Trusted
-            };
-
-        let unsafe_surface = matches!(output_trust, TrustClass::Untrusted);
+        // 5. Derive unsafe reasons and output trust classification.
+        let mut unsafe_reasons = Vec::new();
+        if any_untrusted_input {
+            unsafe_reasons.push(UnsafeReasonV0::UntrustedInput);
+        }
+        if !matches!(node.execution_trust, ExecutionTrust::Core) {
+            unsafe_reasons.push(UnsafeReasonV0::UnsafeExtension);
+        }
+        let unsafe_surface = !unsafe_reasons.is_empty();
+        let output_trust = if unsafe_surface {
+            TrustClass::Untrusted
+        } else {
+            TrustClass::Trusted
+        };
         let cache_decision = if cache_hit {
             CacheDecisionV0::Hit
         } else {
@@ -603,6 +611,7 @@ impl DataOpsSession {
                 cache_hit: cache_hit_from_decision(cache_decision),
                 duration_ms: Some(duration_ms),
                 unsafe_surface,
+                unsafe_reasons: unsafe_reasons.clone(),
                 status: MaterializationStatusV0::Ok,
                 error_code: None,
                 quality: None,
@@ -1187,7 +1196,8 @@ mod tests {
     use super::*;
     use swarm_torch_core::dataops::{
         cache_key_v0, CacheDecisionV0, MaterializationRecordCompat, MaterializationRecordV1,
-        MaterializationStatusV0, MATERIALIZATION_SCHEMA_V2,
+        MaterializationStatusV0, UnsafeReasonV0, MATERIALIZATION_SCHEMA_V2,
+        MAX_ETAG_OR_VERSION_LEN, MAX_SOURCE_URI_LEN,
     };
     use swarm_torch_core::observe::{AttrMap, SpanId, TraceId};
     use swarm_torch_core::run_graph::{
@@ -1838,6 +1848,81 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_reasons_include_untrusted_input() {
+        let base = temp_dir("unsafe_reasons_untrusted_input");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([51u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "http://external/data".to_string(),
+            content_type: "application/json".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/external");
+        session
+            .register_source(
+                "dataset://ns/external",
+                TrustClass::Untrusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let transform = make_transform_node(
+            "transform/process",
+            &["dataset://ns/external"],
+            &["dataset://ns/processed"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/processed".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        let rows: Vec<MaterializationRecordCompat> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let row = rows[0].clone().into_v2();
+
+        assert!(row.unsafe_surface, "untrusted input should mark unsafe");
+        assert!(
+            row.unsafe_reasons.contains(&UnsafeReasonV0::UntrustedInput),
+            "unsafe reasons should include UntrustedInput"
+        );
+        assert!(
+            !row.unsafe_reasons
+                .contains(&UnsafeReasonV0::UnsafeExtension),
+            "core execution should not include UnsafeExtension reason"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn trust_propagates_from_unsafe_extension() {
         let base = temp_dir("trust_unsafe_extension");
         let _ = fs::remove_dir_all(&base);
@@ -1903,6 +1988,155 @@ mod tests {
         assert!(
             matches!(output.trust, TrustClass::Untrusted),
             "output should be Untrusted when execution_trust is UnsafeExtension"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unsafe_reasons_include_unsafe_extension() {
+        let base = temp_dir("unsafe_reasons_unsafe_extension");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([61u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/s3");
+        session
+            .register_source(
+                "dataset://ns/trusted",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let transform = make_transform_node(
+            "transform/custom",
+            &["dataset://ns/trusted"],
+            &["dataset://ns/custom_out"],
+            ExecutionTrust::UnsafeExtension,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/custom_out".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        let rows: Vec<MaterializationRecordCompat> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let row = rows[0].clone().into_v2();
+
+        assert!(row.unsafe_surface, "unsafe extension should mark unsafe");
+        assert!(
+            row.unsafe_reasons
+                .contains(&UnsafeReasonV0::UnsafeExtension),
+            "unsafe reasons should include UnsafeExtension"
+        );
+        assert!(
+            !row.unsafe_reasons.contains(&UnsafeReasonV0::UntrustedInput),
+            "trusted input should not include UntrustedInput reason"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_descriptor_rejects_oversized_uri() {
+        let base = temp_dir("source_descriptor_oversized_uri");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([62u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: format!("s3://bucket/{}", "a".repeat(MAX_SOURCE_URI_LEN + 1)),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/s3");
+
+        let err = session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .expect_err("oversized uri should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("uri too long"),
+            "error should mention uri length violation: {}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_descriptor_rejects_oversized_etag_or_version() {
+        let base = temp_dir("source_descriptor_oversized_etag");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([63u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/path".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: Some("v".repeat(MAX_ETAG_OR_VERSION_LEN + 1)),
+        };
+        let ingest = make_source_node("ingest/s3");
+
+        let err = session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .expect_err("oversized etag_or_version should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("etag_or_version too long"),
+            "error should mention etag_or_version length violation: {}",
+            err
         );
 
         let _ = fs::remove_dir_all(&base);

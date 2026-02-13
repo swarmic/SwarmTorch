@@ -6,13 +6,14 @@
 //! - generates a self-contained `report.html` without requiring a server/DB/UI framework
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use swarm_torch_core::dataops::{
-    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordCompat, MaterializationRecordV2,
-    TrustClass,
+    DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
+    MaterializationRecordCompat, MaterializationRecordV2, TrustClass,
 };
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeId, NodeV1};
@@ -47,8 +48,17 @@ pub fn load_report(run_dir: impl AsRef<Path>) -> io::Result<Report> {
     let mut graph: GraphV1 = read_json(run_dir.join("graph.json"))?;
     graph = graph.normalize();
 
-    let registry: DatasetRegistryV1 = read_json(run_dir.join("datasets").join("registry.json"))?;
-    let lineage: DatasetLineageV1 = read_json(run_dir.join("datasets").join("lineage.json"))?;
+    let registry_snapshot: DatasetRegistryV1 =
+        read_json(run_dir.join("datasets").join("registry.json"))?;
+    let lineage_snapshot: DatasetLineageV1 =
+        read_json(run_dir.join("datasets").join("lineage.json"))?;
+    let registry_updates: Vec<DatasetEntryV1> =
+        read_ndjson_if_exists(run_dir.join("datasets").join("registry_updates.ndjson"))?;
+    let lineage_updates: Vec<LineageEdgeV1> =
+        read_ndjson_if_exists(run_dir.join("datasets").join("lineage_edges.ndjson"))?;
+
+    let registry = apply_registry_updates(registry_snapshot, registry_updates);
+    let lineage = apply_lineage_updates(lineage_snapshot, lineage_updates);
 
     let spans: Vec<SpanRecord> = read_ndjson(run_dir.join("spans.ndjson"))?;
     let events: Vec<EventRecord> = read_ndjson(run_dir.join("events.ndjson"))?;
@@ -132,6 +142,60 @@ fn read_ndjson<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> io::Re
         out.push(v);
     }
     Ok(out)
+}
+
+fn read_ndjson_if_exists<T: serde::de::DeserializeOwned>(
+    path: impl AsRef<Path>,
+) -> io::Result<Vec<T>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    read_ndjson(path)
+}
+
+fn apply_registry_updates(
+    snapshot: DatasetRegistryV1,
+    updates: Vec<DatasetEntryV1>,
+) -> DatasetRegistryV1 {
+    let mut datasets: BTreeMap<String, DatasetEntryV1> = BTreeMap::new();
+    for entry in snapshot.datasets {
+        datasets.insert(entry.asset_key.clone(), entry);
+    }
+    for entry in updates {
+        datasets.insert(entry.asset_key.clone(), entry);
+    }
+    DatasetRegistryV1 {
+        schema_version: snapshot.schema_version,
+        datasets: datasets.into_values().collect(),
+    }
+}
+
+fn apply_lineage_updates(
+    snapshot: DatasetLineageV1,
+    updates: Vec<LineageEdgeV1>,
+) -> DatasetLineageV1 {
+    let mut edges: BTreeMap<(String, String, String), LineageEdgeV1> = BTreeMap::new();
+    for edge in snapshot.edges {
+        let key = (
+            edge.input_fingerprint_v0.clone(),
+            edge.output_fingerprint_v0.clone(),
+            edge.node_id.to_string(),
+        );
+        edges.insert(key, edge);
+    }
+    for edge in updates {
+        let key = (
+            edge.input_fingerprint_v0.clone(),
+            edge.output_fingerprint_v0.clone(),
+            edge.node_id.to_string(),
+        );
+        edges.insert(key, edge);
+    }
+    DatasetLineageV1 {
+        schema_version: snapshot.schema_version,
+        edges: edges.into_values().collect(),
+    }
 }
 
 fn escape_html(s: &str) -> String {
@@ -438,11 +502,15 @@ fn render_html(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{
+        ArtifactWriteProfile, DataOpsSession, ManifestRefreshPolicy, RunArtifactSink,
+        SnapshotProfile,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use swarm_torch_core::dataops::{
         DatasetEntryV1, DatasetLineageV1, MaterializationRecordV1, MaterializationRecordV2,
-        MaterializationStatusV0, TrustClass, MATERIALIZATION_SCHEMA_V2,
+        MaterializationStatusV0, SourceDescriptorV0, TrustClass, MATERIALIZATION_SCHEMA_V2,
     };
     use swarm_torch_core::observe::{RunId, TraceId};
     use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind};
@@ -689,5 +757,67 @@ mod tests {
         );
         assert_eq!(report.materializations[0].asset_key, "dataset://ns/v1");
         assert_eq!(report.materializations[1].asset_key, "dataset://ns/v2");
+    }
+
+    #[test]
+    fn mid_run_report_succeeds_with_manifest_always_policy() {
+        let base = temp_dir("mid_run_report_manifest_always");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([88u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let profile = ArtifactWriteProfile {
+            snapshot_profile: SnapshotProfile::streaming(100),
+            manifest_policy: ManifestRefreshPolicy::Always,
+        };
+        let sink = std::sync::Arc::new(RunArtifactSink::with_profile(bundle, profile));
+        let mut session = DataOpsSession::with_profile(
+            std::sync::Arc::clone(&sink),
+            SnapshotProfile::streaming(100),
+        );
+
+        let ingest_node = NodeV1 {
+            node_key: "ingest/raw".to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "ingest".to_string(),
+            inputs: vec![],
+            outputs: vec![AssetRefV1 {
+                asset_key: "dataset://ns/raw".to_string(),
+                fingerprint: None,
+            }],
+            params: CanonParams::new(),
+            code_ref: Some("test@0.1.0".to_string()),
+            unsafe_surface: false,
+            execution_trust: ExecutionTrust::Core,
+            node_def_hash: None,
+        };
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/raw.parquet".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: Some("v1".to_string()),
+        };
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest_node,
+            )
+            .unwrap();
+
+        // No finalize() call here: this is intentionally a mid-run load.
+        let report = load_report(sink.bundle().run_dir()).unwrap();
+        assert!(
+            report
+                .registry
+                .datasets
+                .iter()
+                .any(|dataset| dataset.asset_key == "dataset://ns/raw"),
+            "report should replay registry updates for mid-run visibility"
+        );
     }
 }

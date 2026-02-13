@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use swarm_torch_core::dataops::{
-    DatasetLineageV1, DatasetRegistryV1, MaterializationRecordV1, MaterializationRecordV2,
+    DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV1,
+    MaterializationRecordV2,
 };
 use swarm_torch_core::observe::{EventRecord, MetricRecord, RunId, SpanRecord};
 use swarm_torch_core::run_graph::GraphV1;
@@ -52,6 +53,65 @@ pub struct RunArtifactBundle {
     run_id: RunId,
 }
 
+/// Snapshot persistence policy for DataOps state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotProfile {
+    /// Rewrite snapshot JSON files on every DataOps mutation.
+    Strict,
+    /// Append deltas and compact snapshots every N DataOps mutations.
+    Streaming { snapshot_every_n_writes: u64 },
+}
+
+impl SnapshotProfile {
+    pub fn strict() -> Self {
+        Self::Strict
+    }
+
+    pub fn streaming(snapshot_every_n_writes: u64) -> Self {
+        Self::Streaming {
+            snapshot_every_n_writes,
+        }
+    }
+}
+
+/// Manifest refresh policy for artifact writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestRefreshPolicy {
+    /// Refresh only when explicitly finalized.
+    FinalOnly,
+    /// Refresh every N writes.
+    IntervalN(u64),
+    /// Refresh after every write.
+    Always,
+}
+
+/// Combined write profile used by artifact sinks/sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactWriteProfile {
+    pub snapshot_profile: SnapshotProfile,
+    pub manifest_policy: ManifestRefreshPolicy,
+}
+
+impl ArtifactWriteProfile {
+    pub fn strict_final_only() -> Self {
+        Self {
+            snapshot_profile: SnapshotProfile::Strict,
+            manifest_policy: ManifestRefreshPolicy::FinalOnly,
+        }
+    }
+}
+
+impl Default for ArtifactWriteProfile {
+    fn default() -> Self {
+        Self::strict_final_only()
+    }
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    write_count: u64,
+}
+
 /// Thread-safe artifact sink (single-writer enforced by an in-process mutex).
 ///
 /// This is the simplest v0.1 strategy for multi-producer telemetry without risking
@@ -59,7 +119,8 @@ pub struct RunArtifactBundle {
 #[derive(Debug)]
 pub struct RunArtifactSink {
     bundle: RunArtifactBundle,
-    lock: Mutex<()>,
+    profile: ArtifactWriteProfile,
+    lock: Mutex<SinkState>,
 }
 
 impl swarm_torch_core::observe::RunEventEmitter for RunArtifactSink {
@@ -80,9 +141,14 @@ impl swarm_torch_core::observe::RunEventEmitter for RunArtifactSink {
 
 impl RunArtifactSink {
     pub fn new(bundle: RunArtifactBundle) -> Self {
+        Self::with_profile(bundle, ArtifactWriteProfile::default())
+    }
+
+    pub fn with_profile(bundle: RunArtifactBundle, profile: ArtifactWriteProfile) -> Self {
         Self {
             bundle,
-            lock: Mutex::new(()),
+            profile,
+            lock: Mutex::new(SinkState::default()),
         }
     }
 
@@ -90,50 +156,93 @@ impl RunArtifactSink {
         &self.bundle
     }
 
-    fn guard(&self) -> io::Result<std::sync::MutexGuard<'_, ()>> {
+    pub fn profile(&self) -> ArtifactWriteProfile {
+        self.profile
+    }
+
+    fn guard(&self) -> io::Result<std::sync::MutexGuard<'_, SinkState>> {
         self.lock
             .lock()
             .map_err(|_| io::Error::other("artifact sink mutex poisoned"))
     }
 
+    fn post_write_maybe_refresh_manifest(
+        &self,
+        state: &mut std::sync::MutexGuard<'_, SinkState>,
+    ) -> io::Result<()> {
+        state.write_count = state.write_count.saturating_add(1);
+
+        match self.profile.manifest_policy {
+            ManifestRefreshPolicy::FinalOnly => Ok(()),
+            ManifestRefreshPolicy::Always => self.bundle.finalize_manifest(),
+            ManifestRefreshPolicy::IntervalN(n) => {
+                let period = n.max(1);
+                if state.write_count % period == 0 {
+                    self.bundle.finalize_manifest()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn write_graph(&self, graph: &GraphV1) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.write_graph(graph)
+        let mut state = self.guard()?;
+        self.bundle.write_graph(graph)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn append_span(&self, span: &SpanRecord) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.append_span(span)
+        let mut state = self.guard()?;
+        self.bundle.append_span(span)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn append_event(&self, event: &EventRecord) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.append_event(event)
+        let mut state = self.guard()?;
+        self.bundle.append_event(event)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn append_metric(&self, metric: &MetricRecord) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.append_metric(metric)
+        let mut state = self.guard()?;
+        self.bundle.append_metric(metric)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn append_materialization(&self, m: &MaterializationRecordV1) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.append_materialization(m)
+        let mut state = self.guard()?;
+        self.bundle.append_materialization(m)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn append_materialization_v2(&self, m: &MaterializationRecordV2) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.append_materialization_v2(m)
+        let mut state = self.guard()?;
+        self.bundle.append_materialization_v2(m)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
+    }
+
+    pub fn append_registry_update(&self, dataset: &DatasetEntryV1) -> io::Result<()> {
+        let mut state = self.guard()?;
+        self.bundle.append_registry_update(dataset)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
+    }
+
+    pub fn append_lineage_edge_update(&self, edge: &LineageEdgeV1) -> io::Result<()> {
+        let mut state = self.guard()?;
+        self.bundle.append_lineage_edge_update(edge)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn write_dataset_registry(&self, r: &DatasetRegistryV1) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.write_dataset_registry(r)
+        let mut state = self.guard()?;
+        self.bundle.write_dataset_registry(r)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn write_dataset_lineage(&self, l: &DatasetLineageV1) -> io::Result<()> {
-        let _g = self.guard()?;
-        self.bundle.write_dataset_lineage(l)
+        let mut state = self.guard()?;
+        self.bundle.write_dataset_lineage(l)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
     }
 
     pub fn finalize_manifest(&self) -> io::Result<()> {
@@ -157,9 +266,9 @@ use std::sync::Arc;
 use swarm_torch_core::dataops::{
     cache_hit_from_decision, cache_key_v0, dataset_fingerprint_v0, derived_source_fingerprint_v0,
     no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, schema_hash_v0,
-    source_fingerprint_v0, CacheDecisionV0, DatasetEntryV1, LineageEdgeV1, MaterializationStatusV0,
-    OutputSpecCore, PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
-    DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
+    source_fingerprint_v0, CacheDecisionV0, MaterializationStatusV0, OutputSpecCore,
+    PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TrustClass, DATAOPS_SCHEMA_V1,
+    MATERIALIZATION_SCHEMA_V2,
 };
 use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
 
@@ -192,10 +301,10 @@ pub struct OutputSpec {
 /// The `RunArtifactSink` mutex is in-process only; concurrent processes writing to the
 /// same bundle will corrupt NDJSON files.
 ///
-/// **Manifest gap:** `flush_snapshots()` writes registry.json/lineage.json after each
-/// materialization but does NOT update manifest.json. Call `finalize()` before reading
-/// the bundle with report tools (which validate manifest hashes). After a crash mid-session,
-/// the manifest will be stale and report generation will fail until `finalize()` is called.
+/// **Manifest behavior:** manifest freshness is controlled by `ArtifactWriteProfile`.
+/// With `ManifestRefreshPolicy::FinalOnly`, call `finalize()` before reading the bundle
+/// with report tools (which validate manifest hashes). `Always` and `IntervalN`
+/// can keep manifests fresh mid-run at the cost of extra hashing I/O.
 #[derive(Debug)]
 pub struct DataOpsSession {
     sink: Arc<RunArtifactSink>,
@@ -205,16 +314,28 @@ pub struct DataOpsSession {
     lineage: BTreeMap<(String, String, String), LineageEdgeV1>,
     /// Monotonic materialization record sequence number.
     next_record_seq: u64,
+    /// Snapshot persistence profile for registry/lineage snapshots.
+    snapshot_profile: SnapshotProfile,
+    /// Monotonic DataOps mutation counter used for streaming compaction cadence.
+    dataops_write_count: u64,
 }
 
 impl DataOpsSession {
     /// Create a new session wrapping an artifact sink.
     pub fn new(sink: Arc<RunArtifactSink>) -> Self {
+        let profile = sink.profile().snapshot_profile;
+        Self::with_profile(sink, profile)
+    }
+
+    /// Create a new session with an explicit snapshot profile.
+    pub fn with_profile(sink: Arc<RunArtifactSink>, snapshot_profile: SnapshotProfile) -> Self {
         Self {
             sink,
             registry: BTreeMap::new(),
             lineage: BTreeMap::new(),
             next_record_seq: 1,
+            snapshot_profile,
+            dataops_write_count: 0,
         }
     }
 
@@ -265,8 +386,9 @@ impl DataOpsSession {
             pii_tags: Vec::new(),
         };
 
-        self.registry.insert(asset_key.to_string(), entry);
-        self.flush_snapshots()
+        self.registry.insert(asset_key.to_string(), entry.clone());
+        self.sink.append_registry_update(&entry)?;
+        self.record_dataops_mutation()
     }
 
     /// Materialize node outputs: derives fingerprints, propagates trust, emits records, flushes.
@@ -443,7 +565,9 @@ impl DataOpsSession {
                 license_flags: Vec::new(),
                 pii_tags: Vec::new(),
             };
-            self.registry.insert(output.asset_key.clone(), entry);
+            self.registry
+                .insert(output.asset_key.clone(), entry.clone());
+            self.sink.append_registry_update(&entry)?;
 
             // 7. Lineage edges from pre-mutation input snapshots (not live registry)
             for (_, in_fp) in &input_snapshots {
@@ -454,7 +578,9 @@ impl DataOpsSession {
                     node_id,
                     op_kind: node.op_kind,
                 };
-                self.lineage.insert(edge_key, edge);
+                if self.lineage.insert(edge_key, edge.clone()).is_none() {
+                    self.sink.append_lineage_edge_update(&edge)?;
+                }
             }
 
             // 8. Append MaterializationRecordV2
@@ -485,8 +611,24 @@ impl DataOpsSession {
             self.next_record_seq = self.next_record_seq.saturating_add(1);
         }
 
-        // 9. flush_snapshots()
-        self.flush_snapshots()
+        // 9. Snapshot compaction (strict or streaming cadence).
+        self.record_dataops_mutation()
+    }
+
+    fn record_dataops_mutation(&mut self) -> io::Result<()> {
+        self.dataops_write_count = self.dataops_write_count.saturating_add(1);
+        match self.snapshot_profile {
+            SnapshotProfile::Strict => self.flush_snapshots(),
+            SnapshotProfile::Streaming {
+                snapshot_every_n_writes,
+            } => {
+                let period = snapshot_every_n_writes.max(1);
+                if self.dataops_write_count % period == 0 {
+                    self.flush_snapshots()?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Flush registry.json + lineage.json atomically (crash-safe).
@@ -688,6 +830,8 @@ impl RunArtifactBundle {
         ensure_file(&run_dir.join("events.ndjson"))?;
         ensure_file(&run_dir.join("metrics.ndjson"))?;
         ensure_file(&run_dir.join("datasets").join("materializations.ndjson"))?;
+        ensure_file(&run_dir.join("datasets").join("registry_updates.ndjson"))?;
+        ensure_file(&run_dir.join("datasets").join("lineage_edges.ndjson"))?;
 
         let bundle = Self { run_dir, run_id };
         // Emit an initial manifest so a bundle is valid immediately.
@@ -752,6 +896,23 @@ impl RunArtifactBundle {
                 .join("datasets")
                 .join("materializations.ndjson"),
             materialization,
+        )
+    }
+
+    pub fn append_registry_update(&self, dataset: &DatasetEntryV1) -> io::Result<()> {
+        append_ndjson(
+            &self
+                .run_dir
+                .join("datasets")
+                .join("registry_updates.ndjson"),
+            dataset,
+        )
+    }
+
+    pub fn append_lineage_edge_update(&self, edge: &LineageEdgeV1) -> io::Result<()> {
+        append_ndjson(
+            &self.run_dir.join("datasets").join("lineage_edges.ndjson"),
+            edge,
         )
     }
 
@@ -2655,5 +2816,424 @@ mod tests {
             k1, k2,
             "cache_key_v0 must change when upstream fingerprints change"
         );
+    }
+
+    #[test]
+    fn registry_updates_log_replays_to_snapshot_equivalence() {
+        let base = temp_dir("registry_updates_replay_equivalence");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([101u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session =
+            DataOpsSession::with_profile(Arc::clone(&sink), SnapshotProfile::streaming(2));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: Some("v1".to_string()),
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let clean = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &clean,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        // In-place rewrite to ensure replay handles "latest wins" by asset key.
+        let rewrite = make_transform_node(
+            "transform/rewrite",
+            &["dataset://ns/clean"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &rewrite,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(120),
+                }],
+                2000,
+                false,
+                12,
+            )
+            .unwrap();
+
+        session.finalize().unwrap();
+
+        let snapshot: DatasetRegistryV1 = read_json(
+            &sink
+                .bundle()
+                .run_dir()
+                .join("datasets")
+                .join("registry.json"),
+        )
+        .unwrap();
+        let updates: Vec<DatasetEntryV1> = fs::read_to_string(
+            sink.bundle()
+                .run_dir()
+                .join("datasets")
+                .join("registry_updates.ndjson"),
+        )
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<DatasetEntryV1>(line).unwrap())
+        .collect();
+
+        let mut replayed = BTreeMap::new();
+        for entry in updates {
+            replayed.insert(entry.asset_key.clone(), entry);
+        }
+        let mut snapshot_map = BTreeMap::new();
+        for entry in snapshot.datasets {
+            snapshot_map.insert(entry.asset_key.clone(), entry);
+        }
+
+        assert_eq!(
+            replayed, snapshot_map,
+            "replayed registry updates must match compacted snapshot"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_updates_log_replays_to_snapshot_equivalence() {
+        let base = temp_dir("lineage_updates_replay_equivalence");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([102u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session =
+            DataOpsSession::with_profile(Arc::clone(&sink), SnapshotProfile::streaming(3));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+        // Same transform/output again: should dedupe lineage edges.
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                2000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        session.finalize().unwrap();
+
+        let snapshot: DatasetLineageV1 = read_json(
+            &sink
+                .bundle()
+                .run_dir()
+                .join("datasets")
+                .join("lineage.json"),
+        )
+        .unwrap();
+        let updates: Vec<LineageEdgeV1> = fs::read_to_string(
+            sink.bundle()
+                .run_dir()
+                .join("datasets")
+                .join("lineage_edges.ndjson"),
+        )
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<LineageEdgeV1>(line).unwrap())
+        .collect();
+
+        let mut replayed = BTreeMap::new();
+        for edge in updates {
+            let key = (
+                edge.input_fingerprint_v0.clone(),
+                edge.output_fingerprint_v0.clone(),
+                edge.node_id.to_string(),
+            );
+            replayed.insert(key, edge);
+        }
+        let mut snapshot_map = BTreeMap::new();
+        for edge in snapshot.edges {
+            let key = (
+                edge.input_fingerprint_v0.clone(),
+                edge.output_fingerprint_v0.clone(),
+                edge.node_id.to_string(),
+            );
+            snapshot_map.insert(key, edge);
+        }
+
+        assert_eq!(
+            replayed, snapshot_map,
+            "replayed lineage updates must match compacted snapshot"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn streaming_profile_defers_snapshot_rewrite_until_interval() {
+        let base = temp_dir("streaming_profile_defers_snapshot");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([103u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session =
+            DataOpsSession::with_profile(Arc::clone(&sink), SnapshotProfile::streaming(2));
+
+        let registry_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("registry.json");
+        let before = fs::read_to_string(&registry_path).unwrap();
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let after_first = fs::read_to_string(&registry_path).unwrap();
+        assert_eq!(
+            before, after_first,
+            "streaming profile should defer snapshot rewrite before interval"
+        );
+
+        let updates = fs::read_to_string(
+            sink.bundle()
+                .run_dir()
+                .join("datasets")
+                .join("registry_updates.ndjson"),
+        )
+        .unwrap();
+        assert_eq!(
+            updates
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "first mutation should still append one registry update"
+        );
+
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(1),
+                    bytes: Some(1),
+                }],
+                1000,
+                false,
+                1,
+            )
+            .unwrap();
+
+        let after_second: DatasetRegistryV1 = read_json(&registry_path).unwrap();
+        assert!(
+            after_second.datasets.len() >= 2,
+            "second mutation should trigger snapshot compaction at interval=2"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strict_profile_updates_manifest_on_each_write() {
+        let base = temp_dir("strict_profile_manifest_always");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([104u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let profile = ArtifactWriteProfile {
+            snapshot_profile: SnapshotProfile::strict(),
+            manifest_policy: ManifestRefreshPolicy::Always,
+        };
+        let sink = Arc::new(RunArtifactSink::with_profile(bundle, profile));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/v1");
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        assert!(
+            sink.validate_manifest().is_ok(),
+            "manifest should refresh after each write under Always policy"
+        );
+
+        let node = make_transform_node(
+            "transform/clean",
+            &["dataset://ns/raw"],
+            &["dataset://ns/clean"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/clean".to_string(),
+                    schema: None,
+                    rows: Some(1),
+                    bytes: Some(1),
+                }],
+                1000,
+                false,
+                1,
+            )
+            .unwrap();
+
+        assert!(
+            sink.validate_manifest().is_ok(),
+            "manifest should remain valid mid-run under Always policy"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn manifest_interval_policy_refreshes_after_n_writes() {
+        let base = temp_dir("manifest_interval_policy");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([105u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let profile = ArtifactWriteProfile {
+            snapshot_profile: SnapshotProfile::strict(),
+            manifest_policy: ManifestRefreshPolicy::IntervalN(2),
+        };
+        let sink = RunArtifactSink::with_profile(bundle, profile);
+
+        let event = EventRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "event/a".to_string(),
+            ts_unix_nanos: 1000,
+            attrs: AttrMap::new(),
+        };
+        sink.append_event(&event).unwrap();
+        assert!(
+            sink.validate_manifest().is_err(),
+            "manifest should be stale after first write when interval is 2"
+        );
+
+        let event_b = EventRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "event/b".to_string(),
+            ts_unix_nanos: 2000,
+            attrs: AttrMap::new(),
+        };
+        sink.append_event(&event_b).unwrap();
+        assert!(
+            sink.validate_manifest().is_ok(),
+            "manifest should refresh after second write when interval is 2"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -36,6 +36,8 @@ pub mod execution;
 pub mod identity;
 pub mod observe;
 #[cfg(feature = "alloc")]
+pub mod replay;
+#[cfg(feature = "alloc")]
 pub mod run_graph;
 pub mod traits;
 

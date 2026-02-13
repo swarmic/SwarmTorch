@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 std = ["alloc", "serde/std", "postcard/use-std", "sha2/std"]
-alloc = ["serde/alloc"]
+alloc = ["serde/alloc", "dep:lru", "lru/hashbrown"]
 
 # Robust aggregation algorithms
 krum = []
@@ -39,6 +39,9 @@ defmt = { workspace = true, optional = true }
 
 # no_std compatible random
 rand_core = { version = "0.6", default-features = false }
+
+# Replay protection cache (alloc-only, hashbrown backend for no_std+alloc)
+lru = { version = "0.12", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

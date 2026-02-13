@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["std", "tcp-transport"]
-std = ["swarm-torch-core/std", "tokio"]
+std = ["alloc", "swarm-torch-core/std", "tokio"]
 alloc = ["swarm-torch-core/alloc"]
 
 # Transport implementations

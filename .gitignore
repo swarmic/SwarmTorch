@@ -111,17 +111,19 @@ probe-rs.log
 # -----------------------------------------------------------------------------
 /doc/
 book/book/
-ROADMAP.md
-SECURITY.md
 SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
 SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
 SWARMIC_NETWORK_WHITE_PAPER_v12.2.md
 SWARMIC_NETWORK_WHITE_PAPER_v12.4.md
 Evcxr.md
-CONTEXT_SOURCES.md
 ADRs.md
 adr-with-updates.md
 v0.1.0-alpha.6x-backlog.md
+
+# Canonical SwarmTorch docs must remain versioned.
+!ADRs.md
+!SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
+!SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
 
 # -----------------------------------------------------------------------------
 # Temporary Files

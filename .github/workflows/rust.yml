@@ -48,6 +48,10 @@ jobs:
         if: matrix.rust == '1.75'
         run: cargo build -p swarm-torch-core --no-default-features --features alloc --verbose --locked
 
+      - name: Build (MSRV core no_std minimal)
+        if: matrix.rust == '1.75'
+        run: cargo build -p swarm-torch-core --no-default-features --verbose --locked
+
       - name: Format (stable only)
         if: matrix.rust == 'stable'
         run: cargo fmt --all -- --check

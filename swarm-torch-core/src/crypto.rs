@@ -220,7 +220,8 @@ impl GradientValidator {
             if g.is_infinite() {
                 return Err(GradientValidationError::Infinite { index: i });
             }
-            if g.abs() > self.max_coordinate_value {
+            let abs_g = if g < 0.0 { -g } else { g };
+            if abs_g > self.max_coordinate_value {
                 return Err(GradientValidationError::CoordinateTooLarge {
                     index: i,
                     value: g,

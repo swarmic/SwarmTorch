@@ -1,11 +1,14 @@
 //! # SwarmTorch
 //!
-//! **Mission-grade swarm learning for heterogeneous fleets—Rust-native, `no_std`-ready, Byzantine-resilient.**
+//! **Mission-grade swarm learning for heterogeneous fleets—Rust-native, Byzantine-resilient, with a portable `swarm-torch-core` base.**
 //!
 //! SwarmTorch is a distributed machine learning framework designed for real-world edge deployments
 //! where devices are resource-constrained, connections are unreliable, and trust cannot be assumed.
+//! The top-level `swarm-torch` crate is currently `std`-only; `no_std` portability is exposed via `swarm-torch-core`.
 //!
 //! ## Quick Start
+//!
+//! The snippet below is an illustrative design-target example; current high-level training/transport APIs are still evolving.
 //!
 //! ```rust,ignore
 //! use swarm_torch::prelude::*;
@@ -47,6 +50,11 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+
+#[cfg(not(feature = "std"))]
+compile_error!(
+    "`swarm-torch` requires the `std` feature. Use `swarm-torch-core` for no_std targets."
+);
 
 // Re-export sub-crates
 pub use swarm_torch_core as core;

@@ -3,7 +3,7 @@ name = "swarm-torch"
 description = "Mission-grade swarm learning for heterogeneous fleets - Rust-native, no_std-ready, Byzantine-resilient"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.81"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -60,10 +60,10 @@ telemetry = ["swarm-torch-core/telemetry"]
 python = []
 
 [dependencies]
-swarm-torch-core = { workspace = true }
-swarm-torch-net = { workspace = true }
-swarm-torch-runtime = { workspace = true }
-swarm-torch-models = { workspace = true }
+swarm-torch-core = { workspace = true, default-features = false, features = ["alloc"] }
+swarm-torch-net = { workspace = true, default-features = false }
+swarm-torch-runtime = { workspace = true, default-features = false }
+swarm-torch-models = { workspace = true, default-features = false }
 
 # Re-export async-trait for users
 async-trait = "0.1"
@@ -76,6 +76,11 @@ sha2 = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true }
+
+[[bin]]
+name = "swarm_torch_report"
+path = "src/bin/swarm_torch_report.rs"
+required-features = ["std"]
 
 [[example]]
 name = "hello_swarm"

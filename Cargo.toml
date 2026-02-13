@@ -49,10 +49,10 @@ thiserror = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-swarm-torch-core = { path = "swarm-torch-core", version = "0.1.0" }
-swarm-torch-net = { path = "swarm-torch-net", version = "0.1.0" }
-swarm-torch-runtime = { path = "swarm-torch-runtime", version = "0.1.0" }
-swarm-torch-models = { path = "swarm-torch-models", version = "0.1.0" }
+swarm-torch-core = { path = "swarm-torch-core", version = "0.1.0", default-features = false }
+swarm-torch-net = { path = "swarm-torch-net", version = "0.1.0", default-features = false }
+swarm-torch-runtime = { path = "swarm-torch-runtime", version = "0.1.0", default-features = false }
+swarm-torch-models = { path = "swarm-torch-models", version = "0.1.0", default-features = false }
 
 [profile.release]
 lto = true

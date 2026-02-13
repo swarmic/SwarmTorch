@@ -4,7 +4,7 @@
 //!
 //! This crate is `no_std` compatible and provides:
 //! - Swarm optimization algorithms (PSO, ACO, Firefly)
-//! - Robust aggregation (Krum, Bulyan, Trimmed Mean)
+//! - Robust aggregation (Krum/Trimmed Mean/Median; requires `alloc`)
 //! - Core traits and abstractions
 //! - Gradient compression utilities
 //! - Offline-first observability IDs + span/event/metric record schemas
@@ -24,6 +24,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
 pub mod aggregation;
 pub mod algorithms;
 pub mod compression;
@@ -46,6 +47,7 @@ pub mod telemetry;
 
 /// Prelude module for convenient imports
 pub mod prelude {
+    #[cfg(feature = "alloc")]
     pub use crate::aggregation::*;
     pub use crate::algorithms::*;
     #[cfg(feature = "alloc")]

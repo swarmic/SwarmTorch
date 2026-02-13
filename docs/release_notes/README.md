@@ -19,8 +19,9 @@ New contributors should read these in order:
 4. [`v0.1.0-alpha.4.md`](v0.1.0-alpha.4.md) — Technical whitepaper, release notes system, current state
 5. [`v0.1.0-alpha.5.md`](v0.1.0-alpha.5.md) — DataOps wiring, ExecutionPolicy, trust propagation
 6. [`v0.1.0-alpha.6.md`](v0.1.0-alpha.6.md) — Contract hardening, cache-hit detection, OpRunner, report derivations
-7. [`M4-02_replay_protection_enforcement.md`](M4-02_replay_protection_enforcement.md) — Replay enforcement baseline
-8. [`M4-02.5_replay_protection_hardening.md`](M4-02.5_replay_protection_hardening.md) — Replay/auth hardening follow-up
+7. [`v0.1.0-alpha.6x.md`](v0.1.0-alpha.6x.md) — Descriptor sanitization, unsafe-reason taxonomy, timeline/report reason rendering
+8. [`M4-02_replay_protection_enforcement.md`](M4-02_replay_protection_enforcement.md) — Replay enforcement baseline
+9. [`M4-02.5_replay_protection_hardening.md`](M4-02.5_replay_protection_hardening.md) — Replay/auth hardening follow-up
 
 ## Versioning
 

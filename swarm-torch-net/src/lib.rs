@@ -4,9 +4,9 @@
 //!
 //! This crate provides:
 //! - Unified `SwarmTransport` trait for all transports
-//! - TCP/UDP implementations for server/edge
-//! - BLE/LoRa/WiFi implementations for embedded
-//! - Multi-transport support with fallback
+//! - Mock transport/network implementations for integration testing
+//! - Placeholder feature flags for TCP/UDP/BLE/LoRa/WiFi backends (planned)
+//! - Multi-transport policy surface with fallback error semantics
 //! - Message framing and serialization
 
 #![cfg_attr(not(feature = "std"), no_std)]

@@ -64,12 +64,16 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Coordination | Gossip coordination + quorum rounds | Evidence: ADR-0006A, swarm-torch-core/src/consensus.rs | Planned | Current crate has structs only; protocol implementation pending |
 | Topology | Topology as a first-class config | Evidence: swarm-torch-core/src/algorithms.rs, ADR-0004A | Partial | Enum exists; adaptive policies/rewiring not implemented |
 | Staleness | Bounded async + staleness-aware policy | Evidence: ADR-0004B | Planned | `staleness.rs` not implemented yet |
-| Runtime | Tokio/Embassy runtime abstraction | Evidence: swarm-torch-runtime/src/lib.rs | Partial | Tokio wrapper works; Embassy is placeholder |
+| Runtime | Tokio/Embassy runtime abstraction | Evidence: swarm-torch-runtime/src/lib.rs | Partial | Tokio wrapper works; Embassy remains placeholder and is not yet a production-gated embedded runtime path |
 | Models | Reference models + backend integration | Evidence: swarm-torch-models/src/simple.rs | Partial | Burn integration is placeholder |
-| Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs, swarm-torch-core/Cargo.toml | Partial | `no_std + alloc` builds (`--no-default-features --features alloc`); `embedded_min` (no alloc) is planned; end-to-end embedded example pending |
+| Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs, swarm-torch-core/Cargo.toml | Partial | Core `no_std + alloc` and minimal `no_std` build gates compile; embedded runtime/transport and end-to-end examples remain planned |
 | GPU | WGPU-first; CUDA optional backend | Evidence: ADR-0015 | Planned | Backend wiring pending |
 | Python | Optional, bounded Python interop | Evidence: ADR-0009 | Planned | Keep separate crate boundary |
 | Supply chain | Dependency/license/source policy configs | Evidence: SECURITY.md, deny.toml, supply-chain/ | Partial | Configs exist; CI enforcement planned |
+
+MSRV policy is currently tiered by crate:
+- `swarm-torch-core` security-critical path is validated on Rust 1.75.
+- top-level/model crates have a higher compiler floor due backend dependency constraints.
 
 ## Abstract
 
@@ -586,8 +590,8 @@ These are blocking gates for releases once implemented in CI:
 | Graph hash normalization | `cargo test -p swarm-torch artifacts::tests::graph_write_normalizes_ids_and_hashes` | Implemented | Evidence: swarm-torch/src/artifacts.rs |
 | Dataset fingerprint determinism | `cargo test -p swarm-torch-core dataops::tests::dataset_fingerprint_is_deterministic` | Implemented | Evidence: swarm-torch-core/src/dataops.rs |
 | No raw rows by default | Assert bundle does not embed raw dataset rows unless explicitly enabled + size-limited | Planned | Evidence: ADR-0016 |
-| Untrusted input marking | If dataset source is `untrusted`, artifacts mark unsafe surface | Planned | Evidence: ADR-0017 |
-| Unsafe extension marking | `unsafe_extension` nodes are explicitly flagged in graph/events/materializations/run summary | Planned | Evidence: ADR-0018 |
+| Untrusted input marking | If dataset source is `untrusted`, artifacts mark unsafe surface | Implemented | Evidence: swarm-torch/src/artifacts.rs, swarm-torch/src/report.rs |
+| Unsafe extension marking | `unsafe_extension` nodes are explicitly flagged in graph/events/materializations/run summary | Implemented | Evidence: swarm-torch/src/artifacts.rs, swarm-torch/src/report.rs |
 
 #### Drift / Doc Hygiene (Repo-Local)
 

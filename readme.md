@@ -9,7 +9,7 @@
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 [![CI](https://github.com/swarmic/SwarmTorch/actions/workflows/rust.yml/badge.svg)](https://github.com/swarmic/SwarmTorch/actions/workflows/rust.yml)
 
-**Mission-grade swarm learning for heterogeneous fleets—Rust-native, `no_std`-ready, Byzantine-resilient.**
+**Mission-grade swarm learning for heterogeneous fleets—Rust-native, with a `no_std` core and Byzantine-resilient security posture.**
 
 SwarmTorch is a distributed machine learning framework designed for real-world edge deployments where devices are resource-constrained, connections are unreliable, and trust cannot be assumed. Built in Rust from the ground up, it brings swarm intelligence and federated learning primitives to environments where PyTorch and TensorFlow cannot operate: embedded microcontrollers, intermittent networks, and adversarial conditions.
 
@@ -19,6 +19,15 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`ADRs.md`](ADRs.md) (architecture decisions)
 - [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) (document hierarchy; drift controls)
 - [`SECURITY.md`](SECURITY.md) (security policy + supply chain gates)
+
+## Implementation Reality (2026-02-13)
+
+- `swarm-torch` (top-level crate) is currently **std-only**.
+- `swarm-torch-core` provides the portable baseline and builds under:
+  - `no_std + alloc` (supported)
+  - minimal `no_std` build (compiles, limited utility)
+- Replay/auth enforcement is implemented (`M4-02`, `M4-02.5`).
+- Concrete TCP/UDP/BLE/LoRa/WiFi transport implementations are still planned (current net path is trait + mock transport).
 
 -----
 
@@ -39,7 +48,7 @@ The Rust ML ecosystem has excellent tools for specific problems:
 |**Embedded targets** (`no_std`)|⚠️ Partial (`no_std + alloc`); `embedded_min` planned|❌ Not supported     |❌ Not supported         |
 |**Asynchronous participation** |✅ Core design            |⚠️ Limited           |⚠️ Experimental          |
 |**Byzantine robustness**       |✅ Pluggable aggregators  |❌ No defense        |⚠️ Research only         |
-|**Heterogeneous networks**     |✅ LoRa/BLE/WiFi/Ethernet |❌ Assumes datacenter|❌ Assumes reliable links|
+|**Heterogeneous networks**     |⚠️ Trait + mock transport (concrete transports planned)|❌ Assumes datacenter|❌ Assumes reliable links|
 |**Memory footprint**           |✅ <256KB for participants|❌ GBs required      |❌ GBs required          |
 |**Zero Python runtime**        |✅ Pure Rust              |❌ Python required   |❌ Python required       |
 
@@ -50,7 +59,7 @@ The Rust ML ecosystem has excellent tools for specific problems:
 ### Prerequisites
 
 ```bash
-# Install Rust (1.75+)
+# Install Rust (1.81+ for `swarm-torch`; core path supports lower MSRV)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # For embedded targets (optional)
@@ -62,7 +71,10 @@ rustup target add thumbv7em-none-eabihf
 
 Train a simple model across 3 local nodes with gossip topology:
 
-```rust
+The snippets below are **design-target pseudocode** for planned high-level APIs.
+Current public APIs are more limited than these examples.
+
+```rust,ignore
 use swarm_torch::prelude::*;
 use tokio;
 
@@ -115,7 +127,7 @@ cargo build --release --target aarch64-unknown-linux-gnu --features edge
 scp target/aarch64-unknown-linux-gnu/release/swarm-node pi@192.168.1.100:~/
 ```
 
-```rust
+```rust,ignore
 use swarm_torch::prelude::*;
 
 #[tokio::main]
@@ -140,7 +152,7 @@ async fn main() -> Result<()> {
 
 Minimal example for ESP32 or STM32 microcontrollers:
 
-```rust
+```rust,ignore
 #![no_std]
 #![no_main]
 
@@ -218,7 +230,7 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`std`               |Enable standard library support          |✅ Yes       |
 |`alloc`             |Enable allocator for dynamic memory      |✅ (with std)|
 |`tokio-runtime`     |Use Tokio for async runtime (server/edge)|✅ Yes       |
-|`embassy-runtime`   |Use Embassy for embedded async           |❌ No        |
+|`embassy-runtime`   |Embassy runtime adapter (placeholder/experimental)|❌ No  |
 |`burn-backend`      |Use Burn for autodiff/training           |✅ Yes       |
 |`tch-backend`       |Use LibTorch via tch-rs                  |❌ No        |
 |`python-bindings`   |Build PyO3 bindings for Python           |❌ No        |
@@ -245,18 +257,19 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 
 ## Architecture Overview
 
-SwarmTorch is structured in layers to maximize portability and composability:
+SwarmTorch is structured in layers to maximize portability and composability.  
+The diagram mixes implemented components and roadmap targets.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │            Application Layer (Your Code)                 │
 ├─────────────────────────────────────────────────────────┤
-│   Swarm Learning API (train, optimize, consensus)       │
+│   Swarm Learning API (design target surface)            │
 │   • ParticleSwarm, AntColony, Firefly optimizers        │
-│   • Robust aggregators (Krum, Trimmed Mean, Bulyan)     │
+│   • Robust aggregators (Krum, Trimmed Mean, Median)     │
 ├─────────────────────────────────────────────────────────┤
 │   Model Abstraction Layer                               │
-│   • Burn integration (default)                          │
+│   • Burn wrapper (placeholder)                          │
 │   • tch-rs bridge (LibTorch interop)                    │
 │   • Custom model traits                                 │
 ├─────────────────────────────────────────────────────────┤
@@ -266,12 +279,11 @@ SwarmTorch is structured in layers to maximize portability and composability:
 │   • Byzantine-robust aggregation                        │
 ├─────────────────────────────────────────────────────────┤
 │   Transport Abstraction (swarm-torch-net)               │
-│   • TCP/UDP (datacenter)                                │
-│   • WiFi/BLE (edge)                                     │
-│   • LoRa (ultra-low-power)                              │
+│   • Trait + mock transport (implemented)                │
+│   • TCP/UDP/BLE/LoRa backends (planned)                 │
 ├─────────────────────────────────────────────────────────┤
 │   Runtime Abstraction                                   │
-│   • Tokio (std)  │  Embassy (no_std)                    │
+│   • Tokio (implemented)  │  Embassy (placeholder)       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -293,7 +305,7 @@ SwarmTorch uses **WGPU as the primary GPU backend** for portable acceleration ac
 |**WGPU**|✅ Vulkan/Metal/DX12|Good           |`wgpu-backend`   |
 |**CUDA**|❌ NVIDIA only      |Highest        |`cuda`           |
 
-```rust
+```rust,ignore
 // GPU backend selection
 let config = SwarmConfig::builder()
     .gpu_backend(GpuBackend::Wgpu)  // Portable default
@@ -316,8 +328,8 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 |**Coordinate-wise Median**|✅ High           |Low               |Low-dimensional models       |
 |**Trimmed Mean**          |✅ Medium-High    |Low               |Balanced performance         |
 |**Krum**                  |✅ High           |Medium            |Small-medium fleets          |
-|**Bulyan**                |✅ Very High      |High              |Security-critical deployments|
-|**Multi-Krum**            |✅ High           |High              |Large fleets                 |
+
+`Bulyan` and `Multi-Krum` are roadmap items, not implemented in the current crate surface.
 
 **Important caveat:** Research shows that all robust aggregators can degrade under specific attack strategies, especially in high-dimensional settings. SwarmTorch provides:
 
@@ -325,15 +337,11 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 - **Attack harnesses:** Test your aggregator against known attacks
 - **Topology-aware weighting:** Use network structure to improve robustness
 
-```rust
-use swarm_torch::aggregation::*;
+```rust,ignore
+use swarm_torch::RobustAggregation;
 
-let aggregator = RobustAggregation::bulyan()
-    .byzantine_ratio(0.3) // Tolerate up to 30% malicious nodes
-    .rejection_logging(true)
-    .attack_detection(AttackDetector::spectral_analysis());
-
-swarm.set_aggregator(aggregator);
+let strategy = RobustAggregation::TrimmedMean { trim_ratio: 0.2 };
+let _ = strategy;
 ```
 
 See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust Aggregation Strategy](ADRs.md#adr-0007-robust-aggregation-strategy)** for design rationale.
@@ -342,9 +350,10 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust
 
 ## Network Transports
 
-SwarmTorch provides a unified `SwarmTransport` trait with implementations for heterogeneous network environments:
+SwarmTorch provides a unified `SwarmTransport` trait.  
+Current implementation includes mock transport/network for integration tests; concrete TCP/UDP/BLE/LoRa/WiFi backends are roadmap work.
 
-```rust
+```rust,ignore
 pub trait SwarmTransport {
     async fn send(&self, peer: PeerId, msg: &[u8]) -> Result<()>;
     async fn recv(&self) -> Result<(PeerId, Vec<u8>)>;
@@ -353,7 +362,7 @@ pub trait SwarmTransport {
 }
 ```
 
-### Transport Implementations
+### Transport Classes (Roadmap Backends)
 
 |Transport|Reliability|Bandwidth     |Range  |Use Case                      |
 |---------|-----------|--------------|-------|------------------------------|
@@ -363,53 +372,56 @@ pub trait SwarmTransport {
 |**BLE**  |Best-effort|Low (Kbps)    |10m    |Wearables, sensors            |
 |**LoRa** |Best-effort|Very low (bps)|10km+  |Remote sensors, agriculture   |
 
-**Multi-transport example:**
+**Multi-transport design-target example:**
 
-```rust
+```rust,ignore
 let transport = MultiTransport::new()
     .add(WiFiTransport::new("192.168.1.0/24"), priority: 1)
     .add(LoRaTransport::new(freq: 915_000_000), priority: 2)
     .fallback_policy(FallbackPolicy::PreferLowLatency);
 ```
 
-Transports automatically handle serialization (via `postcard`), compression, and framing. See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)**.
+Envelope serialization is provided by the protocol module (`postcard`).  
+Concrete transport-specific framing/compression policies remain planned.  
+See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)**.
 
 -----
 
 ## Examples & Demos
 
-SwarmTorch ships with reference implementations for each major use case:
+Roadmap example themes are listed below for planned scenario coverage.
+Only a subset is currently checked into this repository.
 
-### Phase 1: Robotics & ROS2
+### Phase 1 Themes: Robotics & ROS2 (planned)
 
-- **[Multi-robot Policy Learning](examples/robotics/fleet-policy/)** - 10 robots learn collision avoidance over WiFi
-- **[Topology Comparison](examples/robotics/topology-bench/)** - Ring vs Mesh vs Hierarchical convergence analysis
-- **[Byzantine Robot Injection](examples/robotics/poisoning-demo/)** - Adversarial node defense demonstration
+- Multi-robot policy learning
+- Topology comparison (ring vs mesh vs hierarchical)
+- Byzantine robot injection scenario
 
-### Phase 2: Edge & Embedded ML
+### Phase 2 Themes: Edge & Embedded ML (planned)
 
-- **[ESP32 Contributor Node](examples/embedded/esp32-contributor/)** - Gradient computation on microcontroller
-- **[Multi-tier Quantization](examples/edge/quantized-updates/)** - LoRa nodes use INT8, WiFi uses FP16
-- **[On-device Continual Learning](examples/edge/continual-learning/)** - Detect drift, fine-tune locally, share deltas
+- ESP32 contributor node
+- Multi-tier quantization
+- On-device continual learning
 
-### Phase 3: Privacy & Compliance
+### Phase 3 Themes: Privacy & Compliance (planned)
 
-- **[Audit Trail Demo](examples/compliance/audit-logs/)** - Every training round produces verifiable artifacts
-- **[Cross-org Swarm Training](examples/compliance/federated-hospital/)** - 3 hospitals, no central server, HIPAA-aware
-- **[Differential Privacy](examples/privacy/dp-training/)** - DP-SGD with swarm coordination
+- Audit trail demo
+- Cross-org swarm training
+- Differential privacy scenario
 
-### Python Interoperability
+### Python Interoperability (planned)
 
 > **⚠️ Model Zoo Constraint:** Python interop is limited to a **supported model zoo** with explicit portability contracts—NOT arbitrary PyTorch model conversion. See [ADR-0009](ADRs.md#adr-0009-python-interoperability-pyo3-and-model-portability-contract).
 
-- **[Jupyter Notebook Example](examples/python/swarm-notebook.ipynb)** - Train in Python using SwarmTorch model zoo, deploy in Rust
-- **[Model Zoo Reference](examples/python/model-zoo/)** - Supported architectures: MLP, CNN-Small, ResNet-8, Transformer-Tiny
+- Jupyter notebook workflow
+- Model zoo reference
 
-Run all examples:
+Currently available examples in-repo:
 
 ```bash
-cargo run --example robotics-fleet-policy --features tokio-runtime
-cargo run --example esp32-contributor --target xtensa-esp32-espidf --features embassy-runtime
+cargo run -p swarm-torch --example hello_swarm
+cargo run -p swarm-torch --example artifact_pipeline
 ```
 
 -----
@@ -418,10 +430,10 @@ cargo run --example esp32-contributor --target xtensa-esp32-espidf --features em
 
 ### v0.1.0 - Swarm Robotics MVP (Current)
 
-- ✅ Core swarm algorithms (PSO, ACO, Firefly)
-- ✅ TCP/UDP transports with Tokio runtime
+- ⚠️ Core algorithm configuration/types (full execution engine is in progress)
+- ❌ TCP/UDP concrete transports (planned; trait + mock currently implemented)
 - ✅ Basic robust aggregators (Median, Trimmed Mean)
-- ✅ Burn backend integration
+- ❌ Burn backend integration (placeholder wrapper currently)
 - ⏳ ROS2 bridge (beta)
 - ⏳ 5 reference robotics examples
 

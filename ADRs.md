@@ -1002,6 +1002,9 @@ impl SwarmTransport for MultiTransport {
 
 **Message framing and serialization:**
 
+> Historical design sketch from early planning.
+> Current canonical envelope contract is ADR-0008B and `swarm-torch-net/src/protocol.rs`.
+
 ```rust
 // swarm-torch-net/src/framing.rs
 pub struct SwarmMessage {
@@ -1204,6 +1207,9 @@ SwarmTorch exchanges various data types across the network:
 - Quantization (FP32 → INT8 where appropriate)
 
 **Message envelope:**
+
+> Historical design sketch from early planning.
+> Current canonical envelope contract is ADR-0008B and `swarm-torch-net/src/protocol.rs`.
 
 ```rust
 // swarm-torch-net/src/protocol.rs

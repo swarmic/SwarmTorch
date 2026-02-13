@@ -3,13 +3,13 @@
 //! Async runtime abstractions for SwarmTorch.
 //!
 //! This crate provides a unified interface for async operations across:
-//! - **Tokio**: For server and edge deployments (std)
-//! - **Embassy**: For embedded microcontrollers (no_std)
+//! - **Tokio**: Implemented for server/edge deployments (std)
+//! - **Embassy**: Placeholder adapter for embedded microcontrollers (no_std path is partial)
 //!
 //! ## Feature Flags
 //!
 //! - `tokio` (default): Use Tokio runtime
-//! - `embassy`: Use Embassy runtime for embedded
+//! - `embassy`: Enable embassy placeholder runtime adapter
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

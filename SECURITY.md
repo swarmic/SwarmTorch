@@ -45,7 +45,7 @@ See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model an
 
 ### Dependency Auditing
 
-**Planned CI gates:** once CI is added, we intend to enforce the following on every PR:
+**Planned CI gates:** CI is already present; the following supply-chain gates are planned to be enforced on every PR:
 
 | Tool | Purpose | Config |
 |------|---------|--------|
@@ -53,7 +53,7 @@ See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model an
 | `cargo deny` | License/ban/advisory enforcement | [`deny.toml`](deny.toml) |
 | `cargo vet` | Human audit tracking | [`supply-chain/`](supply-chain/) |
 
-**Current (today):** configs exist, but CI enforcement is not yet implemented. Maintainers should run the gates locally before merging:
+**Current (today):** configs exist, and CI runs build/test/lint/doc gates. Supply-chain gate enforcement is not yet wired in CI; maintainers should run the following locally before merging:
 
 ```bash
 cargo deny check

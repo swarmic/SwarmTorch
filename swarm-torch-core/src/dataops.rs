@@ -336,20 +336,12 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn sha256_postcard<T: serde::Serialize>(value: &T) -> [u8; 32] {
-    let bytes = match postcard::to_allocvec(value) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let digest = Sha256::digest(b"swarmtorch.sha256_postcard.serialization_error");
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&digest[..]);
-            return out;
-        }
-    };
+fn sha256_postcard<T: serde::Serialize>(value: &T) -> Result<[u8; 32], postcard::Error> {
+    let bytes = postcard::to_allocvec(value)?;
     let digest = Sha256::digest(&bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..]);
-    out
+    Ok(out)
 }
 
 fn normalize_lower(s: &str) -> String {
@@ -447,7 +439,7 @@ struct SourceFingerprintCanonicalV0 {
 }
 
 /// Compute `source_fingerprint` (v0) from a normalized source descriptor.
-pub fn source_fingerprint_v0(source: &SourceDescriptorV0) -> [u8; 32] {
+pub fn source_fingerprint_v0(source: &SourceDescriptorV0) -> Result<[u8; 32], postcard::Error> {
     let source = normalize_and_redact_source_descriptor(source);
     let canonical = SourceFingerprintCanonicalV0 {
         uri: source.uri,
@@ -465,7 +457,7 @@ struct SchemaHashCanonicalV0 {
 }
 
 /// Compute `schema_hash` (v0) from a normalized schema descriptor.
-pub fn schema_hash_v0(schema: &SchemaDescriptorV0) -> [u8; 32] {
+pub fn schema_hash_v0(schema: &SchemaDescriptorV0) -> Result<[u8; 32], postcard::Error> {
     let canonical = SchemaHashCanonicalV0 {
         format: normalize_lower(&schema.format),
         canonical: normalize_trim(&schema.canonical),
@@ -482,8 +474,11 @@ struct RecipeHashCanonicalV0 {
 /// Compute `recipe_hash` (v0) for a transform definition.
 ///
 /// This is stable without raw rows: it depends on the node definition hash and upstream fingerprints.
-pub fn recipe_hash_v0(node: &NodeV1, upstream_fingerprints: &[[u8; 32]]) -> [u8; 32] {
-    let node_def_hash = node_def_hash_v1(node);
+pub fn recipe_hash_v0(
+    node: &NodeV1,
+    upstream_fingerprints: &[[u8; 32]],
+) -> Result<[u8; 32], postcard::Error> {
+    let node_def_hash = node_def_hash_v1(node)?;
     let canonical = RecipeHashCanonicalV0 {
         node_def_hash,
         upstream_fingerprints: upstream_fingerprints.to_vec(),
@@ -503,7 +498,7 @@ pub fn dataset_fingerprint_v0(
     source_fingerprint: [u8; 32],
     schema_hash: [u8; 32],
     recipe_hash: [u8; 32],
-) -> [u8; 32] {
+) -> Result<[u8; 32], postcard::Error> {
     let canonical = DatasetFingerprintCanonicalV0 {
         source_fingerprint,
         schema_hash,
@@ -519,7 +514,7 @@ pub fn dataset_fingerprint_v0(
 /// Placeholder schema hash when schema descriptor is absent.
 ///
 /// **ADR-0017:** `sha256(postcard("no_schema_v0"))`
-pub fn no_schema_hash_v0() -> [u8; 32] {
+pub fn no_schema_hash_v0() -> Result<[u8; 32], postcard::Error> {
     sha256_postcard(&"no_schema_v0")
 }
 
@@ -528,7 +523,7 @@ pub fn no_schema_hash_v0() -> [u8; 32] {
 /// Salted with `asset_key` to differentiate multi-output nodes.
 ///
 /// **ADR-0017:** `sha256(postcard("derived_v0:{asset_key}"))`
-pub fn derived_source_fingerprint_v0(asset_key: &str) -> [u8; 32] {
+pub fn derived_source_fingerprint_v0(asset_key: &str) -> Result<[u8; 32], postcard::Error> {
     sha256_postcard(&format!("derived_v0:{}", asset_key))
 }
 
@@ -542,26 +537,26 @@ pub fn dataset_entry_v1(
     source: Option<SourceDescriptorV0>,
     schema: Option<SchemaDescriptorV0>,
     recipe_hash: [u8; 32],
-) -> DatasetEntryV1 {
+) -> Result<DatasetEntryV1, postcard::Error> {
     let asset_key = asset_key.into();
 
     // Use canonical helper for missing schema
-    let schema_fp = schema
-        .as_ref()
-        .map(schema_hash_v0)
-        .unwrap_or_else(no_schema_hash_v0);
+    let schema_fp = match schema.as_ref() {
+        Some(s) => schema_hash_v0(s)?,
+        None => no_schema_hash_v0()?,
+    };
 
     // For source: if None, this function uses a non-salted placeholder
     // which is ONLY correct for root sources without upstream.
     // For derived outputs, callers SHOULD use derived_dataset_entry_v1().
-    let source_fp = source
-        .as_ref()
-        .map(source_fingerprint_v0)
-        .unwrap_or_else(|| sha256_postcard(&"root_source_v0"));
+    let source_fp = match source.as_ref() {
+        Some(s) => source_fingerprint_v0(s)?,
+        None => sha256_postcard(&"root_source_v0")?,
+    };
 
-    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash);
+    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash)?;
 
-    DatasetEntryV1 {
+    Ok(DatasetEntryV1 {
         asset_key,
         fingerprint_v0: hex_lower(&dataset_fp),
         source_fingerprint_v0: hex_lower(&source_fp),
@@ -572,7 +567,7 @@ pub fn dataset_entry_v1(
         schema,
         license_flags: Vec::new(),
         pii_tags: Vec::new(),
-    }
+    })
 }
 
 /// Build a registry entry for a derived (non-source) dataset.
@@ -584,17 +579,17 @@ pub fn derived_dataset_entry_v1(
     trust: TrustClass,
     schema: Option<SchemaDescriptorV0>,
     recipe_hash: [u8; 32],
-) -> DatasetEntryV1 {
+) -> Result<DatasetEntryV1, postcard::Error> {
     let asset_key = asset_key.into();
 
-    let source_fp = derived_source_fingerprint_v0(&asset_key);
-    let schema_fp = schema
-        .as_ref()
-        .map(schema_hash_v0)
-        .unwrap_or_else(no_schema_hash_v0);
-    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash);
+    let source_fp = derived_source_fingerprint_v0(&asset_key)?;
+    let schema_fp = match schema.as_ref() {
+        Some(s) => schema_hash_v0(s)?,
+        None => no_schema_hash_v0()?,
+    };
+    let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe_hash)?;
 
-    DatasetEntryV1 {
+    Ok(DatasetEntryV1 {
         asset_key,
         fingerprint_v0: hex_lower(&dataset_fp),
         source_fingerprint_v0: hex_lower(&source_fp),
@@ -605,7 +600,7 @@ pub fn derived_dataset_entry_v1(
         schema,
         license_flags: Vec::new(),
         pii_tags: Vec::new(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -644,25 +639,23 @@ pub fn predict_output_fingerprints(
     node: &NodeV1,
     outputs: &[OutputSpecCore],
     upstream_fps: &[[u8; 32]],
-) -> Vec<PredictedOutput> {
-    let recipe = recipe_hash_v0(node, upstream_fps);
+) -> Result<Vec<PredictedOutput>, postcard::Error> {
+    let recipe = recipe_hash_v0(node, upstream_fps)?;
 
-    outputs
-        .iter()
-        .map(|out| {
-            let source_fp = derived_source_fingerprint_v0(&out.asset_key);
-            let schema_fp = out
-                .schema
-                .as_ref()
-                .map(schema_hash_v0)
-                .unwrap_or_else(no_schema_hash_v0);
-            let fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
-            PredictedOutput {
-                asset_key: out.asset_key.clone(),
-                fingerprint_v0: hex_lower(&fp),
-            }
-        })
-        .collect()
+    let mut results = Vec::with_capacity(outputs.len());
+    for out in outputs {
+        let source_fp = derived_source_fingerprint_v0(&out.asset_key)?;
+        let schema_fp = match out.schema.as_ref() {
+            Some(s) => schema_hash_v0(s)?,
+            None => no_schema_hash_v0()?,
+        };
+        let fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe)?;
+        results.push(PredictedOutput {
+            asset_key: out.asset_key.clone(),
+            fingerprint_v0: hex_lower(&fp),
+        });
+    }
+    Ok(results)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -673,13 +666,17 @@ struct CacheKeyCanonicalV0 {
 }
 
 /// Deterministic cache key for materialization reuse checks.
-pub fn cache_key_v0(node: &NodeV1, upstream_fps: &[[u8; 32]], execution_profile: &str) -> String {
+pub fn cache_key_v0(
+    node: &NodeV1,
+    upstream_fps: &[[u8; 32]],
+    execution_profile: &str,
+) -> Result<String, postcard::Error> {
     let canonical = CacheKeyCanonicalV0 {
-        node_def_hash: node_def_hash_v1(node),
+        node_def_hash: node_def_hash_v1(node)?,
         upstream_fingerprints: upstream_fps.to_vec(),
         execution_profile: normalize_lower(execution_profile),
     };
-    hex_lower(&sha256_postcard(&canonical))
+    Ok(hex_lower(&sha256_postcard(&canonical)?))
 }
 
 /// Compatibility helper for deriving `cache_hit` from a decision enum.
@@ -739,7 +736,7 @@ mod tests {
         };
 
         let upstream = [[7u8; 32]];
-        let recipe = recipe_hash_v0(&node, &upstream);
+        let recipe = recipe_hash_v0(&node, &upstream).unwrap();
 
         let a = dataset_entry_v1(
             "dataset://ns/clean",
@@ -747,14 +744,16 @@ mod tests {
             Some(source.clone()),
             Some(schema.clone()),
             recipe,
-        );
+        )
+        .unwrap();
         let b = dataset_entry_v1(
             "dataset://ns/clean",
             TrustClass::Trusted,
             Some(source),
             Some(schema),
             recipe,
-        );
+        )
+        .unwrap();
         assert_eq!(a.fingerprint_v0, b.fingerprint_v0);
         assert_eq!(a.schema_hash_v0, b.schema_hash_v0);
         assert_eq!(a.source_fingerprint_v0, b.source_fingerprint_v0);
@@ -762,8 +761,8 @@ mod tests {
 
     #[test]
     fn canonical_placeholder_no_schema_is_deterministic() {
-        let a = no_schema_hash_v0();
-        let b = no_schema_hash_v0();
+        let a = no_schema_hash_v0().unwrap();
+        let b = no_schema_hash_v0().unwrap();
         assert_eq!(a, b, "no_schema_hash_v0 must be deterministic");
         // Must be 32 bytes
         assert_eq!(a.len(), 32);
@@ -771,28 +770,29 @@ mod tests {
 
     #[test]
     fn canonical_placeholder_derived_is_salted() {
-        let a = derived_source_fingerprint_v0("dataset://ns/left");
-        let b = derived_source_fingerprint_v0("dataset://ns/right");
+        let a = derived_source_fingerprint_v0("dataset://ns/left").unwrap();
+        let b = derived_source_fingerprint_v0("dataset://ns/right").unwrap();
         assert_ne!(
             a, b,
             "different asset_keys must produce different fingerprints"
         );
         // Same asset_key is deterministic
-        let a2 = derived_source_fingerprint_v0("dataset://ns/left");
+        let a2 = derived_source_fingerprint_v0("dataset://ns/left").unwrap();
         assert_eq!(a, a2, "same asset_key must produce same fingerprint");
     }
 
     #[test]
     fn derived_dataset_entry_uses_canonical_helpers() {
         let recipe = [42u8; 32];
-        let entry = derived_dataset_entry_v1("dataset://ns/out", TrustClass::Trusted, None, recipe);
+        let entry = derived_dataset_entry_v1("dataset://ns/out", TrustClass::Trusted, None, recipe)
+            .unwrap();
 
         // Check that source_fingerprint uses derived_source_fingerprint_v0
-        let expected_source_fp = derived_source_fingerprint_v0("dataset://ns/out");
+        let expected_source_fp = derived_source_fingerprint_v0("dataset://ns/out").unwrap();
         assert_eq!(entry.source_fingerprint_v0, hex_lower(&expected_source_fp));
 
         // Check that schema_hash uses no_schema_hash_v0
-        let expected_schema_hash = no_schema_hash_v0();
+        let expected_schema_hash = no_schema_hash_v0().unwrap();
         assert_eq!(entry.schema_hash_v0, hex_lower(&expected_schema_hash));
     }
 

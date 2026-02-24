@@ -209,7 +209,7 @@ impl PeerReplayState {
 
         // Check if too old (beyond tolerance window)
         let max_acceptable_oldness = seq.saturating_add(SEQUENCE_TOLERANCE_WINDOW as u64);
-        if max_acceptable_oldness < self.last_sequence {
+        if max_acceptable_oldness <= self.last_sequence {
             return Err(ReplayError::TooOld {
                 peer,
                 seq,
@@ -578,5 +578,69 @@ mod tests {
         assert!(format!("{}", too_old).contains("sequence too old"));
         assert!(format!("{}", too_old).contains("seq=10"));
         assert!(format!("{}", too_old).contains("last_seen=100"));
+    }
+
+    /// C-01 regression: boundary sequence must not be replayed after pruning.
+    ///
+    /// Before fix, `validate_and_update()` accepted `seq` when
+    /// `seq + SEQUENCE_TOLERANCE_WINDOW == last_sequence` (strict `<`),
+    /// then `prune_old_sequences()` dropped that exact boundary value via
+    /// `retain(|s| s > threshold)`. Resubmitting the same `seq` succeeded.
+    ///
+    /// After fix (`<=`), the boundary sequence is rejected as `TooOld`.
+    #[test]
+    fn c01_boundary_sequence_rejected_on_second_submission() {
+        let mut guard = ReplayProtection::new();
+        let peer = make_peer(99);
+        let now = 1000;
+
+        // Set last_sequence to N by submitting a high sequence.
+        let n: u64 = 100;
+        assert!(guard.validate(&peer, n, now, now).is_ok());
+
+        // The boundary sequence: seq = N - SEQUENCE_TOLERANCE_WINDOW.
+        let boundary_seq = n - SEQUENCE_TOLERANCE_WINDOW as u64;
+
+        // First submission of boundary_seq must be rejected as TooOld
+        // because seq + WINDOW <= last_sequence (boundary is now excluded).
+        let result = guard.validate(&peer, boundary_seq, now, now);
+        assert_eq!(
+            result,
+            Err(ReplayError::TooOld {
+                peer,
+                seq: boundary_seq,
+                last_seen: n,
+            }),
+            "boundary sequence must be rejected as TooOld"
+        );
+    }
+
+    /// C-01 complementary: sequence just inside the window is still accepted.
+    #[test]
+    fn c01_sequence_inside_window_still_accepted() {
+        let mut guard = ReplayProtection::new();
+        let peer = make_peer(98);
+        let now = 1000;
+
+        let n: u64 = 100;
+        assert!(guard.validate(&peer, n, now, now).is_ok());
+
+        // seq = N - WINDOW + 1 is strictly inside the window.
+        let inside_seq = n - SEQUENCE_TOLERANCE_WINDOW as u64 + 1;
+        assert!(
+            guard.validate(&peer, inside_seq, now, now).is_ok(),
+            "sequence one inside the window must be accepted"
+        );
+
+        // Second submission of the same seq must be rejected as duplicate.
+        let result = guard.validate(&peer, inside_seq, now, now);
+        assert_eq!(
+            result,
+            Err(ReplayError::Replay {
+                peer,
+                seq: inside_seq,
+            }),
+            "duplicate of accepted sequence must be Replay"
+        );
     }
 }

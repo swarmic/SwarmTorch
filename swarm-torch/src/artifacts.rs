@@ -364,16 +364,24 @@ impl DataOpsSession {
     ) -> io::Result<()> {
         let source = sanitize_source_descriptor_v0(&source)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let source_fp = source_fingerprint_v0(&source);
+        let source_fp = source_fingerprint_v0(&source)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let schema_fp = schema
             .as_ref()
             .map(schema_hash_v0)
-            .unwrap_or_else(no_schema_hash_v0);
+            .transpose()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .unwrap_or(
+                no_schema_hash_v0()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+            );
 
         // recipe_hash for source = hash(ingest_node_def, [])
-        let recipe = recipe_hash_v0(ingest_node, &[]);
+        let recipe = recipe_hash_v0(ingest_node, &[])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
+        let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let entry = DatasetEntryV1 {
             asset_key: asset_key.to_string(),
@@ -508,7 +516,8 @@ impl DataOpsSession {
         // ── DERIVE + EMIT ───────────────────────────────────────────────
 
         // 4. Compute recipe_hash_v0(node, upstream_fps)
-        let recipe = recipe_hash_v0(node, &upstream_fps);
+        let recipe = recipe_hash_v0(node, &upstream_fps)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // 5. Derive unsafe reasons and output trust classification.
         let mut unsafe_reasons = Vec::new();
@@ -534,14 +543,18 @@ impl DataOpsSession {
             ExecutionTrust::SandboxedExtension => "sandboxed_extension",
             ExecutionTrust::UnsafeExtension => "unsafe_extension",
         };
-        let cache_key = cache_key_v0(node, &upstream_fps, execution_profile);
+        let cache_key = cache_key_v0(node, &upstream_fps, execution_profile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // Derive node_id
         let node_id = node
             .node_id
             .unwrap_or_else(|| node_id_from_key(&node.node_key));
         let node_id_str = node_id.to_string();
-        let node_hash = hex_lower(&node_def_hash_v1(node));
+        let node_hash = hex_lower(
+            &node_def_hash_v1(node)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        );
         let input_asset_keys: Vec<String> = input_snapshots
             .iter()
             .map(|(asset_key, _)| asset_key.clone())
@@ -551,14 +564,17 @@ impl DataOpsSession {
 
         // 6. For each output: compute fingerprint, insert entry, create lineage, emit record
         for output in outputs {
-            let schema_fp = output
-                .schema
-                .as_ref()
-                .map(schema_hash_v0)
-                .unwrap_or_else(no_schema_hash_v0);
+            let schema_fp = match output.schema.as_ref() {
+                Some(s) => schema_hash_v0(s)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+                None => no_schema_hash_v0()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+            };
 
-            let source_fp = derived_source_fingerprint_v0(&output.asset_key);
-            let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe);
+            let source_fp = derived_source_fingerprint_v0(&output.asset_key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let fp_hex = hex_lower(&dataset_fp);
 
             let entry = DatasetEntryV1 {
@@ -736,7 +752,9 @@ impl DataOpsSession {
             upstream_fps.push(fp_bytes);
         }
 
-        Ok(predict_output_fingerprints(node, outputs, &upstream_fps))
+        let predicted = predict_output_fingerprints(node, outputs, &upstream_fps)
+            .map_err(|e| PredictError::InvalidFingerprint(e.to_string()))?;
+        Ok(predicted)
     }
 
     /// Asset-key scoped cache hit check.
@@ -866,7 +884,9 @@ impl RunArtifactBundle {
                 node.code_ref = Some(format!("swarm-torch@{}", env!("CARGO_PKG_VERSION")));
             }
         }
-        let normalized = g.normalize();
+        let normalized = g
+            .normalize()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         write_json_pretty_atomic(&self.run_dir.join("graph.json"), &normalized)
     }
 
@@ -1307,7 +1327,7 @@ mod tests {
         let expected_id = node_id_from_key(&node.node_key).to_string();
         assert_eq!(node.node_id.unwrap().to_string(), expected_id);
 
-        let digest = node_def_hash_v1(node);
+        let digest = node_def_hash_v1(node).unwrap();
         let expected_hash = hex_lower(&digest);
         assert_eq!(node.node_def_hash.as_ref().unwrap(), &expected_hash);
 

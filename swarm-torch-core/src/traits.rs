@@ -77,7 +77,8 @@ impl PeerId {
     }
 
     /// Create a PeerId from a public key (SHA-256 hash)
-    #[cfg(feature = "std")]
+    ///
+    /// This is the canonical derivation rule for all profiles (std and no_std).
     pub fn from_public_key(public_key: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();

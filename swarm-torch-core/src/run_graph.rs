@@ -170,7 +170,7 @@ pub fn node_id_from_key(node_key: &str) -> NodeId {
 }
 
 /// Compute `node_def_hash` for a node (canonical binary encoding).
-pub fn node_def_hash_v1(node: &NodeV1) -> [u8; 32] {
+pub fn node_def_hash_v1(node: &NodeV1) -> Result<[u8; 32], postcard::Error> {
     let code_ref = node.code_ref.as_deref().unwrap_or("");
     let canonical = NodeDefCanonicalV1 {
         schema_version: GRAPH_SCHEMA_V1,
@@ -184,22 +184,11 @@ pub fn node_def_hash_v1(node: &NodeV1) -> [u8; 32] {
 
     // Postcard provides a deterministic binary encoding when the input types are deterministic
     // (notably: BTreeMap for maps).
-    let bytes = match postcard::to_allocvec(&canonical) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let mut hasher = Sha256::new();
-            hasher.update(b"swarmtorch.node_def_hash_v1.postcard_error");
-            hasher.update(node.op_type.as_bytes());
-            let digest = hasher.finalize();
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&digest[..]);
-            return out;
-        }
-    };
+    let bytes = postcard::to_allocvec(&canonical)?;
     let digest = Sha256::digest(&bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..]);
-    out
+    Ok(out)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -215,19 +204,23 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Normalize a node for persistence:
 /// - fills `node_id` from `node_key`
 /// - computes `node_def_hash`
-pub fn normalize_node_v1(mut node: NodeV1) -> NodeV1 {
+pub fn normalize_node_v1(mut node: NodeV1) -> Result<NodeV1, postcard::Error> {
     node.node_id = Some(node_id_from_key(&node.node_key));
-    let digest = node_def_hash_v1(&node);
+    let digest = node_def_hash_v1(&node)?;
     node.node_def_hash = Some(hex_lower(&digest));
-    node
+    Ok(node)
 }
 
 impl GraphV1 {
     /// Normalize all nodes (fill derived fields).
-    pub fn normalize(mut self) -> Self {
+    pub fn normalize(mut self) -> Result<Self, postcard::Error> {
         self.schema_version = GRAPH_SCHEMA_V1;
-        self.nodes = self.nodes.into_iter().map(normalize_node_v1).collect();
-        self
+        self.nodes = self
+            .nodes
+            .into_iter()
+            .map(normalize_node_v1)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
     }
 }
 
@@ -264,14 +257,14 @@ mod tests {
             node_def_hash: None,
         };
 
-        node = normalize_node_v1(node);
+        node = normalize_node_v1(node).unwrap();
         let h1 = node.node_def_hash.clone().unwrap();
 
         node.params.insert(
             "null_policy".to_string(),
             CanonValue::Str("drop".to_string()),
         );
-        node = normalize_node_v1(node);
+        node = normalize_node_v1(node).unwrap();
         let h2 = node.node_def_hash.clone().unwrap();
 
         assert_ne!(h1, h2);

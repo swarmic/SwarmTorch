@@ -46,7 +46,9 @@ pub fn load_report(run_dir: impl AsRef<Path>) -> io::Result<Report> {
     bundle.validate_manifest()?;
 
     let mut graph: GraphV1 = read_json(run_dir.join("graph.json"))?;
-    graph = graph.normalize();
+    graph = graph
+        .normalize()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     let registry_snapshot: DatasetRegistryV1 =
         read_json(run_dir.join("datasets").join("registry.json"))?;

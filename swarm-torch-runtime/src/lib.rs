@@ -101,8 +101,13 @@ pub mod embassy_runtime {
 
     impl SwarmRuntime for EmbassyRuntime {
         fn now(&self) -> u64 {
-            // Would use embassy_time::Instant::now()
-            0
+            // Embassy clock integration is not yet wired — returning zero
+            // would silently falsify every timestamp in the protocol layer.
+            // Fail-fast until a real embassy_time::Instant driver is available.
+            unimplemented!(
+                "EmbassyRuntime::now() is a placeholder; \
+                 wire embassy_time::Instant before using this runtime"
+            )
         }
 
         async fn sleep(&self, duration: Duration) {

@@ -27,18 +27,10 @@ impl KeyPair {
     }
 
     /// Get the peer ID derived from this key pair
+    ///
+    /// Always uses the canonical SHA-256 hash derivation for cross-profile consistency.
     pub fn peer_id(&self) -> PeerId {
-        #[cfg(feature = "std")]
-        {
-            PeerId::from_public_key(&self.public)
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            // Simple hash for no_std
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&self.public);
-            PeerId::new(id)
-        }
+        PeerId::from_public_key(&self.public)
     }
 
     /// Get the public key bytes
@@ -532,5 +524,32 @@ mod tests {
             MessageAuth::verify(&pair.public, version, msg_type, seq, ts, payload, &bad_sig);
         // VerificationFailed is the correct error for s >= L, as from_bytes is infallible for [u8; 64]
         assert_eq!(result, Err(VerifyError::VerificationFailed));
+    }
+
+    /// H-01 regression: `KeyPair::peer_id()` must produce the exact same
+    /// `PeerId` as `PeerId::from_public_key()`.
+    ///
+    /// Before fix, `peer_id()` returned raw public-key bytes under `no_std`
+    /// and SHA-256-hashed bytes under `std`, causing cross-profile identity
+    /// mismatches.
+    #[test]
+    fn h01_peer_id_matches_from_public_key() {
+        let seed = [42u8; 32];
+        let pair = KeyPair::from_seed(seed);
+
+        let via_method = pair.peer_id();
+        let via_factory = PeerId::from_public_key(&pair.public);
+
+        assert_eq!(
+            via_method, via_factory,
+            "KeyPair::peer_id() must agree with PeerId::from_public_key()"
+        );
+
+        // Also verify that PeerId is NOT the raw public key (it's a hash).
+        assert_ne!(
+            *via_method.as_bytes(),
+            pair.public,
+            "PeerId must be a SHA-256 hash of the public key, not the raw key"
+        );
     }
 }

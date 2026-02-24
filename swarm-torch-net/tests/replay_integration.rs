@@ -363,3 +363,62 @@ fn authenticated_verifier_verify_and_unwrap_with_time() {
     assert!(result.is_ok());
     assert_eq!(result.unwrap().sequence, envelope.sequence);
 }
+
+/// H-02 regression: `verify_authenticated()` must use the canonical
+/// `PeerId::from_public_key()` derivation for the replay cache lookup,
+/// not `PeerId::new(raw_sender_bytes)`.
+///
+/// Before fix, `PeerId::new()` (raw bytes) was used, creating a different
+/// cache key than what `KeyPair::peer_id()` / `PeerId::from_public_key()`
+/// produce. This meant the external PeerId and the internal replay PeerId
+/// were different, breaking replay isolation accountability.
+///
+/// This test verifies that two messages from the same keypair are tracked
+/// under the same replay cache entry (same PeerId) and that the replay
+/// PeerId matches the canonical `sender_peer_id()` derivation.
+#[test]
+fn h02_verify_path_uses_canonical_peer_id_for_replay() {
+    let keypair = KeyPair::from_seed([200u8; 32]);
+    let auth = MessageAuth::new(keypair.clone());
+    let mut replay_guard = ReplayProtection::new();
+    let now = 1000;
+
+    // First message accepted
+    let envelope1 = signed_heartbeat(&keypair, &auth, 1, now, b"msg1".to_vec());
+    assert!(envelope1
+        .verify_authenticated(&mut replay_guard, now)
+        .is_ok());
+
+    // The replay cache should have exactly 1 entry (the canonical PeerId)
+    assert_eq!(replay_guard.cache_size(), 1);
+
+    // Second message with same keypair, different seq: accepted under same peer entry
+    let envelope2 = signed_heartbeat(&keypair, &auth, 2, now, b"msg2".to_vec());
+    assert!(envelope2
+        .verify_authenticated(&mut replay_guard, now)
+        .is_ok());
+
+    // Still 1 entry — both messages are tracked under the same canonical PeerId
+    assert_eq!(
+        replay_guard.cache_size(),
+        1,
+        "both messages must use the same replay cache entry (canonical PeerId)"
+    );
+
+    // Replaying sequence 1 must be caught as Replay (proves same PeerId is used)
+    let replay = signed_heartbeat(&keypair, &auth, 1, now, b"msg1".to_vec());
+    assert!(
+        matches!(
+            replay.verify_authenticated(&mut replay_guard, now),
+            Err(VerifyError::Replay(ReplayError::Replay { .. }))
+        ),
+        "replayed sequence must be detected — same PeerId in cache"
+    );
+
+    // Verify sender_peer_id() matches the canonical derivation
+    assert_eq!(
+        envelope1.sender_peer_id(),
+        keypair.peer_id(),
+        "sender_peer_id() must match KeyPair::peer_id() (canonical hash)"
+    );
+}

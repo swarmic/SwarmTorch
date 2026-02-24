@@ -11,7 +11,6 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "alloc")]
 use swarm_torch_core::replay::ReplayProtection;
-#[cfg(feature = "alloc")]
 use swarm_torch_core::traits::PeerId;
 
 /// Message envelope for all swarm communications
@@ -83,7 +82,8 @@ impl MessageEnvelope {
     }
 
     /// Derive sender `PeerId` from sender public key bytes.
-    #[cfg(feature = "std")]
+    ///
+    /// Uses the canonical SHA-256 hash derivation (available in all profiles).
     pub fn sender_peer_id(&self) -> PeerId {
         PeerId::from_public_key(&self.sender)
     }
@@ -206,7 +206,9 @@ impl MessageEnvelope {
         .map_err(VerifyError::Crypto)?;
 
         // 3. STATEFUL: Replay check (mutates cache)
-        let sender_id = PeerId::new(self.sender);
+        // Use canonical PeerId derivation (hash of public key) for consistency
+        // with KeyPair::peer_id() and PeerId::from_public_key().
+        let sender_id = PeerId::from_public_key(&self.sender);
         replay_guard
             .validate_sequence(&sender_id, self.sequence)
             .map_err(VerifyError::Replay)?;

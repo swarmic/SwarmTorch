@@ -155,9 +155,26 @@ impl OpRunner for NativeOpRunner {
     ) -> Result<Vec<AssetInstanceV1>, Self::Error> {
         // Without ExecutionContext, we can't derive trace_id or deterministic span_id.
         // This is the trait-level fallback; callers should prefer run_with_context().
-        // Use a zero-filled RunId and system clock as fallback.
+        //
+        // H-03: derive a per-invocation RunId from the wall-clock so that
+        // telemetry from different trait-level calls does not silently collide
+        // under a single all-zero sentinel.  The id is NOT cryptographic —
+        // it is a best-effort uniqueness measure for the logging layer.
+        let clock_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"swarmtorch.trait_fallback_run_id");
+            h.update(clock_nanos.to_le_bytes());
+            h.finalize()
+        };
+        let mut run_id_bytes = [0u8; 16];
+        run_id_bytes.copy_from_slice(&hash[..16]);
         let ctx = ExecutionContext {
-            run_id: RunId::from_bytes([0u8; 16]),
+            run_id: RunId::from_bytes(run_id_bytes),
             clock_nanos: || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

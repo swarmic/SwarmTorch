@@ -381,9 +381,18 @@ fn redact_uri_userinfo(uri: &str) -> String {
     out
 }
 
+fn strip_query_fragment(uri: &str) -> &str {
+    let end = uri
+        .find('?')
+        .unwrap_or(uri.len())
+        .min(uri.find('#').unwrap_or(uri.len()));
+    &uri[..end]
+}
+
 fn normalize_and_redact_source_descriptor(source: &SourceDescriptorV0) -> SourceDescriptorV0 {
+    let redacted = redact_uri_userinfo(&normalize_trim(&source.uri));
     SourceDescriptorV0 {
-        uri: redact_uri_userinfo(&normalize_trim(&source.uri)),
+        uri: strip_query_fragment(&redacted).to_string(),
         content_type: normalize_lower(&source.content_type),
         auth_mode: source.auth_mode.clone(),
         etag_or_version: source.etag_or_version.as_ref().map(|v| normalize_trim(v)),
@@ -849,10 +858,7 @@ mod tests {
         };
 
         let sanitized = sanitize_source_descriptor_v0(&source_a).expect("sanitize should succeed");
-        assert_eq!(
-            sanitized.uri,
-            "s3://<redacted>@bucket/path/file.parquet?part=1"
-        );
+        assert_eq!(sanitized.uri, "s3://<redacted>@bucket/path/file.parquet");
 
         // Fingerprints must ignore differing credentials after redaction.
         assert_eq!(
@@ -860,6 +866,43 @@ mod tests {
             source_fingerprint_v0(&source_b),
             "userinfo changes should not affect source fingerprint"
         );
+    }
+
+    #[test]
+    fn source_descriptor_strips_query_and_fragment() {
+        let with_query = SourceDescriptorV0 {
+            uri: "s3://bucket/path/file.parquet?version=2&token=abc".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let with_fragment = SourceDescriptorV0 {
+            uri: "s3://bucket/path/file.parquet#sheet1".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let clean = SourceDescriptorV0 {
+            uri: "s3://bucket/path/file.parquet".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+
+        let sanitized_q = sanitize_source_descriptor_v0(&with_query).unwrap();
+        let sanitized_f = sanitize_source_descriptor_v0(&with_fragment).unwrap();
+        let sanitized_c = sanitize_source_descriptor_v0(&clean).unwrap();
+
+        assert_eq!(sanitized_q.uri, "s3://bucket/path/file.parquet");
+        assert_eq!(sanitized_f.uri, "s3://bucket/path/file.parquet");
+        assert_eq!(sanitized_c.uri, "s3://bucket/path/file.parquet");
+
+        // All three must produce the same fingerprint
+        let fp_q = source_fingerprint_v0(&with_query).unwrap();
+        let fp_f = source_fingerprint_v0(&with_fragment).unwrap();
+        let fp_c = source_fingerprint_v0(&clean).unwrap();
+        assert_eq!(fp_q, fp_c, "query should not affect fingerprint");
+        assert_eq!(fp_f, fp_c, "fragment should not affect fingerprint");
     }
 
     #[test]

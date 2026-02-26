@@ -5,7 +5,24 @@
 use swarm_torch_core::traits::SwarmModel;
 use swarm_torch_core::Result;
 
-/// A simple linear model for testing
+/// Error type for model creation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    /// Model dimensions exceed supported size for fixed storage
+    InvalidDimensions,
+}
+
+impl core::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidDimensions => write!(
+                f,
+                "model dimensions exceed supported size for fixed storage"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LinearModel {
     /// Weight matrix (flattened, row-major)
@@ -20,25 +37,23 @@ pub struct LinearModel {
 
 impl Default for LinearModel {
     fn default() -> Self {
-        Self::new(8, 16)
+        Self::new(8, 16).expect("default dimensions are valid")
     }
 }
 
 impl LinearModel {
     /// Create a new linear model
-    pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        assert!(
-            input_dim * output_dim <= 128,
-            "Model too large for fixed storage"
-        );
-        assert!(output_dim <= 16, "Output dim too large for fixed storage");
+    pub fn new(input_dim: usize, output_dim: usize) -> core::result::Result<Self, ModelError> {
+        if input_dim.checked_mul(output_dim).map_or(true, |p| p > 128) || output_dim > 16 {
+            return Err(ModelError::InvalidDimensions);
+        }
 
-        Self {
+        Ok(Self {
             weights: [0.0; 128],
             bias: [0.0; 16],
             input_dim,
             output_dim,
-        }
+        })
     }
 
     /// Initialize with random weights
@@ -93,10 +108,32 @@ pub struct SimpleMLP {
 
 impl SimpleMLP {
     /// Create a new MLP with the given dimensions
-    pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
-        Self {
-            layer1: LinearModel::new(input_dim, hidden_dim),
-            layer2: LinearModel::new(hidden_dim, output_dim),
-        }
+    pub fn new(
+        input_dim: usize,
+        hidden_dim: usize,
+        output_dim: usize,
+    ) -> core::result::Result<Self, ModelError> {
+        Ok(Self {
+            layer1: LinearModel::new(input_dim, hidden_dim)?,
+            layer2: LinearModel::new(hidden_dim, output_dim)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_model_new_rejects_oversized_dims() {
+        assert!(matches!(
+            LinearModel::new(100, 100),
+            Err(ModelError::InvalidDimensions)
+        ));
+        assert!(matches!(
+            LinearModel::new(8, 20),
+            Err(ModelError::InvalidDimensions)
+        ));
+        assert!(LinearModel::new(8, 16).is_ok());
     }
 }

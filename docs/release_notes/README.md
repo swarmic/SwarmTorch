@@ -23,6 +23,8 @@ New contributors should read these in order:
 8. [`M4-01_ed25519_signatures.md`](M4-01_ed25519_signatures.md) — Ed25519 envelope authentication baseline
 9. [`M4-02_replay_protection_enforcement.md`](M4-02_replay_protection_enforcement.md) — Replay enforcement baseline
 10. [`M4-02.5_replay_protection_hardening.md`](M4-02.5_replay_protection_hardening.md) — Replay/auth hardening follow-up
+11. [`v0.1.0-alpha.6x-wave0.md`](v0.1.0-alpha.6x-wave0.md) — Wave 0 remediation: replay boundary, identity canonicalization, fail-closed hashing, clock/telemetry integrity
+12. [`v0.1.0-alpha.6x-wave1.md`](v0.1.0-alpha.6x-wave1.md) — Wave 1 remediation: aggregation/compression/model safety guards, URI stripping, monotonic clock
 
 ## Versioning
 

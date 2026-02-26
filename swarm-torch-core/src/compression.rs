@@ -8,6 +8,32 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+/// Error type for compression operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressionError {
+    /// Index value exceeds u32 capacity
+    IndexOverflow,
+    /// Invalid compressed data format
+    InvalidData,
+    /// Decompressed index out of bounds
+    IndexOutOfBounds,
+}
+
+impl core::fmt::Display for CompressionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IndexOverflow => write!(f, "index value exceeds u32 capacity"),
+            Self::InvalidData => write!(f, "invalid compressed data format"),
+            Self::IndexOutOfBounds => write!(f, "decompressed index out of bounds"),
+        }
+    }
+}
+
+/// Helper to convert usize length/index to u32 safely
+pub fn try_usize_to_u32(val: usize) -> core::result::Result<u32, CompressionError> {
+    u32::try_from(val).map_err(|_| CompressionError::IndexOverflow)
+}
+
 /// Compression method for gradients
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum CompressionMethod {
@@ -74,17 +100,20 @@ pub struct CompressedGradient {
 #[cfg(feature = "alloc")]
 impl CompressedGradient {
     /// Compress a gradient using the specified method
-    pub fn compress(gradients: &[f32], method: CompressionMethod) -> Self {
+    pub fn compress(
+        gradients: &[f32],
+        method: CompressionMethod,
+    ) -> core::result::Result<Self, CompressionError> {
         match method {
             CompressionMethod::None => {
                 // Convert f32 to bytes
                 let bytes: Vec<u8> = gradients.iter().flat_map(|f| f.to_le_bytes()).collect();
-                Self {
+                Ok(Self {
                     method,
                     shape: alloc::vec![gradients.len()],
                     num_elements: gradients.len(),
                     data: CompressedData::Dense(bytes),
-                }
+                })
             }
             CompressionMethod::TopK { k_ratio } => {
                 // Avoid `f32::ceil()` so `no_std + alloc` builds don't require libm.
@@ -105,15 +134,17 @@ impl CompressedGradient {
                 });
 
                 let top_k: Vec<(usize, f32)> = indexed.into_iter().take(k).collect();
-                let indices: Vec<u32> = top_k.iter().map(|(i, _)| *i as u32).collect();
+                let indices: core::result::Result<Vec<u32>, CompressionError> =
+                    top_k.iter().map(|(i, _)| try_usize_to_u32(*i)).collect();
+                let indices = indices?;
                 let values: Vec<u8> = top_k.iter().flat_map(|(_, v)| v.to_le_bytes()).collect();
 
-                Self {
+                Ok(Self {
                     method,
                     shape: alloc::vec![gradients.len()],
                     num_elements: gradients.len(),
                     data: CompressedData::Sparse { indices, values },
-                }
+                })
             }
             CompressionMethod::Quantized { scale } => {
                 // Quantize to INT8
@@ -124,12 +155,12 @@ impl CompressedGradient {
                         quantized as u8
                     })
                     .collect();
-                Self {
+                Ok(Self {
                     method: CompressionMethod::Quantized { scale },
                     shape: alloc::vec![gradients.len()],
                     num_elements: gradients.len(),
                     data: CompressedData::Dense(bytes),
-                }
+                })
             }
             _ => {
                 // Fallback to no compression for other methods
@@ -139,27 +170,39 @@ impl CompressedGradient {
     }
 
     /// Decompress back to a gradient vector
-    pub fn decompress(&self) -> Vec<f32> {
+    pub fn decompress(&self) -> core::result::Result<Vec<f32>, CompressionError> {
         match (&self.data, &self.method) {
-            (CompressedData::Dense(bytes), CompressionMethod::None) => bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect(),
+            (CompressedData::Dense(bytes), CompressionMethod::None) => {
+                if bytes.len() % 4 != 0 || bytes.len() / 4 != self.num_elements {
+                    return Err(CompressionError::InvalidData);
+                }
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect())
+            }
             (CompressedData::Dense(bytes), CompressionMethod::Quantized { scale }) => {
-                bytes.iter().map(|&b| (b as i8 as f32) * scale).collect()
+                if bytes.len() != self.num_elements {
+                    return Err(CompressionError::InvalidData);
+                }
+                Ok(bytes.iter().map(|&b| (b as i8 as f32) * scale).collect())
             }
             (CompressedData::Sparse { indices, values }, _) => {
+                if values.len() % 4 != 0 || values.len() / 4 != indices.len() {
+                    return Err(CompressionError::InvalidData);
+                }
                 let mut result = alloc::vec![0.0f32; self.num_elements];
                 for (idx, chunk) in indices.iter().zip(values.chunks_exact(4)) {
                     let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     let idx = *idx as usize;
-                    if idx < result.len() {
-                        result[idx] = value;
+                    if idx >= result.len() {
+                        return Err(CompressionError::IndexOutOfBounds);
                     }
+                    result[idx] = value;
                 }
-                result
+                Ok(result)
             }
-            _ => alloc::vec![0.0f32; self.num_elements],
+            _ => Err(CompressionError::InvalidData),
         }
     }
 
@@ -187,7 +230,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decompress_sparse_ignores_out_of_bounds_indices() {
+    fn decompress_rejects_sparse_index_value_mismatch() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::TopK { k_ratio: 0.5 },
+            shape: vec![2],
+            num_elements: 2,
+            data: CompressedData::Sparse {
+                indices: vec![0, 1],      // Two indices
+                values: vec![1, 0, 0, 0], // Four bytes = one value, length mismatch!
+            },
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::InvalidData
+        );
+    }
+
+    #[test]
+    fn decompress_sparse_returns_error_for_out_of_bounds_indices() {
         let compressed = CompressedGradient {
             method: CompressionMethod::TopK { k_ratio: 0.5 },
             shape: vec![2],
@@ -200,13 +260,55 @@ mod tests {
                 ],
             },
         };
-        let decompressed = compressed.decompress();
-        assert_eq!(decompressed.len(), 2);
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::IndexOutOfBounds
+        );
+    }
+
+    #[test]
+    fn decompress_rejects_misaligned_dense_data() {
+        // Missing one byte to be modulo-4 aligned
+        let compressed = CompressedGradient {
+            method: CompressionMethod::None,
+            shape: vec![2],
+            num_elements: 2,
+            data: CompressedData::Dense(vec![1, 0, 0, 0, 2, 0, 0]),
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::InvalidData
+        );
     }
 
     #[test]
     fn compression_ratio_is_well_defined_for_empty_input() {
-        let compressed = CompressedGradient::compress(&[], CompressionMethod::None);
+        let compressed = CompressedGradient::compress(&[], CompressionMethod::None).unwrap();
         assert_eq!(compressed.compression_ratio(), 1.0);
+    }
+
+    #[test]
+    fn try_usize_to_u32_rejects_overflow() {
+        assert_eq!(try_usize_to_u32(0), Ok(0));
+        assert_eq!(try_usize_to_u32(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            try_usize_to_u32((u32::MAX as usize) + 1),
+            Err(CompressionError::IndexOverflow)
+        );
+    }
+
+    #[test]
+    fn decompress_rejects_unmatched_method_data() {
+        // Dense data paired with TopK method — no valid decode path
+        let compressed = CompressedGradient {
+            method: CompressionMethod::TopK { k_ratio: 0.5 },
+            shape: vec![2],
+            num_elements: 2,
+            data: CompressedData::Dense(vec![1, 0, 0, 0, 2, 0, 0, 0]),
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::InvalidData
+        );
     }
 }

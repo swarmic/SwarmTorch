@@ -9,13 +9,15 @@ use alloc::vec::Vec;
 use crate::traits::GradientUpdate;
 use crate::Result;
 
+const MAX_GRADIENT_DIM: usize = 10_000_000;
+
 fn validate_gradient_shapes(updates: &[GradientUpdate]) -> Result<usize> {
     if updates.is_empty() {
         return Err(crate::Error::InsufficientUpdates);
     }
 
     let dim = updates[0].gradients.len();
-    if dim == 0 {
+    if dim == 0 || dim > MAX_GRADIENT_DIM {
         return Err(crate::Error::InvalidGradient);
     }
 
@@ -214,12 +216,17 @@ impl RobustAggregator for Krum {
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
         #[cfg(feature = "alloc")]
         {
+            const MAX_KRUM_PEERS: usize = 50;
+
             let _ = validate_gradient_shapes(updates)?;
             let n = updates.len();
             let f = self.num_byzantine;
 
             if n < 2 * f + 3 {
                 return Err(crate::Error::InsufficientUpdates);
+            }
+            if n > MAX_KRUM_PEERS {
+                return Err(crate::Error::ResourceExhausted);
             }
 
             // Compute pairwise distances
@@ -320,5 +327,26 @@ mod tests {
         let updates = vec![update(vec![]), update(vec![])];
         let result = CoordinateMedian.aggregate(&updates);
         assert!(matches!(result, Err(crate::Error::InvalidGradient)));
+    }
+
+    #[test]
+    fn aggregation_rejects_oversized_gradient_dim() {
+        let oversized = [0.0; 10_000_001].to_vec(); // Just barely over MAX_GRADIENT_DIM
+        let updates = vec![update(oversized.clone())];
+        let result = FedAvg.aggregate(&updates);
+        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
+    }
+
+    #[test]
+    #[cfg(feature = "krum")]
+    fn krum_rejects_oversized_peer_set() {
+        let mut updates = Vec::new();
+        // MAX_KRUM_PEERS is 50. Provide 51 peers.
+        for _ in 0..51 {
+            updates.push(update(vec![1.0; 2]));
+        }
+        let krum = Krum::new(0); // 0 byzantine to keep `n < 2*f + 3` check satisfied
+        let result = krum.aggregate(&updates);
+        assert!(matches!(result, Err(crate::Error::ResourceExhausted)));
     }
 }

@@ -23,7 +23,11 @@ use core::time::Duration;
 
 /// Runtime trait for async operations
 pub trait SwarmRuntime: Send + Sync + 'static {
-    /// Get the current instant
+    /// Returns a monotonically non-decreasing timestamp in milliseconds.
+    ///
+    /// The epoch is **implementation-defined** (not necessarily UNIX epoch).
+    /// Callers must not interpret this value as wall-clock time.
+    /// Implementations must guarantee the value never decreases between calls.
     fn now(&self) -> u64;
 
     /// Sleep for the specified duration
@@ -40,6 +44,12 @@ pub mod tokio_runtime {
     //! Tokio-based runtime implementation
 
     use super::*;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    /// Process-local epoch for monotonic clock derivation.
+    /// Initialized on first call to `TokioRuntime::now()`.
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
 
     /// Tokio runtime wrapper
     #[derive(Debug, Clone, Default)]
@@ -53,12 +63,16 @@ pub mod tokio_runtime {
     }
 
     impl SwarmRuntime for TokioRuntime {
+        /// Returns monotonically non-decreasing milliseconds since process-local epoch.
+        ///
+        /// **Contract**: The returned value is **not** UNIX epoch wall-clock time.
+        /// It is derived from `std::time::Instant` and is guaranteed to never
+        /// decrease between calls, even across NTP step-backs.
+        ///
+        /// Consumers needing absolute wall-clock time must use `SystemTime` directly.
         fn now(&self) -> u64 {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
+            let epoch = EPOCH.get_or_init(Instant::now);
+            epoch.elapsed().as_millis() as u64
         }
 
         async fn sleep(&self, duration: Duration) {
@@ -70,6 +84,23 @@ pub mod tokio_runtime {
             F: Future<Output = ()> + Send + 'static,
         {
             tokio::spawn(future);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tokio_runtime_now_is_monotonic() {
+            let rt = TokioRuntime::new();
+            let t1 = rt.now();
+            // Busy-spin briefly to ensure elapsed time
+            for _ in 0..10_000 {
+                core::hint::black_box(0u64);
+            }
+            let t2 = rt.now();
+            assert!(t2 >= t1, "now() must be monotonically non-decreasing");
         }
     }
 }

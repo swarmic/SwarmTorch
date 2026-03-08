@@ -58,19 +58,6 @@ impl MessageEnvelope {
         }
     }
 
-    /// Create a new message envelope from a `PeerId`.
-    ///
-    /// Deprecated because `PeerId::from_public_key()` hashes the public key,
-    /// while `MessageEnvelope::sender` must contain raw Ed25519 public key bytes.
-    #[cfg(feature = "alloc")]
-    #[deprecated(
-        since = "0.1.0-alpha.6",
-        note = "Use new_with_public_key() with raw Ed25519 public key bytes."
-    )]
-    pub fn new(sender: PeerId, message_type: MessageType, payload: Vec<u8>) -> Self {
-        Self::new_with_public_key(*sender.as_bytes(), message_type, payload)
-    }
-
     /// Returns true when this envelope version is supported.
     pub fn is_version_supported(&self) -> bool {
         Self::SUPPORTED_VERSIONS.contains(&self.version)

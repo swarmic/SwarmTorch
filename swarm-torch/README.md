@@ -4,7 +4,7 @@ This crate is the main entry point for SwarmTorch.
 
 For full documentation, see the repository README and canonical docs:
 
-- Workspace README: https://github.com/swarmic/SwarmTorch/blob/main/readme.md
+- Workspace README: https://github.com/swarmic/SwarmTorch/blob/main/README.md
 - SwarmTorch WP: https://github.com/swarmic/SwarmTorch/blob/main/SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
 - ADRs: https://github.com/swarmic/SwarmTorch/blob/main/ADRs.md
 - Security policy: https://github.com/swarmic/SwarmTorch/blob/main/SECURITY.md

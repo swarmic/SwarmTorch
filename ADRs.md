@@ -3243,7 +3243,6 @@ breaks this cryptographic binding and causes deterministic verification failures
 API contract:
 
 - Primary constructor: `MessageEnvelope::new_with_public_key([u8; 32], ...)`
-- Deprecated compatibility constructor: `MessageEnvelope::new(PeerId, ...)`
 - Verification path: `verify_authenticated()` validates signatures against raw sender bytes
 
 ### Consequences
@@ -3254,19 +3253,12 @@ API contract:
 - Removes a common integration trap (`PeerId::from_public_key` bytes in envelope sender)
 
 **Negative:**
-- Existing `MessageEnvelope::new(PeerId, ...)` callsites should migrate to
-  `new_with_public_key(...)` for explicit semantics
+- Existing legacy callsites must migrate to `new_with_public_key(...)` for
+  explicit sender-key semantics
 
 ### Migration
 
-Before (ambiguous/misuse-prone):
-
-```rust
-let sender = keypair.peer_id();
-let envelope = MessageEnvelope::new(sender, MessageType::Heartbeat, payload);
-```
-
-After (explicit and correct):
+Canonical usage (explicit and correct):
 
 ```rust
 let envelope = MessageEnvelope::new_with_public_key(

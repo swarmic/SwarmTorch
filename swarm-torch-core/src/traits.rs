@@ -111,13 +111,23 @@ impl PeerId {
 
     /// Validated construction from raw public key bytes.
     ///
-    /// Rejects inputs that are not exactly 32 bytes or are all-zeros.
-    /// Use at network entry points to reject degenerate peer identities.
+    /// Rejects inputs that are not exactly 32 bytes, are all-zeros,
+    /// or fail Ed25519 public-key parsing.
+    ///
+    /// Use at network entry points to reject degenerate sender identities
+    /// before replay/verification processing.
     pub fn try_from_public_key_bytes(public_key: &[u8]) -> core::result::Result<Self, CryptoError> {
+        use ed25519_dalek::VerifyingKey;
+
         if public_key.len() != 32 {
             return Err(CryptoError::InvalidPublicKey);
         }
         if public_key.iter().all(|b| *b == 0) {
+            return Err(CryptoError::InvalidPublicKey);
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(public_key);
+        if VerifyingKey::from_bytes(&key).is_err() {
             return Err(CryptoError::InvalidPublicKey);
         }
         Ok(Self::from_public_key(public_key))
@@ -161,7 +171,9 @@ mod tests {
 
     #[test]
     fn peer_id_try_from_valid_key_succeeds() {
-        let key = [42u8; 32];
+        let key = *crate::crypto::KeyPair::from_seed([42u8; 32])
+            .expect("non-zero seed")
+            .public_key();
         let result = PeerId::try_from_public_key_bytes(&key);
         assert!(result.is_ok());
         // Must match canonical derivation

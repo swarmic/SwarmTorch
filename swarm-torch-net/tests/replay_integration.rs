@@ -104,11 +104,15 @@ fn envelope_verify_authenticated_signature_before_replay() {
 fn envelope_verify_authenticated_rejects_missing_signature() {
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
+    let keypair = KeyPair::from_seed([5u8; 32]).expect("non-zero seed");
 
-    let envelope =
-        MessageEnvelope::new_with_public_key([5u8; 32], MessageType::Heartbeat, b"test".to_vec())
-            .with_sequence(1)
-            .with_timestamp(now);
+    let envelope = MessageEnvelope::new_with_public_key(
+        *keypair.public_key(),
+        MessageType::Heartbeat,
+        b"test".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now);
 
     assert!(matches!(
         envelope.verify_authenticated(&mut replay_guard, now),
@@ -120,12 +124,16 @@ fn envelope_verify_authenticated_rejects_missing_signature() {
 fn envelope_verify_authenticated_rejects_wrong_signature_length() {
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
+    let keypair = KeyPair::from_seed([6u8; 32]).expect("non-zero seed");
 
-    let envelope =
-        MessageEnvelope::new_with_public_key([6u8; 32], MessageType::Heartbeat, b"test".to_vec())
-            .with_sequence(1)
-            .with_timestamp(now)
-            .with_signature(vec![0u8; 32]);
+    let envelope = MessageEnvelope::new_with_public_key(
+        *keypair.public_key(),
+        MessageType::Heartbeat,
+        b"test".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .with_signature(vec![0u8; 32]);
 
     assert!(matches!(
         envelope.verify_authenticated(&mut replay_guard, now),
@@ -243,33 +251,6 @@ fn new_with_public_key_uses_raw_bytes() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn new_with_peer_id_deprecated_but_works() {
-    let keypair = KeyPair::from_seed([13u8; 32]).expect("non-zero seed");
-    let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
-    let now = 1000;
-
-    let sender = PeerId::new(*keypair.public_key());
-    let mut envelope = MessageEnvelope::new(sender, MessageType::Heartbeat, b"legacy".to_vec())
-        .with_sequence(1)
-        .with_timestamp(now);
-
-    let sig = auth.sign(
-        envelope.version,
-        envelope.message_type as u8,
-        envelope.sequence,
-        envelope.timestamp,
-        &envelope.payload,
-    );
-    envelope = envelope.with_signature(sig.as_bytes().to_vec());
-
-    assert!(envelope
-        .verify_authenticated(&mut replay_guard, now)
-        .is_ok());
-}
-
-#[test]
 fn verify_authenticated_rejects_hashed_peer_id() {
     let keypair = KeyPair::from_seed([14u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
@@ -296,7 +277,7 @@ fn verify_authenticated_rejects_hashed_peer_id() {
 
     assert!(matches!(
         envelope.verify_authenticated(&mut replay_guard, now),
-        Err(VerifyError::Crypto(_))
+        Err(VerifyError::InvalidSenderKey) | Err(VerifyError::Crypto(_))
     ));
 }
 

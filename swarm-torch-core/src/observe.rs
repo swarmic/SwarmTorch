@@ -424,6 +424,9 @@ pub const MAX_ATTR_KEY_LEN: usize = 128;
 /// Maximum allowed length for string attribute values.
 #[cfg(feature = "alloc")]
 pub const MAX_ATTR_VALUE_STR_LEN: usize = 1024;
+/// Maximum allowed length for metric unit strings.
+#[cfg(feature = "alloc")]
+pub const MAX_METRIC_UNIT_LEN: usize = 64;
 
 /// Validation error for span/event/metric records.
 #[cfg(feature = "alloc")]
@@ -433,6 +436,7 @@ pub enum RecordValidationError {
     TooManyAttrs { count: usize },
     AttrKeyTooLong { key: String, len: usize },
     AttrValueTooLong { key: String, len: usize },
+    MetricUnitTooLong { len: usize },
 }
 
 #[cfg(feature = "alloc")]
@@ -451,6 +455,9 @@ impl fmt::Display for RecordValidationError {
                     f,
                     "string attribute value for key '{key}' length {len} exceeds maximum"
                 )
+            }
+            Self::MetricUnitTooLong { len } => {
+                write!(f, "metric unit length {len} exceeds maximum")
             }
         }
     }
@@ -541,7 +548,13 @@ pub fn validate_event_record(r: &EventRecord) -> Result<(), RecordValidationErro
 /// Validate a metric record against size/count bounds (L-09).
 #[cfg(feature = "alloc")]
 pub fn validate_metric_record(r: &MetricRecord) -> Result<(), RecordValidationError> {
-    validate_name_and_attrs(&r.name, &r.attrs)
+    validate_name_and_attrs(&r.name, &r.attrs)?;
+    if let Some(unit) = r.unit.as_ref() {
+        if unit.len() > MAX_METRIC_UNIT_LEN {
+            return Err(RecordValidationError::MetricUnitTooLong { len: unit.len() });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -670,5 +683,25 @@ mod tests {
             attrs,
         };
         assert!(validate_span_record(&span).is_ok());
+    }
+
+    #[test]
+    fn validate_metric_rejects_oversized_unit() {
+        let metric = MetricRecord {
+            schema_version: 1,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "loss".to_string(),
+            value: 0.1,
+            unit: Some("x".repeat(MAX_METRIC_UNIT_LEN + 1)),
+            attrs: AttrMap::new(),
+        };
+        assert_eq!(
+            validate_metric_record(&metric),
+            Err(RecordValidationError::MetricUnitTooLong {
+                len: MAX_METRIC_UNIT_LEN + 1
+            })
+        );
     }
 }

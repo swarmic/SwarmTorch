@@ -27,11 +27,11 @@ impl core::fmt::Display for ModelError {
 pub struct LinearModel {
     /// Parameter buffer:
     /// `[0..weight_count)` = weights, `[weight_count..weight_count+output_dim)` = bias.
-    pub params: [f32; 144],
+    params: [f32; 144],
     /// Input dimension
-    pub input_dim: usize,
+    input_dim: usize,
     /// Output dimension
-    pub output_dim: usize,
+    output_dim: usize,
 }
 
 impl Default for LinearModel {
@@ -56,6 +56,16 @@ impl LinearModel {
 
     fn weight_count(&self) -> usize {
         self.input_dim * self.output_dim
+    }
+
+    /// Input dimension.
+    pub const fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    /// Output dimension.
+    pub const fn output_dim(&self) -> usize {
+        self.output_dim
     }
 
     /// Initialize with random weights

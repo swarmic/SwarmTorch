@@ -63,10 +63,9 @@ pub use swarm_torch_net as net;
 pub use swarm_torch_runtime as runtime;
 
 // Re-export commonly used items at the top level
-#[allow(deprecated)]
 pub use swarm_torch_core::{
     aggregation::{self, RobustAggregation, RobustAggregator},
-    algorithms::{ParticleSwarmConfig, Topology},
+    algorithms::Topology,
     traits::{GradientUpdate, PeerId, SwarmModel},
     Error, Result,
 };

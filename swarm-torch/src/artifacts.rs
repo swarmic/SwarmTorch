@@ -1241,7 +1241,8 @@ mod tests {
         MAX_ETAG_OR_VERSION_LEN, MAX_SOURCE_URI_LEN,
     };
     use swarm_torch_core::observe::{
-        AttrMap, AttrValue, RunEventEmitter, SpanId, TraceId, MAX_RECORD_ATTRS, MAX_RECORD_NAME_LEN,
+        AttrMap, AttrValue, RunEventEmitter, SpanId, TraceId, MAX_METRIC_UNIT_LEN,
+        MAX_RECORD_ATTRS, MAX_RECORD_NAME_LEN,
     };
     use swarm_torch_core::run_graph::{
         node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, ExecutionTrust,
@@ -1388,6 +1389,35 @@ mod tests {
 
         sink.emit_metric(&metric)
             .expect("valid metric should be accepted");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn emit_metric_rejects_oversized_unit_at_write_time() {
+        let base = temp_dir("emit_metric_rejects_oversized_unit");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([114u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = RunArtifactSink::new(bundle);
+
+        let metric = MetricRecord {
+            schema_version: 1,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "m".to_string(),
+            value: 1.0,
+            unit: Some("x".repeat(MAX_METRIC_UNIT_LEN + 1)),
+            attrs: AttrMap::new(),
+        };
+
+        let err = sink
+            .emit_metric(&metric)
+            .expect_err("oversized metric unit should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let _ = fs::remove_dir_all(&base);
     }

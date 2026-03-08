@@ -44,8 +44,26 @@ pub struct AssetInstanceV1 {
 ///
 /// NOTE: `RunEventEmitter` keeps this sink-agnostic. A std artifact sink can persist NDJSON,
 /// and a future exporter can map to OTLP.
+#[cfg(feature = "std")]
+pub trait OpRunnerError:
+    core::fmt::Debug + core::fmt::Display + Send + Sync + 'static + std::error::Error
+{
+}
+
+#[cfg(feature = "std")]
+impl<T> OpRunnerError for T where
+    T: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static + std::error::Error
+{
+}
+
+#[cfg(not(feature = "std"))]
+pub trait OpRunnerError: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static {}
+
+#[cfg(not(feature = "std"))]
+impl<T> OpRunnerError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static {}
+
 pub trait OpRunner: Send + Sync {
-    type Error;
+    type Error: OpRunnerError;
 
     fn run<E: RunEventEmitter<Error = Self::Error>>(
         &self,
@@ -160,5 +178,12 @@ mod tests {
             policy.allow(&test_node(ExecutionTrust::UnsafeExtension), &registry),
             PolicyDecision::Allowed
         );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn op_runner_error_contract_accepts_io_error() {
+        fn assert_op_runner_error<E: OpRunnerError>() {}
+        assert_op_runner_error::<std::io::Error>();
     }
 }

@@ -15,6 +15,14 @@ For detailed milestones and current status, see the [**Roadmap section in README
 
 All releases must pass the gates defined in [ADR-0014](ADRs.md#adr-0014-benchmark-dataset-and-release-gates).
 
+## Wave 4 Convergence Gate
+
+Wave 4 is the remediation convergence point for `E-01..E-05` and semver-batched API tightening.
+After Wave 4 sign-off, the v0.2 feature track opens in this order:
+
+1. `F1` execution hints (`ExecutionHint`) as a standalone additive schema slice.
+2. `F2a + F2 + F3 + F4` as one grouped v0.2 minor-bump feature batch.
+
 ## Conformance Lock (A6X-05)
 
 This section is the repo-local contract lock for current implementation reality.

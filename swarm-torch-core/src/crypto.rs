@@ -76,6 +76,20 @@ pub enum CryptoError {
     VerificationFailed,
 }
 
+impl core::fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AllZeroSeed => write!(f, "all-zero seed is not allowed"),
+            Self::InvalidSignatureEncoding => write!(f, "invalid signature encoding"),
+            Self::InvalidPublicKey => write!(f, "invalid public key"),
+            Self::VerificationFailed => write!(f, "signature verification failed"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CryptoError {}
+
 /// Legacy alias for backward compatibility.
 pub type VerifyError = CryptoError;
 

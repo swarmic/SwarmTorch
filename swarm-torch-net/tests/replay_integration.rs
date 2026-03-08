@@ -361,6 +361,38 @@ fn verify_authenticated_rejects_zero_sender_key() {
 }
 
 #[test]
+fn verify_error_source_chain_includes_crypto() {
+    let keypair = KeyPair::from_seed([23u8; 32]).expect("non-zero seed");
+    let auth = MessageAuth::new(keypair.clone());
+    let mut replay_guard = ReplayProtection::new();
+    let now = 1000;
+
+    let envelope = MessageEnvelope::new_with_public_key(
+        *keypair.public_key(),
+        MessageType::Heartbeat,
+        b"invalid signature".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .with_signature(vec![0xAA; 64]);
+
+    let err = envelope
+        .verify_authenticated(&mut replay_guard, now)
+        .expect_err("invalid signature must fail");
+    assert!(matches!(err, VerifyError::Crypto(_)));
+
+    let source = std::error::Error::source(&err).expect("crypto source must be chained");
+    assert!(
+        source.to_string().contains("signature verification failed")
+            || source.to_string().contains("invalid signature"),
+        "unexpected source text: {}",
+        source
+    );
+    // Keep `auth` referenced so this test mirrors signed-path setup and avoids future drift.
+    let _ = auth;
+}
+
+#[test]
 fn authenticated_verifier_verify_and_unwrap_with_time() {
     let keypair = KeyPair::from_seed([17u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());

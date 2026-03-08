@@ -138,6 +138,8 @@ impl std::fmt::Display for SwarmConfigError {
     }
 }
 
+impl std::error::Error for SwarmConfigError {}
+
 impl SwarmConfig {
     /// Validate configuration.
     pub fn validate(&self) -> std::result::Result<(), SwarmConfigError> {

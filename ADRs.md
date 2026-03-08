@@ -3749,12 +3749,13 @@ These placeholders are implemented in `swarm-torch-core::dataops` and MUST be us
 **Date:** 2026-02-08  
 **Deciders:** Core Team
 
-**Implementation Status (2026-02-13):** Partial (execution trust/policy + unsafe-surface artifacting implemented; sandbox host/runtime enforcement remains planned)
+**Implementation Status (2026-03-09):** Partial (execution trust/policy + unsafe-surface artifacting implemented; `OpRunner::Error` contract tightened via `OpRunnerError`; sandbox host/runtime enforcement remains planned)
 
 ### Conformance Hooks (Current)
 
 - `cargo test -p swarm-torch-core execution::tests::policy_denies_unsafe_extension`
 - `cargo test -p swarm-torch-core execution::tests::policy_denies_sandboxed_extension`
+- `cargo test -p swarm-torch-core execution::tests::op_runner_error_contract_accepts_io_error`
 - `cargo test -p swarm-torch unsafe_reasons`
 - `cargo test -p swarm-torch report::tests::report_warning_lists_unsafe_materialization_reasons`
 

@@ -23,32 +23,82 @@ impl core::fmt::Display for ModelError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_unit_f32(&mut self) -> f32 {
+        // 53-bit precision path for stable [0, 1) generation.
+        let u = self.next_u64() >> 11;
+        (u as f64 * (1.0 / ((1u64 << 53) as f64))) as f32
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct LinearModel {
+pub struct LinearModelWithCapacity<const MAX_PARAMS: usize = 144, const MAX_OUTPUT: usize = 16> {
     /// Parameter buffer:
     /// `[0..weight_count)` = weights, `[weight_count..weight_count+output_dim)` = bias.
-    params: [f32; 144],
+    params: [f32; MAX_PARAMS],
     /// Input dimension
     input_dim: usize,
     /// Output dimension
     output_dim: usize,
 }
 
-impl Default for LinearModel {
+/// Backward-compatible default linear model type.
+pub type LinearModel = LinearModelWithCapacity<144, 16>;
+
+impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> Default
+    for LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>
+{
     fn default() -> Self {
-        Self::new(8, 16).expect("default dimensions are valid")
+        let output_dim = MAX_OUTPUT.min(16).min(MAX_PARAMS);
+        let max_weight_capacity = MAX_PARAMS.saturating_sub(MAX_OUTPUT);
+        let input_dim = if output_dim == 0 {
+            0
+        } else {
+            (max_weight_capacity / output_dim).min(8)
+        };
+        Self::new(input_dim, output_dim).expect("default dimensions are valid for model capacity")
     }
 }
 
-impl LinearModel {
+impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize>
+    LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>
+{
     /// Create a new linear model
     pub fn new(input_dim: usize, output_dim: usize) -> core::result::Result<Self, ModelError> {
-        if input_dim.checked_mul(output_dim).map_or(true, |p| p > 128) || output_dim > 16 {
+        let weight_count = input_dim
+            .checked_mul(output_dim)
+            .ok_or(ModelError::InvalidDimensions)?;
+        let max_weight_capacity = MAX_PARAMS.saturating_sub(MAX_OUTPUT);
+        let total = weight_count
+            .checked_add(output_dim)
+            .ok_or(ModelError::InvalidDimensions)?;
+        if weight_count > max_weight_capacity
+            || output_dim > MAX_OUTPUT
+            || output_dim > MAX_PARAMS
+            || total > MAX_PARAMS
+        {
             return Err(ModelError::InvalidDimensions);
         }
 
         Ok(Self {
-            params: [0.0; 144],
+            params: [0.0; MAX_PARAMS],
             input_dim,
             output_dim,
         })
@@ -70,24 +120,24 @@ impl LinearModel {
 
     /// Initialize with random weights
     pub fn with_random_init(mut self, seed: u64) -> Self {
-        // Simple LCG for reproducible random initialization
-        let mut state = seed;
+        // E-02: SplitMix64 gives stronger deterministic seeded initialization than LCG.
+        let mut rng = SplitMix64::new(seed);
         let weight_count = self.weight_count();
         for w in self.params[..weight_count].iter_mut() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *w = ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
+            *w = rng.next_unit_f32() - 0.5;
         }
         let bias_start = weight_count;
         let bias_end = bias_start + self.output_dim;
         for b in self.params[bias_start..bias_end].iter_mut() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = ((state >> 33) as f32 / (1u64 << 31) as f32) * 0.1;
+            *b = (rng.next_unit_f32() - 0.5) * 0.1;
         }
         self
     }
 }
 
-impl SwarmModel for LinearModel {
+impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> SwarmModel
+    for LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>
+{
     type Input = ();
     type Output = ();
     type Error = core::convert::Infallible;
@@ -176,5 +226,59 @@ mod tests {
         let model = LinearModel::new(8, 16).unwrap();
         let out = model.forward(&());
         assert!(out.is_ok());
+    }
+
+    #[test]
+    fn linear_model_init_is_seed_deterministic() {
+        let a = LinearModel::new(8, 16).unwrap().with_random_init(42);
+        let b = LinearModel::new(8, 16).unwrap().with_random_init(42);
+        let c = LinearModel::new(8, 16).unwrap().with_random_init(43);
+
+        assert_eq!(a.parameters(), b.parameters());
+        assert_ne!(a.parameters(), c.parameters());
+    }
+
+    #[test]
+    fn linear_model_init_distribution_sanity() {
+        let model = LinearModel::new(8, 16).unwrap().with_random_init(1337);
+        let params = model.parameters();
+        let n = params.len() as f32;
+        let mean = params.iter().copied().sum::<f32>() / n;
+        let var = params
+            .iter()
+            .map(|v| {
+                let d = *v - mean;
+                d * d
+            })
+            .sum::<f32>()
+            / n;
+
+        assert!(mean.abs() < 0.1, "mean drift too large: {mean}");
+        assert!(var > 1.0e-4, "variance too small: {var}");
+        assert!(var < 0.2, "variance too large: {var}");
+    }
+
+    #[test]
+    fn linear_model_const_generic_capacity_bounds() {
+        type TinyLinear = LinearModelWithCapacity<32, 4>;
+
+        assert!(TinyLinear::new(7, 4).is_ok(), "7*4=28 fits");
+        assert!(
+            matches!(TinyLinear::new(8, 4), Err(ModelError::InvalidDimensions)),
+            "8*4=32 exceeds MAX_PARAMS-MAX_OUTPUT (28)"
+        );
+        assert!(
+            matches!(TinyLinear::new(7, 5), Err(ModelError::InvalidDimensions)),
+            "output_dim exceeds MAX_OUTPUT"
+        );
+    }
+
+    #[test]
+    fn linear_model_rejects_output_dim_exceeding_param_capacity() {
+        type WeirdLinear = LinearModelWithCapacity<8, 32>;
+        assert!(
+            matches!(WeirdLinear::new(0, 16), Err(ModelError::InvalidDimensions)),
+            "output region must fit inside MAX_PARAMS even when MAX_OUTPUT is larger"
+        );
     }
 }

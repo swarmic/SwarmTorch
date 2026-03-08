@@ -305,7 +305,7 @@ pub enum VerifyError {
 impl core::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            VerifyError::Crypto(e) => write!(f, "crypto error: {:?}", e),
+            VerifyError::Crypto(e) => write!(f, "crypto error: {}", e),
             VerifyError::Replay(e) => write!(f, "replay error: {}", e),
             VerifyError::MissingSignature => write!(f, "missing signature"),
             VerifyError::InvalidSignatureLength { expected, found } => {
@@ -328,6 +328,7 @@ impl core::fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            VerifyError::Crypto(e) => Some(e),
             VerifyError::Replay(e) => Some(e),
             VerifyError::Time(e) => Some(e),
             _ => None,

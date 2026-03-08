@@ -8,6 +8,19 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "alloc")]
+fn topk_priority_cmp(a: &(usize, f32), b: &(usize, f32)) -> core::cmp::Ordering {
+    // Deterministic total order:
+    // 1) descending |value| (largest first)
+    // 2) ascending index (tie-breaker)
+    let abs_cmp = b.1.abs().total_cmp(&a.1.abs());
+    if abs_cmp == core::cmp::Ordering::Equal {
+        a.0.cmp(&b.0)
+    } else {
+        abs_cmp
+    }
+}
+
 /// Error type for compression operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressionError {
@@ -37,6 +50,9 @@ impl core::fmt::Display for CompressionError {
         }
     }
 }
+
+#[cfg(feature = "std")]
+impl std::error::Error for CompressionError {}
 
 /// Helper to convert usize length/index to u32 safely
 pub fn try_usize_to_u32(val: usize) -> core::result::Result<u32, CompressionError> {
@@ -133,20 +149,21 @@ impl CompressedGradient {
                 }
                 let k = k.max(1).min(gradients.len());
 
-                // Find top-k by absolute value
+                // E-01: selection-based TopK with deterministic tie handling.
                 let mut indexed: Vec<(usize, f32)> =
                     gradients.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                indexed.sort_by(|a, b| {
-                    b.1.abs()
-                        .partial_cmp(&a.1.abs())
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                });
+                if k < indexed.len() {
+                    indexed.select_nth_unstable_by(k, topk_priority_cmp);
+                    indexed.truncate(k);
+                }
 
-                let top_k: Vec<(usize, f32)> = indexed.into_iter().take(k).collect();
+                // Stabilize wire output regardless of selection internals.
+                indexed.sort_unstable_by_key(|(idx, _)| *idx);
+
                 let indices: core::result::Result<Vec<u32>, CompressionError> =
-                    top_k.iter().map(|(i, _)| try_usize_to_u32(*i)).collect();
+                    indexed.iter().map(|(i, _)| try_usize_to_u32(*i)).collect();
                 let indices = indices?;
-                let values: Vec<u8> = top_k.iter().flat_map(|(_, v)| v.to_le_bytes()).collect();
+                let values: Vec<u8> = indexed.iter().flat_map(|(_, v)| v.to_le_bytes()).collect();
 
                 Ok(Self {
                     method,
@@ -248,6 +265,27 @@ impl CompressedGradient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeSet;
+
+    fn topk_reference_sparse(gradients: &[f32], k_ratio: f32) -> (Vec<u32>, Vec<u8>) {
+        let raw = (gradients.len() as f32) * k_ratio;
+        let mut k = raw as usize;
+        if (k as f32) < raw {
+            k = k.saturating_add(1);
+        }
+        let k = k.max(1).min(gradients.len());
+
+        let mut indexed: Vec<(usize, f32)> =
+            gradients.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(topk_priority_cmp);
+        indexed.truncate(k);
+        indexed.sort_unstable_by_key(|(idx, _)| *idx);
+
+        (
+            indexed.iter().map(|(i, _)| *i as u32).collect(),
+            indexed.iter().flat_map(|(_, v)| v.to_le_bytes()).collect(),
+        )
+    }
 
     #[test]
     fn decompress_rejects_sparse_index_value_mismatch() {
@@ -464,5 +502,87 @@ mod tests {
             CompressionError::InvalidScale,
             "decompress must reject NaN scale (crafted payload)"
         );
+    }
+
+    #[test]
+    fn topk_selection_matches_sort_semantics() {
+        let gradients = vec![
+            1.0, -3.0, 3.0, 0.2, -0.2, 8.0, -8.0, 5.0, -5.0, 0.0, -1.5, 1.5,
+        ];
+        let k_ratio = 0.25;
+        let compressed =
+            CompressedGradient::compress(&gradients, CompressionMethod::TopK { k_ratio }).unwrap();
+        let (expected_indices, expected_values) = topk_reference_sparse(&gradients, k_ratio);
+
+        match compressed.data {
+            CompressedData::Sparse { indices, values } => {
+                assert_eq!(indices, expected_indices);
+                assert_eq!(values, expected_values);
+            }
+            _ => panic!("expected sparse data for TopK"),
+        }
+    }
+
+    #[test]
+    fn topk_selection_deterministic_with_ties() {
+        // Absolute-value ties at the boundary stress deterministic selection.
+        let gradients = vec![2.0, -2.0, 2.0, -2.0, 1.0, -1.0, 1.0, -1.0];
+        let method = CompressionMethod::TopK { k_ratio: 0.5 };
+
+        let a = CompressedGradient::compress(&gradients, method.clone()).unwrap();
+        let b = CompressedGradient::compress(&gradients, method).unwrap();
+
+        match (&a.data, &b.data) {
+            (
+                CompressedData::Sparse {
+                    indices: a_i,
+                    values: a_v,
+                },
+                CompressedData::Sparse {
+                    indices: b_i,
+                    values: b_v,
+                },
+            ) => {
+                assert_eq!(a_i, b_i);
+                assert_eq!(a_v, b_v);
+                let uniq: BTreeSet<u32> = a_i.iter().copied().collect();
+                assert_eq!(uniq.len(), a_i.len());
+            }
+            _ => panic!("expected sparse TopK outputs"),
+        }
+    }
+
+    #[test]
+    fn topk_selection_matches_sort_semantics_across_shapes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let sizes = [1usize, 2, 3, 7, 16, 33, 127];
+        let ratios = [0.01f32, 0.1, 0.25, 0.5, 0.9, 1.0];
+
+        for len in sizes {
+            let mut gradients = Vec::with_capacity(len);
+            for i in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let x = ((state >> 16) as u32) as f32 / (u32::MAX as f32);
+                let sign = if (i & 1) == 0 { 1.0 } else { -1.0 };
+                gradients.push(sign * (x - 0.5) * 10.0);
+            }
+
+            for k_ratio in ratios {
+                let compressed =
+                    CompressedGradient::compress(&gradients, CompressionMethod::TopK { k_ratio })
+                        .expect("topk compression should succeed");
+                let (expected_indices, expected_values) =
+                    topk_reference_sparse(&gradients, k_ratio);
+                match compressed.data {
+                    CompressedData::Sparse { indices, values } => {
+                        assert_eq!(indices, expected_indices, "len={len} k_ratio={k_ratio}");
+                        assert_eq!(values, expected_values, "len={len} k_ratio={k_ratio}");
+                    }
+                    _ => panic!("expected sparse data for TopK"),
+                }
+            }
+        }
     }
 }

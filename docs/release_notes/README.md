@@ -25,6 +25,8 @@ New contributors should read these in order:
 10. [`M4-02.5_replay_protection_hardening.md`](M4-02.5_replay_protection_hardening.md) — Replay/auth hardening follow-up
 11. [`v0.1.0-alpha.6x-wave0.md`](v0.1.0-alpha.6x-wave0.md) — Wave 0 remediation: replay boundary, identity canonicalization, fail-closed hashing, clock/telemetry integrity
 12. [`v0.1.0-alpha.6x-wave1.md`](v0.1.0-alpha.6x-wave1.md) — Wave 1 remediation: aggregation/compression/model safety guards, URI stripping, monotonic clock
+13. [`v0.1.0-alpha.6x-wave2.md`](v0.1.0-alpha.6x-wave2.md) — Wave 2 remediation: replay configurability, compression fail-closed, node validation, descriptor bounds, SwarmConfig/Topology constructors
+14. [`v0.1.0-alpha.6x-wave3.md`](v0.1.0-alpha.6x-wave3.md) — Wave 3 remediation: identity/crypto hardening, observe bounds enforcement, trait/model API batch, mock backpressure realism
 
 ## Versioning
 

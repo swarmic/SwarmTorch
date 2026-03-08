@@ -5,7 +5,7 @@
 use crate::Result;
 use swarm_torch_core::traits::PeerId;
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "std")]
 use alloc::vec::Vec;
 
 /// Reliability classification for transports

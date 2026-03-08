@@ -25,10 +25,9 @@ impl core::fmt::Display for ModelError {
 
 #[derive(Debug, Clone)]
 pub struct LinearModel {
-    /// Weight matrix (flattened, row-major)
-    pub weights: [f32; 128],
-    /// Bias vector
-    pub bias: [f32; 16],
+    /// Parameter buffer:
+    /// `[0..weight_count)` = weights, `[weight_count..weight_count+output_dim)` = bias.
+    pub params: [f32; 144],
     /// Input dimension
     pub input_dim: usize,
     /// Output dimension
@@ -49,22 +48,28 @@ impl LinearModel {
         }
 
         Ok(Self {
-            weights: [0.0; 128],
-            bias: [0.0; 16],
+            params: [0.0; 144],
             input_dim,
             output_dim,
         })
+    }
+
+    fn weight_count(&self) -> usize {
+        self.input_dim * self.output_dim
     }
 
     /// Initialize with random weights
     pub fn with_random_init(mut self, seed: u64) -> Self {
         // Simple LCG for reproducible random initialization
         let mut state = seed;
-        for w in self.weights.iter_mut() {
+        let weight_count = self.weight_count();
+        for w in self.params[..weight_count].iter_mut() {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             *w = ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
         }
-        for b in self.bias.iter_mut() {
+        let bias_start = weight_count;
+        let bias_end = bias_start + self.output_dim;
+        for b in self.params[bias_start..bias_end].iter_mut() {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             *b = ((state >> 33) as f32 / (1u64 << 31) as f32) * 0.1;
         }
@@ -75,24 +80,28 @@ impl LinearModel {
 impl SwarmModel for LinearModel {
     type Input = ();
     type Output = ();
+    type Error = core::convert::Infallible;
 
-    fn forward(&self, _input: Self::Input) -> Self::Output {}
+    fn forward(&self, _input: &Self::Input) -> core::result::Result<Self::Output, Self::Error> {
+        Ok(())
+    }
 
     fn parameters(&self) -> &[f32] {
-        // Return weights as slice (bias handled separately for simplicity)
-        &self.weights[..self.input_dim * self.output_dim]
+        let len = self.weight_count() + self.output_dim;
+        &self.params[..len]
     }
 
     fn parameters_mut(&mut self) -> &mut [f32] {
-        &mut self.weights[..self.input_dim * self.output_dim]
+        let len = self.weight_count() + self.output_dim;
+        &mut self.params[..len]
     }
 
     fn load_parameters(&mut self, params: &[f32]) -> Result<()> {
-        let expected = self.input_dim * self.output_dim;
+        let expected = self.weight_count() + self.output_dim;
         if params.len() != expected {
             return Err(swarm_torch_core::Error::InvalidGradient);
         }
-        self.weights[..expected].copy_from_slice(params);
+        self.params[..expected].copy_from_slice(params);
         Ok(())
     }
 }
@@ -135,5 +144,27 @@ mod tests {
             Err(ModelError::InvalidDimensions)
         ));
         assert!(LinearModel::new(8, 16).is_ok());
+    }
+
+    #[test]
+    fn linear_model_parameters_include_bias() {
+        let model = LinearModel::new(8, 16).unwrap();
+        assert_eq!(model.parameters().len(), 8 * 16 + 16);
+    }
+
+    #[test]
+    fn linear_model_load_parameters_roundtrip_preserves_bias() {
+        let mut model = LinearModel::new(4, 3).unwrap();
+        let expected_len = 4 * 3 + 3;
+        let source: Vec<f32> = (0..expected_len).map(|i| i as f32 + 0.5).collect();
+        model.load_parameters(&source).unwrap();
+        assert_eq!(model.parameters(), source.as_slice());
+    }
+
+    #[test]
+    fn linear_model_forward_returns_ok_with_ref_input() {
+        let model = LinearModel::new(8, 16).unwrap();
+        let out = model.forward(&());
+        assert!(out.is_ok());
     }
 }

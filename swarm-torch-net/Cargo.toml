@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["std", "tcp-transport"]
-std = ["alloc", "swarm-torch-core/std", "tokio"]
+std = ["alloc", "swarm-torch-core/std", "tokio", "async-trait"]
 alloc = ["swarm-torch-core/alloc"]
 
 # Transport implementations
@@ -31,8 +31,8 @@ swarm-torch-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true }
 
-# Async trait for transport trait
-async-trait = "0.1"
+# Async trait for transport trait (std only)
+async-trait = { version = "0.1", optional = true }
 
 # Async runtime (optional, for std builds)
 tokio = { workspace = true, optional = true, features = ["net", "io-util"] }

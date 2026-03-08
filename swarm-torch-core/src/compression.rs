@@ -17,6 +17,10 @@ pub enum CompressionError {
     InvalidData,
     /// Decompressed index out of bounds
     IndexOutOfBounds,
+    /// Compression method is not yet implemented
+    UnsupportedMethod,
+    /// Quantization scale is invalid (non-finite, zero, or negative)
+    InvalidScale,
 }
 
 impl core::fmt::Display for CompressionError {
@@ -25,6 +29,11 @@ impl core::fmt::Display for CompressionError {
             Self::IndexOverflow => write!(f, "index value exceeds u32 capacity"),
             Self::InvalidData => write!(f, "invalid compressed data format"),
             Self::IndexOutOfBounds => write!(f, "decompressed index out of bounds"),
+            Self::UnsupportedMethod => write!(f, "compression method is not yet implemented"),
+            Self::InvalidScale => write!(
+                f,
+                "quantization scale is invalid (non-finite, zero, or negative)"
+            ),
         }
     }
 }
@@ -147,6 +156,10 @@ impl CompressedGradient {
                 })
             }
             CompressionMethod::Quantized { scale } => {
+                // L-03: reject non-finite, zero, or negative scales
+                if !scale.is_finite() || scale <= 0.0 {
+                    return Err(CompressionError::InvalidScale);
+                }
                 // Quantize to INT8
                 let bytes: Vec<u8> = gradients
                     .iter()
@@ -162,10 +175,8 @@ impl CompressedGradient {
                     data: CompressedData::Dense(bytes),
                 })
             }
-            _ => {
-                // Fallback to no compression for other methods
-                Self::compress(gradients, CompressionMethod::None)
-            }
+            CompressionMethod::RandomSparse { .. } => Err(CompressionError::UnsupportedMethod),
+            CompressionMethod::TopKQuantized { .. } => Err(CompressionError::UnsupportedMethod),
         }
     }
 
@@ -182,12 +193,16 @@ impl CompressedGradient {
                     .collect())
             }
             (CompressedData::Dense(bytes), CompressionMethod::Quantized { scale }) => {
+                // L-03: reject non-finite, zero, or negative scales on decompress too
+                if !scale.is_finite() || *scale <= 0.0 {
+                    return Err(CompressionError::InvalidScale);
+                }
                 if bytes.len() != self.num_elements {
                     return Err(CompressionError::InvalidData);
                 }
                 Ok(bytes.iter().map(|&b| (b as i8 as f32) * scale).collect())
             }
-            (CompressedData::Sparse { indices, values }, _) => {
+            (CompressedData::Sparse { indices, values }, CompressionMethod::TopK { .. }) => {
                 if values.len() % 4 != 0 || values.len() / 4 != indices.len() {
                     return Err(CompressionError::InvalidData);
                 }
@@ -201,6 +216,11 @@ impl CompressedGradient {
                     result[idx] = value;
                 }
                 Ok(result)
+            }
+            // NEW-06: unsupported methods must fail closed on decompress too.
+            (CompressedData::Sparse { .. }, CompressionMethod::RandomSparse { .. })
+            | (CompressedData::Sparse { .. }, CompressionMethod::TopKQuantized { .. }) => {
+                Err(CompressionError::UnsupportedMethod)
             }
             _ => Err(CompressionError::InvalidData),
         }
@@ -309,6 +329,140 @@ mod tests {
         assert_eq!(
             compressed.decompress().unwrap_err(),
             CompressionError::InvalidData
+        );
+    }
+
+    /// NEW-06: RandomSparse is not yet implemented and returns UnsupportedMethod.
+    #[test]
+    fn compress_random_sparse_returns_unsupported() {
+        let gradients = vec![1.0, 2.0, 3.0];
+        let result = CompressedGradient::compress(
+            &gradients,
+            CompressionMethod::RandomSparse { p: 0.5, seed: 42 },
+        );
+        assert_eq!(result.unwrap_err(), CompressionError::UnsupportedMethod);
+    }
+
+    /// NEW-06: TopKQuantized is not yet implemented and returns UnsupportedMethod.
+    #[test]
+    fn compress_topk_quantized_returns_unsupported() {
+        let gradients = vec![1.0, 2.0, 3.0];
+        let result = CompressedGradient::compress(
+            &gradients,
+            CompressionMethod::TopKQuantized {
+                k_ratio: 0.5,
+                scale: 1.0,
+            },
+        );
+        assert_eq!(result.unwrap_err(), CompressionError::UnsupportedMethod);
+    }
+
+    /// NEW-06: decompress must also reject sparse data paired with RandomSparse method.
+    #[test]
+    fn decompress_sparse_random_sparse_returns_unsupported() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::RandomSparse { p: 0.5, seed: 42 },
+            shape: vec![4],
+            num_elements: 4,
+            data: CompressedData::Sparse {
+                indices: vec![0, 1],
+                values: vec![0, 0, 128, 63, 0, 0, 0, 64], // 1.0f32, 2.0f32 in LE
+            },
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::UnsupportedMethod,
+            "sparse data with RandomSparse method must be rejected on decompress"
+        );
+    }
+
+    /// NEW-06: decompress must also reject sparse data paired with TopKQuantized method.
+    #[test]
+    fn decompress_sparse_topk_quantized_returns_unsupported() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::TopKQuantized {
+                k_ratio: 0.5,
+                scale: 1.0,
+            },
+            shape: vec![4],
+            num_elements: 4,
+            data: CompressedData::Sparse {
+                indices: vec![0, 1],
+                values: vec![0, 0, 128, 63, 0, 0, 0, 64], // 1.0f32, 2.0f32 in LE
+            },
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::UnsupportedMethod,
+            "sparse data with TopKQuantized method must be rejected on decompress"
+        );
+    }
+
+    // L-03: compress rejects invalid scales
+    #[test]
+    fn compress_quantized_rejects_zero_scale() {
+        let data = vec![1.0f32; 4];
+        let result =
+            CompressedGradient::compress(&data, CompressionMethod::Quantized { scale: 0.0 });
+        assert_eq!(result.unwrap_err(), CompressionError::InvalidScale);
+    }
+
+    #[test]
+    fn compress_quantized_rejects_nan_scale() {
+        let data = vec![1.0f32; 4];
+        let result =
+            CompressedGradient::compress(&data, CompressionMethod::Quantized { scale: f32::NAN });
+        assert_eq!(result.unwrap_err(), CompressionError::InvalidScale);
+    }
+
+    #[test]
+    fn compress_quantized_rejects_negative_scale() {
+        let data = vec![1.0f32; 4];
+        let result =
+            CompressedGradient::compress(&data, CompressionMethod::Quantized { scale: -1.0 });
+        assert_eq!(result.unwrap_err(), CompressionError::InvalidScale);
+    }
+
+    #[test]
+    fn compress_quantized_rejects_infinity_scale() {
+        let data = vec![1.0f32; 4];
+        let result = CompressedGradient::compress(
+            &data,
+            CompressionMethod::Quantized {
+                scale: f32::INFINITY,
+            },
+        );
+        assert_eq!(result.unwrap_err(), CompressionError::InvalidScale);
+    }
+
+    // L-03: decompress rejects crafted invalid scales
+    #[test]
+    fn decompress_quantized_rejects_zero_scale_crafted() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::Quantized { scale: 0.0 },
+            shape: vec![4],
+            num_elements: 4,
+            data: CompressedData::Dense(vec![10, 20, 30, 40]),
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::InvalidScale,
+            "decompress must reject zero scale (crafted payload)"
+        );
+    }
+
+    #[test]
+    fn decompress_quantized_rejects_nan_scale_crafted() {
+        let compressed = CompressedGradient {
+            method: CompressionMethod::Quantized { scale: f32::NAN },
+            shape: vec![4],
+            num_elements: 4,
+            data: CompressedData::Dense(vec![10, 20, 30, 40]),
+        };
+        assert_eq!(
+            compressed.decompress().unwrap_err(),
+            CompressionError::InvalidScale,
+            "decompress must reject NaN scale (crafted payload)"
         );
     }
 }

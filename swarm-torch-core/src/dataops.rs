@@ -409,15 +409,25 @@ pub fn sanitize_source_descriptor_v0(
     source: &SourceDescriptorV0,
 ) -> core::result::Result<SourceDescriptorV0, SourceDescriptorError> {
     let sanitized = normalize_and_redact_source_descriptor(source);
+    check_descriptor_bounds(&sanitized)?;
+    Ok(sanitized)
+}
 
-    if sanitized.uri.len() > MAX_SOURCE_URI_LEN {
+/// Shared bounds check for source descriptors.
+///
+/// Used by both the write-path (`sanitize_source_descriptor_v0`) and
+/// the read-path (`validate_source_descriptor_bounds`) to ensure
+/// one validation core with no drift.
+fn check_descriptor_bounds(
+    desc: &SourceDescriptorV0,
+) -> core::result::Result<(), SourceDescriptorError> {
+    if desc.uri.len() > MAX_SOURCE_URI_LEN {
         return Err(SourceDescriptorError::UriTooLong {
-            len: sanitized.uri.len(),
+            len: desc.uri.len(),
             max: MAX_SOURCE_URI_LEN,
         });
     }
-
-    if let Some(etag_or_version) = sanitized.etag_or_version.as_ref() {
+    if let Some(etag_or_version) = desc.etag_or_version.as_ref() {
         if etag_or_version.len() > MAX_ETAG_OR_VERSION_LEN {
             return Err(SourceDescriptorError::EtagOrVersionTooLong {
                 len: etag_or_version.len(),
@@ -425,8 +435,18 @@ pub fn sanitize_source_descriptor_v0(
             });
         }
     }
+    Ok(())
+}
 
-    Ok(sanitized)
+/// Validate source descriptor bounds without mutation (read-path check).
+///
+/// Returns `Ok(())` if the descriptor's URI and etag/version lengths are within
+/// acceptable limits. This function does not sanitize or redact — it is intended
+/// for use at deserialization boundaries (e.g., `load_report`).
+pub fn validate_source_descriptor_bounds(
+    desc: &SourceDescriptorV0,
+) -> core::result::Result<(), SourceDescriptorError> {
+    check_descriptor_bounds(desc)
 }
 
 fn auth_mode_marker_str(m: &AuthModeMarker) -> String {
@@ -965,5 +985,32 @@ mod tests {
             normalized.unsafe_surface,
             "missing provenance reason should mark record unsafe"
         );
+    }
+
+    // ── M-12: Read-path descriptor bounds validation ──
+
+    #[test]
+    fn validate_bounds_rejects_oversized_uri_on_read() {
+        let desc = SourceDescriptorV0 {
+            uri: "x".repeat(MAX_SOURCE_URI_LEN + 1),
+            content_type: "text/plain".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        assert!(matches!(
+            validate_source_descriptor_bounds(&desc),
+            Err(SourceDescriptorError::UriTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_bounds_accepts_within_limit_descriptor() {
+        let desc = SourceDescriptorV0 {
+            uri: "s3://bucket/path".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: Some("v1".to_string()),
+        };
+        assert!(validate_source_descriptor_bounds(&desc).is_ok());
     }
 }

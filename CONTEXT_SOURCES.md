@@ -9,7 +9,7 @@
 | [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) | Canonical SwarmTorch system model + conformance (SwarmTorch-only) |
 | [`ADRs.md`](ADRs.md) | All architectural decisions |
 | `swarm-torch-*` crates | Implementation source of truth |
-| [`readme.md`](readme.md) | Project overview, roadmap, usage |
+| [`README.md`](README.md) | Project overview, roadmap, usage |
 
 ## Secondary Sources (Reference Only)
 

@@ -1,6 +1,6 @@
 //! Integration tests for replay protection with message envelopes.
 
-use swarm_torch_core::crypto::{KeyPair, MessageAuth};
+use swarm_torch_core::crypto::{CryptoError, KeyPair, MessageAuth};
 use swarm_torch_core::replay::{ReplayError, ReplayProtection};
 use swarm_torch_core::traits::PeerId;
 use swarm_torch_net::protocol::{
@@ -35,7 +35,7 @@ fn signed_heartbeat(
 
 #[test]
 fn envelope_verify_authenticated_golden_path() {
-    let keypair = KeyPair::from_seed([1u8; 32]);
+    let keypair = KeyPair::from_seed([1u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -48,7 +48,7 @@ fn envelope_verify_authenticated_golden_path() {
 
 #[test]
 fn envelope_verify_authenticated_rejects_replay() {
-    let keypair = KeyPair::from_seed([2u8; 32]);
+    let keypair = KeyPair::from_seed([2u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -65,7 +65,7 @@ fn envelope_verify_authenticated_rejects_replay() {
 
 #[test]
 fn envelope_verify_authenticated_rejects_expired() {
-    let keypair = KeyPair::from_seed([3u8; 32]);
+    let keypair = KeyPair::from_seed([3u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let old_ts = 900;
@@ -80,7 +80,7 @@ fn envelope_verify_authenticated_rejects_expired() {
 
 #[test]
 fn envelope_verify_authenticated_signature_before_replay() {
-    let keypair = KeyPair::from_seed([4u8; 32]);
+    let keypair = KeyPair::from_seed([4u8; 32]).expect("non-zero seed");
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
 
@@ -138,7 +138,7 @@ fn envelope_verify_authenticated_rejects_wrong_signature_length() {
 
 #[test]
 fn envelope_verify_authenticated_rejects_tampered_payload() {
-    let keypair = KeyPair::from_seed([7u8; 32]);
+    let keypair = KeyPair::from_seed([7u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -154,7 +154,7 @@ fn envelope_verify_authenticated_rejects_tampered_payload() {
 
 #[test]
 fn envelope_verify_authenticated_monotonic_sequences() {
-    let keypair = KeyPair::from_seed([8u8; 32]);
+    let keypair = KeyPair::from_seed([8u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -170,7 +170,7 @@ fn envelope_verify_authenticated_monotonic_sequences() {
 
 #[test]
 fn envelope_verify_authenticated_out_of_order_within_window() {
-    let keypair = KeyPair::from_seed([9u8; 32]);
+    let keypair = KeyPair::from_seed([9u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -205,10 +205,10 @@ fn envelope_verify_authenticated_out_of_order_within_window() {
 
 #[test]
 fn envelope_verify_authenticated_multi_peer_isolation() {
-    let keypair_a = KeyPair::from_seed([10u8; 32]);
+    let keypair_a = KeyPair::from_seed([10u8; 32]).expect("non-zero seed");
     let auth_a = MessageAuth::new(keypair_a.clone());
 
-    let keypair_b = KeyPair::from_seed([11u8; 32]);
+    let keypair_b = KeyPair::from_seed([11u8; 32]).expect("non-zero seed");
     let auth_b = MessageAuth::new(keypair_b.clone());
 
     let mut replay_guard = ReplayProtection::new();
@@ -232,7 +232,7 @@ fn envelope_verify_authenticated_multi_peer_isolation() {
 
 #[test]
 fn new_with_public_key_uses_raw_bytes() {
-    let keypair = KeyPair::from_seed([12u8; 32]);
+    let keypair = KeyPair::from_seed([12u8; 32]).expect("non-zero seed");
     let envelope = MessageEnvelope::new_with_public_key(
         *keypair.public_key(),
         MessageType::Heartbeat,
@@ -245,7 +245,7 @@ fn new_with_public_key_uses_raw_bytes() {
 #[test]
 #[allow(deprecated)]
 fn new_with_peer_id_deprecated_but_works() {
-    let keypair = KeyPair::from_seed([13u8; 32]);
+    let keypair = KeyPair::from_seed([13u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -271,7 +271,7 @@ fn new_with_peer_id_deprecated_but_works() {
 
 #[test]
 fn verify_authenticated_rejects_hashed_peer_id() {
-    let keypair = KeyPair::from_seed([14u8; 32]);
+    let keypair = KeyPair::from_seed([14u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -308,7 +308,7 @@ fn current_unix_secs_returns_valid_timestamp() {
 
 #[test]
 fn verify_authenticated_requires_unix_seconds_not_millis() {
-    let keypair = KeyPair::from_seed([15u8; 32]);
+    let keypair = KeyPair::from_seed([15u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now_secs = 1_700_000_000;
@@ -351,8 +351,37 @@ fn verify_authenticated_rejects_unsupported_version() {
 }
 
 #[test]
+fn sender_peer_id_rejects_zero_sender() {
+    let envelope =
+        MessageEnvelope::new_with_public_key([0u8; 32], MessageType::Heartbeat, b"zero".to_vec());
+    assert!(matches!(
+        envelope.sender_peer_id(),
+        Err(CryptoError::InvalidPublicKey)
+    ));
+}
+
+#[test]
+fn verify_authenticated_rejects_zero_sender_key() {
+    let mut replay_guard = ReplayProtection::new();
+    let now = 1000;
+    let envelope = MessageEnvelope::new_with_public_key(
+        [0u8; 32],
+        MessageType::Heartbeat,
+        b"zero sender".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .with_signature(vec![0u8; 64]);
+
+    assert!(matches!(
+        envelope.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::InvalidSenderKey)
+    ));
+}
+
+#[test]
 fn authenticated_verifier_verify_and_unwrap_with_time() {
-    let keypair = KeyPair::from_seed([17u8; 32]);
+    let keypair = KeyPair::from_seed([17u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let now = 1000;
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"wrapped".to_vec());
@@ -378,7 +407,7 @@ fn authenticated_verifier_verify_and_unwrap_with_time() {
 /// PeerId matches the canonical `sender_peer_id()` derivation.
 #[test]
 fn h02_verify_path_uses_canonical_peer_id_for_replay() {
-    let keypair = KeyPair::from_seed([200u8; 32]);
+    let keypair = KeyPair::from_seed([200u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
     let mut replay_guard = ReplayProtection::new();
     let now = 1000;
@@ -417,7 +446,7 @@ fn h02_verify_path_uses_canonical_peer_id_for_replay() {
 
     // Verify sender_peer_id() matches the canonical derivation
     assert_eq!(
-        envelope1.sender_peer_id(),
+        envelope1.sender_peer_id().expect("valid sender key"),
         keypair.peer_id(),
         "sender_peer_id() must match KeyPair::peer_id() (canonical hash)"
     );

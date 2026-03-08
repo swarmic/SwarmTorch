@@ -16,10 +16,17 @@ use swarm_torch_core::dataops::{
     DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV1,
     MaterializationRecordV2,
 };
-use swarm_torch_core::observe::{EventRecord, MetricRecord, RunId, SpanRecord};
-use swarm_torch_core::run_graph::GraphV1;
+use swarm_torch_core::observe::{
+    validate_event_record, validate_metric_record, validate_span_record, EventRecord, MetricRecord,
+    RunId, SpanRecord,
+};
+use swarm_torch_core::run_graph::{validate_node_v1, GraphV1};
 
 const SCHEMA_VERSION_V1: u32 = 1;
+
+fn record_validation_error_to_io<E: core::fmt::Display>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ManifestV1 {
@@ -127,14 +134,17 @@ impl swarm_torch_core::observe::RunEventEmitter for RunArtifactSink {
     type Error = io::Error;
 
     fn emit_span(&self, span: &SpanRecord) -> Result<(), Self::Error> {
+        validate_span_record(span).map_err(record_validation_error_to_io)?;
         self.append_span(span)
     }
 
     fn emit_event(&self, event: &EventRecord) -> Result<(), Self::Error> {
+        validate_event_record(event).map_err(record_validation_error_to_io)?;
         self.append_event(event)
     }
 
     fn emit_metric(&self, metric: &MetricRecord) -> Result<(), Self::Error> {
+        validate_metric_record(metric).map_err(record_validation_error_to_io)?;
         self.append_metric(metric)
     }
 }
@@ -876,9 +886,17 @@ impl RunArtifactBundle {
 
     /// Write (replace) `graph.json` with a normalized graph.
     ///
-    /// This computes derived fields (`node_id`, `node_def_hash`) according to ADR-0017.
+    /// This validates node field bounds (M-09) and computes derived fields
+    /// (`node_id`, `node_def_hash`) according to ADR-0017.
+    ///
+    /// Returns `Err(InvalidData)` if any node violates M-09 field bounds.
     pub fn write_graph(&self, graph: &GraphV1) -> io::Result<()> {
         let mut g = graph.clone();
+        // M-09: validate node field bounds before persist (fail-closed).
+        for node in &g.nodes {
+            validate_node_v1(node)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        }
         for node in &mut g.nodes {
             if node.code_ref.as_deref().unwrap_or("").is_empty() {
                 node.code_ref = Some(format!("swarm-torch@{}", env!("CARGO_PKG_VERSION")));
@@ -891,14 +909,17 @@ impl RunArtifactBundle {
     }
 
     pub fn append_span(&self, span: &SpanRecord) -> io::Result<()> {
+        validate_span_record(span).map_err(record_validation_error_to_io)?;
         append_ndjson(&self.run_dir.join("spans.ndjson"), span)
     }
 
     pub fn append_event(&self, event: &EventRecord) -> io::Result<()> {
+        validate_event_record(event).map_err(record_validation_error_to_io)?;
         append_ndjson(&self.run_dir.join("events.ndjson"), event)
     }
 
     pub fn append_metric(&self, metric: &MetricRecord) -> io::Result<()> {
+        validate_metric_record(metric).map_err(record_validation_error_to_io)?;
         append_ndjson(&self.run_dir.join("metrics.ndjson"), metric)
     }
 
@@ -1219,10 +1240,12 @@ mod tests {
         MaterializationStatusV0, UnsafeReasonV0, MATERIALIZATION_SCHEMA_V2,
         MAX_ETAG_OR_VERSION_LEN, MAX_SOURCE_URI_LEN,
     };
-    use swarm_torch_core::observe::{AttrMap, SpanId, TraceId};
+    use swarm_torch_core::observe::{
+        AttrMap, AttrValue, RunEventEmitter, SpanId, TraceId, MAX_RECORD_ATTRS, MAX_RECORD_NAME_LEN,
+    };
     use swarm_torch_core::run_graph::{
         node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, ExecutionTrust,
-        GraphV1, NodeV1, OpKind,
+        GraphV1, NodeV1, OpKind, MAX_NODE_KEY_LEN,
     };
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -1283,6 +1306,93 @@ mod tests {
     }
 
     #[test]
+    fn emit_span_rejects_oversized_name_at_write_time() {
+        let base = temp_dir("emit_span_rejects_oversized_name");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([111u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = RunArtifactSink::new(bundle);
+
+        let span = SpanRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: SpanId::from_bytes([1u8; 8]),
+            parent_span_id: None,
+            name: "x".repeat(MAX_RECORD_NAME_LEN + 1),
+            start_unix_nanos: 1,
+            end_unix_nanos: Some(2),
+            attrs: AttrMap::new(),
+        };
+
+        let err = sink
+            .emit_span(&span)
+            .expect_err("oversized span name should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn emit_event_rejects_too_many_attrs_at_write_time() {
+        let base = temp_dir("emit_event_rejects_too_many_attrs");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([112u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = RunArtifactSink::new(bundle);
+
+        let mut attrs = AttrMap::new();
+        for i in 0..(MAX_RECORD_ATTRS + 1) {
+            attrs.insert(format!("k{i}"), AttrValue::Bool(true));
+        }
+        let event = EventRecord {
+            schema_version: 1,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "evt".to_string(),
+            attrs,
+        };
+
+        let err = sink
+            .emit_event(&event)
+            .expect_err("too many attrs should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn emit_metric_accepts_valid_record_at_write_time() {
+        let base = temp_dir("emit_metric_accepts_valid");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([113u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = RunArtifactSink::new(bundle);
+
+        let metric = MetricRecord {
+            schema_version: 1,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "m".to_string(),
+            value: 1.0,
+            unit: Some("count".to_string()),
+            attrs: AttrMap::new(),
+        };
+
+        sink.emit_metric(&metric)
+            .expect("valid metric should be accepted");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn graph_write_normalizes_ids_and_hashes() {
         let base = temp_dir("graph_write_normalizes");
         let _ = fs::remove_dir_all(&base);
@@ -1330,6 +1440,45 @@ mod tests {
         let digest = node_def_hash_v1(node).unwrap();
         let expected_hash = hex_lower(&digest);
         assert_eq!(node.node_def_hash.as_ref().unwrap(), &expected_hash);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// M-09: write_graph must reject nodes that violate field-bounds validation.
+    #[test]
+    fn write_graph_rejects_oversized_node_key() {
+        let base = temp_dir("write_graph_rejects_oversized");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([10u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+        let mut graph = GraphV1::default();
+        graph.nodes.push(NodeV1 {
+            node_key: "x".repeat(MAX_NODE_KEY_LEN + 1),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "validate".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: None,
+            unsafe_surface: false,
+            execution_trust: ExecutionTrust::Core,
+            node_def_hash: None,
+        });
+
+        let result = bundle.write_graph(&graph);
+        assert!(
+            result.is_err(),
+            "write_graph must reject oversized node_key"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("node_key length"),
+            "error should mention node_key length: {err_msg}"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

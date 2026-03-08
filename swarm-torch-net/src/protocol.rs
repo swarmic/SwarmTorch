@@ -84,8 +84,11 @@ impl MessageEnvelope {
     /// Derive sender `PeerId` from sender public key bytes.
     ///
     /// Uses the canonical SHA-256 hash derivation (available in all profiles).
-    pub fn sender_peer_id(&self) -> PeerId {
-        PeerId::from_public_key(&self.sender)
+    /// Returns `CryptoError::InvalidPublicKey` if sender bytes are all-zero.
+    pub fn sender_peer_id(
+        &self,
+    ) -> core::result::Result<PeerId, swarm_torch_core::crypto::CryptoError> {
+        PeerId::try_from_public_key_bytes(&self.sender)
     }
 
     /// Get current Unix time in seconds.
@@ -174,7 +177,12 @@ impl MessageEnvelope {
             .check_timestamp_only(self.timestamp, current_time)
             .map_err(VerifyError::Replay)?;
 
-        // 2. EXPENSIVE: Signature verification (CPU-intensive)
+        // 2. CHEAP: validate sender key before expensive signature verification.
+        let sender_id = self
+            .sender_peer_id()
+            .map_err(|_| VerifyError::InvalidSenderKey)?;
+
+        // 3. EXPENSIVE: Signature verification (CPU-intensive)
         let sig_bytes = self
             .signature
             .as_ref()
@@ -205,10 +213,7 @@ impl MessageEnvelope {
         )
         .map_err(VerifyError::Crypto)?;
 
-        // 3. STATEFUL: Replay check (mutates cache)
-        // Use canonical PeerId derivation (hash of public key) for consistency
-        // with KeyPair::peer_id() and PeerId::from_public_key().
-        let sender_id = PeerId::from_public_key(&self.sender);
+        // 4. STATEFUL: Replay check (mutates cache)
         replay_guard
             .validate_sequence(&sender_id, self.sequence)
             .map_err(VerifyError::Replay)?;
@@ -303,6 +308,8 @@ pub enum VerifyError {
         /// Unsupported minor version
         minor: u8,
     },
+    /// Sender public key is invalid (all-zeros or wrong length)
+    InvalidSenderKey,
     /// System time lookup failed
     Time(TimeError),
 }
@@ -324,6 +331,7 @@ impl core::fmt::Display for VerifyError {
             VerifyError::UnsupportedVersion { major, minor } => {
                 write!(f, "unsupported protocol version: {}.{}", major, minor)
             }
+            VerifyError::InvalidSenderKey => write!(f, "invalid sender key"),
             VerifyError::Time(e) => write!(f, "time error: {}", e),
         }
     }

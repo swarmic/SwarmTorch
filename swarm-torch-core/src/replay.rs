@@ -33,11 +33,13 @@ use alloc::collections::BTreeSet;
 #[cfg(feature = "alloc")]
 use lru::LruCache;
 
-/// Sequence tolerance window size (messages)
+/// Default sequence tolerance window size (messages).
 ///
 /// Allows minor out-of-order delivery while bounding replay risk.
 /// Set to 0 for strict monotonic enforcement.
-const SEQUENCE_TOLERANCE_WINDOW: usize = 16;
+const DEFAULT_SEQUENCE_TOLERANCE_WINDOW: usize = 16;
+/// Upper bound for configurable tolerance window.
+const MAX_SEQUENCE_TOLERANCE_WINDOW: usize = 256;
 const DEFAULT_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_MAX_CLOCK_SKEW_SECS: u32 = 60;
 
@@ -46,12 +48,22 @@ const DEFAULT_MAX_CLOCK_SKEW_SECS: u32 = 60;
 pub enum ReplayConfigError {
     /// Replay cache capacity must be non-zero.
     ZeroCapacity,
+    /// Tolerance window exceeds maximum.
+    ToleranceWindowTooLarge {
+        /// Requested window size.
+        window: usize,
+        /// Maximum allowed window size.
+        max: usize,
+    },
 }
 
 impl core::fmt::Display for ReplayConfigError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReplayConfigError::ZeroCapacity => write!(f, "capacity must be non-zero"),
+            ReplayConfigError::ToleranceWindowTooLarge { window, max } => {
+                write!(f, "tolerance window {window} exceeds maximum {max}")
+            }
         }
     }
 }
@@ -62,12 +74,16 @@ impl std::error::Error for ReplayConfigError {}
 /// Replay protection state
 ///
 /// Tracks per-peer sequence numbers and validates timestamp freshness.
+#[derive(Debug)]
 #[cfg(feature = "alloc")]
 pub struct ReplayProtection {
     /// Per-peer replay state (LRU eviction)
     peer_state: LruCache<PeerId, PeerReplayState>,
     /// Maximum clock skew tolerance (seconds)
     max_clock_skew_secs: u32,
+    /// Sequence tolerance window (messages). Out-of-order delivery
+    /// within this window is accepted; beyond it is rejected as `TooOld`.
+    tolerance_window: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -81,10 +97,12 @@ impl ReplayProtection {
             Some(capacity) => Self {
                 peer_state: LruCache::new(capacity),
                 max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
+                tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
             },
             None => Self {
                 peer_state: LruCache::new(core::num::NonZeroUsize::MIN),
                 max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
+                tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
             },
         }
     }
@@ -99,6 +117,35 @@ impl ReplayProtection {
         Ok(Self {
             peer_state: LruCache::new(non_zero_capacity),
             max_clock_skew_secs,
+            tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
+        })
+    }
+
+    /// Create with custom configuration including tolerance window (fallible).
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - Maximum number of peers to track (LRU eviction)
+    /// * `max_clock_skew_secs` - Maximum allowed clock skew in seconds
+    /// * `tolerance_window` - Sequence tolerance window (0 = strict monotonic,
+    ///   max [`MAX_SEQUENCE_TOLERANCE_WINDOW`] = 256)
+    pub fn try_with_tolerance_window(
+        capacity: usize,
+        max_clock_skew_secs: u32,
+        tolerance_window: usize,
+    ) -> Result<Self, ReplayConfigError> {
+        let non_zero_capacity =
+            core::num::NonZeroUsize::new(capacity).ok_or(ReplayConfigError::ZeroCapacity)?;
+        if tolerance_window > MAX_SEQUENCE_TOLERANCE_WINDOW {
+            return Err(ReplayConfigError::ToleranceWindowTooLarge {
+                window: tolerance_window,
+                max: MAX_SEQUENCE_TOLERANCE_WINDOW,
+            });
+        }
+        Ok(Self {
+            peer_state: LruCache::new(non_zero_capacity),
+            max_clock_skew_secs,
+            tolerance_window,
         })
     }
 
@@ -108,10 +155,17 @@ impl ReplayProtection {
     ///
     /// * `capacity` - Maximum number of peers to track (LRU eviction)
     /// * `max_clock_skew_secs` - Maximum allowed clock skew in seconds
+    #[deprecated(
+        since = "0.1.0-alpha.6x",
+        note = "Use `try_with_config` instead. This constructor panics on invalid input."
+    )]
     pub fn with_config(capacity: usize, max_clock_skew_secs: u32) -> Self {
         match Self::try_with_config(capacity, max_clock_skew_secs) {
             Ok(protection) => protection,
             Err(ReplayConfigError::ZeroCapacity) => panic!("capacity must be non-zero"),
+            Err(ReplayConfigError::ToleranceWindowTooLarge { .. }) => {
+                unreachable!("try_with_config uses default tolerance window")
+            }
         }
     }
 
@@ -133,8 +187,9 @@ impl ReplayProtection {
     ///
     /// Checks for duplicate or retrograde sequences and updates peer state.
     pub fn validate_sequence(&mut self, peer: &PeerId, seq: u64) -> Result<(), ReplayError> {
+        let tw = self.tolerance_window;
         match self.peer_state.get_mut(peer) {
-            Some(state) => state.validate_and_update(seq, *peer),
+            Some(state) => state.validate_and_update(seq, *peer, tw),
             None => {
                 // First message from this peer
                 self.peer_state.put(*peer, PeerReplayState::new(seq));
@@ -201,14 +256,19 @@ impl PeerReplayState {
         }
     }
 
-    fn validate_and_update(&mut self, seq: u64, peer: PeerId) -> Result<(), ReplayError> {
+    fn validate_and_update(
+        &mut self,
+        seq: u64,
+        peer: PeerId,
+        tolerance_window: usize,
+    ) -> Result<(), ReplayError> {
         // Check if already seen (duplicate)
         if self.recent_sequences.contains(&seq) {
             return Err(ReplayError::Replay { peer, seq });
         }
 
         // Check if too old (beyond tolerance window)
-        let max_acceptable_oldness = seq.saturating_add(SEQUENCE_TOLERANCE_WINDOW as u64);
+        let max_acceptable_oldness = seq.saturating_add(tolerance_window as u64);
         if max_acceptable_oldness <= self.last_sequence {
             return Err(ReplayError::TooOld {
                 peer,
@@ -224,10 +284,7 @@ impl PeerReplayState {
         }
 
         // Prune against the highest seen sequence so window is anchored to current frontier.
-        self.prune_old_sequences(
-            self.last_sequence
-                .saturating_sub(SEQUENCE_TOLERANCE_WINDOW as u64),
-        );
+        self.prune_old_sequences(self.last_sequence.saturating_sub(tolerance_window as u64));
 
         Ok(())
     }
@@ -402,7 +459,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_timestamp_too_old() {
-        let guard = ReplayProtection::with_config(100, 60);
+        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
         let now = 1000;
         let old_ts = now - 100; // Beyond 60s window
 
@@ -419,7 +476,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_timestamp_too_new() {
-        let guard = ReplayProtection::with_config(100, 60);
+        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
         let now = 1000;
         let future_ts = now + 100; // Beyond 60s window
 
@@ -436,7 +493,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_timestamp_within_skew_window() {
-        let guard = ReplayProtection::with_config(100, 60);
+        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
         let now = 1000;
 
         assert!(guard.check_timestamp_only(now - 50, now).is_ok());
@@ -448,7 +505,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_respects_capacity() {
-        let mut guard = ReplayProtection::with_config(10, 60);
+        let mut guard = ReplayProtection::try_with_config(10, 60).unwrap();
         let now = 1000;
 
         // Fill cache with 10 peers
@@ -518,10 +575,18 @@ mod tests {
         let peer = make_peer(1);
 
         // Insert out of order
-        assert!(state.validate_and_update(5, peer).is_ok());
-        assert!(state.validate_and_update(3, peer).is_ok());
-        assert!(state.validate_and_update(4, peer).is_ok());
-        assert!(state.validate_and_update(2, peer).is_ok());
+        assert!(state
+            .validate_and_update(5, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
+            .is_ok());
+        assert!(state
+            .validate_and_update(3, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
+            .is_ok());
+        assert!(state
+            .validate_and_update(4, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
+            .is_ok());
+        assert!(state
+            .validate_and_update(2, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
+            .is_ok());
 
         // BTreeSet maintains sorted order
         let sequences: Vec<u64> = state.recent_sequences.iter().copied().collect();
@@ -598,8 +663,8 @@ mod tests {
         let n: u64 = 100;
         assert!(guard.validate(&peer, n, now, now).is_ok());
 
-        // The boundary sequence: seq = N - SEQUENCE_TOLERANCE_WINDOW.
-        let boundary_seq = n - SEQUENCE_TOLERANCE_WINDOW as u64;
+        // The boundary sequence: seq = N - DEFAULT_SEQUENCE_TOLERANCE_WINDOW.
+        let boundary_seq = n - DEFAULT_SEQUENCE_TOLERANCE_WINDOW as u64;
 
         // First submission of boundary_seq must be rejected as TooOld
         // because seq + WINDOW <= last_sequence (boundary is now excluded).
@@ -626,7 +691,7 @@ mod tests {
         assert!(guard.validate(&peer, n, now, now).is_ok());
 
         // seq = N - WINDOW + 1 is strictly inside the window.
-        let inside_seq = n - SEQUENCE_TOLERANCE_WINDOW as u64 + 1;
+        let inside_seq = n - DEFAULT_SEQUENCE_TOLERANCE_WINDOW as u64 + 1;
         assert!(
             guard.validate(&peer, inside_seq, now, now).is_ok(),
             "sequence one inside the window must be accepted"
@@ -642,5 +707,77 @@ mod tests {
             }),
             "duplicate of accepted sequence must be Replay"
         );
+    }
+
+    /// M-03: Smaller configurable tolerance window rejects further out-of-order.
+    #[test]
+    fn configurable_tolerance_window_smaller_rejects_further_out_of_order() {
+        // Window of 4 instead of default 16.
+        let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 4).unwrap();
+        let peer = make_peer(200);
+        let now = 1000;
+
+        // Advance to seq 50.
+        assert!(guard.validate(&peer, 50, now, now).is_ok());
+
+        // seq 47 is within window (50 - 4 + 1 = 47).
+        assert!(guard.validate(&peer, 47, now, now).is_ok());
+
+        // seq 45 is outside window (50 - 4 = 46, boundary excluded).
+        let result = guard.validate(&peer, 45, now, now);
+        assert_eq!(
+            result,
+            Err(ReplayError::TooOld {
+                peer,
+                seq: 45,
+                last_seen: 50,
+            })
+        );
+    }
+
+    /// M-03: Zero tolerance window enforces strict monotonic ordering.
+    #[test]
+    fn configurable_tolerance_window_zero_enforces_strict_monotonic() {
+        let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 0).unwrap();
+        let peer = make_peer(201);
+        let now = 1000;
+
+        assert!(guard.validate(&peer, 10, now, now).is_ok());
+
+        // Any sequence <= 10 must be rejected (zero tolerance = strict monotonic).
+        let result = guard.validate(&peer, 10, now, now);
+        assert!(
+            result.is_err(),
+            "duplicate at zero tolerance must be rejected"
+        );
+
+        let result = guard.validate(&peer, 9, now, now);
+        assert_eq!(
+            result,
+            Err(ReplayError::TooOld {
+                peer,
+                seq: 9,
+                last_seen: 10,
+            })
+        );
+
+        // Forward sequence is still accepted.
+        assert!(guard.validate(&peer, 11, now, now).is_ok());
+    }
+
+    /// M-03: Tolerance window exceeding maximum is rejected.
+    #[test]
+    fn tolerance_window_too_large_rejected() {
+        let result = ReplayProtection::try_with_tolerance_window(100, 60, 257);
+        assert_eq!(
+            result.unwrap_err(),
+            ReplayConfigError::ToleranceWindowTooLarge {
+                window: 257,
+                max: MAX_SEQUENCE_TOLERANCE_WINDOW,
+            }
+        );
+
+        // Max value should be accepted.
+        assert!(ReplayProtection::try_with_tolerance_window(100, 60, 256).is_ok());
     }
 }

@@ -29,6 +29,9 @@ robust-aggregation = ["krum", "bulyan", "trimmed-mean"]
 telemetry = ["tracing"]
 defmt = ["dep:defmt"]
 
+# Experimental algorithms
+experimental-pso = []
+
 [dependencies]
 serde = { workspace = true }
 postcard = { workspace = true }

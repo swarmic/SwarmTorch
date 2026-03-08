@@ -1252,6 +1252,9 @@ pub enum MessageType {
 }
 ```
 
+`timestamp` is currently `u32` Unix seconds (overflow at 2106-02-07T06:28:15Z).
+Migration to `u64` is tracked as protocol v2 envelope debt.
+
 **Gradient compression protocol:**
 
 ```rust

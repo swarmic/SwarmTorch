@@ -58,10 +58,10 @@ pub enum RoundState {
 pub struct MembershipView {
     /// Known active peers
     #[cfg(feature = "alloc")]
-    pub active_peers: alloc::vec::Vec<PeerId>,
+    pub active_peers: alloc::collections::BTreeSet<PeerId>,
     /// Peers suspected to be offline
     #[cfg(feature = "alloc")]
-    pub suspected_peers: alloc::vec::Vec<PeerId>,
+    pub suspected_peers: alloc::collections::BTreeSet<PeerId>,
     /// Last update timestamp (unix seconds)
     pub last_updated: u64,
 }
@@ -77,6 +77,22 @@ impl MembershipView {
     #[cfg(feature = "alloc")]
     pub fn is_active(&self, peer: &PeerId) -> bool {
         self.active_peers.contains(peer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_is_active_set_lookup() {
+        let mut m = MembershipView::default();
+        let a = PeerId::new([1u8; 32]);
+        let b = PeerId::new([2u8; 32]);
+        m.active_peers.insert(a);
+        assert!(m.is_active(&a));
+        assert!(!m.is_active(&b));
+        assert_eq!(m.active_count(), 1);
     }
 }
 

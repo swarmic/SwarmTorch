@@ -12,8 +12,9 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use swarm_torch_core::dataops::{
-    DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
-    MaterializationRecordCompat, MaterializationRecordV2, TrustClass, UnsafeReasonV0,
+    validate_source_descriptor_bounds, DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1,
+    LineageEdgeV1, MaterializationRecordCompat, MaterializationRecordV2, TrustClass,
+    UnsafeReasonV0,
 };
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeId, NodeV1};
@@ -61,6 +62,20 @@ pub fn load_report(run_dir: impl AsRef<Path>) -> io::Result<Report> {
 
     let registry = apply_registry_updates(registry_snapshot, registry_updates);
     let lineage = apply_lineage_updates(lineage_snapshot, lineage_updates);
+
+    // M-12: Read-path descriptor bounds check (warn-and-continue).
+    // Historical bundles with oversized descriptors remain loadable;
+    // violations are logged but do not fail the load.
+    for entry in &registry.datasets {
+        if let Some(ref source) = entry.source {
+            if let Err(e) = validate_source_descriptor_bounds(source) {
+                eprintln!(
+                    "warning: descriptor bounds exceeded for {}: {e}",
+                    entry.asset_key
+                );
+            }
+        }
+    }
 
     let spans: Vec<SpanRecord> = read_ndjson(run_dir.join("spans.ndjson"))?;
     let events: Vec<EventRecord> = read_ndjson(run_dir.join("events.ndjson"))?;

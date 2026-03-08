@@ -63,6 +63,7 @@ pub use swarm_torch_net as net;
 pub use swarm_torch_runtime as runtime;
 
 // Re-export commonly used items at the top level
+#[allow(deprecated)]
 pub use swarm_torch_core::{
     aggregation::{self, RobustAggregation, RobustAggregator},
     algorithms::{ParticleSwarmConfig, Topology},
@@ -111,6 +112,47 @@ pub struct SwarmConfig {
     pub max_rounds: u64,
     /// Convergence threshold for early stopping
     pub convergence_threshold: f32,
+}
+
+/// SwarmConfig validation error (M-13).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwarmConfigError {
+    /// `max_rounds` must be non-zero.
+    MaxRoundsZero,
+    /// `convergence_threshold` must be a finite number.
+    ConvergenceThresholdNotFinite,
+    /// `convergence_threshold` must be non-negative.
+    ConvergenceThresholdNegative,
+}
+
+impl std::fmt::Display for SwarmConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MaxRoundsZero => write!(f, "max_rounds must be non-zero"),
+            Self::ConvergenceThresholdNotFinite => {
+                write!(f, "convergence_threshold must be finite")
+            }
+            Self::ConvergenceThresholdNegative => {
+                write!(f, "convergence_threshold must be non-negative")
+            }
+        }
+    }
+}
+
+impl SwarmConfig {
+    /// Validate configuration.
+    pub fn validate(&self) -> std::result::Result<(), SwarmConfigError> {
+        if self.max_rounds == 0 {
+            return Err(SwarmConfigError::MaxRoundsZero);
+        }
+        if !self.convergence_threshold.is_finite() {
+            return Err(SwarmConfigError::ConvergenceThresholdNotFinite);
+        }
+        if self.convergence_threshold < 0.0 {
+            return Err(SwarmConfigError::ConvergenceThresholdNegative);
+        }
+        Ok(())
+    }
 }
 
 impl Default for SwarmConfig {
@@ -163,6 +205,14 @@ impl SwarmConfigBuilder {
     /// Build the configuration
     pub fn build(self) -> SwarmConfig {
         self.config
+    }
+
+    /// Build the configuration with validation (M-13).
+    ///
+    /// Returns `Err` if configuration values are invalid.
+    pub fn try_build(self) -> std::result::Result<SwarmConfig, SwarmConfigError> {
+        self.config.validate()?;
+        Ok(self.config)
     }
 }
 
@@ -218,5 +268,44 @@ mod tests {
         let bytes = [1u8; 32];
         let peer = PeerId::new(bytes);
         assert_eq!(peer.as_bytes(), &bytes);
+    }
+
+    // ── M-13: SwarmConfig validation tests ──
+
+    #[test]
+    fn try_build_rejects_zero_max_rounds() {
+        let result = SwarmCluster::builder().max_rounds(0).try_build();
+        assert_eq!(result.unwrap_err(), SwarmConfigError::MaxRoundsZero);
+    }
+
+    #[test]
+    fn try_build_rejects_nan_threshold() {
+        let result = SwarmCluster::builder()
+            .convergence_threshold(f32::NAN)
+            .try_build();
+        assert_eq!(
+            result.unwrap_err(),
+            SwarmConfigError::ConvergenceThresholdNotFinite
+        );
+    }
+
+    #[test]
+    fn try_build_rejects_negative_threshold() {
+        let result = SwarmCluster::builder()
+            .convergence_threshold(-0.1)
+            .try_build();
+        assert_eq!(
+            result.unwrap_err(),
+            SwarmConfigError::ConvergenceThresholdNegative
+        );
+    }
+
+    #[test]
+    fn try_build_accepts_valid_config() {
+        let result = SwarmCluster::builder()
+            .max_rounds(50)
+            .convergence_threshold(0.001)
+            .try_build();
+        assert!(result.is_ok());
     }
 }

@@ -161,7 +161,15 @@ struct NodeDefCanonicalV1<'a> {
     params: &'a CanonParams,
 }
 
-/// Compute stable `node_id` from a human-stable `node_key`.
+/// Derive a stable [`NodeId`] from a human-readable `node_key`.
+///
+/// # Collision characteristics (M-08)
+///
+/// `NodeId` is 128-bit (16 bytes) derived from `SHA-256(node_key)` truncated to
+/// the first 16 bytes. The birthday-bound collision probability for `n` nodes is
+/// approximately `n² / 2¹²⁹`. For 10,000 nodes this is ~2⁻¹⁰³ — negligible
+/// for all practical graph sizes. If collision avoidance is ever required for
+/// cross-graph identity, consider using the full 32-byte SHA-256 digest.
 pub fn node_id_from_key(node_key: &str) -> NodeId {
     let digest = Sha256::digest(node_key.as_bytes());
     let mut bytes = [0u8; 16];
@@ -209,6 +217,100 @@ pub fn normalize_node_v1(mut node: NodeV1) -> Result<NodeV1, postcard::Error> {
     let digest = node_def_hash_v1(&node)?;
     node.node_def_hash = Some(hex_lower(&digest));
     Ok(node)
+}
+
+// ── NodeV1 write-path validation (M-09) ──────────────────────────
+
+/// Maximum length for `NodeV1.node_key`.
+pub const MAX_NODE_KEY_LEN: usize = 256;
+/// Maximum length for `NodeV1.op_type`.
+pub const MAX_OP_TYPE_LEN: usize = 128;
+/// Maximum number of inputs per node.
+pub const MAX_NODE_INPUTS: usize = 256;
+/// Maximum number of outputs per node.
+pub const MAX_NODE_OUTPUTS: usize = 256;
+/// Maximum number of entries in `NodeV1.params`.
+pub const MAX_PARAMS_COUNT: usize = 128;
+
+/// Validation error for `NodeV1` field bounds.
+///
+/// These checks are applied on the **write path** only (graph construction /
+/// artifact persistence). The read path (`load_report` → `normalize`) remains
+/// tolerant to avoid breaking historical bundles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeValidationError {
+    /// `node_key` exceeds `MAX_NODE_KEY_LEN` chars.
+    NodeKeyTooLong { len: usize, max: usize },
+    /// `op_type` exceeds `MAX_OP_TYPE_LEN` chars.
+    OpTypeTooLong { len: usize, max: usize },
+    /// Number of inputs exceeds `MAX_NODE_INPUTS`.
+    TooManyInputs { count: usize, max: usize },
+    /// Number of outputs exceeds `MAX_NODE_OUTPUTS`.
+    TooManyOutputs { count: usize, max: usize },
+    /// Number of params exceeds `MAX_PARAMS_COUNT`.
+    TooManyParams { count: usize, max: usize },
+}
+
+impl core::fmt::Display for NodeValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NodeKeyTooLong { len, max } => {
+                write!(f, "node_key length {len} exceeds maximum {max}")
+            }
+            Self::OpTypeTooLong { len, max } => {
+                write!(f, "op_type length {len} exceeds maximum {max}")
+            }
+            Self::TooManyInputs { count, max } => {
+                write!(f, "input count {count} exceeds maximum {max}")
+            }
+            Self::TooManyOutputs { count, max } => {
+                write!(f, "output count {count} exceeds maximum {max}")
+            }
+            Self::TooManyParams { count, max } => {
+                write!(f, "params count {count} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+/// Validate `NodeV1` field bounds (write-path only).
+///
+/// Returns `Ok(())` if all fields are within acceptable limits.
+///
+/// This function does NOT mutate the node. Call it before `normalize_node_v1`
+/// on the write path (graph construction / artifact persistence).
+pub fn validate_node_v1(node: &NodeV1) -> Result<(), NodeValidationError> {
+    if node.node_key.len() > MAX_NODE_KEY_LEN {
+        return Err(NodeValidationError::NodeKeyTooLong {
+            len: node.node_key.len(),
+            max: MAX_NODE_KEY_LEN,
+        });
+    }
+    if node.op_type.len() > MAX_OP_TYPE_LEN {
+        return Err(NodeValidationError::OpTypeTooLong {
+            len: node.op_type.len(),
+            max: MAX_OP_TYPE_LEN,
+        });
+    }
+    if node.inputs.len() > MAX_NODE_INPUTS {
+        return Err(NodeValidationError::TooManyInputs {
+            count: node.inputs.len(),
+            max: MAX_NODE_INPUTS,
+        });
+    }
+    if node.outputs.len() > MAX_NODE_OUTPUTS {
+        return Err(NodeValidationError::TooManyOutputs {
+            count: node.outputs.len(),
+            max: MAX_NODE_OUTPUTS,
+        });
+    }
+    if node.params.len() > MAX_PARAMS_COUNT {
+        return Err(NodeValidationError::TooManyParams {
+            count: node.params.len(),
+            max: MAX_PARAMS_COUNT,
+        });
+    }
+    Ok(())
 }
 
 impl GraphV1 {
@@ -268,5 +370,72 @@ mod tests {
         let h2 = node.node_def_hash.clone().unwrap();
 
         assert_ne!(h1, h2);
+    }
+
+    // ── M-09 validation tests ──
+
+    fn make_valid_node() -> NodeV1 {
+        NodeV1 {
+            node_key: "prep/clean".to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "validate".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: None,
+            unsafe_surface: false,
+            execution_trust: ExecutionTrust::Core,
+            node_def_hash: None,
+        }
+    }
+
+    #[test]
+    fn valid_node_passes_validation() {
+        assert!(validate_node_v1(&make_valid_node()).is_ok());
+    }
+
+    #[test]
+    fn node_key_too_long_rejected() {
+        let mut node = make_valid_node();
+        node.node_key = "x".repeat(MAX_NODE_KEY_LEN + 1);
+        assert_eq!(
+            validate_node_v1(&node),
+            Err(NodeValidationError::NodeKeyTooLong {
+                len: MAX_NODE_KEY_LEN + 1,
+                max: MAX_NODE_KEY_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn op_type_too_long_rejected() {
+        let mut node = make_valid_node();
+        node.op_type = "x".repeat(MAX_OP_TYPE_LEN + 1);
+        assert_eq!(
+            validate_node_v1(&node),
+            Err(NodeValidationError::OpTypeTooLong {
+                len: MAX_OP_TYPE_LEN + 1,
+                max: MAX_OP_TYPE_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn too_many_inputs_rejected() {
+        let mut node = make_valid_node();
+        node.inputs = (0..MAX_NODE_INPUTS + 1)
+            .map(|i| AssetRefV1 {
+                asset_key: format!("dataset://ns/{i}"),
+                fingerprint: None,
+            })
+            .collect();
+        assert_eq!(
+            validate_node_v1(&node),
+            Err(NodeValidationError::TooManyInputs {
+                count: MAX_NODE_INPUTS + 1,
+                max: MAX_NODE_INPUTS,
+            })
+        );
     }
 }

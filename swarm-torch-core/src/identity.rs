@@ -20,12 +20,16 @@ pub enum NodeRole {
     Gateway,
 }
 
-/// Node identity containing keys and role
+/// Node identity containing keys and role.
+///
+/// `id` and `key_pair` are private to enforce the invariant `id == key_pair.peer_id()`.
+/// Use [`NodeIdentity::new`] (or convenience constructors) to create instances,
+/// and [`NodeIdentity::id()`] / [`NodeIdentity::key_pair()`] for read access.
 pub struct NodeIdentity {
-    /// Unique node ID (derived from public key)
-    pub id: PeerId,
-    /// Cryptographic key pair
-    pub key_pair: KeyPair,
+    /// Unique node ID (derived from public key) — private to enforce invariant.
+    id: PeerId,
+    /// Cryptographic key pair — private; mutation would break id invariant.
+    key_pair: KeyPair,
     /// Role in the swarm
     pub role: NodeRole,
     /// Human-readable name (optional)
@@ -34,7 +38,9 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
-    /// Create a new node identity from a key pair
+    /// Create a new node identity from a key pair.
+    ///
+    /// `id` is always derived from `key_pair.peer_id()` to enforce the identity invariant.
     pub fn new(key_pair: KeyPair, role: NodeRole) -> Self {
         let id = key_pair.peer_id();
         Self {
@@ -44,6 +50,21 @@ impl NodeIdentity {
             #[cfg(feature = "alloc")]
             name: None,
         }
+    }
+
+    /// Get the node's peer identity (immutable).
+    ///
+    /// Always equals `key_pair().peer_id()`.
+    pub fn id(&self) -> &PeerId {
+        &self.id
+    }
+
+    /// Get the node's cryptographic key pair (immutable).
+    ///
+    /// No mutable accessor is provided — changing the key pair would desync `id`.
+    /// To change identity, construct a new `NodeIdentity`.
+    pub fn key_pair(&self) -> &KeyPair {
+        &self.key_pair
     }
 
     /// Create a new contributor identity
@@ -71,6 +92,29 @@ impl NodeIdentity {
     /// Check if this node can contribute updates
     pub fn can_contribute(&self) -> bool {
         matches!(self.role, NodeRole::Coordinator | NodeRole::Contributor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KeyPair;
+
+    #[test]
+    fn node_identity_id_always_equals_keypair_peer_id() {
+        let kp = KeyPair::from_seed([42u8; 32]).expect("non-zero seed");
+        let identity = NodeIdentity::new(kp.clone(), NodeRole::Contributor);
+        assert_eq!(*identity.id(), kp.peer_id());
+    }
+
+    #[test]
+    fn node_identity_getters_return_correct_values() {
+        let kp = KeyPair::from_seed([7u8; 32]).expect("non-zero seed");
+        let expected_id = kp.peer_id();
+        let identity = NodeIdentity::coordinator(kp);
+        assert_eq!(*identity.id(), expected_id);
+        assert_eq!(identity.key_pair().peer_id(), expected_id);
+        assert_eq!(identity.role, NodeRole::Coordinator);
     }
 }
 

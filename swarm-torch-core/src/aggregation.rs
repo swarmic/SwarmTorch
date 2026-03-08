@@ -65,10 +65,15 @@ impl RobustAggregator for FedAvg {
             let n = updates.len() as f32;
             let mut result = alloc::vec![0.0f32; dim];
 
+            // Sum all gradients first to minimize floating-point rounding drift.
             for update in updates {
                 for (slot, &gradient) in result.iter_mut().zip(update.gradients.iter()) {
-                    *slot += gradient / n;
+                    *slot += gradient;
                 }
+            }
+            // Single division pass after accumulation.
+            for slot in result.iter_mut() {
+                *slot /= n;
             }
 
             Ok(result)
@@ -87,15 +92,33 @@ impl RobustAggregator for FedAvg {
     }
 }
 
-/// Trimmed mean aggregator - discards top/bottom k% of values per coordinate
+/// Trimmed mean aggregator — discards top/bottom k% of values per coordinate.
+///
+/// # Rounding Behavior (M-10)
+///
+/// - `trim_ratio` is clamped to `[0.0, 0.49]` by [`TrimmedMean::new`].
+///   A ratio of 0.49 trims nearly half from each end.
+/// - The trim count is computed as `((n as f32) * trim_ratio) as usize`,
+///   which truncates toward zero. For small peer counts this means fewer
+///   values are actually trimmed than the ratio might suggest.
+/// - If the trim count leaves no values (`n <= 2 * trim_count`), the guard
+///   returns [`Error::InsufficientUpdates`](crate::Error::InsufficientUpdates).
+/// - The guard is only reachable via direct struct construction (bypassing
+///   `new()`'s clamp) when using a `trim_ratio` above 0.49.
 #[derive(Debug, Clone)]
 pub struct TrimmedMean {
-    /// Fraction of values to trim from each end (e.g., 0.2 for 20%)
+    /// Fraction of values to trim from each end (e.g., 0.2 for 20%).
+    ///
+    /// Clamped to `[0.0, 0.49]` by [`TrimmedMean::new`].
     pub trim_ratio: f32,
 }
 
 impl TrimmedMean {
-    /// Create a new TrimmedMean aggregator
+    /// Create a new TrimmedMean aggregator.
+    ///
+    /// `trim_ratio` is clamped to `[0.0, 0.49]`. A value of 0.0 produces
+    /// a simple mean (no trimming). Values above 0.49 are capped to prevent
+    /// all peers from being trimmed.
     pub fn new(trim_ratio: f32) -> Self {
         Self {
             trim_ratio: trim_ratio.clamp(0.0, 0.49),
@@ -348,5 +371,62 @@ mod tests {
         let krum = Krum::new(0); // 0 byzantine to keep `n < 2*f + 3` check satisfied
         let result = krum.aggregate(&updates);
         assert!(matches!(result, Err(crate::Error::ResourceExhausted)));
+    }
+
+    /// NEW-04: FedAvg sum-then-divide produces results matching f64 oracle
+    /// within 1e-6 relative tolerance.
+    #[test]
+    fn fedavg_sum_then_divide_precision() {
+        // Use many small values where per-element division would drift.
+        let n = 100;
+        let dim = 4;
+        let updates: Vec<GradientUpdate> = (0..n)
+            .map(|i| {
+                let base = (i as f32) * 0.001 + 1e-7;
+                update(vec![base; dim])
+            })
+            .collect();
+
+        let result = FedAvg.aggregate(&updates).unwrap();
+
+        // f64 oracle: compute exact mean in double precision.
+        for (d, &actual_f32) in result.iter().enumerate() {
+            let oracle: f64 =
+                updates.iter().map(|u| u.gradients[d] as f64).sum::<f64>() / (n as f64);
+            let actual = actual_f32 as f64;
+            let rel_err = if oracle.abs() > 1e-15 {
+                (actual - oracle).abs() / oracle.abs()
+            } else {
+                (actual - oracle).abs()
+            };
+            assert!(
+                rel_err < 1e-6,
+                "FedAvg precision drift: dim={d}, oracle={oracle}, actual={actual}, rel_err={rel_err}"
+            );
+        }
+    }
+
+    /// M-10: TrimmedMean::new() clamp prevents all-trimmed via normal construction.
+    #[test]
+    fn trimmed_mean_new_clamps_ratio() {
+        let tm = TrimmedMean::new(0.6);
+        assert!(
+            (tm.trim_ratio - 0.49).abs() < f32::EPSILON,
+            "ratio above 0.49 should clamp"
+        );
+    }
+
+    /// M-10: InsufficientUpdates guard reachable via direct struct construction.
+    #[test]
+    fn trimmed_mean_direct_construction_insufficient_updates() {
+        // Direct construction bypasses new()'s clamp.
+        let tm = TrimmedMean { trim_ratio: 0.6 };
+        // 2 peers, 0.6 ratio: trim_count = (2 * 0.6) as usize = 1, n=2, 2<=2*1.
+        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0, 4.0])];
+        let result = tm.aggregate(&updates);
+        assert!(
+            matches!(result, Err(crate::Error::InsufficientUpdates)),
+            "guard should return InsufficientUpdates, got {result:?}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Roadmap
 
-For detailed milestones and current status, see the [**Roadmap section in README**](readme.md#roadmap).
+For detailed milestones and current status, see the [**Roadmap section in README**](README.md#roadmap).
 
 ## Quick Overview
 

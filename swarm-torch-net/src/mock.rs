@@ -57,12 +57,28 @@ impl MockTransport {
 
 /// A network of interconnected mock transports for testing
 #[cfg(feature = "alloc")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MockNetwork {
     /// Messages in transit
     pub messages: VecDeque<(PeerId, PeerId, Vec<u8>)>,
     /// Connected peers
     pub peers: Vec<PeerId>,
+    /// Maximum queued messages before backpressure error.
+    pub max_queue_depth: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl Default for MockNetwork {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+/// Mock network send error.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockTransportError {
+    QueueFull,
 }
 
 #[cfg(feature = "alloc")]
@@ -71,21 +87,32 @@ impl MockNetwork {
     pub fn new(num_peers: usize) -> Self {
         let peers = (0..num_peers)
             .map(|i| {
-                let mut bytes = [0u8; 32];
-                bytes[0] = i as u8;
-                PeerId::new(bytes)
+                let mut seed = [0u8; 40];
+                seed[..13].copy_from_slice(b"mock-peer-v1:");
+                seed[13..21].copy_from_slice(&(i as u64).to_le_bytes());
+                PeerId::from_public_key(&seed)
             })
             .collect();
 
         Self {
             messages: VecDeque::new(),
             peers,
+            max_queue_depth: 1024,
         }
     }
 
     /// Queue a message for delivery
-    pub fn send(&mut self, from: PeerId, to: PeerId, msg: Vec<u8>) {
+    pub fn send(
+        &mut self,
+        from: PeerId,
+        to: PeerId,
+        msg: Vec<u8>,
+    ) -> Result<(), MockTransportError> {
+        if self.messages.len() >= self.max_queue_depth {
+            return Err(MockTransportError::QueueFull);
+        }
         self.messages.push_back((from, to, msg));
+        Ok(())
     }
 
     /// Deliver the next message for a peer
@@ -98,5 +125,45 @@ impl MockNetwork {
     /// Get all peers in the network
     pub fn peers(&self) -> &[PeerId] {
         &self.peers
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_peer_ids_are_distinct_and_fully_populated() {
+        let net = MockNetwork::new(16);
+        let mut unique = std::collections::HashSet::new();
+        for peer in &net.peers {
+            unique.insert(*peer.as_bytes());
+            assert!(
+                peer.as_bytes().iter().any(|b| *b != 0),
+                "peer id should not be all-zero"
+            );
+        }
+        assert_eq!(unique.len(), 16, "peer IDs should be unique");
+    }
+
+    #[test]
+    fn mock_network_send_rejects_when_queue_full() {
+        let mut net = MockNetwork::new(2);
+        net.max_queue_depth = 1;
+        let a = net.peers[0];
+        let b = net.peers[1];
+        net.send(a, b, vec![1]).unwrap();
+        let err = net.send(a, b, vec![2]).unwrap_err();
+        assert_eq!(err, MockTransportError::QueueFull);
+    }
+
+    #[test]
+    fn mock_network_send_accepts_under_capacity() {
+        let mut net = MockNetwork::new(2);
+        net.max_queue_depth = 2;
+        let a = net.peers[0];
+        let b = net.peers[1];
+        assert!(net.send(a, b, vec![1]).is_ok());
+        assert!(net.send(a, b, vec![2]).is_ok());
     }
 }

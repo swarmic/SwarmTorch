@@ -3,6 +3,10 @@
 //! This module defines SwarmTorch's canonical ID types and record schemas for
 //! spans/events/metrics. The goal is to be compatible with W3C Trace Context and
 //! OpenTelemetry ID sizing, while remaining OTel-independent.
+//!
+//! Note (L-15): all `Display`/`Debug` implementations in this module use
+//! stack-based fixed buffers. No heap allocation occurs on the span formatting
+//! hot path.
 
 use core::fmt;
 
@@ -77,6 +81,12 @@ where
 {
     if serializer.is_human_readable() {
         // Rust 1.75 doesn't support `N * 2` in array lengths; use a fixed max buffer.
+        // L-08: 32-byte buffer only supports up to 16-byte IDs in hex mode.
+        if N > 16 {
+            return Err(serde::ser::Error::custom(
+                "observe hex buffer supports at most 16-byte IDs (N <= 16)",
+            ));
+        }
         let mut buf = [0u8; 32];
         let hex_len = N * 2;
         write_hex_lower(bytes, &mut buf[..hex_len]);
@@ -402,6 +412,80 @@ pub enum AttrValue {
 #[cfg(feature = "alloc")]
 pub type AttrMap = BTreeMap<String, AttrValue>;
 
+/// Maximum allowed length for span/event/metric record names.
+#[cfg(feature = "alloc")]
+pub const MAX_RECORD_NAME_LEN: usize = 256;
+/// Maximum number of attributes per record.
+#[cfg(feature = "alloc")]
+pub const MAX_RECORD_ATTRS: usize = 64;
+/// Maximum allowed length for attribute keys.
+#[cfg(feature = "alloc")]
+pub const MAX_ATTR_KEY_LEN: usize = 128;
+/// Maximum allowed length for string attribute values.
+#[cfg(feature = "alloc")]
+pub const MAX_ATTR_VALUE_STR_LEN: usize = 1024;
+
+/// Validation error for span/event/metric records.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordValidationError {
+    NameTooLong { len: usize },
+    TooManyAttrs { count: usize },
+    AttrKeyTooLong { key: String, len: usize },
+    AttrValueTooLong { key: String, len: usize },
+}
+
+#[cfg(feature = "alloc")]
+impl fmt::Display for RecordValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameTooLong { len } => write!(f, "record name length {len} exceeds maximum"),
+            Self::TooManyAttrs { count } => {
+                write!(f, "record attribute count {count} exceeds maximum")
+            }
+            Self::AttrKeyTooLong { key, len } => {
+                write!(f, "attribute key '{key}' length {len} exceeds maximum")
+            }
+            Self::AttrValueTooLong { key, len } => {
+                write!(
+                    f,
+                    "string attribute value for key '{key}' length {len} exceeds maximum"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "alloc", feature = "std"))]
+impl std::error::Error for RecordValidationError {}
+
+#[cfg(feature = "alloc")]
+fn validate_name_and_attrs(name: &str, attrs: &AttrMap) -> Result<(), RecordValidationError> {
+    if name.len() > MAX_RECORD_NAME_LEN {
+        return Err(RecordValidationError::NameTooLong { len: name.len() });
+    }
+    if attrs.len() > MAX_RECORD_ATTRS {
+        return Err(RecordValidationError::TooManyAttrs { count: attrs.len() });
+    }
+    for (key, value) in attrs {
+        if key.len() > MAX_ATTR_KEY_LEN {
+            return Err(RecordValidationError::AttrKeyTooLong {
+                key: key.clone(),
+                len: key.len(),
+            });
+        }
+        if let AttrValue::Str(s) = value {
+            if s.len() > MAX_ATTR_VALUE_STR_LEN {
+                return Err(RecordValidationError::AttrValueTooLong {
+                    key: key.clone(),
+                    len: s.len(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A span record (NDJSON line schema v1).
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -442,9 +526,28 @@ pub struct MetricRecord {
     pub attrs: AttrMap,
 }
 
+/// Validate a span record against size/count bounds (L-09).
+#[cfg(feature = "alloc")]
+pub fn validate_span_record(r: &SpanRecord) -> Result<(), RecordValidationError> {
+    validate_name_and_attrs(&r.name, &r.attrs)
+}
+
+/// Validate an event record against size/count bounds (L-09).
+#[cfg(feature = "alloc")]
+pub fn validate_event_record(r: &EventRecord) -> Result<(), RecordValidationError> {
+    validate_name_and_attrs(&r.name, &r.attrs)
+}
+
+/// Validate a metric record against size/count bounds (L-09).
+#[cfg(feature = "alloc")]
+pub fn validate_metric_record(r: &MetricRecord) -> Result<(), RecordValidationError> {
+    validate_name_and_attrs(&r.name, &r.attrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     #[test]
     fn trace_id_hex_roundtrip() {
@@ -488,5 +591,84 @@ mod tests {
             SpanId::parse_hex("abcd").unwrap_err(),
             ParseIdError::InvalidLength
         );
+    }
+
+    #[test]
+    fn serialize_id_hex_or_bytes_rejects_large_id_len() {
+        struct Id20([u8; 20]);
+        impl Serialize for Id20 {
+            fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serialize_id_hex_or_bytes::<S, 20>(&self.0, serializer)
+            }
+        }
+
+        let err = serde_json::to_string(&Id20([1u8; 20])).unwrap_err();
+        assert!(
+            err.to_string().contains("at most 16-byte IDs"),
+            "expected fail-closed N>16 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_span_rejects_oversized_name() {
+        let span = SpanRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: SpanId::from_bytes([2u8; 8]),
+            parent_span_id: None,
+            name: "x".repeat(MAX_RECORD_NAME_LEN + 1),
+            start_unix_nanos: 1,
+            end_unix_nanos: Some(2),
+            attrs: AttrMap::new(),
+        };
+        assert!(matches!(
+            validate_span_record(&span),
+            Err(RecordValidationError::NameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_span_rejects_too_many_attrs() {
+        let mut attrs = AttrMap::new();
+        for i in 0..(MAX_RECORD_ATTRS + 1) {
+            attrs.insert(format!("k{i}"), AttrValue::Bool(true));
+        }
+
+        let span = SpanRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: SpanId::from_bytes([2u8; 8]),
+            parent_span_id: None,
+            name: "span".to_string(),
+            start_unix_nanos: 1,
+            end_unix_nanos: Some(2),
+            attrs,
+        };
+
+        assert!(matches!(
+            validate_span_record(&span),
+            Err(RecordValidationError::TooManyAttrs { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_span_accepts_valid_record() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("k".to_string(), AttrValue::Str("v".to_string()));
+
+        let span = SpanRecord {
+            schema_version: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: SpanId::from_bytes([2u8; 8]),
+            parent_span_id: None,
+            name: "ok".to_string(),
+            start_unix_nanos: 1,
+            end_unix_nanos: Some(2),
+            attrs,
+        };
+        assert!(validate_span_record(&span).is_ok());
     }
 }

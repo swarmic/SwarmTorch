@@ -46,6 +46,36 @@ pub enum ExecutionTrust {
     UnsafeExtension,
 }
 
+/// Target portability profile for node scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredProfile {
+    EmbeddedMin,
+    EmbeddedAlloc,
+    EdgeStd,
+}
+
+/// Device role affinity hint (informational; planner may override).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceAffinity {
+    Coordinator,
+    AnyParticipant,
+}
+
+/// Optional scheduling hint for run-graph planning.
+///
+/// This metadata is intentionally excluded from `node_def_hash` and cache identity.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionHint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_profile: Option<PreferredProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_affinity: Option<DeviceAffinity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
+}
+
 /// A canonical JSON-like value that is stable for hashing and deterministic for serialization.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -121,6 +151,10 @@ pub struct NodeV1 {
     /// Encoding: lowercase hex of SHA-256 (64 chars).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_def_hash: Option<String>,
+
+    /// Optional scheduling hint — excluded from `node_def_hash` and cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_hint: Option<ExecutionHint>,
 }
 
 /// The executable graph file (`graph.json`) schema v1.
@@ -159,6 +193,7 @@ struct NodeDefCanonicalV1<'a> {
     inputs: &'a [AssetRefV1],
     outputs: &'a [AssetRefV1],
     params: &'a CanonParams,
+    // execution_hint is intentionally excluded: it is planner metadata, not op identity (F1).
 }
 
 /// Derive a stable [`NodeId`] from a human-readable `node_key`.
@@ -178,6 +213,8 @@ pub fn node_id_from_key(node_key: &str) -> NodeId {
 }
 
 /// Compute `node_def_hash` for a node (canonical binary encoding).
+///
+/// Excludes runtime/planner metadata such as `execution_hint`.
 pub fn node_def_hash_v1(node: &NodeV1) -> Result<[u8; 32], postcard::Error> {
     let code_ref = node.code_ref.as_deref().unwrap_or("");
     let canonical = NodeDefCanonicalV1 {
@@ -357,6 +394,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         };
 
         node = normalize_node_v1(node).unwrap();
@@ -387,6 +425,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 
@@ -437,5 +476,71 @@ mod tests {
                 max: MAX_NODE_INPUTS,
             })
         );
+    }
+
+    #[test]
+    fn execution_hint_excluded_from_node_def_hash() {
+        let mut a = make_valid_node();
+        let mut b = a.clone();
+        b.execution_hint = Some(ExecutionHint {
+            preferred_profile: Some(PreferredProfile::EdgeStd),
+            device_affinity: Some(DeviceAffinity::Coordinator),
+            memory_budget_bytes: Some(65_536),
+        });
+
+        let ha = node_def_hash_v1(&a).unwrap();
+        let hb = node_def_hash_v1(&b).unwrap();
+        assert_eq!(ha, hb, "execution_hint must not affect node_def_hash");
+
+        a = normalize_node_v1(a).unwrap();
+        b = normalize_node_v1(b).unwrap();
+        assert_eq!(a.node_def_hash, b.node_def_hash);
+    }
+
+    #[test]
+    fn node_v1_roundtrips_with_full_execution_hint() {
+        let mut node = make_valid_node();
+        node.execution_hint = Some(ExecutionHint {
+            preferred_profile: Some(PreferredProfile::EmbeddedAlloc),
+            device_affinity: Some(DeviceAffinity::AnyParticipant),
+            memory_budget_bytes: Some(32_768),
+        });
+
+        let json = serde_json::to_string(&node).unwrap();
+        let decoded: NodeV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.execution_hint, node.execution_hint);
+    }
+
+    #[test]
+    fn node_v1_roundtrips_with_no_execution_hint() {
+        let node = make_valid_node();
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(
+            !json.contains("execution_hint"),
+            "execution_hint should be omitted when None"
+        );
+        let decoded: NodeV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.execution_hint, None);
+    }
+
+    #[test]
+    fn graph_json_backward_compatible_without_hint_field() {
+        let json = r#"{
+            "schema_version": 1,
+            "nodes": [{
+                "node_key": "prep/clean",
+                "op_kind": "data",
+                "op_type": "validate",
+                "inputs": [],
+                "outputs": [],
+                "params": {},
+                "unsafe_surface": false,
+                "execution_trust": "core"
+            }],
+            "edges": []
+        }"#;
+        let graph: GraphV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.nodes[0].execution_hint.is_none());
     }
 }

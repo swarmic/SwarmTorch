@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use swarm_torch_core::dataops::{
     DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV1,
-    MaterializationRecordV2,
+    MaterializationRecordV2, TransformAuditV0,
 };
 use swarm_torch_core::observe::{
     validate_event_record, validate_metric_record, validate_span_record, EventRecord, MetricRecord,
@@ -328,6 +328,8 @@ pub struct DataOpsSession {
     snapshot_profile: SnapshotProfile,
     /// Monotonic DataOps mutation counter used for streaming compaction cadence.
     dataops_write_count: u64,
+    /// Transform audits to attach to the next materialization record(s).
+    pending_transform_audits: Vec<TransformAuditV0>,
 }
 
 impl DataOpsSession {
@@ -346,7 +348,15 @@ impl DataOpsSession {
             next_record_seq: 1,
             snapshot_profile,
             dataops_write_count: 0,
+            pending_transform_audits: Vec::new(),
         }
+    }
+
+    /// Record an applied update transform for the next materialization emission.
+    ///
+    /// These audits are attached to the next `materialize_node_outputs` call and then cleared.
+    pub fn record_transform_applied(&mut self, audit: &TransformAuditV0) {
+        self.pending_transform_audits.push(audit.clone());
     }
 
     /// Look up fingerprint (64-char hex) for an asset_key.
@@ -537,6 +547,12 @@ impl DataOpsSession {
         if !matches!(node.execution_trust, ExecutionTrust::Core) {
             unsafe_reasons.push(UnsafeReasonV0::UnsafeExtension);
         }
+        let applied_transforms = self.pending_transform_audits.clone();
+        if applied_transforms.iter().any(|audit| !audit.core_trusted)
+            && !unsafe_reasons.contains(&UnsafeReasonV0::UnsafeExtension)
+        {
+            unsafe_reasons.push(UnsafeReasonV0::UnsafeExtension);
+        }
         let unsafe_surface = !unsafe_reasons.is_empty();
         let output_trust = if unsafe_surface {
             TrustClass::Untrusted
@@ -638,6 +654,7 @@ impl DataOpsSession {
                 duration_ms: Some(duration_ms),
                 unsafe_surface,
                 unsafe_reasons: unsafe_reasons.clone(),
+                applied_transforms: applied_transforms.clone(),
                 status: MaterializationStatusV0::Ok,
                 error_code: None,
                 quality: None,
@@ -645,6 +662,8 @@ impl DataOpsSession {
             self.sink.append_materialization_v2(&mat)?;
             self.next_record_seq = self.next_record_seq.saturating_add(1);
         }
+
+        self.pending_transform_audits.clear();
 
         // 9. Snapshot compaction (strict or streaming cadence).
         self.record_dataops_mutation()
@@ -1237,7 +1256,7 @@ mod tests {
     use super::*;
     use swarm_torch_core::dataops::{
         cache_key_v0, CacheDecisionV0, MaterializationRecordCompat, MaterializationRecordV1,
-        MaterializationStatusV0, UnsafeReasonV0, MATERIALIZATION_SCHEMA_V2,
+        MaterializationStatusV0, TransformAuditV0, UnsafeReasonV0, MATERIALIZATION_SCHEMA_V2,
         MAX_ETAG_OR_VERSION_LEN, MAX_SOURCE_URI_LEN,
     };
     use swarm_torch_core::observe::{
@@ -1245,8 +1264,8 @@ mod tests {
         MAX_RECORD_ATTRS, MAX_RECORD_NAME_LEN,
     };
     use swarm_torch_core::run_graph::{
-        node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, ExecutionTrust,
-        GraphV1, NodeV1, OpKind, MAX_NODE_KEY_LEN,
+        node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, CanonValue, DeviceAffinity,
+        ExecutionHint, ExecutionTrust, GraphV1, NodeV1, OpKind, PreferredProfile, MAX_NODE_KEY_LEN,
     };
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -1450,6 +1469,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         });
 
         bundle.write_graph(&graph).unwrap();
@@ -1497,6 +1517,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         });
 
         let result = bundle.write_graph(&graph);
@@ -1509,6 +1530,45 @@ mod tests {
             err_msg.contains("node_key length"),
             "error should mention node_key length: {err_msg}"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_graph_accepts_node_with_execution_hint() {
+        let base = temp_dir("write_graph_accepts_execution_hint");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([55u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+        let mut graph = GraphV1::default();
+        graph.nodes.push(NodeV1 {
+            node_key: "prep/hinted".to_string(),
+            node_id: None,
+            op_kind: OpKind::Data,
+            op_type: "validate".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params: CanonParams::new(),
+            code_ref: None,
+            unsafe_surface: false,
+            execution_trust: ExecutionTrust::Core,
+            node_def_hash: None,
+            execution_hint: Some(ExecutionHint {
+                preferred_profile: Some(PreferredProfile::EdgeStd),
+                device_affinity: Some(DeviceAffinity::Coordinator),
+                memory_budget_bytes: Some(65_536),
+            }),
+        });
+
+        bundle
+            .write_graph(&graph)
+            .expect("execution_hint should be accepted on write path");
+        let on_disk: GraphV1 = read_json(&bundle.run_dir().join("graph.json")).unwrap();
+        assert_eq!(on_disk.nodes.len(), 1);
+        assert!(on_disk.nodes[0].execution_hint.is_some());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1530,6 +1590,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 
@@ -1563,6 +1624,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: trust,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 
@@ -2263,6 +2325,84 @@ mod tests {
             !row.unsafe_reasons.contains(&UnsafeReasonV0::UntrustedInput),
             "trusted input should not include UntrustedInput reason"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn untrusted_transform_audit_adds_unsafe_extension_reason() {
+        let base = temp_dir("unsafe_reasons_transform_audit");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([62u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = Arc::new(RunArtifactSink::new(bundle));
+        let mut session = DataOpsSession::new(Arc::clone(&sink));
+
+        let source = SourceDescriptorV0 {
+            uri: "s3://bucket/data".to_string(),
+            content_type: "application/parquet".to_string(),
+            auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        let ingest = make_source_node("ingest/s3");
+        session
+            .register_source(
+                "dataset://ns/trusted",
+                TrustClass::Trusted,
+                source,
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        session.record_transform_applied(&TransformAuditV0 {
+            transform_name: "dp_clip".to_string(),
+            core_trusted: false,
+            round_id: 1,
+        });
+
+        let transform = make_transform_node(
+            "transform/core_with_transform",
+            &["dataset://ns/trusted"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        session
+            .materialize_node_outputs(
+                &transform,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/out".to_string(),
+                    schema: None,
+                    rows: Some(10),
+                    bytes: Some(100),
+                }],
+                1000,
+                false,
+                10,
+            )
+            .unwrap();
+
+        let mat_path = sink
+            .bundle()
+            .run_dir()
+            .join("datasets")
+            .join("materializations.ndjson");
+        let content = fs::read_to_string(&mat_path).unwrap();
+        let rows: Vec<MaterializationRecordCompat> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let row = rows[0].clone().into_v2();
+
+        assert!(row.unsafe_surface);
+        assert!(row
+            .unsafe_reasons
+            .contains(&UnsafeReasonV0::UnsafeExtension));
+        assert_eq!(row.applied_transforms.len(), 1);
+        assert_eq!(row.applied_transforms[0].transform_name, "dp_clip");
+        assert!(!row.applied_transforms[0].core_trusted);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -28,6 +28,7 @@ New contributors should read these in order:
 13. [`v0.1.0-alpha.6x-wave2.md`](v0.1.0-alpha.6x-wave2.md) — Wave 2 remediation: replay configurability, compression fail-closed, node validation, descriptor bounds, SwarmConfig/Topology constructors
 14. [`v0.1.0-alpha.6x-wave3.md`](v0.1.0-alpha.6x-wave3.md) — Wave 3 remediation: identity/crypto hardening, observe bounds enforcement, trait/model API batch, mock backpressure realism
 15. [`v0.1.0-alpha.6x-wave4.md`](v0.1.0-alpha.6x-wave4.md) — Wave 4 remediation convergence: TopK throughput, model RNG/capacity evolution, OpRunner error contract, error chaining, v0.2 handoff gate
+16. [`v0.1.0-alpha.6x-wave5.md`](v0.1.0-alpha.6x-wave5.md) — v0.2 F-track rollout: ExecutionHint schema, transform-audit plumbing, UpdateTransform + aggregation pipeline + tracing
 
 ## Versioning
 

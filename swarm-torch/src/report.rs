@@ -276,6 +276,17 @@ fn format_unsafe_reasons(reasons: &[UnsafeReasonV0]) -> String {
         .join(",")
 }
 
+fn format_transform_names(transforms: &[swarm_torch_core::dataops::TransformAuditV0]) -> String {
+    if transforms.is_empty() {
+        return "none".to_string();
+    }
+    transforms
+        .iter()
+        .map(|t| t.transform_name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn render_svg(graph: &GraphV1, registry: &DatasetRegistryV1) -> String {
     let width = 900;
     let node_w = 820;
@@ -393,12 +404,13 @@ fn render_timeline(report: &Report) -> String {
     for m in &report.materializations {
         let derived_unsafe = node_unsafe_by_id.get(&m.node_id).copied().unwrap_or(true);
         let unsafe_reasons = format_unsafe_reasons(&m.unsafe_reasons);
+        let transforms = format_transform_names(&m.applied_transforms);
         rows.push(TimelineRow {
             ts: m.ts_unix_nanos,
             kind: "materialization",
             name: m.asset_key.clone(),
             detail: format!(
-                "rows={} bytes={} cache_hit={} unsafe={} unsafe_reasons={} node_id={} node_def_hash={}",
+                "rows={} bytes={} cache_hit={} unsafe={} unsafe_reasons={} transforms={} node_id={} node_def_hash={}",
                 m.rows
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".to_string()),
@@ -410,6 +422,7 @@ fn render_timeline(report: &Report) -> String {
                     .unwrap_or_else(|| "?".to_string()),
                 derived_unsafe,
                 unsafe_reasons,
+                transforms,
                 m.node_id,
                 &m.node_def_hash
             ),
@@ -552,7 +565,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use swarm_torch_core::dataops::{
         DatasetEntryV1, DatasetLineageV1, MaterializationRecordV1, MaterializationRecordV2,
-        MaterializationStatusV0, SourceDescriptorV0, TrustClass, UnsafeReasonV0,
+        MaterializationStatusV0, SourceDescriptorV0, TransformAuditV0, TrustClass, UnsafeReasonV0,
         MATERIALIZATION_SCHEMA_V2,
     };
     use swarm_torch_core::observe::{RunId, TraceId};
@@ -588,6 +601,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: trust,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 
@@ -691,6 +705,7 @@ mod tests {
             duration_ms: Some(50),
             unsafe_surface: false, // intentionally false: timeline should derive from node+registry.
             unsafe_reasons: Vec::new(),
+            applied_transforms: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,
@@ -767,6 +782,7 @@ mod tests {
                 UnsafeReasonV0::UntrustedInput,
                 UnsafeReasonV0::UnsafeExtension,
             ],
+            applied_transforms: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,
@@ -824,6 +840,7 @@ mod tests {
             duration_ms: Some(3),
             unsafe_surface: true,
             unsafe_reasons: vec![UnsafeReasonV0::MissingProvenance],
+            applied_transforms: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,
@@ -912,6 +929,7 @@ mod tests {
             cache_hit: Some(true),
             unsafe_surface: true,
             unsafe_reasons: Vec::new(),
+            applied_transforms: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: None,
@@ -931,6 +949,92 @@ mod tests {
         );
         assert_eq!(report.materializations[0].asset_key, "dataset://ns/v1");
         assert_eq!(report.materializations[1].asset_key, "dataset://ns/v2");
+        assert!(
+            report.materializations[0].applied_transforms.is_empty(),
+            "v1 compatibility rows should default to empty applied_transforms"
+        );
+        assert!(
+            report.materializations[1].applied_transforms.is_empty(),
+            "v2 row with no transform audits should remain empty"
+        );
+    }
+
+    #[test]
+    fn report_loads_record_with_and_without_applied_transforms() {
+        let base = temp_dir("compat_applied_transforms");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([79u8; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let node_id = TraceId::from_bytes([3u8; 16]);
+
+        let no_transforms = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 1,
+            ts_unix_nanos: 1000,
+            asset_key: "dataset://ns/no_transform".to_string(),
+            fingerprint_v0: "a".repeat(64),
+            node_id,
+            node_def_hash: "b".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec![],
+            input_fingerprints_v0: vec![],
+            rows: None,
+            bytes: None,
+            duration_ms: None,
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Unknown,
+            cache_reason: None,
+            cache_key_v0: None,
+            cache_hit: None,
+            unsafe_surface: false,
+            unsafe_reasons: Vec::new(),
+            applied_transforms: Vec::new(),
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
+        };
+        bundle.append_materialization_v2(&no_transforms).unwrap();
+
+        let with_transforms = MaterializationRecordV2 {
+            schema_version: MATERIALIZATION_SCHEMA_V2,
+            record_seq: 2,
+            ts_unix_nanos: 2000,
+            asset_key: "dataset://ns/with_transform".to_string(),
+            fingerprint_v0: "c".repeat(64),
+            node_id,
+            node_def_hash: "d".repeat(64),
+            op_type: "transform".to_string(),
+            input_asset_keys: vec![],
+            input_fingerprints_v0: vec![],
+            rows: None,
+            bytes: None,
+            duration_ms: None,
+            cache_decision: swarm_torch_core::dataops::CacheDecisionV0::Unknown,
+            cache_reason: None,
+            cache_key_v0: None,
+            cache_hit: None,
+            unsafe_surface: true,
+            unsafe_reasons: vec![UnsafeReasonV0::UnsafeExtension],
+            applied_transforms: vec![TransformAuditV0 {
+                transform_name: "dp_clip".to_string(),
+                core_trusted: false,
+                round_id: 11,
+            }],
+            status: MaterializationStatusV0::Ok,
+            error_code: None,
+            quality: None,
+        };
+        bundle.append_materialization_v2(&with_transforms).unwrap();
+        bundle.finalize_manifest().unwrap();
+
+        let report = load_report(bundle.run_dir()).unwrap();
+        assert_eq!(report.materializations.len(), 2);
+        assert!(report.materializations[0].applied_transforms.is_empty());
+        assert_eq!(report.materializations[1].applied_transforms.len(), 1);
+        assert_eq!(
+            report.materializations[1].applied_transforms[0].transform_name,
+            "dp_clip"
+        );
     }
 
     #[test]
@@ -965,6 +1069,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         };
 
         let source = SourceDescriptorV0 {

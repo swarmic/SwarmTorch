@@ -196,6 +196,17 @@ pub enum UnsafeReasonV0 {
     MissingProvenance,
 }
 
+/// Audit metadata for update-transform application.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransformAuditV0 {
+    /// Human-readable transform name.
+    pub transform_name: String,
+    /// Whether this transform is trusted as a core transform.
+    pub core_trusted: bool,
+    /// Round in which the transform was applied.
+    pub round_id: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceDescriptorError {
     UriTooLong { len: usize, max: usize },
@@ -270,6 +281,9 @@ pub struct MaterializationRecordV2 {
     pub unsafe_surface: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsafe_reasons: Vec<UnsafeReasonV0>,
+    /// Applied update transforms (if any) for this materialization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_transforms: Vec<TransformAuditV0>,
 
     pub status: MaterializationStatusV0,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +296,7 @@ pub struct MaterializationRecordV2 {
 /// Compatibility reader for `datasets/materializations.ndjson`.
 ///
 /// Ordering is important: V2 MUST come first so V2 rows are not down-cast to V1.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum MaterializationRecordCompat {
@@ -318,6 +333,7 @@ impl MaterializationRecordCompat {
                 cache_hit: v1.cache_hit,
                 unsafe_surface: true,
                 unsafe_reasons: vec![UnsafeReasonV0::MissingProvenance],
+                applied_transforms: Vec::new(),
                 status: MaterializationStatusV0::Ok,
                 error_code: None,
                 quality: None,
@@ -762,6 +778,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         };
 
         let upstream = [[7u8; 32]];
@@ -848,6 +865,7 @@ mod tests {
             cache_hit: cache_hit_from_decision(CacheDecisionV0::Hit),
             unsafe_surface: false,
             unsafe_reasons: Vec::new(),
+            applied_transforms: Vec::new(),
             status: MaterializationStatusV0::Ok,
             error_code: None,
             quality: Some(QualitySummaryV0 {
@@ -860,6 +878,40 @@ mod tests {
         let json = serde_json::to_string(&row).expect("serialize v2");
         let decoded: MaterializationRecordV2 = serde_json::from_str(&json).expect("deserialize v2");
         assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn transform_audit_v0_serialization_roundtrip() {
+        let audit = TransformAuditV0 {
+            transform_name: "dp_clip".to_string(),
+            core_trusted: false,
+            round_id: 7,
+        };
+        let json = serde_json::to_string(&audit).unwrap();
+        let decoded: TransformAuditV0 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, audit);
+    }
+
+    #[test]
+    fn applied_transforms_empty_by_default_in_record() {
+        let json = r#"{
+            "schema_version": 2,
+            "record_seq": 1,
+            "ts_unix_nanos": 100,
+            "asset_key": "dataset://ns/out",
+            "fingerprint_v0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "node_id": "01010101010101010101010101010101",
+            "node_def_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "op_type": "transform",
+            "cache_decision": "unknown",
+            "unsafe_surface": false,
+            "status": "ok"
+        }"#;
+        let decoded: MaterializationRecordV2 = serde_json::from_str(json).unwrap();
+        assert!(
+            decoded.applied_transforms.is_empty(),
+            "missing field must default to empty"
+        );
     }
 
     #[test]

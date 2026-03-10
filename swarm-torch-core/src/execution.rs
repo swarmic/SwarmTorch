@@ -125,6 +125,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: trust,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 

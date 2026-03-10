@@ -249,6 +249,7 @@ mod tests {
             unsafe_surface: false,
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
+            execution_hint: None,
         }
     }
 

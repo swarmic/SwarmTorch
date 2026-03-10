@@ -447,8 +447,8 @@ cargo run -p swarm-torch --example artifact_pipeline
 - ⏳ Compressed gradient protocols (TopK, randomized sparsification)
 - ⏳ Memory-bounded participant roles (<256KB)
 - ⏳ ESP32 and STM32 reference implementations
-- ⏳ F1: run-graph execution hints (`ExecutionHint`) for profile/device-aware planning
-- ⏳ F2a/F2/F3/F4 batch: transform audit plumbing, `UpdateTransform`, composable aggregation pipeline, lightweight tracing
+- ✅ F1: run-graph execution hints (`ExecutionHint`) for profile/device-aware planning
+- ✅ F2a/F2/F3/F4 batch: transform audit plumbing, `UpdateTransform`, composable aggregation pipeline, lightweight tracing
 
 ### v0.3.0 - Production Hardening
 

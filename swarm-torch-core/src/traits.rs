@@ -50,6 +50,28 @@ pub struct GradientUpdate {
     pub round_id: u64,
 }
 
+#[cfg(feature = "alloc")]
+/// User-defined transformation applied to a peer update before aggregation.
+///
+/// Implementors should be deterministic for identical inputs. The output
+/// update's `sender`, `sequence`, and `round_id` are treated as provenance and
+/// are preserved by the application helper in `aggregation.rs`.
+pub trait UpdateTransform: Send + Sync {
+    /// Apply the transform to one update.
+    fn transform(&self, update: GradientUpdate) -> GradientUpdate;
+
+    /// Human-readable transform name for audit records.
+    fn name(&self) -> &str;
+
+    /// Whether this transform is considered core-trusted.
+    ///
+    /// Returning `false` will propagate `UnsafeExtension` via transform audit
+    /// plumbing on the artifact path.
+    fn is_core_trusted(&self) -> bool {
+        false
+    }
+}
+
 /// An optimizer that can be used in swarm learning
 pub trait SwarmOptimizer: Send + Sync {
     /// Model type this optimizer updates.

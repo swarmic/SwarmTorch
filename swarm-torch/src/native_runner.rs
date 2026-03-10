@@ -250,6 +250,10 @@ mod tests {
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
             execution_hint: None,
+            cache_policy: None,
+            materialization_policy: None,
+            resources: None,
+            op_hash: None,
         }
     }
 

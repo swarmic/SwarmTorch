@@ -180,6 +180,16 @@ pub enum CacheDecisionV0 {
     Unknown,
 }
 
+impl From<bool> for CacheDecisionV0 {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Hit
+        } else {
+            Self::Miss
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterializationStatusV0 {
@@ -779,6 +789,10 @@ mod tests {
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
             execution_hint: None,
+            cache_policy: None,
+            materialization_policy: None,
+            resources: None,
+            op_hash: None,
         };
 
         let upstream = [[7u8; 32]];

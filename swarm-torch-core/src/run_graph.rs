@@ -76,6 +76,35 @@ pub struct ExecutionHint {
     pub memory_budget_bytes: Option<u64>,
 }
 
+/// Cache policy hint (deferred ADR-0017 field, typed for schema stability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CachePolicyV0 {
+    Auto,
+    PreferReuse,
+    Bypass,
+}
+
+/// Materialization policy hint (deferred ADR-0017 field, typed for schema stability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializationPolicyV0 {
+    Full,
+    MetadataOnly,
+    Lazy,
+}
+
+/// Resource hints for planner/scheduler decisions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResourceHintsV0 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<String>,
+}
+
 /// A canonical JSON-like value that is stable for hashing and deterministic for serialization.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -155,6 +184,25 @@ pub struct NodeV1 {
     /// Optional scheduling hint — excluded from `node_def_hash` and cache identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_hint: Option<ExecutionHint>,
+
+    /// Optional cache policy hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<CachePolicyV0>,
+
+    /// Optional materialization policy hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_policy: Option<MaterializationPolicyV0>,
+
+    /// Optional resource hints for planner/scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceHintsV0>,
+
+    /// Canonical operation hash (computed metadata, not user-authoritative).
+    ///
+    /// - Includes only operation definition semantics (`op_kind`, `op_type`, `code_ref`, `params`).
+    /// - Excludes graph wiring (`inputs`, `outputs`), identity fields, and planner/runtime hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_hash: Option<String>,
 }
 
 /// The executable graph file (`graph.json`) schema v1.
@@ -194,6 +242,19 @@ struct NodeDefCanonicalV1<'a> {
     outputs: &'a [AssetRefV1],
     params: &'a CanonParams,
     // execution_hint is intentionally excluded: it is planner metadata, not op identity (F1).
+}
+
+/// Canonical struct used for op hash derivation.
+///
+/// This is narrower than `NodeDefCanonicalV1` by design: it excludes wiring (`inputs`, `outputs`)
+/// so `op_hash` is stable across equivalent op definitions placed at different graph positions.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct NodeOpCanonicalV0<'a> {
+    schema_version: u32,
+    op_kind: OpKind,
+    op_type: &'a str,
+    code_ref: &'a str,
+    params: &'a CanonParams,
 }
 
 /// Derive a stable [`NodeId`] from a human-readable `node_key`.
@@ -236,6 +297,23 @@ pub fn node_def_hash_v1(node: &NodeV1) -> Result<[u8; 32], postcard::Error> {
     Ok(out)
 }
 
+/// Compute canonical op hash from operation definition semantics only.
+pub fn op_hash_v0(node: &NodeV1) -> Result<[u8; 32], postcard::Error> {
+    let code_ref = node.code_ref.as_deref().unwrap_or("");
+    let canonical = NodeOpCanonicalV0 {
+        schema_version: GRAPH_SCHEMA_V1,
+        op_kind: node.op_kind,
+        op_type: &node.op_type,
+        code_ref,
+        params: &node.params,
+    };
+    let bytes = postcard::to_allocvec(&canonical)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..]);
+    Ok(out)
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -253,6 +331,8 @@ pub fn normalize_node_v1(mut node: NodeV1) -> Result<NodeV1, postcard::Error> {
     node.node_id = Some(node_id_from_key(&node.node_key));
     let digest = node_def_hash_v1(&node)?;
     node.node_def_hash = Some(hex_lower(&digest));
+    let op_digest = op_hash_v0(&node)?;
+    node.op_hash = Some(hex_lower(&op_digest));
     Ok(node)
 }
 
@@ -395,6 +475,10 @@ mod tests {
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
             execution_hint: None,
+            cache_policy: None,
+            materialization_policy: None,
+            resources: None,
+            op_hash: None,
         };
 
         node = normalize_node_v1(node).unwrap();
@@ -426,6 +510,10 @@ mod tests {
             execution_trust: ExecutionTrust::Core,
             node_def_hash: None,
             execution_hint: None,
+            cache_policy: None,
+            materialization_policy: None,
+            resources: None,
+            op_hash: None,
         }
     }
 
@@ -542,5 +630,76 @@ mod tests {
         let graph: GraphV1 = serde_json::from_str(json).unwrap();
         assert_eq!(graph.nodes.len(), 1);
         assert!(graph.nodes[0].execution_hint.is_none());
+        assert!(graph.nodes[0].cache_policy.is_none());
+        assert!(graph.nodes[0].materialization_policy.is_none());
+        assert!(graph.nodes[0].resources.is_none());
+        assert!(graph.nodes[0].op_hash.is_none());
+    }
+
+    #[test]
+    fn node_v1_roundtrip_with_cache_materialization_resources_fields() {
+        let mut node = make_valid_node();
+        node.cache_policy = Some(CachePolicyV0::PreferReuse);
+        node.materialization_policy = Some(MaterializationPolicyV0::MetadataOnly);
+        node.resources = Some(ResourceHintsV0 {
+            cpu_millis: Some(500),
+            memory_bytes: Some(64 * 1024 * 1024),
+            accelerator: Some("none".to_string()),
+        });
+        node = normalize_node_v1(node).unwrap();
+
+        let json = serde_json::to_string(&node).unwrap();
+        let decoded: NodeV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cache_policy, node.cache_policy);
+        assert_eq!(decoded.materialization_policy, node.materialization_policy);
+        assert_eq!(decoded.resources, node.resources);
+        assert_eq!(decoded.op_hash, node.op_hash);
+    }
+
+    #[test]
+    fn op_hash_stable_for_equivalent_op_definition() {
+        let mut a = make_valid_node();
+        let mut b = make_valid_node();
+        a.node_key = "node/a".to_string();
+        b.node_key = "node/b".to_string();
+        a.inputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/a".to_string(),
+            fingerprint: None,
+        }];
+        b.inputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/b".to_string(),
+            fingerprint: None,
+        }];
+        a.outputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/out_a".to_string(),
+            fingerprint: None,
+        }];
+        b.outputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/out_b".to_string(),
+            fingerprint: None,
+        }];
+
+        let ha = op_hash_v0(&a).unwrap();
+        let hb = op_hash_v0(&b).unwrap();
+        assert_eq!(
+            ha, hb,
+            "op_hash should ignore graph wiring and node identity"
+        );
+    }
+
+    #[test]
+    fn op_hash_changes_when_op_definition_changes() {
+        let mut a = make_valid_node();
+        let mut b = make_valid_node();
+        b.params
+            .insert("drop_nulls".to_string(), CanonValue::Bool(true));
+
+        let ha = op_hash_v0(&a).unwrap();
+        let hb = op_hash_v0(&b).unwrap();
+        assert_ne!(ha, hb, "op_hash must change when op definition changes");
+
+        a = normalize_node_v1(a).unwrap();
+        b = normalize_node_v1(b).unwrap();
+        assert_ne!(a.op_hash, b.op_hash);
     }
 }

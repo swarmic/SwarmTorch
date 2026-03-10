@@ -1,7 +1,7 @@
 # SwarmTorch Technical White Paper (ST-TWP)
 
 **Version:** v0.1 (Draft)  
-**Date:** 2026-02-08  
+**Date:** 2026-03-11  
 **Scope:** SwarmTorch-only (this is not a SwarmicOS/GridSwarm/Swarmflow spec)  
 
 ## Reader's Guide
@@ -49,8 +49,8 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 
 | Area | Claim / Component | Evidence | Status (Implemented / Partial / Planned / Non-goal) | Notes |
 |------|-------------------|----------|-----------------------------------------------------|-------|
-| Artifact spine | Run Artifact Bundle (v1) writer + manifest hashing exists | Evidence: ADR-0016, swarm-torch/src/artifacts.rs | Partial | Atomic writes for JSON/manifest; thread-safe sink; schema validator + profiled defaults pending |
-| DataOps | Executable `graph.json` schema + deterministic hashing + fingerprint metadata schemas | Evidence: ADR-0017, swarm-torch-core/src/run_graph.rs, swarm-torch-core/src/dataops.rs | Partial | Execution engine is pending; registry/lineage/materialization emitters are metadata-first |
+| Artifact spine | Run Artifact Bundle (v1) writer + manifest hashing exists | Evidence: ADR-0016, swarm-torch/src/artifacts/mod.rs, swarm-torch/src/artifacts/bundle.rs | Partial | Atomic writes + thread-safe sink + profile policies implemented; higher-level UI/export tooling pending |
+| DataOps | Executable `graph.json` schema + deterministic hashing + fingerprint metadata schemas | Evidence: ADR-0017, swarm-torch-core/src/run_graph.rs, swarm-torch-core/src/dataops.rs, swarm-torch/src/artifacts/session.rs | Partial | Execution engine is pending; registry/lineage/materialization emitters are implemented metadata-first |
 | Extensibility | Sandboxed-by-default extensions | Evidence: ADR-0018 | Planned | WASM-first host (future) |
 | Telemetry | Canonical IDs + span/event/metric record types + emitter trait | Evidence: ADR-0012, ADR-0016, swarm-torch-core/src/observe.rs | Partial | Tracing integration + OTLP export is not implemented yet |
 | Threat model | Threat model + trust boundaries defined | Evidence: ADR-0008, ADR-0008A | Implemented | Documented; enforcement varies by feature |
@@ -433,11 +433,11 @@ Fingerprint v0 (metadata-first) is defined so it can be computed without raw row
 
 Evidence: ADR-0017, swarm-torch-core/src/dataops.rs
 
-TODO: finalize cache/materialization semantics (cache keys, invalidation, execution profiles) and publish JSON schema docs.
+TODO: finalize deferred `NodeV1` schema fields (`op_hash`, `resources`, `cache_policy`, `materialization_policy`) and publish JSON schema docs.
 
 Evidence: ADR-0017.
 
-Current status: minimal `graph.json` schema types exist (with `node_id` derived from `node_key`, and `node_def_hash = sha256(postcard(NodeDefCanonicalV1))`). Execution and materialization emitters are planned.
+Current status: `graph.json` schema types and canonical hashing are implemented (with `node_id` derived from `node_key`, and `node_def_hash = sha256(postcard(NodeDefCanonicalV1))`). Materialization emitters are implemented (`DataOpsSession`/artifact sink path), while the full execution engine remains planned. `execution_hint` is implemented as planner metadata and excluded from `node_def_hash`; deferred schema fields are tracked in ADR-0017.
 
 Evidence: swarm-torch-core/src/run_graph.rs
 

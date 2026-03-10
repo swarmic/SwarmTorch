@@ -449,6 +449,7 @@ cargo run -p swarm-torch --example artifact_pipeline
 - ⏳ ESP32 and STM32 reference implementations
 - ✅ F1: run-graph execution hints (`ExecutionHint`) for profile/device-aware planning
 - ✅ F2a/F2/F3/F4 batch: transform audit plumbing, `UpdateTransform`, composable aggregation pipeline, lightweight tracing
+- ✅ Wave 6 convergence: canon truth-sync + behavior-preserving `A6X-06` decomposition of artifact/report modules (no runtime/schema feature expansion)
 
 ### v0.3.0 - Production Hardening
 

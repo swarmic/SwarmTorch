@@ -62,7 +62,10 @@ pub mod prelude {
     pub use crate::observe::{AttrMap, AttrValue, EventRecord, MetricRecord, SpanRecord};
     pub use crate::observe::{RunId, SpanId, TraceId};
     #[cfg(feature = "alloc")]
-    pub use crate::run_graph::{GraphV1, NodeId, NodeV1, OpKind};
+    pub use crate::run_graph::{
+        op_hash_v0, CachePolicyV0, GraphV1, MaterializationPolicyV0, NodeId, NodeV1, OpKind,
+        ResourceHintsV0,
+    };
     pub use crate::traits::*;
 }
 

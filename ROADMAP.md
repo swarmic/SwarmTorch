@@ -25,6 +25,14 @@ Wave 4 is signed off; the v0.2 feature-track kickoff has landed in Wave 5:
 
 See `docs/release_notes/v0.1.0-alpha.6x-wave5.md` for implementation details and gate evidence.
 
+Wave 6 completes backlog convergence and canon lock:
+
+1. Behavior-preserving `A6X-06` decomposition of artifact/report modules.
+2. ADR/whitepaper/roadmap truth-sync for Wave 5 (`F1..F4`) implementation reality.
+3. Explicit ADR-0017 deferment note for remaining schema fields (`op_hash/resources/cache_policy/materialization_policy`).
+
+See `docs/release_notes/v0.1.0-alpha.6x-wave6.md` for decomposition scope and compatibility evidence.
+
 ## Conformance Lock (A6X-05)
 
 This section is the repo-local contract lock for current implementation reality.

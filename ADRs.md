@@ -1619,6 +1619,14 @@ impl GossipConsensus {
 **Date:** 2025-01-08  
 **Deciders:** Core Team
 
+**Implementation Status (2026-03-11):** Partial (core robust aggregators implemented; Wave 5 added composable `AggregationPipeline` + `UpdateTransform` integration path; full attack-harness release gate remains ADR-0007A scope)
+
+### Conformance Hooks (Current)
+
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_trimmed_mean_no_compression_matches_direct`
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_fedavg_topk_compression_roundtrip`
+- `cargo test -p swarm-torch-core aggregation::tests::apply_transforms_then_aggregate_trimmed_mean_end_to_end`
+
 ### Context
 
 In federated/swarm learning, the central aggregation step is vulnerable to Byzantine attacks:
@@ -2541,6 +2549,15 @@ jobs:
 **Date:** 2025-01-08  
 **Deciders:** Core Team
 
+**Implementation Status (2026-03-11):** Partial (core span/event/metric contracts implemented; Wave 5 added lightweight integer-only aggregation trace estimates via `AggregationPipeline::trace`; OTLP export pipeline remains planned)
+
+### Conformance Hooks (Current)
+
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_trace_nonzero_estimates_for_valid_inputs`
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_trace_topk_compressed_less_than_raw`
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_trace_memory_lower_bound_holds`
+- `cargo test -p swarm-torch-core aggregation::tests::pipeline_trace_zero_peers_zero_estimates`
+
 ### Context
 
 Debugging distributed swarm learning is notoriously difficult:
@@ -3112,6 +3129,8 @@ pub struct GossipConfig {
 **Date:** 2026-01-09  
 **Deciders:** Core Team
 
+**Implementation Status (2026-03-11):** Planned (pipeline/hardening foundations landed; dedicated attack-harness gate remains pending for v0.3 hardening track)
+
 ### Context
 
 Byzantine-robust aggregators have theoretical guarantees that depend on assumptions. We need reproducible robustness testing before each release.
@@ -3374,7 +3393,7 @@ cuda = ["cudarc", "burn/cuda"]
 **Date:** 2026-02-08  
 **Deciders:** Core Team
 
-**Implementation Status (2026-02-13):** Partial (artifact contract baseline implemented; higher-level tooling/extensions remain planned)
+**Implementation Status (2026-03-11):** Partial (artifact contract + transform-audit pipeline implemented in Wave 5; behavior-preserving artifacts/report module decomposition completed in Wave 6; higher-level UI/export tooling remains planned)
 
 ### Conformance Hooks (Current)
 
@@ -3383,6 +3402,8 @@ cuda = ["cudarc", "burn/cuda"]
 - `cargo test -p swarm-torch artifacts::tests::strict_profile_updates_manifest_on_each_write`
 - `cargo test -p swarm-torch artifacts::tests::streaming_profile_defers_snapshot_rewrite_until_interval`
 - `cargo test -p swarm-torch report::tests::mid_run_report_succeeds_with_manifest_always_policy`
+- `cargo test -p swarm-torch artifacts::tests::artifact_pipeline_smoke_after_artifacts_module_split`
+- `cargo test -p swarm-torch report::tests::load_report_backward_compatible_after_artifacts_module_split`
 
 ### Context
 
@@ -3562,15 +3583,37 @@ runs/<run_id>/
 **Date:** 2026-02-08  
 **Deciders:** Core Team
 
-**Implementation Status (2026-02-13):** Partial (graph/fingerprint/materialization contract implemented; full execution engine remains planned)
+**Implementation Status (2026-03-11):** Partial (graph/fingerprint/materialization contract implemented; Wave 5 added `execution_hint`, transform-audit propagation, composable aggregation pipeline, and trace estimates; full execution engine and additional `NodeV1` schema fields remain planned)
 
 ### Conformance Hooks (Current)
 
 - `cargo test -p swarm-torch-core dataops::tests::dataset_fingerprint_is_deterministic`
 - `cargo test -p swarm-torch-core dataops::tests::source_descriptor_redacts_userinfo_in_uri`
+- `cargo test -p swarm-torch-core run_graph::tests::execution_hint_excluded_from_node_def_hash`
+- `cargo test -p swarm-torch-core run_graph::tests::node_v1_roundtrips_with_full_execution_hint`
 - `cargo test -p swarm-torch materialization_v2_includes_input_provenance`
 - `cargo test -p swarm-torch materialize_rejects_output_not_declared_in_node`
 - `cargo test -p swarm-torch materialize_fails_on_missing_input_asset`
+
+### Schema Deferments (2026-03-11)
+
+`NodeV1` intentionally ships in a staged schema profile:
+
+- Implemented now:
+  - `params`
+  - `execution_trust`
+  - optional `execution_hint`
+- Deferred to a dedicated schema slice:
+  - `op_hash`
+  - `resources`
+  - `cache_policy`
+  - `materialization_policy`
+
+Normative hash policy for the current schema:
+
+- `execution_hint` is planner metadata and is **excluded** from `NodeDefCanonicalV1`.
+- Changing `execution_hint` **MUST NOT** change `node_def_hash`.
+- Deferred fields above are not present in the current canonical struct and therefore do not affect current hash/cache invariants.
 
 ### Context
 
@@ -3606,10 +3649,12 @@ Define a SwarmTorch-native **pipeline graph DSL** and **asset model**, serialize
   - `op_kind` (enum string): `data`, `train`, `comms`, `governance`, `system`
   - `op_type` (enum string): e.g. `ingest`, `transform`, `validate`, `split`, `stats`, `persist`, `train`, `aggregate`, `eval`, `export`, `broadcast`, `vote`, `redact`, ...
   - `inputs[]` / `outputs[]` as asset keys
-  - `params` (JSON object) + `op_hash` (deterministic hash of op code/config)
-  - `resources` (cpu/mem hints; optional accelerator hints)
-  - `cache_policy` and `materialization_policy`
+  - `params` (JSON object)
+  - `op_hash` (deterministic hash of op code/config) — deferred schema field
+  - `resources` (cpu/mem hints; optional accelerator hints) — deferred schema field
+  - `cache_policy` and `materialization_policy` — deferred schema fields
   - `execution_trust` (e.g. `core`, `sandboxed_extension`, `unsafe_extension`)
+  - optional `execution_hint` planner metadata (excluded from `node_def_hash`)
   - `output_refs[]` (optional): how to locate outputs (bundle path or external URI + hash)
 - `edges[]` (optional if inputs/outputs fully define edges)
 
@@ -3749,13 +3794,15 @@ These placeholders are implemented in `swarm-torch-core::dataops` and MUST be us
 **Date:** 2026-02-08  
 **Deciders:** Core Team
 
-**Implementation Status (2026-03-09):** Partial (execution trust/policy + unsafe-surface artifacting implemented; `OpRunner::Error` contract tightened via `OpRunnerError`; sandbox host/runtime enforcement remains planned)
+**Implementation Status (2026-03-11):** Partial (execution trust/policy + unsafe-surface artifacting implemented; `OpRunner::Error` contract tightened via `OpRunnerError`; Wave 5 added `UpdateTransform` + `TransformAuditV0` trust-path propagation into materializations/reports; sandbox host/runtime enforcement remains planned)
 
 ### Conformance Hooks (Current)
 
 - `cargo test -p swarm-torch-core execution::tests::policy_denies_unsafe_extension`
 - `cargo test -p swarm-torch-core execution::tests::policy_denies_sandboxed_extension`
 - `cargo test -p swarm-torch-core execution::tests::op_runner_error_contract_accepts_io_error`
+- `cargo test -p swarm-torch-core aggregation::tests::update_transform_preserves_sender_sequence_round_id`
+- `cargo test -p swarm-torch-core aggregation::tests::untrusted_transform_audit_has_core_trusted_false`
 - `cargo test -p swarm-torch unsafe_reasons`
 - `cargo test -p swarm-torch report::tests::report_warning_lists_unsafe_materialization_reasons`
 
@@ -3802,6 +3849,12 @@ Define an explicit execution policy for pipeline ops:
   - `events.*` (an explicit event or attribute indicating unsafe surface)
   - `datasets/materializations.*` (materializations from unsafe nodes are flagged)
 - The run bundle **SHOULD** include a summary list in `run.json` (e.g. `unsafe_surfaces[]`) to make unsafe usage obvious without scanning events.
+
+Wave 5 trust path contract (implemented):
+
+- `UpdateTransform::is_core_trusted() == false` MUST emit `TransformAuditV0 { core_trusted: false }`.
+- Any materialization carrying such an audit MUST include `UnsafeReasonV0::UnsafeExtension`.
+- Report readers/renderers MUST preserve and display this unsafe reason consistently with execution-trust derived unsafe surfaces.
 
 ### Consequences
 

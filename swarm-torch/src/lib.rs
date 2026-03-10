@@ -87,6 +87,10 @@ pub mod report;
 #[cfg(feature = "std")]
 pub mod native_runner;
 
+/// Sequential graph scheduler (std-only).
+#[cfg(feature = "std")]
+pub mod scheduler;
+
 /// Prelude module for convenient imports
 ///
 /// ```rust,ignore

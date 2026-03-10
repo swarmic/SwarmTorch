@@ -29,6 +29,8 @@ New contributors should read these in order:
 14. [`v0.1.0-alpha.6x-wave3.md`](v0.1.0-alpha.6x-wave3.md) — Wave 3 remediation: identity/crypto hardening, observe bounds enforcement, trait/model API batch, mock backpressure realism
 15. [`v0.1.0-alpha.6x-wave4.md`](v0.1.0-alpha.6x-wave4.md) — Wave 4 remediation convergence: TopK throughput, model RNG/capacity evolution, OpRunner error contract, error chaining, v0.2 handoff gate
 16. [`v0.1.0-alpha.6x-wave5.md`](v0.1.0-alpha.6x-wave5.md) — v0.2 F-track rollout: ExecutionHint schema, transform-audit plumbing, UpdateTransform + aggregation pipeline + tracing
+17. [`v0.1.0-alpha.6x-wave6.md`](v0.1.0-alpha.6x-wave6.md) — Backlog convergence: canon lock + behavior-preserving artifacts/report module decomposition (`A6X-06`)
+18. [`v0.1.0-alpha.7x.md`](v0.1.0-alpha.7x.md) — Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed NodeV1 deferred fields, robustness harness
 
 ## Versioning
 

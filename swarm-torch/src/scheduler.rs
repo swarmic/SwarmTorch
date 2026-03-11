@@ -13,7 +13,9 @@ use std::io;
 use swarm_torch_core::dataops::CacheDecisionV0;
 use swarm_torch_core::execution::{AssetInstanceV1, ExecutionPolicy, PolicyDecision};
 use swarm_torch_core::observe::{AttrMap, AttrValue, EventRecord, RunEventEmitter, RunId, TraceId};
-use swarm_torch_core::run_graph::{node_id_from_key, GraphV1, NodeId, NodeV1};
+use swarm_torch_core::run_graph::{
+    node_id_from_key, validate_graph_v1, GraphV1, GraphValidationError, NodeId, NodeV1,
+};
 
 use crate::artifacts::{DataOpsSession, OutputSpec};
 use crate::native_runner::{ExecutionContext, NativeOpRunner};
@@ -21,6 +23,7 @@ use crate::native_runner::{ExecutionContext, NativeOpRunner};
 #[derive(Debug)]
 pub enum SchedulerError {
     GraphNormalization(String),
+    GraphValidation(GraphValidationError),
     InvalidEdgeReference {
         from_node_id: NodeId,
         to_node_id: NodeId,
@@ -28,6 +31,7 @@ pub enum SchedulerError {
     CycleDetected {
         node_keys: Vec<String>,
     },
+    InvariantViolation(&'static str),
     Io(io::Error),
 }
 
@@ -35,6 +39,7 @@ impl core::fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::GraphNormalization(message) => write!(f, "graph normalization failed: {message}"),
+            Self::GraphValidation(error) => write!(f, "graph validation failed: {error}"),
             Self::InvalidEdgeReference {
                 from_node_id,
                 to_node_id,
@@ -45,6 +50,9 @@ impl core::fmt::Display for SchedulerError {
             ),
             Self::CycleDetected { node_keys } => {
                 write!(f, "graph contains cycle(s): {}", node_keys.join(","))
+            }
+            Self::InvariantViolation(message) => {
+                write!(f, "scheduler invariant violation: {message}")
             }
             Self::Io(error) => write!(f, "scheduler I/O error: {error}"),
         }
@@ -59,6 +67,12 @@ impl From<io::Error> for SchedulerError {
     }
 }
 
+impl From<GraphValidationError> for SchedulerError {
+    fn from(value: GraphValidationError) -> Self {
+        Self::GraphValidation(value)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerReport {
     pub executed_nodes: Vec<String>,
@@ -68,10 +82,13 @@ pub struct SchedulerReport {
 
 /// Return nodes in deterministic topological order (`node_key` tie-break).
 pub fn topological_sort_nodes(graph: &GraphV1) -> Result<Vec<NodeV1>, SchedulerError> {
+    validate_graph_v1(graph)?;
+
     let normalized = graph
         .clone()
         .normalize()
         .map_err(|e| SchedulerError::GraphNormalization(e.to_string()))?;
+    validate_graph_v1(&normalized)?;
 
     let mut node_by_id: HashMap<String, NodeV1> = HashMap::new();
     for mut node in normalized.nodes {
@@ -79,7 +96,17 @@ pub fn topological_sort_nodes(graph: &GraphV1) -> Result<Vec<NodeV1>, SchedulerE
             .node_id
             .unwrap_or_else(|| node_id_from_key(&node.node_key));
         node.node_id = Some(node_id);
-        node_by_id.insert(node_id.to_string(), node);
+        let node_id_hex = node_id.to_string();
+        if let Some(existing) = node_by_id.get(&node_id_hex) {
+            return Err(SchedulerError::GraphValidation(
+                GraphValidationError::DuplicateNodeId {
+                    node_id: node_id_hex,
+                    first_node_key: existing.node_key.clone(),
+                    duplicate_node_key: node.node_key.clone(),
+                },
+            ));
+        }
+        node_by_id.insert(node_id_hex, node);
     }
 
     let mut indegree: HashMap<String, usize> = HashMap::new();
@@ -98,53 +125,66 @@ pub fn topological_sort_nodes(graph: &GraphV1) -> Result<Vec<NodeV1>, SchedulerE
                 to_node_id: edge.to_node_id,
             });
         }
-        let edge_inserted = adjacency
-            .get_mut(&from_id)
-            .expect("from node_id must exist")
-            .insert(to_id.clone());
+        let from_neighbors =
+            adjacency
+                .get_mut(&from_id)
+                .ok_or(SchedulerError::InvariantViolation(
+                    "missing adjacency set for from node_id",
+                ))?;
+        let edge_inserted = from_neighbors.insert(to_id.clone());
         if edge_inserted {
-            *indegree.get_mut(&to_id).expect("to node_id must exist") += 1;
+            let to_degree = indegree
+                .get_mut(&to_id)
+                .ok_or(SchedulerError::InvariantViolation(
+                    "missing indegree entry for to node_id",
+                ))?;
+            *to_degree += 1;
         }
     }
 
-    let mut ready: BTreeSet<(String, String)> = indegree
-        .iter()
-        .filter_map(|(node_id, degree)| {
-            if *degree == 0 {
-                Some((
-                    node_by_id
-                        .get(node_id)
-                        .expect("node_id must exist")
-                        .node_key
-                        .clone(),
-                    node_id.clone(),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut ready: BTreeSet<(String, String)> = BTreeSet::new();
+    for (node_id, degree) in &indegree {
+        if *degree == 0 {
+            let node = node_by_id
+                .get(node_id)
+                .ok_or(SchedulerError::InvariantViolation(
+                    "missing node for indegree entry",
+                ))?;
+            ready.insert((node.node_key.clone(), node_id.clone()));
+        }
+    }
 
     let mut ordered = Vec::with_capacity(node_by_id.len());
     while let Some((_, node_id)) = ready.pop_first() {
-        let node = node_by_id.get(&node_id).expect("node must exist").clone();
+        let node = node_by_id
+            .get(&node_id)
+            .ok_or(SchedulerError::InvariantViolation(
+                "missing node for ready queue entry",
+            ))?
+            .clone();
         ordered.push(node);
 
         let neighbors: Vec<String> = adjacency
             .get(&node_id)
-            .expect("adjacency must exist")
+            .ok_or(SchedulerError::InvariantViolation(
+                "missing adjacency for ready queue entry",
+            ))?
             .iter()
             .cloned()
             .collect();
         for neighbor in neighbors {
             let degree = indegree
                 .get_mut(&neighbor)
-                .expect("neighbor indegree must exist");
+                .ok_or(SchedulerError::InvariantViolation(
+                    "missing indegree for adjacency neighbor",
+                ))?;
             *degree = degree.saturating_sub(1);
             if *degree == 0 {
                 let neighbor_key = node_by_id
                     .get(&neighbor)
-                    .expect("neighbor must exist")
+                    .ok_or(SchedulerError::InvariantViolation(
+                        "missing node for adjacency neighbor",
+                    ))?
                     .node_key
                     .clone();
                 ready.insert((neighbor_key, neighbor.clone()));
@@ -153,22 +193,17 @@ pub fn topological_sort_nodes(graph: &GraphV1) -> Result<Vec<NodeV1>, SchedulerE
     }
 
     if ordered.len() != node_by_id.len() {
-        let mut remaining: Vec<String> = indegree
-            .iter()
-            .filter_map(|(node_id, degree)| {
-                if *degree > 0 {
-                    Some(
-                        node_by_id
-                            .get(node_id)
-                            .expect("node must exist")
-                            .node_key
-                            .clone(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut remaining: Vec<String> = Vec::new();
+        for (node_id, degree) in &indegree {
+            if *degree > 0 {
+                let node = node_by_id
+                    .get(node_id)
+                    .ok_or(SchedulerError::InvariantViolation(
+                        "missing node while collecting cycle members",
+                    ))?;
+                remaining.push(node.node_key.clone());
+            }
+        }
         remaining.sort();
         return Err(SchedulerError::CycleDetected {
             node_keys: remaining,
@@ -465,6 +500,98 @@ mod tests {
 
         let err = topological_sort_nodes(&graph).expect_err("cycle should be rejected");
         assert!(matches!(err, SchedulerError::CycleDetected { .. }));
+    }
+
+    #[test]
+    fn scheduler_rejects_duplicate_node_ids() {
+        let mut a = make_node(
+            "node/a",
+            "passthrough",
+            &[],
+            &["dataset://ns/a"],
+            ExecutionTrust::Core,
+        );
+        let mut b = make_node(
+            "node/b",
+            "passthrough",
+            &[],
+            &["dataset://ns/b"],
+            ExecutionTrust::Core,
+        );
+        let duplicate = node_id_from_key("node/shared");
+        a.node_id = Some(duplicate);
+        b.node_id = Some(duplicate);
+
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("dup-ids".to_string()),
+            nodes: vec![a, b],
+            edges: vec![],
+        };
+
+        let err = topological_sort_nodes(&graph).expect_err("duplicate node ids should fail");
+        assert!(matches!(
+            err,
+            SchedulerError::GraphValidation(GraphValidationError::DuplicateNodeId { .. })
+        ));
+    }
+
+    #[test]
+    fn scheduler_rejects_duplicate_node_keys() {
+        let a = make_node(
+            "node/dup",
+            "passthrough",
+            &[],
+            &["dataset://ns/a"],
+            ExecutionTrust::Core,
+        );
+        let b = make_node(
+            "node/dup",
+            "passthrough",
+            &[],
+            &["dataset://ns/b"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("dup-keys".to_string()),
+            nodes: vec![a, b],
+            edges: vec![],
+        };
+
+        let err = topological_sort_nodes(&graph).expect_err("duplicate node keys should fail");
+        assert!(matches!(
+            err,
+            SchedulerError::GraphValidation(GraphValidationError::DuplicateNodeKey { .. })
+        ));
+    }
+
+    #[test]
+    fn scheduler_invalid_graph_returns_error_not_panic() {
+        let node = make_node(
+            "node/only",
+            "passthrough",
+            &[],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        let missing = node_id_from_key("node/missing");
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("invalid-edge".to_string()),
+            nodes: vec![node.clone()],
+            edges: vec![EdgeV1 {
+                from_node_id: node_id_from_key(&node.node_key),
+                to_node_id: missing,
+                asset_key: None,
+            }],
+        };
+
+        let err = topological_sort_nodes(&graph).expect_err("invalid edge must return typed error");
+        assert!(matches!(
+            err,
+            SchedulerError::GraphValidation(GraphValidationError::UnknownEdgeEndpoint { .. })
+        ));
     }
 
     #[test]

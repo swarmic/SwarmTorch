@@ -433,11 +433,11 @@ Fingerprint v0 (metadata-first) is defined so it can be computed without raw row
 
 Evidence: ADR-0017, swarm-torch-core/src/dataops.rs
 
-TODO: finalize deferred `NodeV1` schema fields (`op_hash`, `resources`, `cache_policy`, `materialization_policy`) and publish JSON schema docs.
+TODO: publish standalone `graph.json` schema docs with explicit compatibility/migration guidance for typed optional policy/resource fields.
 
 Evidence: ADR-0017.
 
-Current status: `graph.json` schema types and canonical hashing are implemented (with `node_id` derived from `node_key`, and `node_def_hash = sha256(postcard(NodeDefCanonicalV1))`). Materialization emitters are implemented (`DataOpsSession`/artifact sink path), while the full execution engine remains planned. `execution_hint` is implemented as planner metadata and excluded from `node_def_hash`; deferred schema fields are tracked in ADR-0017.
+Current status: `graph.json` schema types and canonical hashing are implemented (with `node_id` derived from `node_key`, and `node_def_hash = sha256(postcard(NodeDefCanonicalV1))`). Materialization emitters are implemented (`DataOpsSession`/artifact sink path). A sequential execution engine MVP is implemented (`swarm-torch/src/scheduler.rs`) with deterministic topological execution and fail-closed status recording; distributed orchestration remains planned. `execution_hint` is planner metadata and excluded from `node_def_hash`. Typed optional `NodeV1` fields (`op_hash`, `resources`, `cache_policy`, `materialization_policy`) are implemented; `op_hash` is computed metadata.
 
 Evidence: swarm-torch-core/src/run_graph.rs
 

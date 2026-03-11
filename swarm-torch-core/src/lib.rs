@@ -63,8 +63,8 @@ pub mod prelude {
     pub use crate::observe::{RunId, SpanId, TraceId};
     #[cfg(feature = "alloc")]
     pub use crate::run_graph::{
-        op_hash_v0, CachePolicyV0, GraphV1, MaterializationPolicyV0, NodeId, NodeV1, OpKind,
-        ResourceHintsV0,
+        op_hash_v0, validate_graph_v1, CachePolicyV0, GraphV1, GraphValidationError,
+        MaterializationPolicyV0, NodeId, NodeV1, OpKind, ResourceHintsV0,
     };
     pub use crate::traits::*;
 }

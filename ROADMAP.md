@@ -29,9 +29,18 @@ Wave 6 completes backlog convergence and canon lock:
 
 1. Behavior-preserving `A6X-06` decomposition of artifact/report modules.
 2. ADR/whitepaper/roadmap truth-sync for Wave 5 (`F1..F4`) implementation reality.
-3. Explicit ADR-0017 deferment note for remaining schema fields (`op_hash/resources/cache_policy/materialization_policy`).
+3. A6X canon stabilization for artifact/report contracts and release-gate evidence.
 
 See `docs/release_notes/v0.1.0-alpha.6x-wave6.md` for decomposition scope and compatibility evidence.
+
+Wave 7 extends reliability and execution scope:
+
+1. Reliability hardening on artifact/report load and manifest/write-path consistency.
+2. Sequential graph execution engine MVP (deterministic topo scheduling, cycle detection, policy gating, fail-closed node status recording).
+3. Typed `NodeV1` optional fields shipped (`op_hash`, `resources`, `cache_policy`, `materialization_policy`).
+4. Initial robustness harness coverage for Byzantine attack evaluation.
+
+See `docs/release_notes/v0.1.0-alpha.7x.md` for full Wave 7 implementation and gate evidence.
 
 ## Conformance Lock (A6X-05)
 

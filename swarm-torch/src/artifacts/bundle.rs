@@ -12,7 +12,7 @@ use swarm_torch_core::observe::{
     validate_event_record, validate_metric_record, validate_span_record, EventRecord, MetricRecord,
     RunId, SpanRecord,
 };
-use swarm_torch_core::run_graph::{validate_node_v1, GraphV1};
+use swarm_torch_core::run_graph::{validate_graph_v1, validate_node_v1, GraphV1};
 
 use super::io::{
     append_ndjson, collect_files_recursive, ensure_file, hex_lower, read_json, rel_path_string,
@@ -149,6 +149,8 @@ impl RunArtifactBundle {
             validate_node_v1(node)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         }
+        validate_graph_v1(&g)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         for node in &mut g.nodes {
             if node.code_ref.as_deref().unwrap_or("").is_empty() {
                 node.code_ref = Some(format!("swarm-torch@{}", env!("CARGO_PKG_VERSION")));
@@ -156,6 +158,8 @@ impl RunArtifactBundle {
         }
         let normalized = g
             .normalize()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        validate_graph_v1(&normalized)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         write_json_pretty_atomic(&self.run_dir.join("graph.json"), &normalized)
     }

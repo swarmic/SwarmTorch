@@ -9,7 +9,7 @@
 //! IMPORTANT: Do not hash JSON bytes for identity. Hash canonical binary (postcard)
 //! encoding of a canonical struct (`NodeDefCanonicalV1`).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -430,6 +430,109 @@ pub fn validate_node_v1(node: &NodeV1) -> Result<(), NodeValidationError> {
     Ok(())
 }
 
+/// Validation error for `GraphV1` graph-scope invariants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphValidationError {
+    /// Duplicate `node_key` was found.
+    DuplicateNodeKey { node_key: String },
+    /// Duplicate effective `node_id` was found.
+    DuplicateNodeId {
+        node_id: String,
+        first_node_key: String,
+        duplicate_node_key: String,
+    },
+    /// An edge references a `node_id` that does not exist in `nodes[]`.
+    UnknownEdgeEndpoint {
+        from_node_id: NodeId,
+        to_node_id: NodeId,
+        missing_node_id: NodeId,
+    },
+}
+
+impl core::fmt::Display for GraphValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DuplicateNodeKey { node_key } => {
+                write!(f, "duplicate node_key in graph: {node_key}")
+            }
+            Self::DuplicateNodeId {
+                node_id,
+                first_node_key,
+                duplicate_node_key,
+            } => write!(
+                f,
+                "duplicate node_id in graph: {node_id} (first node_key: {first_node_key}, duplicate node_key: {duplicate_node_key})"
+            ),
+            Self::UnknownEdgeEndpoint {
+                from_node_id,
+                to_node_id,
+                missing_node_id,
+            } => write!(
+                f,
+                "graph edge references unknown node_id: {} -> {} (missing: {})",
+                from_node_id, to_node_id, missing_node_id
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for GraphValidationError {}
+
+/// Validate graph-scope invariants for `GraphV1`.
+///
+/// Invariants:
+/// - `node_key` values are unique.
+/// - Effective `node_id` values are unique (`node.node_id` if present, otherwise `node_id_from_key(node_key)`).
+/// - Every edge endpoint exists in `nodes[]`.
+pub fn validate_graph_v1(graph: &GraphV1) -> Result<(), GraphValidationError> {
+    let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+    let mut node_ids: BTreeMap<String, String> = BTreeMap::new();
+
+    for node in &graph.nodes {
+        if !seen_keys.insert(node.node_key.clone()) {
+            return Err(GraphValidationError::DuplicateNodeKey {
+                node_key: node.node_key.clone(),
+            });
+        }
+
+        let effective_id = node
+            .node_id
+            .unwrap_or_else(|| node_id_from_key(&node.node_key));
+        let effective_id_hex = effective_id.to_string();
+        if let Some(first_key) = node_ids.get(&effective_id_hex) {
+            return Err(GraphValidationError::DuplicateNodeId {
+                node_id: effective_id_hex,
+                first_node_key: first_key.clone(),
+                duplicate_node_key: node.node_key.clone(),
+            });
+        }
+        node_ids.insert(effective_id_hex, node.node_key.clone());
+    }
+
+    for edge in &graph.edges {
+        let from_hex = edge.from_node_id.to_string();
+        if !node_ids.contains_key(&from_hex) {
+            return Err(GraphValidationError::UnknownEdgeEndpoint {
+                from_node_id: edge.from_node_id,
+                to_node_id: edge.to_node_id,
+                missing_node_id: edge.from_node_id,
+            });
+        }
+
+        let to_hex = edge.to_node_id.to_string();
+        if !node_ids.contains_key(&to_hex) {
+            return Err(GraphValidationError::UnknownEdgeEndpoint {
+                from_node_id: edge.from_node_id,
+                to_node_id: edge.to_node_id,
+                missing_node_id: edge.to_node_id,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl GraphV1 {
     /// Normalize all nodes (fill derived fields).
     pub fn normalize(mut self) -> Result<Self, postcard::Error> {
@@ -701,5 +804,71 @@ mod tests {
         a = normalize_node_v1(a).unwrap();
         b = normalize_node_v1(b).unwrap();
         assert_ne!(a.op_hash, b.op_hash);
+    }
+
+    #[test]
+    fn validate_graph_rejects_duplicate_node_keys() {
+        let mut a = make_valid_node();
+        let mut b = make_valid_node();
+        a.node_key = "node/dup".to_string();
+        b.node_key = "node/dup".to_string();
+
+        let graph = GraphV1 {
+            schema_version: GRAPH_SCHEMA_V1,
+            graph_id: Some("dup-key".to_string()),
+            nodes: vec![a, b],
+            edges: vec![],
+        };
+
+        let err = validate_graph_v1(&graph).expect_err("duplicate node_key should fail");
+        assert!(matches!(err, GraphValidationError::DuplicateNodeKey { .. }));
+    }
+
+    #[test]
+    fn validate_graph_rejects_duplicate_node_ids() {
+        let mut a = make_valid_node();
+        let mut b = make_valid_node();
+        a.node_key = "node/a".to_string();
+        b.node_key = "node/b".to_string();
+
+        let duplicate_id = node_id_from_key(&a.node_key);
+        a.node_id = Some(duplicate_id);
+        b.node_id = Some(duplicate_id);
+
+        let graph = GraphV1 {
+            schema_version: GRAPH_SCHEMA_V1,
+            graph_id: Some("dup-id".to_string()),
+            nodes: vec![a, b],
+            edges: vec![],
+        };
+
+        let err = validate_graph_v1(&graph).expect_err("duplicate node_id should fail");
+        assert!(matches!(err, GraphValidationError::DuplicateNodeId { .. }));
+    }
+
+    #[test]
+    fn validate_graph_rejects_unknown_edge_endpoints() {
+        let mut node = make_valid_node();
+        node.node_key = "node/known".to_string();
+
+        let known = node_id_from_key(&node.node_key);
+        let missing = node_id_from_key("node/missing");
+        let graph = GraphV1 {
+            schema_version: GRAPH_SCHEMA_V1,
+            graph_id: Some("missing-edge-endpoint".to_string()),
+            nodes: vec![node],
+            edges: vec![EdgeV1 {
+                from_node_id: known,
+                to_node_id: missing,
+                asset_key: None,
+            }],
+        };
+
+        let err =
+            validate_graph_v1(&graph).expect_err("unknown edge endpoint should fail validation");
+        assert!(matches!(
+            err,
+            GraphValidationError::UnknownEdgeEndpoint { .. }
+        ));
     }
 }

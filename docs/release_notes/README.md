@@ -26,11 +26,13 @@ New contributors should read these in order:
 11. [`v0.1.0-alpha.6x-wave0.md`](v0.1.0-alpha.6x-wave0.md) — Wave 0 remediation: replay boundary, identity canonicalization, fail-closed hashing, clock/telemetry integrity
 12. [`v0.1.0-alpha.6x-wave1.md`](v0.1.0-alpha.6x-wave1.md) — Wave 1 remediation: aggregation/compression/model safety guards, URI stripping, monotonic clock
 13. [`v0.1.0-alpha.6x-wave2.md`](v0.1.0-alpha.6x-wave2.md) — Wave 2 remediation: replay configurability, compression fail-closed, node validation, descriptor bounds, SwarmConfig/Topology constructors
-14. [`v0.1.0-alpha.6x-wave3.md`](v0.1.0-alpha.6x-wave3.md) — Wave 3 remediation: identity/crypto hardening, observe bounds enforcement, trait/model API batch, mock backpressure realism
-15. [`v0.1.0-alpha.6x-wave4.md`](v0.1.0-alpha.6x-wave4.md) — Wave 4 remediation convergence: TopK throughput, model RNG/capacity evolution, OpRunner error contract, error chaining, v0.2 handoff gate
-16. [`v0.1.0-alpha.6x-wave5.md`](v0.1.0-alpha.6x-wave5.md) — v0.2 F-track rollout: ExecutionHint schema, transform-audit plumbing, UpdateTransform + aggregation pipeline + tracing
-17. [`v0.1.0-alpha.6x-wave6.md`](v0.1.0-alpha.6x-wave6.md) — Backlog convergence: canon lock + behavior-preserving artifacts/report module decomposition (`A6X-06`)
-18. [`v0.1.0-alpha.7x.md`](v0.1.0-alpha.7x.md) — Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed NodeV1 deferred fields, robustness harness
+14. [`v0.1.0-alpha.6x-wave2.1.md`](v0.1.0-alpha.6x-wave2.1.md) — Archival bridge note restoring historical alpha.6x evidence references
+15. [`v0.1.0-alpha.6x-wave3.md`](v0.1.0-alpha.6x-wave3.md) — Wave 3 remediation: identity/crypto hardening, observe bounds enforcement, trait/model API batch, mock backpressure realism
+16. [`v0.1.0-alpha.6x-wave4.md`](v0.1.0-alpha.6x-wave4.md) — Wave 4 remediation convergence: TopK throughput, model RNG/capacity evolution, OpRunner error contract, error chaining, v0.2 handoff gate
+17. [`v0.1.0-alpha.6x-wave5.md`](v0.1.0-alpha.6x-wave5.md) — v0.2 F-track rollout: ExecutionHint schema, transform-audit plumbing, UpdateTransform + aggregation pipeline + tracing
+18. [`v0.1.0-alpha.6x-wave6.md`](v0.1.0-alpha.6x-wave6.md) — Backlog convergence: canon lock + behavior-preserving artifacts/report module decomposition (`A6X-06`)
+19. [`v0.1.0-alpha.7x.md`](v0.1.0-alpha.7x.md) — Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed NodeV1 deferred fields, robustness harness
+20. [`v0.1.0-alpha.7x-wave1.md`](v0.1.0-alpha.7x-wave1.md) — Wave 7.1 convergence: scheduler fail-closed hardening, graph invariants, canon/release-trace reconciliation
 
 ## Versioning
 

@@ -135,8 +135,7 @@ fn robustness_harness_collusion_cluster_degrades_fedavg_more_than_median() {
 
 #[test]
 fn robustness_harness_sign_flip_attack_penalizes_fedavg() {
-    let (updates, target) =
-        make_round_updates(11, 2, 32, AttackFamily::SignFlip, 0x000A_11CE_5EED);
+    let (updates, target) = make_round_updates(11, 2, 32, AttackFamily::SignFlip, 0x000A_11CE_5EED);
     let fedavg = FedAvg.aggregate(&updates).expect("fedavg should aggregate");
     let trimmed = TrimmedMean::new(0.2)
         .aggregate(&updates)

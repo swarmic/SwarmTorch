@@ -432,7 +432,8 @@ cargo run -p swarm-torch --example artifact_pipeline
 
 ### v0.1.0 - Swarm Robotics MVP (Current)
 
-- ⚠️ Core algorithm configuration/types (full execution engine is in progress)
+- ✅ Sequential execution engine MVP (single-process deterministic scheduler)
+- ⚠️ Distributed orchestration/execution remains in progress
 - ❌ TCP/UDP concrete transports (planned; trait + mock currently implemented)
 - ✅ Basic robust aggregators (Median, Trimmed Mean, Krum)
 - ❌ Burn backend integration (placeholder wrapper currently)
@@ -450,6 +451,7 @@ cargo run -p swarm-torch --example artifact_pipeline
 - ✅ F1: run-graph execution hints (`ExecutionHint`) for profile/device-aware planning
 - ✅ F2a/F2/F3/F4 batch: transform audit plumbing, `UpdateTransform`, composable aggregation pipeline, lightweight tracing
 - ✅ Wave 6 convergence: canon truth-sync + behavior-preserving `A6X-06` decomposition of artifact/report modules (no runtime/schema feature expansion)
+- ✅ Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed `NodeV1` policy/resource fields, robustness harness baseline
 
 ### v0.3.0 - Production Hardening
 

@@ -3583,7 +3583,7 @@ runs/<run_id>/
 **Date:** 2026-02-08  
 **Deciders:** Core Team
 
-**Implementation Status (2026-03-11):** Partial (graph/fingerprint/materialization contract implemented; Wave 5 added `execution_hint`, transform-audit propagation, composable aggregation pipeline, and trace estimates; full execution engine and additional `NodeV1` schema fields remain planned)
+**Implementation Status (2026-03-11):** Active (graph/fingerprint/materialization contract implemented; Wave 5 added `execution_hint`, transform-audit propagation, composable aggregation pipeline, and trace estimates; Wave 7 added sequential execution engine MVP and typed `NodeV1` fields `op_hash/resources/cache_policy/materialization_policy`; distributed orchestration remains planned)
 
 ### Conformance Hooks (Current)
 
@@ -3595,25 +3595,24 @@ runs/<run_id>/
 - `cargo test -p swarm-torch materialize_rejects_output_not_declared_in_node`
 - `cargo test -p swarm-torch materialize_fails_on_missing_input_asset`
 
-### Schema Deferments (2026-03-11)
+### Schema Status (2026-03-11)
 
-`NodeV1` intentionally ships in a staged schema profile:
+`NodeV1` now includes:
 
-- Implemented now:
-  - `params`
-  - `execution_trust`
-  - optional `execution_hint`
-- Deferred to a dedicated schema slice:
-  - `op_hash`
-  - `resources`
-  - `cache_policy`
-  - `materialization_policy`
+- `params`
+- `execution_trust`
+- optional `execution_hint`
+- optional `op_hash` (computed metadata, not caller-authoritative)
+- optional `resources`
+- optional `cache_policy`
+- optional `materialization_policy`
 
 Normative hash policy for the current schema:
 
 - `execution_hint` is planner metadata and is **excluded** from `NodeDefCanonicalV1`.
 - Changing `execution_hint` **MUST NOT** change `node_def_hash`.
-- Deferred fields above are not present in the current canonical struct and therefore do not affect current hash/cache invariants.
+- `op_hash` is computed from operation-definition semantics only and excludes graph wiring.
+- Typed optional policy/resource fields are additive metadata and do not mutate `node_def_hash`.
 
 ### Context
 
@@ -3650,9 +3649,9 @@ Define a SwarmTorch-native **pipeline graph DSL** and **asset model**, serialize
   - `op_type` (enum string): e.g. `ingest`, `transform`, `validate`, `split`, `stats`, `persist`, `train`, `aggregate`, `eval`, `export`, `broadcast`, `vote`, `redact`, ...
   - `inputs[]` / `outputs[]` as asset keys
   - `params` (JSON object)
-  - `op_hash` (deterministic hash of op code/config) — deferred schema field
-  - `resources` (cpu/mem hints; optional accelerator hints) — deferred schema field
-  - `cache_policy` and `materialization_policy` — deferred schema fields
+  - `op_hash` (deterministic hash of op definition metadata)
+  - `resources` (cpu/mem hints; optional accelerator hints)
+  - `cache_policy` and `materialization_policy` (typed policy hints)
   - `execution_trust` (e.g. `core`, `sandboxed_extension`, `unsafe_extension`)
   - optional `execution_hint` planner metadata (excluded from `node_def_hash`)
   - `output_refs[]` (optional): how to locate outputs (bundle path or external URI + hash)

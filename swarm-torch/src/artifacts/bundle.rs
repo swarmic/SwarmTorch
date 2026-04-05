@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use swarm_torch_core::dataops::{
@@ -250,6 +250,8 @@ impl RunArtifactBundle {
     ///
     /// Note: `manifest.json` is excluded from itself (non-self-referential).
     pub fn finalize_manifest(&self) -> io::Result<()> {
+        let canonical_root = self.run_dir.canonicalize()?;
+
         // Ensure baseline v1 required files exist before hashing.
         for p in required_paths_v1() {
             let full = self.run_dir.join(p);
@@ -270,6 +272,8 @@ impl RunArtifactBundle {
                 continue;
             }
             let rel = rel_path_string(&file_path, &self.run_dir)?;
+            validate_manifest_path(&rel)?;
+            ensure_path_within_bundle(&file_path, &canonical_root, &rel)?;
             let bytes = fs::metadata(&file_path)?.len();
             let digest = sha256_file(&file_path)?;
             entries.push(ManifestEntryV1 {
@@ -295,6 +299,7 @@ impl RunArtifactBundle {
     pub fn validate_manifest(&self) -> io::Result<()> {
         let manifest_path = self.run_dir.join("manifest.json");
         let manifest: ManifestV1 = read_json(&manifest_path)?;
+        let canonical_root = self.run_dir.canonicalize()?;
 
         if manifest.schema_version != SCHEMA_VERSION_V1 {
             return Err(io::Error::new(
@@ -319,6 +324,8 @@ impl RunArtifactBundle {
         let mut seen_required_paths: BTreeSet<String> = BTreeSet::new();
 
         for entry in manifest.entries {
+            validate_manifest_path(&entry.path)?;
+
             if !seen_paths.insert(entry.path.clone()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -347,6 +354,7 @@ impl RunArtifactBundle {
                     format!("missing file listed in manifest: {}", entry.path),
                 ));
             }
+            ensure_path_within_bundle(&path, &canonical_root, &entry.path)?;
             let meta = fs::metadata(&path)?;
             if meta.len() != entry.bytes {
                 return Err(io::Error::new(
@@ -390,9 +398,81 @@ fn required_paths_v1() -> &'static [&'static str] {
         "datasets/registry.json",
         "datasets/lineage.json",
         "datasets/materializations.ndjson",
+        "datasets/registry_updates.ndjson",
+        "datasets/lineage_edges.ndjson",
     ]
 }
 
 fn is_required_path_v1(p: &str) -> bool {
     required_paths_v1().contains(&p)
+}
+
+fn validate_manifest_path(path: &str) -> io::Result<()> {
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest path must be non-empty",
+        ));
+    }
+
+    let parsed = Path::new(path);
+    if parsed.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest path must be relative: {path}"),
+        ));
+    }
+
+    let mut has_normal_component = false;
+    for component in parsed.components() {
+        match component {
+            Component::Normal(_) => {
+                has_normal_component = true;
+            }
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("manifest path must not contain '..': {path}"),
+                ));
+            }
+            Component::CurDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("manifest path must not contain '.': {path}"),
+                ));
+            }
+            Component::RootDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("manifest path must be relative: {path}"),
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("manifest path must be relative: {path}"),
+                ));
+            }
+        }
+    }
+
+    if !has_normal_component {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest path is invalid: {path}"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_path_within_bundle(path: &Path, canonical_root: &Path, rel: &str) -> io::Result<()> {
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest path escapes bundle root: {rel}"),
+        ));
+    }
+    Ok(())
 }

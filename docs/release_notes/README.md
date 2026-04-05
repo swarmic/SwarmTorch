@@ -33,6 +33,7 @@ New contributors should read these in order:
 18. [`v0.1.0-alpha.6x-wave6.md`](v0.1.0-alpha.6x-wave6.md) — Backlog convergence: canon lock + behavior-preserving artifacts/report module decomposition (`A6X-06`)
 19. [`v0.1.0-alpha.7x.md`](v0.1.0-alpha.7x.md) — Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed NodeV1 deferred fields, robustness harness
 20. [`v0.1.0-alpha.7x-wave1.md`](v0.1.0-alpha.7x-wave1.md) — Wave 7.1 convergence: scheduler fail-closed hardening, graph invariants, canon/release-trace reconciliation
+21. [`v0.1.0-alpha.8x-wave0.md`](v0.1.0-alpha.8x-wave0.md) — Wave 8.0 contract recovery + artifact trust-boundary hardening + telemetry namespace canon sync
 
 ## Versioning
 

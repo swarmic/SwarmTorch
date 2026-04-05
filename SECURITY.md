@@ -36,8 +36,21 @@ SwarmTorch is pre-1.0 and actively building out its security posture. Core secur
 **Known Limitations:**
 
 - Replay cache is **memory-only** (non-persistent). Node restart resets the cache, creating a brief replay window (≤ max_clock_skew_secs, default 60s).
+- Replay cache uses bounded LRU capacity. Under extreme peer churn, an evicted peer can be re-admitted as a fresh replay state entry.
 - Transport security (TLS/DTLS) is planned but not yet implemented.
 - Sybil resistance requires external identity providers (see ADR-0008A).
+
+**Operational controls for replay limitations (current wave policy):**
+
+- Treat process restart as a replay-boundary event and avoid rejoining an untrusted mesh until `max_clock_skew_secs` has elapsed.
+- Keep sender sequence generation monotonic per peer key and avoid sequence resets across rolling restarts.
+- Use capacity sizing (`ReplayProtection::try_with_config`) appropriate for expected active-peer cardinality to reduce LRU-eviction replay exposure.
+
+**SecurityConfig enforcement scope (current reality):**
+
+- `swarm_torch_core::crypto::SecurityConfig` is currently a configuration surface, not a runtime enforcement hook in `swarm-torch-net` verifier flow.
+- Do not treat `SecurityConfig` fields as active policy toggles for transport auth/replay decisions in this release.
+- Enforcement wiring is tracked as near-term follow-on work in `docs/plans/v0.1.0-alpha.8x-phase2-remediation-roadmap.md`.
 
 See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model and implementation status.
 
@@ -64,7 +77,7 @@ cargo vet
 ### Policy
 
 - **No unvetted dependencies** may be merged without explicit sign-off
-- **License policy violations** are blocked per [`deny.toml`](deny.toml) (project license is MPL-2.0; strong copyleft dependencies like GPL/AGPL remain disallowed)
+- **License policy violations** are blocked by maintainer policy via [`deny.toml`](deny.toml) checks (project license is MPL-2.0; strong copyleft dependencies like GPL/AGPL remain disallowed). CI enforcement remains planned.
 
 ---
 
@@ -83,7 +96,7 @@ permissions:
 
 ### Action Pinning
 
-All third-party actions pinned to full-length commit SHAs, not tags.
+Third-party actions in `.github/workflows/rust.yml` are pinned to full-length commit SHAs, not tags.
 
 ---
 

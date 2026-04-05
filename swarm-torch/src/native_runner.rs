@@ -89,19 +89,19 @@ impl NativeOpRunner {
         // Emit span
         let mut attrs: AttrMap = BTreeMap::new();
         attrs.insert(
-            "op_type".to_string(),
+            "swarmtorch.op_type".to_string(),
             swarm_torch_core::observe::AttrValue::Str(node.op_type.clone()),
         );
         attrs.insert(
-            "node_key".to_string(),
+            "swarmtorch.node_key".to_string(),
             swarm_torch_core::observe::AttrValue::Str(node.node_key.clone()),
         );
         attrs.insert(
-            "input_count".to_string(),
+            "swarmtorch.input_count".to_string(),
             swarm_torch_core::observe::AttrValue::I64(inputs.len() as i64),
         );
         attrs.insert(
-            "output_count".to_string(),
+            "swarmtorch.output_count".to_string(),
             swarm_torch_core::observe::AttrValue::I64(outputs.len() as i64),
         );
 
@@ -364,5 +364,30 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("unsupported op_type"));
+    }
+
+    #[test]
+    fn native_runner_spans_use_swarmtorch_namespace() {
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let runner = NativeOpRunner;
+        let node = test_node("passthrough");
+        let inputs = test_inputs();
+
+        let _ = runner
+            .run_with_context(&ctx, &node, &inputs, &emitter)
+            .expect("run should succeed");
+        let spans = emitter.spans.read().unwrap();
+        assert_eq!(spans.len(), 1);
+        let attrs = &spans[0].attrs;
+
+        assert!(attrs.contains_key("swarmtorch.op_type"));
+        assert!(attrs.contains_key("swarmtorch.node_key"));
+        assert!(attrs.contains_key("swarmtorch.input_count"));
+        assert!(attrs.contains_key("swarmtorch.output_count"));
+        assert!(!attrs.contains_key("op_type"));
+        assert!(!attrs.contains_key("node_key"));
+        assert!(!attrs.contains_key("input_count"));
+        assert!(!attrs.contains_key("output_count"));
     }
 }

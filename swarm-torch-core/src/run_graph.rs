@@ -11,6 +11,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};

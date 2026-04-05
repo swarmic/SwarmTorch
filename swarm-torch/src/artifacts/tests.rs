@@ -151,6 +151,205 @@ fn validate_manifest_rejects_duplicate_paths() {
 }
 
 #[test]
+fn validate_manifest_rejects_parent_traversal_path() {
+    let base = temp_dir("manifest_parent_traversal");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([14u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let outside = bundle
+        .run_dir()
+        .parent()
+        .expect("run_dir parent should exist")
+        .join("outside");
+    fs::write(&outside, b"outside").unwrap();
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] = serde_json::Value::String("../outside".to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("parent traversal path should fail");
+    assert!(
+        err.to_string().contains("must not contain '..'"),
+        "error should mention traversal rejection: {err}"
+    );
+
+    let _ = fs::remove_file(&outside);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn validate_manifest_rejects_absolute_path() {
+    let base = temp_dir("manifest_absolute_path");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([15u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let abs = std::env::temp_dir().join(format!(
+        "swarmtorch_absolute_target_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::write(&abs, b"abs").unwrap();
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] = serde_json::Value::String(abs.to_string_lossy().to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("absolute path should fail");
+    assert!(
+        err.to_string().contains("must be relative"),
+        "error should mention relative path requirement: {err}"
+    );
+
+    let _ = fs::remove_file(&abs);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_manifest_rejects_symlink_escape() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    let base = temp_dir("manifest_symlink_escape");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([16u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let outside = base.join("outside_target.bin");
+    fs::write(&outside, b"outside-data").unwrap();
+    let symlink_path = bundle.run_dir().join("datasets").join("escape_link");
+    symlink(&outside, &symlink_path).expect("symlink creation should succeed");
+
+    let outside_bytes = fs::read(&outside).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(&outside_bytes);
+    let outside_sha = format!("{:x}", hasher.finalize());
+    let outside_len = outside_bytes.len() as u64;
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] = serde_json::Value::String("datasets/escape_link".to_string());
+    first["sha256"] = serde_json::Value::String(outside_sha);
+    first["bytes"] = serde_json::Value::from(outside_len);
+    first["required"] = serde_json::Value::Bool(false);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("symlink escape should fail");
+    assert!(
+        err.to_string().contains("escapes bundle root"),
+        "error should mention bundle root escape: {err}"
+    );
+
+    let _ = fs::remove_file(&outside);
+    let _ = fs::remove_file(&symlink_path);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn validate_manifest_accepts_legitimate_nested_path() {
+    let base = temp_dir("manifest_legitimate_nested");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([17u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    bundle
+        .validate_manifest()
+        .expect("valid nested bundle paths should pass");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn validate_manifest_requires_registry_updates_ndjson() {
+    let base = temp_dir("manifest_requires_registry_updates");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([18u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    entries.retain(|entry| {
+        entry.get("path")
+            != Some(&serde_json::Value::String(
+                "datasets/registry_updates.ndjson".into(),
+            ))
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("registry_updates.ndjson should be required");
+    assert!(
+        err.to_string()
+            .contains("required manifest entry missing: datasets/registry_updates.ndjson"),
+        "error should mention missing required update log: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn emit_span_rejects_oversized_name_at_write_time() {
     let base = temp_dir("emit_span_rejects_oversized_name");
     let _ = fs::remove_dir_all(&base);

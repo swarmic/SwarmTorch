@@ -350,9 +350,15 @@ fn emit_scheduler_event(
     detail: Option<&str>,
 ) -> io::Result<()> {
     let mut attrs = AttrMap::new();
-    attrs.insert("node_key".to_string(), AttrValue::Str(node_key.to_string()));
+    attrs.insert(
+        "swarmtorch.node_key".to_string(),
+        AttrValue::Str(node_key.to_string()),
+    );
     if let Some(detail) = detail {
-        attrs.insert("detail".to_string(), AttrValue::Str(detail.to_string()));
+        attrs.insert(
+            "swarmtorch.detail".to_string(),
+            AttrValue::Str(detail.to_string()),
+        );
     }
     let event = EventRecord {
         schema_version: 1,
@@ -741,6 +747,61 @@ mod tests {
             statuses.contains(&MaterializationStatusV0::Skipped),
             "dependent node should emit skipped status"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scheduler_events_use_swarmtorch_namespace() {
+        let (base, mut session) = create_session("event_namespace");
+        register_source(&mut session, "dataset://ns/raw");
+
+        let node = make_node(
+            "node/a",
+            "passthrough",
+            &["dataset://ns/raw"],
+            &["dataset://ns/a"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("event-namespace".to_string()),
+            nodes: vec![node],
+            edges: vec![],
+        };
+
+        let report = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x55; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(report.executed_nodes, vec!["node/a"]);
+
+        session.finalize().unwrap();
+        let loaded = load_report(session.sink().bundle().run_dir()).unwrap();
+        assert!(
+            !loaded.events.is_empty(),
+            "scheduler execution should emit events"
+        );
+
+        for event in &loaded.events {
+            assert!(
+                event.attrs.contains_key("swarmtorch.node_key"),
+                "scheduler event should contain swarmtorch.node_key"
+            );
+            assert!(
+                !event.attrs.contains_key("node_key"),
+                "legacy node_key key must not be emitted"
+            );
+            assert!(
+                !event.attrs.contains_key("detail"),
+                "legacy detail key must not be emitted"
+            );
+        }
 
         let _ = fs::remove_dir_all(&base);
     }

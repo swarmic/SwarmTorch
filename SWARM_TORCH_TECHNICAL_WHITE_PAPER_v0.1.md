@@ -54,7 +54,7 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Extensibility | Sandboxed-by-default extensions | Evidence: ADR-0018 | Planned | WASM-first host (future) |
 | Telemetry | Canonical IDs + span/event/metric record types + emitter trait | Evidence: ADR-0012, ADR-0016, swarm-torch-core/src/observe.rs | Partial | Tracing integration + OTLP export is not implemented yet |
 | Threat model | Threat model + trust boundaries defined | Evidence: ADR-0008, ADR-0008A | Implemented | Documented; enforcement varies by feature |
-| Robustness | Robust aggregation algorithms | Evidence: swarm-torch-core/src/aggregation.rs | Partial | FedAvg/TrimmedMean/Median implemented; harness pending |
+| Robustness | Robust aggregation algorithms | Evidence: swarm-torch-core/src/aggregation.rs, swarm-torch-core/tests/robustness_harness.rs | Partial | FedAvg/TrimmedMean/Median implemented; initial robustness harness implemented (not a release gate) |
 | Compression | Update compression primitives | Evidence: swarm-torch-core/src/compression.rs | Partial | TopK/Quantized implemented; convergence guarantees TBD |
 | Networking | Message envelope + transport trait | Evidence: swarm-torch-net/src/protocol.rs, swarm-torch-net/src/traits.rs | Partial | Real transports are placeholders |
 | Replay protection | Sequence/timestamp validation enforced (memory-only cache) | Evidence: swarm-torch-core/src/replay.rs, swarm-torch-net/src/protocol.rs, ADR-0008B | Implemented | LRU cache, ±60s skew window, 16-message out-of-order tolerance |
@@ -368,7 +368,8 @@ Implemented robust aggregation configuration includes:
 
 Evidence: swarm-torch-core/src/aggregation.rs
 
-Planned (not yet implemented in code): Bulyan, robust aggregation harness, and rejection/telemetry integration.
+Planned (not yet implemented in code): Bulyan and rejection/telemetry integration.  
+Implemented but not yet release-gated: initial robustness harness scenarios (outlier/sign-flip/NaN-Inf/collusion + optional Krum gate).
 
 Evidence: ADR-0007, ADR-0007A
 
@@ -542,7 +543,7 @@ This appendix lists conformance hooks that keep the white paper’s normative cl
 | Workspace builds | `cargo check --workspace` | Implemented | Evidence: Cargo.toml |
 | Workspace tests | `cargo test --workspace` | Implemented | Evidence: Cargo.toml |
 | Docs build | `cargo doc --workspace --no-deps` | Implemented | Evidence: Cargo.toml |
-| embedded_min core build | `cargo build -p swarm-torch-core --no-default-features` | Planned | Evidence: ADR-0002 |
+| embedded_min core build | `cargo build -p swarm-torch-core --no-default-features` | Implemented | Evidence: .github/workflows/rust.yml |
 | no_std + alloc core build | `cargo build -p swarm-torch-core --no-default-features --features alloc` | Implemented | Evidence: swarm-torch-core/Cargo.toml |
 | Embedded target build | `cargo build -p swarm-torch-core --no-default-features --features alloc --target thumbv7em-none-eabihf` | Planned | Evidence: ADR-0002 |
 

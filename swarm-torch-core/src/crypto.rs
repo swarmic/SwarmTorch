@@ -187,16 +187,20 @@ impl MessageAuth {
     }
 }
 
-/// Configuration for security features
+/// Configuration surface for security features.
+///
+/// Current enforcement reality (Wave 8):
+/// - This struct is not yet wired into `swarm-torch-net` verifier/runtime policy paths.
+/// - Values here are configuration intent only until follow-on enforcement wiring lands.
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
-    /// Require message signatures
+    /// Require message signatures (declarative; not currently verifier-enforced via this struct)
     pub require_signatures: bool,
-    /// Encrypt network traffic
+    /// Encrypt network traffic (declarative; transport security is not implemented yet)
     pub encrypt_transport: bool,
-    /// Validate gradient bounds
+    /// Validate gradient bounds (declarative; not currently wired as a runtime toggle)
     pub validate_gradients: bool,
-    /// Maximum clock skew for replay protection (seconds)
+    /// Maximum clock skew for replay protection (seconds; declarative in this config surface)
     pub max_clock_skew_secs: u32,
 }
 

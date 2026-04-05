@@ -6,7 +6,7 @@
 //! - Integration with Burn ML framework
 //! - Model serialization/deserialization
 //! - Reference model implementations
-//! - ONNX import/export utilities
+//! - ONNX import/export utilities (planned)
 //!
 //! ## Feature Flags
 //!

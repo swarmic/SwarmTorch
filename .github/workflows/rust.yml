@@ -71,3 +71,64 @@ jobs:
       - name: Artifact pipeline example (stable only)
         if: matrix.rust == 'stable'
         run: cargo run -p swarm-torch --example artifact_pipeline --locked
+
+  supply_chain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Install supply-chain tools
+        run: |
+          cargo install --locked cargo-deny --version 0.19.0
+          cargo install --locked cargo-audit --version 0.22.1
+          cargo install --locked cargo-vet --version 0.10.2
+
+      - name: Enforce exemption rationale policy (PR)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          BASE_SHA="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+          ADDED_EXEMPTIONS="$(git diff --unified=0 "${BASE_SHA}...HEAD" -- supply-chain/config.toml | grep -E '^\+\[\[exemptions\.' || true)"
+          if [[ -n "${ADDED_EXEMPTIONS}" ]]; then
+            if ! git diff --name-only "${BASE_SHA}...HEAD" | grep -Eq '^supply-chain/exemption-rationale\.md$'; then
+              echo "New cargo-vet exemptions detected in supply-chain/config.toml."
+              echo "You must update supply-chain/exemption-rationale.md with explicit rationale entries."
+              exit 1
+            fi
+          fi
+
+      - name: cargo deny (blocking)
+        run: cargo deny check
+
+      - name: cargo audit (blocking)
+        run: cargo audit
+
+      - name: cargo vet (advisory in Wave 8.1)
+        continue-on-error: true
+        run: cargo vet
+
+  windows_artifact_trust:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Build workspace (Windows)
+        run: cargo build --workspace --verbose --locked
+
+      - name: Artifact trust-boundary tests (Windows)
+        run: cargo test -p swarm-torch artifacts::tests::validate_manifest_ --locked
+
+      - name: Report loader trust checks (Windows)
+        run: cargo test -p swarm-torch report::tests::load_report_ --locked

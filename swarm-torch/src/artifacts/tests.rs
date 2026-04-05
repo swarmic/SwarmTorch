@@ -239,6 +239,145 @@ fn validate_manifest_rejects_absolute_path() {
     let _ = fs::remove_dir_all(&base);
 }
 
+#[cfg(windows)]
+#[test]
+fn validate_manifest_rejects_windows_drive_absolute_path() {
+    let base = temp_dir("manifest_windows_drive_absolute");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([19u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] = serde_json::Value::String("C:\\Windows\\System32\\drivers\\etc\\hosts".into());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("windows drive absolute path should fail");
+    assert!(
+        err.to_string().contains("must be relative"),
+        "error should mention relative path requirement: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(windows)]
+#[test]
+fn validate_manifest_rejects_windows_verbatim_prefix_path() {
+    let base = temp_dir("manifest_windows_verbatim_prefix");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([20u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] =
+        serde_json::Value::String("\\\\?\\C:\\Windows\\System32\\drivers\\etc\\hosts".into());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("windows verbatim-prefix path should fail");
+    assert!(
+        err.to_string().contains("must be relative"),
+        "error should mention relative path requirement: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(windows)]
+#[test]
+fn validate_manifest_rejects_symlink_escape_windows() {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::fs::symlink_file;
+
+    let base = temp_dir("manifest_symlink_escape_windows");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([21u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let outside = base.join("outside_target_windows.bin");
+    fs::write(&outside, b"outside-data").unwrap();
+    let symlink_path = bundle.run_dir().join("datasets").join("escape_link_win");
+    match symlink_file(&outside, &symlink_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            // Some Windows runners require elevated privileges for symlink creation.
+            // In those environments, absolute/prefix traversal tests still exercise
+            // path-confinement behavior, and this symlink-specific assertion is skipped.
+            let _ = fs::remove_file(&outside);
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        Err(err) => panic!("windows symlink creation failed unexpectedly: {err}"),
+    }
+
+    let outside_bytes = fs::read(&outside).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(&outside_bytes);
+    let outside_sha = format!("{:x}", hasher.finalize());
+    let outside_len = outside_bytes.len() as u64;
+
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entries = manifest
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("manifest entries must exist");
+    let first = entries.first_mut().expect("manifest must contain entries");
+    first["path"] = serde_json::Value::String("datasets/escape_link_win".to_string());
+    first["sha256"] = serde_json::Value::String(outside_sha);
+    first["bytes"] = serde_json::Value::from(outside_len);
+    first["required"] = serde_json::Value::Bool(false);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .validate_manifest()
+        .expect_err("symlink escape should fail on windows");
+    assert!(
+        err.to_string().contains("escapes bundle root"),
+        "error should mention bundle root escape: {err}"
+    );
+
+    let _ = fs::remove_file(&outside);
+    let _ = fs::remove_file(&symlink_path);
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[cfg(unix)]
 #[test]
 fn validate_manifest_rejects_symlink_escape() {

@@ -4,13 +4,17 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
+# cargo-deny 0.19 expects scope selection for unmaintained checks.
+# Use full graph coverage; lint level is handled by cargo-deny's advisory output policy.
+unmaintained = "all"
+ignore = [
+    # Deferred to Wave 8.2 dependency remediation (P2-11).
+    { id = "RUSTSEC-2025-0141", reason = "Transitive via burn-core; tracked in docs/plans/v0.1.0-alpha.8x-phase2-remediation-roadmap.md as P2-11." },
+]
 
 [licenses]
-unlicensed = "deny"
+# Allow-list policy: only SPDX IDs listed below are accepted.
+# Strong copyleft licenses (GPL/AGPL/LGPL) are implicitly denied by omission.
 allow = [
     "MPL-2.0",
     "MIT",
@@ -18,27 +22,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
     "Zlib",
-    "CC0-1.0",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",
 ]
-# The project is MPL-2.0 (file-level copyleft). We still disallow strong copyleft
-# dependencies by default.
-deny = [
-    # Strong copyleft (deny by default).
-    "AGPL-3.0-only",
-    "AGPL-3.0-or-later",
-    "GPL-2.0-only",
-    "GPL-2.0-or-later",
-    "GPL-3.0-only",
-    "GPL-3.0-or-later",
-    "LGPL-2.1-only",
-    "LGPL-2.1-or-later",
-    "LGPL-3.0-only",
-    "LGPL-3.0-or-later",
-]
-copyleft = "warn"
 confidence-threshold = 0.8
 
 [bans]

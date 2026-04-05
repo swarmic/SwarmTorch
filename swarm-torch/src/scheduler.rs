@@ -805,4 +805,65 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn scheduler_artifacts_use_swarmtorch_namespace_end_to_end() {
+        let (base, mut session) = create_session("namespace_end_to_end");
+        register_source(&mut session, "dataset://ns/raw");
+
+        let node = make_node(
+            "node/end_to_end",
+            "passthrough",
+            &["dataset://ns/raw"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("namespace-end-to-end".to_string()),
+            nodes: vec![node],
+            edges: vec![],
+        };
+
+        let report = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x66; 16]),
+            test_clock,
+        )
+        .expect("scheduler run should succeed");
+        assert_eq!(report.executed_nodes, vec!["node/end_to_end"]);
+
+        session.finalize().expect("session finalize should succeed");
+        let loaded = load_report(session.sink().bundle().run_dir()).expect("report should load");
+
+        assert!(
+            !loaded.events.is_empty(),
+            "scheduler should emit namespaced events"
+        );
+        assert!(
+            !loaded.spans.is_empty(),
+            "native runner should emit namespaced spans"
+        );
+
+        for event in &loaded.events {
+            assert!(event.attrs.contains_key("swarmtorch.node_key"));
+            assert!(!event.attrs.contains_key("node_key"));
+            assert!(!event.attrs.contains_key("detail"));
+        }
+        for span in &loaded.spans {
+            assert!(span.attrs.contains_key("swarmtorch.op_type"));
+            assert!(span.attrs.contains_key("swarmtorch.node_key"));
+            assert!(span.attrs.contains_key("swarmtorch.input_count"));
+            assert!(span.attrs.contains_key("swarmtorch.output_count"));
+            assert!(!span.attrs.contains_key("op_type"));
+            assert!(!span.attrs.contains_key("node_key"));
+            assert!(!span.attrs.contains_key("input_count"));
+            assert!(!span.attrs.contains_key("output_count"));
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

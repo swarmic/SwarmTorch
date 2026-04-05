@@ -69,7 +69,7 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs, swarm-torch-core/Cargo.toml | Partial | Core `no_std + alloc` and minimal `no_std` build gates compile; embedded runtime/transport and end-to-end examples remain planned |
 | GPU | WGPU-first; CUDA optional backend | Evidence: ADR-0015 | Planned | Backend wiring pending |
 | Python | Optional, bounded Python interop | Evidence: ADR-0009 | Planned | Keep separate crate boundary |
-| Supply chain | Dependency/license/source policy configs | Evidence: SECURITY.md, deny.toml, supply-chain/ | Partial | Configs exist; CI enforcement planned |
+| Supply chain | Dependency/license/source policy configs | Evidence: SECURITY.md, deny.toml, supply-chain/, .github/workflows/rust.yml | Partial | `cargo deny` + `cargo audit` are CI-enforced; `cargo vet` is advisory in Wave 8.1 |
 
 MSRV policy is currently tiered by crate:
 - `swarm-torch-core` security-critical path is validated on Rust 1.75.
@@ -119,7 +119,7 @@ SwarmTorch is designed for:
 
 Evidence: ADR-0004B, ADR-0006A
 
-TODO: define which assumptions are normative vs profiled (timeouts, quorum ratios, staleness thresholds).
+Tracked follow-up: `P2-12` (`Status: Planned`, Wave 8.2) defines normative vs profiled assumptions (timeouts, quorum ratios, staleness thresholds) in an enforceable matrix.
 
 ### Coordination Model (Design Target vs Current)
 
@@ -379,7 +379,7 @@ Compression primitives include `TopK`, `RandomSparse`, and `Quantized` modes.
 
 Evidence: swarm-torch-core/src/compression.rs
 
-TODO: specify default compression profiles and convergence/accuracy expectations.
+Tracked follow-up: `P2-15` (`Status: Planned`, Wave 8.3) specifies default compression profiles and convergence/accuracy expectations.
 
 Evidence: ADR-0007, ADR-0007A.
 
@@ -402,7 +402,7 @@ SwarmTorch includes a `GradientValidator` for basic bounds checking (NaN/Inf/coo
 
 Evidence: swarm-torch-core/src/crypto.rs
 
-TODO: map threat model requirements to concrete enforcement hooks (protocol parsing fuzzing, signature verification, byzantine harness, supply-chain gates).
+Tracked follow-up: `P2-13` (`Status: Planned`, Wave 8.2) maps threat model requirements to concrete enforcement hooks (protocol parsing fuzzing, signature verification, byzantine harness, supply-chain gates).
 
 Evidence: ADR-0008, ADR-0008A, `SECURITY.md`, `deny.toml`, `supply-chain/`.
 
@@ -434,7 +434,7 @@ Fingerprint v0 (metadata-first) is defined so it can be computed without raw row
 
 Evidence: ADR-0017, swarm-torch-core/src/dataops.rs
 
-TODO: publish standalone `graph.json` schema docs with explicit compatibility/migration guidance for typed optional policy/resource fields.
+Tracked follow-up: `P2-14` (`Status: Planned`, Wave 8.2) publishes standalone `graph.json` schema docs with explicit compatibility/migration guidance for typed optional policy/resource fields.
 
 Evidence: ADR-0017.
 
@@ -449,17 +449,17 @@ Evidence: swarm-torch-core/src/run_graph.rs
 Implemented (initial): standalone artifact reader that generates a self-contained `report.html` from a run bundle. Notebooks can render the HTML as a pure reader workflow.
 
 Evidence: ADR-0016.
-Evidence: swarm-torch/src/report.rs, swarm-torch/src/bin/swarm_torch_report.rs
+Evidence: swarm-torch/src/report/load.rs, swarm-torch/src/bin/swarm_torch_report.rs
 
 ### Local Dashboard (Phase 2)
 
-TODO: local server that reads artifacts (no tracking DB by default).
+Tracked follow-up: `P2-16` (`Status: Planned`, Wave 8.3) defines a local server profile that reads artifacts without requiring a tracking DB by default.
 
 Evidence: ADR-0016.
 
 ### Desktop Wrapper (Phase 3)
 
-TODO: Tauri/Iced wrapper once UX stabilizes; treat UI surface as part of the threat model.
+Tracked follow-up: `P2-17` (`Status: Planned`, Wave 8.3) scopes the Tauri/Iced wrapper once UX stabilizes and treats the UI surface as part of the threat model.
 
 Evidence: ADR-0016.
 
@@ -484,7 +484,7 @@ Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#Docs-RS, SWARM_TORCH
 - Reproducibility and benchmark gates (planned)  
   Evidence: ADR-0013, ADR-0014
 
-TODO: publish the exact CI workflow and conformance mapping in Appendix B.
+Status: `Implemented` (Wave 8.1). Appendix B now maps CI workflow hooks to conformance gates and security policy.
 
 Evidence: ADR-0011, ADR-0013, ADR-0014, `SECURITY.md`.
 
@@ -492,13 +492,13 @@ Evidence: ADR-0011, ADR-0013, ADR-0014, `SECURITY.md`.
 
 ### Swarmic Network Provider Profile (Secondary)
 
-TODO: define integration-only mapping without importing mission-plane semantics into SwarmTorch core.
+Tracked follow-up: `P2-18` (`Status: Planned`, Wave 8.3) defines integration-only mapping without importing mission-plane semantics into SwarmTorch core.
 
 Evidence: `CONTEXT_SOURCES.md`.
 
 ## Roadmap and Open Problems
 
-TODO: open research gaps, heterogeneity mitigation, compression tradeoffs, privacy roadmap, and maturity milestones.
+Tracked follow-up: `P2-19` (`Status: Planned`, Wave 8.3) records open research gaps, heterogeneity mitigation, compression tradeoffs, privacy roadmap, and maturity milestones.
 
 Evidence: `ROADMAP.md`.
 
@@ -551,9 +551,9 @@ This appendix lists conformance hooks that keep the white paper’s normative cl
 
 | Gate | Hook | Status | Evidence |
 |------|------|--------|----------|
-| RustSec advisories | `cargo audit` | Planned | Evidence: SECURITY.md |
-| License/source policy | `cargo deny check` | Planned | Evidence: deny.toml, SECURITY.md |
-| Human audit tracking | `cargo vet` | Planned | Evidence: supply-chain/, SECURITY.md |
+| RustSec advisories | `cargo audit` | Implemented | Evidence: .github/workflows/rust.yml, SECURITY.md |
+| License/source policy | `cargo deny check` | Implemented | Evidence: .github/workflows/rust.yml, deny.toml, SECURITY.md |
+| Human audit tracking | `cargo vet` | Partial | Evidence: .github/workflows/rust.yml, supply-chain/, SECURITY.md (advisory in Wave 8.1) |
 | Public API SemVer regression | `cargo semver-checks check-release` | Planned | Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#cargo-semver-checks |
 | OSV lockfile scan | CI: `google/osv-scanner-action` (Cargo.lock) | Planned | Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#OSV-Scanner-Action |
 
@@ -561,8 +561,8 @@ This appendix lists conformance hooks that keep the white paper’s normative cl
 
 | Gate | Hook (intended) | Status | Evidence |
 |------|------------------|--------|----------|
-| Least-privilege workflows | CI: explicit `permissions:` and minimal `GITHUB_TOKEN` scope | Planned | Evidence: SECURITY.md, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#GitHub-Actions-Hardening |
-| Action pinning | CI: pin third-party `uses:` to full commit SHAs | Planned | Evidence: SECURITY.md, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#GitHub-Actions-Hardening |
+| Least-privilege workflows | CI: explicit `permissions:` and minimal `GITHUB_TOKEN` scope | Implemented | Evidence: .github/workflows/rust.yml, SECURITY.md |
+| Action pinning | CI: pin third-party `uses:` to full commit SHAs | Implemented | Evidence: .github/workflows/rust.yml, SECURITY.md |
 | Artifact attestations | CI: generate/publish build provenance attestations | Planned | Evidence: SECURITY.md, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#GitHub-Attestations, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#SLSA |
 
 #### Protocol Robustness (Fuzzing)
@@ -588,12 +588,12 @@ These are blocking gates for releases once implemented in CI:
 | Gate | Hook (intended) | Status | Evidence |
 |------|------------------|--------|----------|
 | Artifact bundle schema | Validate bundle layout + required files + schema versions | Planned | Evidence: ADR-0016 |
-| Manifest integrity | `cargo test -p swarm-torch artifacts::tests::bundle_manifest_roundtrip` (recompute SHA-256 for manifest entries) | Implemented | Evidence: swarm-torch/src/artifacts.rs |
-| Graph hash normalization | `cargo test -p swarm-torch artifacts::tests::graph_write_normalizes_ids_and_hashes` | Implemented | Evidence: swarm-torch/src/artifacts.rs |
+| Manifest integrity | `cargo test -p swarm-torch artifacts::tests::bundle_manifest_roundtrip` (recompute SHA-256 for manifest entries) | Implemented | Evidence: swarm-torch/src/artifacts/bundle.rs |
+| Graph hash normalization | `cargo test -p swarm-torch artifacts::tests::graph_write_normalizes_ids_and_hashes` | Implemented | Evidence: swarm-torch/src/artifacts/bundle.rs |
 | Dataset fingerprint determinism | `cargo test -p swarm-torch-core dataops::tests::dataset_fingerprint_is_deterministic` | Implemented | Evidence: swarm-torch-core/src/dataops.rs |
 | No raw rows by default | Assert bundle does not embed raw dataset rows unless explicitly enabled + size-limited | Planned | Evidence: ADR-0016 |
-| Untrusted input marking | If dataset source is `untrusted`, artifacts mark unsafe surface | Implemented | Evidence: swarm-torch/src/artifacts.rs, swarm-torch/src/report.rs |
-| Unsafe extension marking | `unsafe_extension` nodes are explicitly flagged in graph/events/materializations/run summary | Implemented | Evidence: swarm-torch/src/artifacts.rs, swarm-torch/src/report.rs |
+| Untrusted input marking | If dataset source is `untrusted`, artifacts mark unsafe surface | Implemented | Evidence: swarm-torch/src/artifacts/session.rs, swarm-torch/src/report/model.rs |
+| Unsafe extension marking | `unsafe_extension` nodes are explicitly flagged in graph/events/materializations/run summary | Implemented | Evidence: swarm-torch/src/artifacts/session.rs, swarm-torch/src/report/model.rs |
 
 #### Drift / Doc Hygiene (Repo-Local)
 
@@ -604,7 +604,7 @@ These are blocking gates for releases once implemented in CI:
 
 ### Appendix C: Artifact Schema References
 
-TODO: publish JSON schema definitions and Parquet schema notes; keep versioned.
+Tracked follow-up: `P2-20` (`Status: Planned`, Wave 8.3) publishes versioned JSON schema definitions and Parquet schema notes.
 
 ### Appendix D: Glossary
 

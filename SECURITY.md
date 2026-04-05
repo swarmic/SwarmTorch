@@ -58,7 +58,7 @@ See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model an
 
 ### Dependency Auditing
 
-**Planned CI gates:** CI is already present; the following supply-chain gates are planned to be enforced on every PR:
+CI now includes a dedicated supply-chain job. Wave 8.1 policy:
 
 | Tool | Purpose | Config |
 |------|---------|--------|
@@ -66,7 +66,23 @@ See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model an
 | `cargo deny` | License/ban/advisory enforcement | [`deny.toml`](deny.toml) |
 | `cargo vet` | Human audit tracking | [`supply-chain/`](supply-chain/) |
 
-**Current (today):** configs exist, and CI runs build/test/lint/doc gates. Supply-chain gate enforcement is not yet wired in CI; maintainers should run the following locally before merging:
+Enforcement mode:
+- `cargo deny`: blocking in CI
+- `cargo audit`: blocking in CI
+- `cargo vet`: advisory for one wave (Wave 8.1), then promoted to blocking once audit baseline is stabilized
+
+Pinned tool baseline for Wave 8.1 CI:
+- `cargo-deny` `0.19.0`
+- `cargo-audit` `0.22.1`
+- `cargo-vet` `0.10.2`
+
+Current `cargo audit` state at Wave 8.1:
+- Vulnerability failures: none (blocking gate passes).
+- Non-failing warnings remain on transitive dependencies (`bincode 2.0.0-rc.3` unmaintained via `burn`, `lru 0.12.5` unsound warning).
+- `cargo deny` tracks `RUSTSEC-2025-0141` as an explicit temporary ignore in `deny.toml` with Wave 8.2 closure target (`P2-11`).
+- `cargo vet` baseline now includes first-party audits for critical crates (`ed25519-dalek`, `sha2`, `postcard`) and reduced exemption count from the initial bootstrap.
+
+Maintainers should still run the following locally before merging:
 
 ```bash
 cargo deny check
@@ -74,10 +90,15 @@ cargo audit
 cargo vet
 ```
 
+Exemption governance:
+- New `cargo vet` exemptions must include explicit rationale in [`supply-chain/exemption-rationale.md`](supply-chain/exemption-rationale.md).
+- PRs that add `[[exemptions.*]]` without rationale updates are rejected by CI policy.
+- Exemptions must include an owner and removal target.
+
 ### Policy
 
 - **No unvetted dependencies** may be merged without explicit sign-off
-- **License policy violations** are blocked by maintainer policy via [`deny.toml`](deny.toml) checks (project license is MPL-2.0; strong copyleft dependencies like GPL/AGPL remain disallowed). CI enforcement remains planned.
+- **License policy violations** are blocked by [`deny.toml`](deny.toml) checks in CI (project license is MPL-2.0; strong copyleft dependencies like GPL/AGPL remain disallowed).
 
 ---
 
@@ -97,6 +118,10 @@ permissions:
 ### Action Pinning
 
 Third-party actions in `.github/workflows/rust.yml` are pinned to full-length commit SHAs, not tags.
+
+### Cross-Platform Trust-Boundary Checks
+
+CI now includes a dedicated Windows lane that runs artifact manifest trust-boundary tests (`validate_manifest_*`) and report-loader trust checks (`load_report_*`) to reduce platform-specific path-validation blind spots.
 
 ---
 

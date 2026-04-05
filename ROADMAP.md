@@ -42,6 +42,24 @@ Wave 7 extends reliability and execution scope:
 
 See `docs/release_notes/v0.1.0-alpha.7x.md` for full Wave 7 implementation and gate evidence.
 
+Wave 8.0 closes post-Wave 7 contract and trust-boundary hardening:
+
+1. Rust 1.75 `no_std + alloc` conformance recovery in `run_graph`.
+2. Artifact manifest path confinement hardening (traversal/absolute/symlink escape checks).
+3. Telemetry namespace contract sync to `swarmtorch.*`.
+4. Canon/security truth-sync (docs, security policy, CI action pinning claims).
+
+See `docs/release_notes/v0.1.0-alpha.8x-wave0.md` for implementation details and gate evidence.
+
+Wave 8.1 focuses on operational hardening in three slices:
+
+1. Supply-chain CI enforcement (`cargo deny`, `cargo audit`, `cargo vet` policy staging).
+2. Windows trust-boundary CI lane for artifact/report path validation.
+3. Telemetry migration follow-through for downstream artifact consumers.
+
+Execution ordering and deferred follow-ons are tracked in
+`docs/plans/v0.1.0-alpha.8x-phase2-remediation-roadmap.md`.
+
 ## Conformance Lock (A6X-05)
 
 This section is the repo-local contract lock for current implementation reality.

@@ -7,10 +7,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # cargo-deny 0.19 expects scope selection for unmaintained checks.
 # Use full graph coverage; lint level is handled by cargo-deny's advisory output policy.
 unmaintained = "all"
-ignore = [
-    # Deferred to Wave 8.2 dependency remediation (P2-11).
-    { id = "RUSTSEC-2025-0141", reason = "Transitive via burn-core; tracked in docs/plans/v0.1.0-alpha.8x-phase2-remediation-roadmap.md as P2-11." },
-]
+# RUSTSEC-2025-0141 (bincode 2.0.0-rc.3 via burn-core) retired in Wave 9 (W9-05 / P2-11).
+ignore = []
 
 [licenses]
 # Allow-list policy: only SPDX IDs listed below are accepted.

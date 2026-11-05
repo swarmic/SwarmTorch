@@ -29,6 +29,8 @@ use crate::run_graph::{node_def_hash_v1, NodeId, NodeV1, OpKind};
 pub const DATAOPS_SCHEMA_V1: u32 = 1;
 pub const MATERIALIZATION_SCHEMA_V2: u32 = 2;
 pub const MAX_SOURCE_URI_LEN: usize = 2048;
+/// Pre-allocation raw URI length bound (2x MAX_SOURCE_URI_LEN to allow query/userinfo stripping while preventing heap DoS).
+pub const MAX_RAW_SOURCE_URI_LEN: usize = 4096;
 pub const MAX_ETAG_OR_VERSION_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -416,9 +418,11 @@ fn strip_query_fragment(uri: &str) -> &str {
 }
 
 fn normalize_and_redact_source_descriptor(source: &SourceDescriptorV0) -> SourceDescriptorV0 {
-    let redacted = redact_uri_userinfo(&normalize_trim(&source.uri));
+    let trimmed_uri = source.uri.trim();
+    let stripped_uri = strip_query_fragment(trimmed_uri);
+    let redacted = redact_uri_userinfo(stripped_uri);
     SourceDescriptorV0 {
-        uri: strip_query_fragment(&redacted).to_string(),
+        uri: redacted,
         content_type: normalize_lower(&source.content_type),
         auth_mode: source.auth_mode.clone(),
         etag_or_version: source.etag_or_version.as_ref().map(|v| normalize_trim(v)),
@@ -434,6 +438,22 @@ fn normalize_and_redact_source_descriptor(source: &SourceDescriptorV0) -> Source
 pub fn sanitize_source_descriptor_v0(
     source: &SourceDescriptorV0,
 ) -> core::result::Result<SourceDescriptorV0, SourceDescriptorError> {
+    let trimmed_raw_len = source.uri.trim().len();
+    if trimmed_raw_len > MAX_RAW_SOURCE_URI_LEN {
+        return Err(SourceDescriptorError::UriTooLong {
+            len: trimmed_raw_len,
+            max: MAX_SOURCE_URI_LEN,
+        });
+    }
+    if let Some(etag_or_version) = source.etag_or_version.as_ref() {
+        let trimmed_etag_len = etag_or_version.trim().len();
+        if trimmed_etag_len > MAX_ETAG_OR_VERSION_LEN {
+            return Err(SourceDescriptorError::EtagOrVersionTooLong {
+                len: trimmed_etag_len,
+                max: MAX_ETAG_OR_VERSION_LEN,
+            });
+        }
+    }
     let sanitized = normalize_and_redact_source_descriptor(source);
     check_descriptor_bounds(&sanitized)?;
     Ok(sanitized)
@@ -1078,5 +1098,16 @@ mod tests {
             etag_or_version: Some("v1".to_string()),
         };
         assert!(validate_source_descriptor_bounds(&desc).is_ok());
+
+        let oversized_raw = SourceDescriptorV0 {
+            uri: format!("s3://bucket/file?q={}", "x".repeat(MAX_RAW_SOURCE_URI_LEN)),
+            content_type: "application/parquet".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        assert!(matches!(
+            sanitize_source_descriptor_v0(&oversized_raw),
+            Err(SourceDescriptorError::UriTooLong { .. })
+        ));
     }
 }

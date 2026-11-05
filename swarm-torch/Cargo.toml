@@ -18,7 +18,7 @@ name = "swarm_torch"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "tokio-runtime", "burn-backend", "robust-aggregation"]
+default = ["std", "tokio-runtime", "robust-aggregation"]
 
 # Core features
 std = [
@@ -39,10 +39,6 @@ alloc = [
 # Runtime selection
 tokio-runtime = ["swarm-torch-runtime/tokio"]
 embassy-runtime = ["swarm-torch-runtime/embassy"]
-
-# Backend selection
-burn-backend = ["swarm-torch-models/burn"]
-tch-backend = ["swarm-torch-models/tch"]
 
 # Transport selection
 tcp-transport = ["swarm-torch-net/tcp-transport"]
@@ -65,16 +61,13 @@ swarm-torch-net = { workspace = true, default-features = false }
 swarm-torch-runtime = { workspace = true, default-features = false }
 swarm-torch-models = { workspace = true, default-features = false }
 
-# Re-export async-trait for users
-async-trait = "0.1"
-
 # Artifact bundle writing/validation (std-only).
 serde = { workspace = true, optional = true }
 serde_json = { version = "1.0", optional = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 criterion = { workspace = true }
 
 [[bin]]

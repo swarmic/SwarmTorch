@@ -1,17 +1,12 @@
 //! # SwarmTorch Models
 //!
-//! Model utilities and backend integrations for SwarmTorch.
+//! Reference models, analytical loss functions, and optimizers for SwarmTorch (`ADR-0024`).
 //!
-//! This crate provides:
-//! - Integration with Burn ML framework
-//! - Model serialization/deserialization
-//! - Reference model implementations
-//! - ONNX import/export utilities (planned)
-//!
-//! ## Feature Flags
-//!
-//! - `burn` (default): Burn framework integration
-//! - `tch`: PyTorch interop via tch-rs (requires libtorch)
+//! This crate is `no_std`-compatible by default and provides:
+//! - Contiguous-parameter reference models ([`simple::LinearModel`], [`simple::MlpModel`])
+//! - Analytical loss functions ([`loss::MseLoss`], [`loss::CrossEntropyLoss`], [`loss::HuberLoss`], [`loss::FedProxRegularizer`])
+//! - Reference optimizers ([`optim::SgdOptimizer`])
+//! - Model state serialization ([`ModelState`], requires `alloc`)
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -19,17 +14,16 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(feature = "burn")]
-pub mod burn_integration;
-
+pub mod loss;
+pub mod mlp;
+pub mod optim;
 pub mod simple;
 
 /// Prelude for convenient imports
 pub mod prelude {
+    pub use crate::loss::*;
+    pub use crate::optim::*;
     pub use crate::simple::*;
-
-    #[cfg(feature = "burn")]
-    pub use crate::burn_integration::*;
 }
 
 /// Model state for serialization

@@ -49,6 +49,7 @@ pub mod telemetry;
 pub mod prelude {
     #[cfg(feature = "alloc")]
     pub use crate::aggregation::*;
+    #[allow(deprecated)]
     pub use crate::algorithms::*;
     #[cfg(feature = "alloc")]
     pub use crate::dataops::{
@@ -73,7 +74,7 @@ pub mod prelude {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Error type for SwarmTorch core operations
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Serialization/deserialization error
     Serialization,
@@ -81,12 +82,24 @@ pub enum Error {
     VerificationFailed,
     /// Gradient validation failed
     InvalidGradient,
+    /// NaN value detected in gradient or parameter tensor
+    NanDetected,
+    /// Infinite value detected in gradient or parameter tensor
+    InfDetected,
+    /// Invalid threshold or hyperparameter configuration
+    InvalidThreshold,
     /// Aggregation failed
     AggregationFailed,
     /// Insufficient updates for aggregation
     InsufficientUpdates,
+    /// Insufficient peers to satisfy resilience quorum
+    InsufficientPeers,
     /// Resource limit exceeded
     ResourceExhausted,
+    /// Operation exceeds configured memory or work budget
+    ResourceBudgetExceeded,
+    /// Requested method or profile is not supported
+    UnsupportedMethod,
 }
 
 #[cfg(feature = "std")]
@@ -98,9 +111,25 @@ impl core::fmt::Display for Error {
             Error::Serialization => write!(f, "serialization error"),
             Error::VerificationFailed => write!(f, "cryptographic verification failed"),
             Error::InvalidGradient => write!(f, "gradient validation failed"),
+            Error::NanDetected => write!(f, "NaN value detected in gradient or parameter tensor"),
+            Error::InfDetected => {
+                write!(f, "infinite value detected in gradient or parameter tensor")
+            }
+            Error::InvalidThreshold => {
+                write!(f, "invalid threshold or hyperparameter configuration")
+            }
             Error::AggregationFailed => write!(f, "aggregation failed"),
             Error::InsufficientUpdates => write!(f, "insufficient updates for aggregation"),
+            Error::InsufficientPeers => {
+                write!(f, "insufficient peers to satisfy resilience quorum")
+            }
             Error::ResourceExhausted => write!(f, "resource limit exceeded"),
+            Error::ResourceBudgetExceeded => {
+                write!(f, "operation exceeds configured memory or work budget")
+            }
+            Error::UnsupportedMethod => {
+                write!(f, "requested method or profile is not supported")
+            }
         }
     }
 }

@@ -1,7 +1,10 @@
+#[cfg(feature = "bulyan")]
+use swarm_torch_core::aggregation::Bulyan;
 #[cfg(feature = "krum")]
 use swarm_torch_core::aggregation::Krum;
 use swarm_torch_core::aggregation::{CoordinateMedian, FedAvg, RobustAggregator, TrimmedMean};
 use swarm_torch_core::traits::GradientUpdate;
+use swarm_torch_core::Error;
 
 #[derive(Clone, Copy)]
 enum AttackFamily {
@@ -150,17 +153,27 @@ fn robustness_harness_sign_flip_attack_penalizes_fedavg() {
 
 #[test]
 fn robustness_harness_nan_inf_attack_surfaces_non_finite_outputs() {
-    let (updates, _) = make_round_updates(9, 2, 16, AttackFamily::NaNInf, 0xBAD5EED);
-    let fedavg = FedAvg.aggregate(&updates).expect("fedavg should aggregate");
-    assert!(
-        fedavg.iter().any(|v| !v.is_finite()),
-        "non-finite attack inputs should be observable in fedavg output to enable downstream guards"
+    let (updates, _) = make_round_updates(11, 2, 16, AttackFamily::NaNInf, 0xBAD5EED);
+    // AttackFamily::NaNInf places f32::INFINITY at index 0 and f32::NAN at remaining coordinates.
+    // All aggregators must explicitly reject non-finite inputs at the admission boundary (W9-01).
+    assert_eq!(FedAvg.aggregate(&updates), Err(Error::InfDetected));
+    assert_eq!(
+        CoordinateMedian.aggregate(&updates),
+        Err(Error::InfDetected)
     );
+    assert_eq!(
+        TrimmedMean::new(0.2).aggregate(&updates),
+        Err(Error::InfDetected)
+    );
+    #[cfg(feature = "krum")]
+    assert_eq!(Krum::new(2).aggregate(&updates), Err(Error::InfDetected));
+    #[cfg(feature = "bulyan")]
+    assert_eq!(Bulyan::new(2).aggregate(&updates), Err(Error::InfDetected));
 }
 
 #[cfg(feature = "krum")]
 #[test]
-fn robustness_harness_krum_tolerates_f_byzantine_within_bound() {
+fn robustness_harness_krum_and_multi_krum_tolerate_f_byzantine_within_bound() {
     let n = 13usize;
     let f = 3usize;
     let (updates, target) = make_round_updates(n, f, 64, AttackFamily::SignFlip, 0xC001_CAFE);
@@ -173,5 +186,35 @@ fn robustness_harness_krum_tolerates_f_byzantine_within_bound() {
     assert!(
         error < 2.0,
         "krum output should stay close to benign baseline within bound: error={error}"
+    );
+
+    let multi_krum = Krum::multi(f, 5);
+    let mk_result = multi_krum
+        .aggregate(&updates)
+        .expect("multi-krum should aggregate when m <= n - f - 2");
+    let mk_error = l2_error(&mk_result, &target);
+    assert!(
+        mk_error < error,
+        "multi-krum averaging top honest candidates should reduce variance over single krum: mk_error={mk_error}, krum_error={error}"
+    );
+}
+
+#[cfg(feature = "bulyan")]
+#[test]
+fn robustness_harness_bulyan_tolerates_collusion_and_outlier_attacks() {
+    let n = 11usize;
+    let f = 2usize; // n = 11 >= 4f + 3 = 11
+    let (updates, target) = make_round_updates(n, f, 64, AttackFamily::Outlier, 0xB011_CAFE);
+
+    let fedavg = FedAvg.aggregate(&updates).expect("fedavg should aggregate");
+    let bulyan = Bulyan::new(f)
+        .aggregate(&updates)
+        .expect("bulyan should aggregate when n >= 4f + 3");
+
+    let fedavg_error = l2_error(&fedavg, &target);
+    let bulyan_error = l2_error(&bulyan, &target);
+    assert!(
+        bulyan_error < 0.25 && bulyan_error < fedavg_error * 0.01,
+        "bulyan must reject extreme outliers across all coordinates: bulyan={bulyan_error}, fedavg={fedavg_error}"
     );
 }

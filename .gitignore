@@ -3,15 +3,18 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Internal Documentation (not for public exposure)
+# Private Planning Guard (Safety Net)
 # -----------------------------------------------------------------------------
-#
-# NOTE: Canonical SwarmTorch docs (e.g., `ADRs.md`, `SECURITY.md`, the SwarmTorch WP)
-# must remain versioned. Do not ignore them here.
-
+# NOTE: Canonical public contracts (`ADRs.md`, `SECURITY.md`, `ROADMAP.md`,
+# `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`, and `.sources.md`) are versioned
+# in this repository. Private strategic planning and internal audit artifacts
+# are versioned in the separate `swarm-torch-planning` repository outside this
+# working tree.
 docs/adr/
 docs/internal/
-docs/plans/jax_adoption_v0.2.md
+docs/plans/
+docs/audits/
+
 # -----------------------------------------------------------------------------
 # Rust Build Artifacts
 # -----------------------------------------------------------------------------
@@ -43,7 +46,7 @@ Thumbs.db
 security-key.asc
 
 # -----------------------------------------------------------------------------
-# Python Artifacts (for swarm-torch-python)
+# Python Artifacts (for optional Python boundary work)
 # -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
@@ -112,19 +115,6 @@ probe-rs.log
 # -----------------------------------------------------------------------------
 /doc/
 book/book/
-SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
-SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
-SWARMIC_NETWORK_WHITE_PAPER_v12.2.md
-SWARMIC_NETWORK_WHITE_PAPER_v12.4.md
-Evcxr.md
-ADRs.md
-adr-with-updates.md
-v0.1.0-alpha.6x-backlog.md
-
-# Canonical SwarmTorch docs must remain versioned.
-!ADRs.md
-!SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md
-!SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
 
 # -----------------------------------------------------------------------------
 # Temporary Files

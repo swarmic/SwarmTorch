@@ -1,0 +1,28 @@
+# Default ownership across the SwarmTorch repository
+* @swarmic
+
+# Governance, architecture contracts, and contribution policy
+/ADRs.md @swarmic
+/ROADMAP.md @swarmic
+/SECURITY.md @swarmic
+/CONTRIBUTING.md @swarmic
+/CONTEXT_SOURCES.md @swarmic
+/SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md @swarmic
+/SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md @swarmic
+
+# CI/CD workflows, supply-chain gates, and workspace dependency resolution
+/.github/ @swarmic
+/Cargo.toml @swarmic
+/Cargo.lock @swarmic
+/deny.toml @swarmic
+/supply-chain/ @swarmic
+
+# Security-critical protocol, crypto, replay, aggregation, and compression modules
+/swarm-torch-core/src/crypto.rs @swarmic
+/swarm-torch-core/src/replay.rs @swarmic
+/swarm-torch-core/src/aggregation.rs @swarmic
+/swarm-torch-core/src/compression.rs @swarmic
+/swarm-torch-net/src/protocol.rs @swarmic
+/swarm-torch-net/src/traits.rs @swarmic
+/swarm-torch/src/artifacts/ @swarmic
+/swarm-torch/src/report/ @swarmic

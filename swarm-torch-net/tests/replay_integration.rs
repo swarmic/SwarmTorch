@@ -464,3 +464,125 @@ fn h02_verify_path_uses_canonical_peer_id_for_replay() {
         "sender_peer_id() must match KeyPair::peer_id() (canonical hash)"
     );
 }
+
+#[test]
+fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
+    use swarm_torch_core::crypto::SessionHandshakeChallenge;
+    use swarm_torch_core::replay::CohortAllowlist;
+    use swarm_torch_net::protocol::HeartbeatMessage;
+
+    let swarm_id = [0x42u8; 16];
+    let sender_kp = KeyPair::from_seed([81u8; 32]).unwrap();
+    let unauthorized_kp = KeyPair::from_seed([82u8; 32]).unwrap();
+    let receiver_kp = KeyPair::from_seed([83u8; 32]).unwrap();
+    let sender_auth = MessageAuth::new(sender_kp.clone());
+    let unauthorized_auth = MessageAuth::new(unauthorized_kp.clone());
+
+    let allowlist = CohortAllowlist::from_peers([sender_kp.peer_id()]);
+    let mut replay_guard = ReplayProtection::new().with_cohort_allowlist(allowlist);
+    let now = 5000;
+
+    // Stage 1: Oversized frame rejected before deserialization.
+    assert_eq!(
+        MessageEnvelope::deserialize_bounded(&[0u8; 128], 64).unwrap_err(),
+        VerifyError::FrameTooLarge { len: 128, max: 64 }
+    );
+
+    // Stage 3: Unauthorized peer is rejected with UnauthorizedPeer before state mutation.
+    let unauth_env = MessageEnvelope::new_v1(
+        *unauthorized_kp.public_key(),
+        swarm_id,
+        1,
+        10,
+        MessageType::Heartbeat,
+        b"unauth".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .sign_with(&unauthorized_auth);
+
+    assert_eq!(
+        unauth_env.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::Replay(ReplayError::UnauthorizedPeer {
+            peer: unauthorized_kp.peer_id()
+        }))
+    );
+    assert_eq!(replay_guard.cache_size(), 0);
+
+    // Stage 4-6: Authorized v1 envelope with serialized HeartbeatMessage verifies and decodes.
+    let hb = HeartbeatMessage {
+        current_round: 10,
+        role: 1,
+        known_peers: 7,
+        load: 42,
+    };
+    let hb_bytes = postcard::to_allocvec(&hb).unwrap();
+    let env_e1 = MessageEnvelope::new_v1(
+        *sender_kp.public_key(),
+        swarm_id,
+        1,
+        10,
+        MessageType::Heartbeat,
+        hb_bytes.clone(),
+    )
+    .with_sequence(5)
+    .with_timestamp(now)
+    .sign_with(&sender_auth);
+
+    let wire = env_e1.serialize().unwrap();
+    let decoded_env = MessageEnvelope::deserialize_bounded(&wire, 4096).unwrap();
+    let decoded_hb: HeartbeatMessage = decoded_env
+        .verify_and_decode_payload(&mut replay_guard, now)
+        .unwrap();
+    assert_eq!(decoded_hb, hb);
+
+    // Cross-swarm replay of the signed v1 envelope fails signature verification.
+    let mut cross_swarm = decoded_env.clone();
+    cross_swarm.swarm_instance_id = [0x99u8; 16];
+    assert_eq!(
+        cross_swarm.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::Crypto(CryptoError::VerificationFailed))
+    );
+
+    // Unauthenticated epoch jump (epoch 2 without recovery handshake) fails at Stage 3 with RecoveryRequired.
+    let env_e2_unrecovered = MessageEnvelope::new_v1(
+        *sender_kp.public_key(),
+        swarm_id,
+        2,
+        11,
+        MessageType::Heartbeat,
+        hb_bytes.clone(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .sign_with(&sender_auth);
+
+    assert_eq!(
+        env_e2_unrecovered.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::Replay(ReplayError::RecoveryRequired {
+            peer: sender_kp.peer_id(),
+            current_epoch: 1,
+            requested_epoch: 2,
+        }))
+    );
+
+    // Receiver issues recovery challenge; sender completes handshake; epoch 2 envelope now succeeds.
+    let challenge = SessionHandshakeChallenge {
+        swarm_instance_id: swarm_id,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: sender_kp.peer_id(),
+        requested_epoch: 2,
+        initial_sequence: 0,
+        challenge_nonce: [0xAB; 32],
+        issued_at_secs: now,
+    };
+    replay_guard.register_recovery_challenge(challenge).unwrap();
+    let hs_sig = sender_auth.sign_session_handshake(&challenge);
+    replay_guard
+        .complete_recovery_handshake(swarm_id, sender_kp.public_key(), &hs_sig, now)
+        .unwrap();
+
+    assert!(env_e2_unrecovered
+        .verify_authenticated(&mut replay_guard, now)
+        .is_ok());
+}

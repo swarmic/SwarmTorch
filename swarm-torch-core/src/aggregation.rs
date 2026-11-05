@@ -1,7 +1,12 @@
-//! Robust aggregation algorithms for Byzantine-resilient swarm learning
+//! Robust aggregation algorithms for Byzantine-resilient swarm learning (`ADR-0019`, `W9-01`).
 //!
-//! This module provides various aggregation strategies that can tolerate
-//! malicious or faulty participants in the swarm.
+//! This module provides aggregation strategies that tolerate malicious or faulty
+//! participants in the swarm with:
+//! - strict pre-aggregation rejection of `NaN` (`Error::NanDetected`) and `±Inf` (`Error::InfDetected`),
+//! - total-order sorting (`f32::total_cmp` / `f64::total_cmp`) and canonical peer tie-breaking,
+//! - widened `f64` internal accumulation and distance computation,
+//! - checked arithmetic and bounded scratch/work budgets (`AggregationBudget`),
+//! - one-pass `Multi-Krum` (`Krum::multi`) and `Bulyan` (`BulyanProfile::IterativeKrumV1`).
 
 #[cfg(feature = "alloc")]
 use alloc::string::ToString;
@@ -15,32 +20,120 @@ use crate::dataops::TransformAuditV0;
 use crate::traits::GradientUpdate;
 #[cfg(feature = "alloc")]
 use crate::traits::UpdateTransform;
-use crate::Result;
+use crate::{Error, Result};
 
-const MAX_GRADIENT_DIM: usize = 10_000_000;
+/// Maximum gradient vector dimension accepted by default (`10,000,000` coordinates).
+pub const MAX_GRADIENT_DIM: usize = 10_000_000;
 
-fn validate_gradient_shapes(updates: &[GradientUpdate]) -> Result<usize> {
+/// Default maximum peers for pairwise $O(n^2 d)$ distance aggregators (`Krum`, `Bulyan`).
+pub const MAX_KRUM_PEERS: usize = 50;
+
+/// Explicit resource and work budget for aggregation (`ADR-0019`, `W9-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub struct AggregationBudget {
+    /// Maximum allowed number of peer updates (`n`).
+    pub max_peers: usize,
+    /// Maximum allowed gradient vector dimension (`d`).
+    pub max_dimension: usize,
+    /// Maximum allowed scratch memory bytes (`n * n * 8` for pairwise or `n * 4` for coordinate-wise).
+    pub max_scratch_bytes: usize,
+    /// Maximum allowed elementary `f64` operations (`n * n * d` for pairwise or `n * d` for linear).
+    pub max_work_ops: usize,
+}
+
+impl AggregationBudget {
+    /// Default budget for pairwise quadratic/cubic aggregators (`Krum`, `Bulyan`).
+    pub const fn default_pairwise() -> Self {
+        Self {
+            max_peers: MAX_KRUM_PEERS,
+            max_dimension: MAX_GRADIENT_DIM,
+            max_scratch_bytes: 64 * 1024 * 1024,
+            max_work_ops: 250_000_000,
+        }
+    }
+
+    /// Validate `(n, dim)` against this budget using checked arithmetic.
+    pub fn check(&self, n: usize, dim: usize, pairwise: bool) -> Result<()> {
+        if n > self.max_peers || dim > self.max_dimension {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+        let scratch_bytes = if pairwise {
+            n.checked_mul(n)
+                .and_then(|nn| nn.checked_mul(core::mem::size_of::<f64>()))
+                .ok_or(Error::ResourceExhausted)?
+        } else {
+            n.checked_mul(core::mem::size_of::<f32>())
+                .ok_or(Error::ResourceExhausted)?
+        };
+        if scratch_bytes > self.max_scratch_bytes {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+        let work_ops = if pairwise {
+            n.checked_mul(n)
+                .and_then(|nn| nn.checked_mul(dim))
+                .ok_or(Error::ResourceExhausted)?
+        } else {
+            n.checked_mul(dim).ok_or(Error::ResourceExhausted)?
+        };
+        if work_ops > self.max_work_ops {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+        Ok(())
+    }
+}
+
+impl Default for AggregationBudget {
+    fn default() -> Self {
+        Self::default_pairwise()
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn validate_gradient_shapes_and_finiteness(updates: &[GradientUpdate]) -> Result<usize> {
     if updates.is_empty() {
-        return Err(crate::Error::InsufficientUpdates);
+        return Err(Error::InsufficientUpdates);
     }
 
     let dim = updates[0].gradients.len();
     if dim == 0 || dim > MAX_GRADIENT_DIM {
-        return Err(crate::Error::InvalidGradient);
+        return Err(Error::InvalidGradient);
     }
 
-    for update in updates.iter().skip(1) {
+    for update in updates {
         if update.gradients.len() != dim {
-            return Err(crate::Error::InvalidGradient);
+            return Err(Error::InvalidGradient);
+        }
+        for &val in &update.gradients {
+            if val.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if val.is_infinite() {
+                return Err(Error::InfDetected);
+            }
         }
     }
 
     Ok(dim)
 }
 
+#[cfg(feature = "alloc")]
+fn validate_finite_output(values: &[f32]) -> Result<()> {
+    for &val in values {
+        if val.is_nan() {
+            return Err(Error::NanDetected);
+        }
+        if val.is_infinite() {
+            return Err(Error::InfDetected);
+        }
+    }
+    Ok(())
+}
+
 /// Trait for robust aggregation algorithms
 pub trait RobustAggregator: Send + Sync {
     /// Aggregate multiple gradient updates into one
+    #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>>;
 
     /// Fraction of Byzantine nodes this aggregator tolerates
@@ -62,13 +155,15 @@ pub enum AggregatorComplexity {
 }
 
 /// Pipeline error for composable aggregation execution.
+#[cfg(feature = "alloc")]
 #[derive(Debug)]
 pub enum AggregationPipelineError {
-    Aggregation(crate::Error),
+    Aggregation(Error),
     Compression(CompressionError),
 }
 
 /// Composable aggregation pipeline over a concrete robust aggregator.
+#[cfg(feature = "alloc")]
 #[derive(Debug, Clone)]
 pub struct AggregationPipeline<A: RobustAggregator> {
     aggregator: A,
@@ -85,6 +180,7 @@ pub struct AggregationTraceResult {
     pub gradient_len: usize,
 }
 
+#[cfg(feature = "alloc")]
 impl<A: RobustAggregator> AggregationPipeline<A> {
     pub fn new(aggregator: A) -> Self {
         Self {
@@ -158,6 +254,7 @@ impl<A: RobustAggregator> AggregationPipeline<A> {
 /// Apply an update transform and return transformed updates plus audit metadata.
 ///
 /// Provenance fields (`sender`, `sequence`, `round_id`) are preserved from input updates.
+#[cfg(feature = "alloc")]
 pub fn apply_update_transforms<T: UpdateTransform>(
     updates: Vec<GradientUpdate>,
     transform: &T,
@@ -186,38 +283,33 @@ pub fn apply_update_transforms<T: UpdateTransform>(
     (transformed, audit)
 }
 
-/// Simple averaging aggregator (no Byzantine protection)
+/// Simple averaging aggregator (no Byzantine protection), widened to `f64` internal accumulation.
 #[derive(Debug, Clone, Default)]
 pub struct FedAvg;
 
 impl RobustAggregator for FedAvg {
+    #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        #[cfg(feature = "alloc")]
-        {
-            let dim = validate_gradient_shapes(updates)?;
-            let n = updates.len() as f32;
-            let mut result = alloc::vec![0.0f32; dim];
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        let inv_n = 1.0f64 / (updates.len() as f64);
+        let mut sums = alloc::vec![0.0f64; dim];
 
-            // Sum all gradients first to minimize floating-point rounding drift.
-            for update in updates {
-                for (slot, &gradient) in result.iter_mut().zip(update.gradients.iter()) {
-                    *slot += gradient;
-                }
+        for update in updates {
+            for (slot, &gradient) in sums.iter_mut().zip(update.gradients.iter()) {
+                *slot += gradient as f64;
             }
-            // Single division pass after accumulation.
-            for slot in result.iter_mut() {
-                *slot /= n;
-            }
-
-            Ok(result)
         }
 
-        #[cfg(not(feature = "alloc"))]
-        Err(crate::Error::ResourceExhausted)
+        let mut result = alloc::vec![0.0f32; dim];
+        for (out, &sum) in result.iter_mut().zip(sums.iter()) {
+            *out = (sum * inv_n) as f32;
+        }
+        validate_finite_output(&result)?;
+        Ok(result)
     }
 
     fn byzantine_tolerance(&self) -> f32 {
-        0.0 // No Byzantine tolerance
+        0.0
     }
 
     fn complexity(&self) -> AggregatorComplexity {
@@ -225,37 +317,32 @@ impl RobustAggregator for FedAvg {
     }
 }
 
-/// Trimmed mean aggregator — discards top/bottom k% of values per coordinate.
-///
-/// # Rounding Behavior (M-10)
-///
-/// - `trim_ratio` is clamped to `[0.0, 0.49]` by [`TrimmedMean::new`].
-///   A ratio of 0.49 trims nearly half from each end.
-/// - The trim count is computed as `((n as f32) * trim_ratio) as usize`,
-///   which truncates toward zero. For small peer counts this means fewer
-///   values are actually trimmed than the ratio might suggest.
-/// - If the trim count leaves no values (`n <= 2 * trim_count`), the guard
-///   returns [`Error::InsufficientUpdates`](crate::Error::InsufficientUpdates).
-/// - The guard is only reachable via direct struct construction (bypassing
-///   `new()`'s clamp) when using a `trim_ratio` above 0.49.
+/// Trimmed mean aggregator — discards top/bottom `k%` of values per coordinate.
 #[derive(Debug, Clone)]
 pub struct TrimmedMean {
-    /// Fraction of values to trim from each end (e.g., 0.2 for 20%).
-    ///
-    /// Clamped to `[0.0, 0.49]` by [`TrimmedMean::new`].
+    /// Fraction of values to trim from each end (e.g., `0.2` for 20%).
     pub trim_ratio: f32,
 }
 
 impl TrimmedMean {
-    /// Create a new TrimmedMean aggregator.
-    ///
-    /// `trim_ratio` is clamped to `[0.0, 0.49]`. A value of 0.0 produces
-    /// a simple mean (no trimming). Values above 0.49 are capped to prevent
-    /// all peers from being trimmed.
+    /// Create a new `TrimmedMean` aggregator (clamping `trim_ratio` to `[0.0, 0.49]`).
     pub fn new(trim_ratio: f32) -> Self {
+        let clamped = if trim_ratio.is_nan() {
+            0.0
+        } else {
+            trim_ratio.clamp(0.0, 0.49)
+        };
         Self {
-            trim_ratio: trim_ratio.clamp(0.0, 0.49),
+            trim_ratio: clamped,
         }
+    }
+
+    /// Fallible constructor that rejects non-finite or out-of-range (`< 0.0` or `>= 0.5`) trim ratios.
+    pub fn try_new(trim_ratio: f32) -> Result<Self> {
+        if !trim_ratio.is_finite() || !(0.0..0.5).contains(&trim_ratio) {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(Self { trim_ratio })
     }
 }
 
@@ -266,35 +353,41 @@ impl Default for TrimmedMean {
 }
 
 impl RobustAggregator for TrimmedMean {
+    #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        #[cfg(feature = "alloc")]
+        if !self.trim_ratio.is_finite() || self.trim_ratio < 0.0 {
+            return Err(Error::InvalidThreshold);
+        }
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        let n = updates.len();
+        let trim_count = ((n as f64) * (self.trim_ratio as f64)) as usize;
+
+        if trim_count
+            .checked_mul(2)
+            .map(|two_k| n <= two_k)
+            .unwrap_or(true)
         {
-            let dim = validate_gradient_shapes(updates)?;
-            let n = updates.len();
-            let trim_count = ((n as f32) * self.trim_ratio) as usize;
-
-            if n <= 2 * trim_count {
-                return Err(crate::Error::InsufficientUpdates);
-            }
-
-            let mut result = alloc::vec![0.0f32; dim];
-
-            // For each coordinate, sort values and compute trimmed mean
-            for (i, slot) in result.iter_mut().enumerate().take(dim) {
-                let mut values: Vec<f32> = updates.iter().map(|u| u.gradients[i]).collect();
-                values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-
-                // Trim and average
-                let trimmed = &values[trim_count..n - trim_count];
-                let sum: f32 = trimmed.iter().sum();
-                *slot = sum / (trimmed.len() as f32);
-            }
-
-            Ok(result)
+            return Err(Error::InsufficientUpdates);
         }
 
-        #[cfg(not(feature = "alloc"))]
-        Err(crate::Error::ResourceExhausted)
+        let mut result = alloc::vec![0.0f32; dim];
+        let mut values = alloc::vec![0.0f32; n];
+        let kept_len = n - 2 * trim_count;
+        let inv_kept = 1.0f64 / (kept_len as f64);
+
+        for (i, slot) in result.iter_mut().enumerate().take(dim) {
+            for (dst, u) in values.iter_mut().zip(updates.iter()) {
+                *dst = u.gradients[i];
+            }
+            values.sort_by(f32::total_cmp);
+
+            let trimmed = &values[trim_count..n - trim_count];
+            let sum: f64 = trimmed.iter().map(|&v| v as f64).sum();
+            *slot = (sum * inv_kept) as f32;
+        }
+
+        validate_finite_output(&result)?;
+        Ok(result)
     }
 
     fn byzantine_tolerance(&self) -> f32 {
@@ -306,39 +399,37 @@ impl RobustAggregator for TrimmedMean {
     }
 }
 
-/// Coordinate-wise median aggregator
+/// Coordinate-wise median aggregator with widened `f64` even-count midpoint calculation.
 #[derive(Debug, Clone, Default)]
 pub struct CoordinateMedian;
 
 impl RobustAggregator for CoordinateMedian {
+    #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        #[cfg(feature = "alloc")]
-        {
-            let dim = validate_gradient_shapes(updates)?;
-            let n = updates.len();
-            let mut result = alloc::vec![0.0f32; dim];
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        let n = updates.len();
+        let mut result = alloc::vec![0.0f32; dim];
+        let mut values = alloc::vec![0.0f32; n];
 
-            for (i, slot) in result.iter_mut().enumerate().take(dim) {
-                let mut values: Vec<f32> = updates.iter().map(|u| u.gradients[i]).collect();
-                values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-
-                // Compute median
-                *slot = if n % 2 == 0 {
-                    (values[n / 2 - 1] + values[n / 2]) / 2.0
-                } else {
-                    values[n / 2]
-                };
+        for (i, slot) in result.iter_mut().enumerate().take(dim) {
+            for (dst, u) in values.iter_mut().zip(updates.iter()) {
+                *dst = u.gradients[i];
             }
+            values.sort_by(f32::total_cmp);
 
-            Ok(result)
+            *slot = if n % 2 == 0 {
+                (((values[n / 2 - 1] as f64) + (values[n / 2] as f64)) * 0.5) as f32
+            } else {
+                values[n / 2]
+            };
         }
 
-        #[cfg(not(feature = "alloc"))]
-        Err(crate::Error::ResourceExhausted)
+        validate_finite_output(&result)?;
+        Ok(result)
     }
 
     fn byzantine_tolerance(&self) -> f32 {
-        0.5 // Can tolerate up to 50% malicious (theoretically)
+        0.5
     }
 
     fn complexity(&self) -> AggregatorComplexity {
@@ -346,88 +437,395 @@ impl RobustAggregator for CoordinateMedian {
     }
 }
 
-/// Krum aggregator - selects the update closest to others
+#[cfg(all(feature = "alloc", feature = "krum"))]
+fn compute_pairwise_sq_distances_f64(updates: &[GradientUpdate], dim: usize) -> Result<Vec<f64>> {
+    let n = updates.len();
+    let nn = n.checked_mul(n).ok_or(Error::ResourceExhausted)?;
+    let _ = nn.checked_mul(dim).ok_or(Error::ResourceExhausted)?;
+    let mut distances = alloc::vec![0.0f64; nn];
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut dist = 0.0f64;
+            for (&a, &b) in updates[i].gradients.iter().zip(updates[j].gradients.iter()) {
+                let diff = (a as f64) - (b as f64);
+                dist += diff * diff;
+            }
+            if !dist.is_finite() {
+                return Err(Error::InfDetected);
+            }
+            distances[i * n + j] = dist;
+            distances[j * n + i] = dist;
+        }
+    }
+    Ok(distances)
+}
+
+/// Krum and Multi-Krum aggregator (`ADR-0019`, `W9-01`).
+///
+/// When `num_selected == 1`, selects the single update minimizing the sum of squared
+/// Euclidean distances to its `n - f - 2` closest neighbors.
+/// When `num_selected > 1` (`Multi-Krum`), selects the top `num_selected` updates from
+/// a single Krum scoring pass (`1 <= num_selected <= n - f - 2`) and returns their
+/// coordinate-wise mean accumulated in `f64`.
 #[cfg(feature = "krum")]
 #[derive(Debug, Clone)]
 pub struct Krum {
-    /// Number of updates to select
+    /// Number of updates to select (`1` for standard Krum, `m > 1` for Multi-Krum).
     pub num_selected: usize,
-    /// Expected number of Byzantine nodes
+    /// Expected number of Byzantine nodes (`f`).
     pub num_byzantine: usize,
 }
 
 #[cfg(feature = "krum")]
 impl Krum {
-    /// Create a new Krum aggregator
-    pub fn new(num_byzantine: usize) -> Self {
+    /// Create a standard single-winner Krum aggregator (`num_selected = 1`).
+    pub const fn new(num_byzantine: usize) -> Self {
         Self {
             num_selected: 1,
             num_byzantine,
         }
     }
+
+    /// Create a Multi-Krum aggregator selecting the top `num_selected` candidates in one pass.
+    pub const fn multi(num_byzantine: usize, num_selected: usize) -> Self {
+        Self {
+            num_selected,
+            num_byzantine,
+        }
+    }
+
+    /// Fallible Multi-Krum constructor that validates `num_selected >= 1`.
+    pub fn try_multi(num_byzantine: usize, num_selected: usize) -> Result<Self> {
+        if num_selected == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(Self::multi(num_byzantine, num_selected))
+    }
 }
 
 #[cfg(feature = "krum")]
 impl RobustAggregator for Krum {
+    #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
-        #[cfg(feature = "alloc")]
-        {
-            const MAX_KRUM_PEERS: usize = 50;
+        if self.num_selected == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        let n = updates.len();
+        let f = self.num_byzantine;
 
-            let _ = validate_gradient_shapes(updates)?;
-            let n = updates.len();
-            let f = self.num_byzantine;
-
-            if n < 2 * f + 3 {
-                return Err(crate::Error::InsufficientUpdates);
-            }
-            if n > MAX_KRUM_PEERS {
-                return Err(crate::Error::ResourceExhausted);
-            }
-
-            // Compute pairwise distances
-            let mut distances: Vec<Vec<f32>> = alloc::vec![alloc::vec![0.0; n]; n];
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let dist: f32 = updates[i]
-                        .gradients
-                        .iter()
-                        .zip(&updates[j].gradients)
-                        .map(|(a, b)| (a - b).powi(2))
-                        .sum();
-                    distances[i][j] = dist;
-                    distances[j][i] = dist;
-                }
-            }
-
-            // For each update, compute sum of distances to n-f-2 closest neighbors
-            let k = n - f - 2;
-            let mut scores: Vec<(usize, f32)> = (0..n)
-                .map(|i| {
-                    let mut dists: Vec<f32> = distances[i].clone();
-                    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-                    let score: f32 = dists[1..=k].iter().sum(); // Skip self (distance 0)
-                    (i, score)
-                })
-                .collect();
-
-            scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
-
-            // Return the update with lowest Krum score
-            Ok(updates[scores[0].0].gradients.clone())
+        let min_peers = f
+            .checked_mul(2)
+            .and_then(|two_f| two_f.checked_add(3))
+            .ok_or(Error::ResourceExhausted)?;
+        if n < min_peers {
+            return Err(Error::InsufficientUpdates);
+        }
+        if n > MAX_KRUM_PEERS {
+            return Err(Error::ResourceExhausted);
         }
 
-        #[cfg(not(feature = "alloc"))]
-        Err(crate::Error::ResourceExhausted)
+        let k = n - f - 2;
+        if self.num_selected > k {
+            return Err(Error::InvalidThreshold);
+        }
+
+        let distances = compute_pairwise_sq_distances_f64(updates, dim)?;
+        let mut neighbor_dists = alloc::vec![0.0f64; n - 1];
+        let mut scores: Vec<(usize, f64)> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let mut slot = 0usize;
+            for j in 0..n {
+                if i != j {
+                    neighbor_dists[slot] = distances[i * n + j];
+                    slot += 1;
+                }
+            }
+            neighbor_dists.sort_by(f64::total_cmp);
+            let score: f64 = neighbor_dists[..k].iter().copied().sum();
+            if !score.is_finite() {
+                return Err(Error::InfDetected);
+            }
+            scores.push((i, score));
+        }
+
+        scores.sort_by(|&(idx_a, score_a), &(idx_b, score_b)| {
+            score_a
+                .total_cmp(&score_b)
+                .then_with(|| updates[idx_a].sender.cmp(&updates[idx_b].sender))
+                .then_with(|| idx_a.cmp(&idx_b))
+        });
+
+        if self.num_selected == 1 {
+            return Ok(updates[scores[0].0].gradients.clone());
+        }
+
+        let m = self.num_selected;
+        let inv_m = 1.0f64 / (m as f64);
+        let mut out = alloc::vec![0.0f32; dim];
+        for (coord, slot) in out.iter_mut().enumerate().take(dim) {
+            let mut sum = 0.0f64;
+            for &(idx, _) in scores.iter().take(m) {
+                sum += updates[idx].gradients[coord] as f64;
+            }
+            *slot = (sum * inv_m) as f32;
+        }
+        validate_finite_output(&out)?;
+        Ok(out)
     }
 
     fn byzantine_tolerance(&self) -> f32 {
-        // Krum tolerates f Byzantine nodes out of n >= 2f+3
         0.33
     }
 
     fn complexity(&self) -> AggregatorComplexity {
         AggregatorComplexity::Quadratic
+    }
+}
+
+/// Versioned Bulyan execution profile (`ADR-0019`, `W9-01`).
+#[cfg(feature = "bulyan")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub enum BulyanProfile {
+    /// El Mhamdi et al. (*Distributed Momentum for Byzantine-resilient Learning*, §2.2.3)
+    /// specialized to `m = 1` ordinary Krum:
+    /// - requires `f >= 1` and `n >= 4f + 3`,
+    /// - selects `theta = n - 2f - 2` candidates via iterative fixed-`f` single-winner Krum
+    ///   without replacement (`k = r - f - 2` at remaining pool size `r`),
+    /// - averages the `beta = theta - 2f = n - 4f - 2` values closest to the coordinate median.
+    #[default]
+    IterativeKrumV1,
+}
+
+/// Stage 1 of [`BulyanProfile::IterativeKrumV1`]: selects `theta = n - 2f - 2` candidate indices
+/// (in selection order, indexing into `updates`) via iterative fixed-`f` Krum without replacement.
+#[cfg(all(feature = "alloc", feature = "bulyan"))]
+pub fn bulyan_stage1_iterative_krum_v1(
+    updates: &[GradientUpdate],
+    max_byzantine: usize,
+    budget: &AggregationBudget,
+) -> Result<Vec<usize>> {
+    if max_byzantine == 0 {
+        return Err(Error::InvalidThreshold);
+    }
+    let min_peers = max_byzantine
+        .checked_mul(4)
+        .and_then(|four_f| four_f.checked_add(3))
+        .ok_or(Error::ResourceExhausted)?;
+    if updates.len() < min_peers {
+        return Err(Error::InsufficientPeers);
+    }
+
+    let dim = validate_gradient_shapes_and_finiteness(updates)?;
+    let n = updates.len();
+    budget.check(n, dim, true)?;
+
+    let distances = compute_pairwise_sq_distances_f64(updates, dim)?;
+    let theta = n - 2 * max_byzantine - 2;
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut selected: Vec<usize> = Vec::with_capacity(theta);
+    let mut neighbor_dists: Vec<f64> = Vec::with_capacity(n);
+
+    for _ in 0..theta {
+        let r = remaining.len();
+        let k = r - max_byzantine - 2;
+
+        let mut best_pos = 0usize;
+        let mut best_orig = remaining[0];
+        let mut best_score = f64::INFINITY;
+
+        for (pos, &orig_i) in remaining.iter().enumerate() {
+            neighbor_dists.clear();
+            for &orig_j in &remaining {
+                if orig_i != orig_j {
+                    neighbor_dists.push(distances[orig_i * n + orig_j]);
+                }
+            }
+            neighbor_dists.sort_by(f64::total_cmp);
+            let score: f64 = neighbor_dists[..k].iter().copied().sum();
+            if !score.is_finite() {
+                return Err(Error::InfDetected);
+            }
+
+            let is_better = if pos == 0 {
+                true
+            } else {
+                score
+                    .total_cmp(&best_score)
+                    .then_with(|| updates[orig_i].sender.cmp(&updates[best_orig].sender))
+                    .then_with(|| orig_i.cmp(&best_orig))
+                    .is_lt()
+            };
+
+            if is_better {
+                best_pos = pos;
+                best_orig = orig_i;
+                best_score = score;
+            }
+        }
+
+        selected.push(best_orig);
+        remaining.remove(best_pos);
+    }
+
+    Ok(selected)
+}
+
+/// Stage 2 of Bulyan (`ADR-0019`, `W9-01`): given `theta` selected vectors and `f = max_byzantine`,
+/// computes each coordinate's median $m_j$ over the `theta` values and averages the
+/// $\beta = \theta - 2f$ values minimizing $|v - m_j|$ in `f64`.
+#[cfg(all(feature = "alloc", feature = "bulyan"))]
+pub fn bulyan_stage2_nearest_to_median(
+    selected_updates: &[&[f32]],
+    max_byzantine: usize,
+) -> Result<Vec<f32>> {
+    if max_byzantine == 0 {
+        return Err(Error::InvalidThreshold);
+    }
+    let theta = selected_updates.len();
+    let min_theta = max_byzantine
+        .checked_mul(2)
+        .and_then(|two_f| two_f.checked_add(1))
+        .ok_or(Error::ResourceExhausted)?;
+    if theta < min_theta {
+        return Err(Error::InsufficientPeers);
+    }
+
+    let dim = selected_updates[0].len();
+    if dim == 0 || dim > MAX_GRADIENT_DIM {
+        return Err(Error::InvalidGradient);
+    }
+    for slice in selected_updates {
+        if slice.len() != dim {
+            return Err(Error::InvalidGradient);
+        }
+        for &val in *slice {
+            if val.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if val.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+        }
+    }
+
+    let beta = theta - 2 * max_byzantine;
+    let inv_beta = 1.0f64 / (beta as f64);
+    let mut out = alloc::vec![0.0f32; dim];
+    let mut sorted = alloc::vec![0.0f32; theta];
+    let mut ranked: Vec<(usize, f32, f64)> = Vec::with_capacity(theta);
+
+    for (coord, slot) in out.iter_mut().enumerate().take(dim) {
+        for (idx, slice) in selected_updates.iter().enumerate() {
+            sorted[idx] = slice[coord];
+        }
+        sorted.sort_by(f32::total_cmp);
+
+        let median = if theta % 2 == 0 {
+            ((sorted[theta / 2 - 1] as f64) + (sorted[theta / 2] as f64)) * 0.5
+        } else {
+            sorted[theta / 2] as f64
+        };
+
+        ranked.clear();
+        for (idx, slice) in selected_updates.iter().enumerate() {
+            let val = slice[coord];
+            let dist = ((val as f64) - median).abs();
+            ranked.push((idx, val, dist));
+        }
+
+        ranked.sort_by(|&(idx_a, val_a, dist_a), &(idx_b, val_b, dist_b)| {
+            dist_a
+                .total_cmp(&dist_b)
+                .then_with(|| val_a.total_cmp(&val_b))
+                .then_with(|| idx_a.cmp(&idx_b))
+        });
+
+        let sum: f64 = ranked
+            .iter()
+            .take(beta)
+            .map(|&(_, val, _)| val as f64)
+            .sum();
+        *slot = (sum * inv_beta) as f32;
+    }
+
+    validate_finite_output(&out)?;
+    Ok(out)
+}
+
+/// Bulyan Byzantine-resilient aggregator (`ADR-0019`, `W9-01`).
+#[cfg(feature = "bulyan")]
+#[derive(Debug, Clone)]
+pub struct Bulyan {
+    /// Maximum tolerated Byzantine peers (`f >= 1`).
+    pub max_byzantine: usize,
+    /// Versioned execution profile.
+    pub profile: BulyanProfile,
+    /// Checked resource/work budget.
+    pub budget: AggregationBudget,
+}
+
+#[cfg(feature = "bulyan")]
+impl Bulyan {
+    /// Create a new Bulyan aggregator using [`BulyanProfile::IterativeKrumV1`] and the default budget.
+    pub const fn new(max_byzantine: usize) -> Self {
+        Self {
+            max_byzantine,
+            profile: BulyanProfile::IterativeKrumV1,
+            budget: AggregationBudget::default_pairwise(),
+        }
+    }
+
+    /// Fallible constructor that rejects `max_byzantine == 0`.
+    pub fn try_new(max_byzantine: usize, profile: BulyanProfile) -> Result<Self> {
+        if max_byzantine == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(Self {
+            max_byzantine,
+            profile,
+            budget: AggregationBudget::default_pairwise(),
+        })
+    }
+
+    /// Override the aggregation resource budget.
+    pub const fn with_budget(mut self, budget: AggregationBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Run Stage 1 and return the selected original peer indices in selection order.
+    #[cfg(feature = "alloc")]
+    pub fn select_indices(&self, updates: &[GradientUpdate]) -> Result<Vec<usize>> {
+        match self.profile {
+            BulyanProfile::IterativeKrumV1 => {
+                bulyan_stage1_iterative_krum_v1(updates, self.max_byzantine, &self.budget)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bulyan")]
+impl RobustAggregator for Bulyan {
+    #[cfg(feature = "alloc")]
+    fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
+        let selected_indices = self.select_indices(updates)?;
+        let selected_slices: Vec<&[f32]> = selected_indices
+            .iter()
+            .map(|&idx| updates[idx].gradients.as_slice())
+            .collect();
+        bulyan_stage2_nearest_to_median(&selected_slices, self.max_byzantine)
+    }
+
+    fn byzantine_tolerance(&self) -> f32 {
+        0.25
+    }
+
+    fn complexity(&self) -> AggregatorComplexity {
+        AggregatorComplexity::Cubic
     }
 }
 
@@ -443,6 +841,18 @@ pub enum RobustAggregation {
     /// Krum algorithm
     #[cfg(feature = "krum")]
     Krum { num_byzantine: usize },
+    /// One-pass Multi-Krum algorithm
+    #[cfg(feature = "krum")]
+    MultiKrum {
+        num_byzantine: usize,
+        num_selected: usize,
+    },
+    /// Bulyan algorithm with explicit versioned profile
+    #[cfg(feature = "bulyan")]
+    Bulyan {
+        max_byzantine: usize,
+        profile: BulyanProfile,
+    },
 }
 
 impl Default for RobustAggregation {
@@ -451,276 +861,6 @@ impl Default for RobustAggregation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::compression::CompressionMethod;
-    use crate::traits::UpdateTransform;
-
-    fn update(gradients: Vec<f32>) -> GradientUpdate {
-        GradientUpdate {
-            sender: [0u8; 32],
-            sequence: 0,
-            gradients,
-            round_id: 0,
-        }
-    }
-
-    fn update_with_meta(
-        sender_byte: u8,
-        sequence: u64,
-        round_id: u64,
-        gradients: Vec<f32>,
-    ) -> GradientUpdate {
-        GradientUpdate {
-            sender: [sender_byte; 32],
-            sequence,
-            gradients,
-            round_id,
-        }
-    }
-
-    struct AddOneTransform;
-
-    impl UpdateTransform for AddOneTransform {
-        fn transform(&self, mut update: GradientUpdate) -> GradientUpdate {
-            for g in &mut update.gradients {
-                *g += 1.0;
-            }
-            update
-        }
-
-        fn name(&self) -> &str {
-            "add_one"
-        }
-
-        fn is_core_trusted(&self) -> bool {
-            true
-        }
-    }
-
-    struct UntrustedClipTransform;
-
-    impl UpdateTransform for UntrustedClipTransform {
-        fn transform(&self, mut update: GradientUpdate) -> GradientUpdate {
-            for g in &mut update.gradients {
-                *g = g.clamp(-1.0, 1.0);
-            }
-            update
-        }
-
-        fn name(&self) -> &str {
-            "clip"
-        }
-    }
-
-    #[test]
-    fn fedavg_rejects_mismatched_gradient_dimensions() {
-        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0])];
-        let result = FedAvg.aggregate(&updates);
-        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
-    }
-
-    #[test]
-    fn trimmed_mean_rejects_mismatched_gradient_dimensions() {
-        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0])];
-        let result = TrimmedMean::new(0.2).aggregate(&updates);
-        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
-    }
-
-    #[test]
-    fn coordinate_median_rejects_empty_gradient_vectors() {
-        let updates = vec![update(vec![]), update(vec![])];
-        let result = CoordinateMedian.aggregate(&updates);
-        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
-    }
-
-    #[test]
-    fn aggregation_rejects_oversized_gradient_dim() {
-        let oversized = [0.0; 10_000_001].to_vec(); // Just barely over MAX_GRADIENT_DIM
-        let updates = vec![update(oversized.clone())];
-        let result = FedAvg.aggregate(&updates);
-        assert!(matches!(result, Err(crate::Error::InvalidGradient)));
-    }
-
-    #[test]
-    #[cfg(feature = "krum")]
-    fn krum_rejects_oversized_peer_set() {
-        let mut updates = Vec::new();
-        // MAX_KRUM_PEERS is 50. Provide 51 peers.
-        for _ in 0..51 {
-            updates.push(update(vec![1.0; 2]));
-        }
-        let krum = Krum::new(0); // 0 byzantine to keep `n < 2*f + 3` check satisfied
-        let result = krum.aggregate(&updates);
-        assert!(matches!(result, Err(crate::Error::ResourceExhausted)));
-    }
-
-    /// NEW-04: FedAvg sum-then-divide produces results matching f64 oracle
-    /// within 1e-6 relative tolerance.
-    #[test]
-    fn fedavg_sum_then_divide_precision() {
-        // Use many small values where per-element division would drift.
-        let n = 100;
-        let dim = 4;
-        let updates: Vec<GradientUpdate> = (0..n)
-            .map(|i| {
-                let base = (i as f32) * 0.001 + 1e-7;
-                update(vec![base; dim])
-            })
-            .collect();
-
-        let result = FedAvg.aggregate(&updates).unwrap();
-
-        // f64 oracle: compute exact mean in double precision.
-        for (d, &actual_f32) in result.iter().enumerate() {
-            let oracle: f64 =
-                updates.iter().map(|u| u.gradients[d] as f64).sum::<f64>() / (n as f64);
-            let actual = actual_f32 as f64;
-            let rel_err = if oracle.abs() > 1e-15 {
-                (actual - oracle).abs() / oracle.abs()
-            } else {
-                (actual - oracle).abs()
-            };
-            assert!(
-                rel_err < 1e-6,
-                "FedAvg precision drift: dim={d}, oracle={oracle}, actual={actual}, rel_err={rel_err}"
-            );
-        }
-    }
-
-    /// M-10: TrimmedMean::new() clamp prevents all-trimmed via normal construction.
-    #[test]
-    fn trimmed_mean_new_clamps_ratio() {
-        let tm = TrimmedMean::new(0.6);
-        assert!(
-            (tm.trim_ratio - 0.49).abs() < f32::EPSILON,
-            "ratio above 0.49 should clamp"
-        );
-    }
-
-    /// M-10: InsufficientUpdates guard reachable via direct struct construction.
-    #[test]
-    fn trimmed_mean_direct_construction_insufficient_updates() {
-        // Direct construction bypasses new()'s clamp.
-        let tm = TrimmedMean { trim_ratio: 0.6 };
-        // 2 peers, 0.6 ratio: trim_count = (2 * 0.6) as usize = 1, n=2, 2<=2*1.
-        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0, 4.0])];
-        let result = tm.aggregate(&updates);
-        assert!(
-            matches!(result, Err(crate::Error::InsufficientUpdates)),
-            "guard should return InsufficientUpdates, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn update_transform_preserves_sender_sequence_round_id() {
-        let updates = vec![
-            update_with_meta(1, 11, 101, vec![0.5, 1.5]),
-            update_with_meta(2, 12, 101, vec![2.5, 3.5]),
-        ];
-        let (transformed, _) = apply_update_transforms(updates.clone(), &AddOneTransform);
-
-        for (input, output) in updates.iter().zip(transformed.iter()) {
-            assert_eq!(input.sender, output.sender);
-            assert_eq!(input.sequence, output.sequence);
-            assert_eq!(input.round_id, output.round_id);
-        }
-        assert_eq!(transformed[0].gradients, vec![1.5, 2.5]);
-    }
-
-    #[test]
-    fn untrusted_transform_audit_has_core_trusted_false() {
-        let updates = vec![update_with_meta(7, 1, 9, vec![2.0, -4.0])];
-        let (_, audit) = apply_update_transforms(updates, &UntrustedClipTransform);
-        assert_eq!(audit.transform_name, "clip");
-        assert!(!audit.core_trusted);
-        assert_eq!(audit.round_id, 9);
-    }
-
-    #[test]
-    fn core_trusted_transform_audit_has_core_trusted_true() {
-        let updates = vec![update_with_meta(7, 1, 3, vec![1.0])];
-        let (_, audit) = apply_update_transforms(updates, &AddOneTransform);
-        assert_eq!(audit.transform_name, "add_one");
-        assert!(audit.core_trusted);
-        assert_eq!(audit.round_id, 3);
-    }
-
-    #[test]
-    fn apply_transforms_then_aggregate_trimmed_mean_end_to_end() {
-        let updates = vec![
-            update_with_meta(1, 1, 4, vec![1.0, 2.0]),
-            update_with_meta(2, 2, 4, vec![3.0, 4.0]),
-        ];
-        let (transformed, _) = apply_update_transforms(updates, &AddOneTransform);
-        let aggregated = TrimmedMean::new(0.0).aggregate(&transformed).unwrap();
-        assert_eq!(aggregated, vec![3.0, 4.0]);
-    }
-
-    #[test]
-    fn pipeline_trimmed_mean_no_compression_matches_direct() {
-        let updates = vec![update(vec![1.0, 2.0]), update(vec![3.0, 4.0])];
-        let direct = TrimmedMean::new(0.0).aggregate(&updates).unwrap();
-        let piped = AggregationPipeline::new(TrimmedMean::new(0.0))
-            .run(&updates)
-            .unwrap();
-        assert_eq!(piped, direct);
-    }
-
-    #[test]
-    fn pipeline_fedavg_topk_compression_roundtrip() {
-        let updates = vec![update(vec![1.0, 2.0, 3.0]), update(vec![5.0, 6.0, 7.0])];
-        let direct = FedAvg.aggregate(&updates).unwrap();
-        let piped = AggregationPipeline::new(FedAvg)
-            .with_compression(CompressionMethod::TopK { k_ratio: 1.0 })
-            .run(&updates)
-            .unwrap();
-        assert_eq!(piped, direct);
-    }
-
-    #[test]
-    fn pipeline_returns_error_on_empty_updates() {
-        let updates: Vec<GradientUpdate> = Vec::new();
-        let err = AggregationPipeline::new(FedAvg).run(&updates).unwrap_err();
-        assert!(matches!(
-            err,
-            AggregationPipelineError::Aggregation(crate::Error::InsufficientUpdates)
-        ));
-    }
-
-    #[test]
-    fn pipeline_trace_nonzero_estimates_for_valid_inputs() {
-        let trace = AggregationPipeline::new(FedAvg).trace(1024, 10);
-        assert!(trace.estimated_memory_bytes > 0);
-        assert!(trace.estimated_flops > 0);
-    }
-
-    #[test]
-    fn pipeline_trace_topk_compressed_less_than_raw() {
-        let trace = AggregationPipeline::new(FedAvg)
-            .with_compression(CompressionMethod::TopK { k_ratio: 0.1 })
-            .trace(1000, 8);
-        let compressed = trace.estimated_compressed_bytes.unwrap();
-        assert!(compressed < trace.estimated_memory_bytes);
-    }
-
-    #[test]
-    fn pipeline_trace_memory_lower_bound_holds() {
-        let gradient_len = 257usize;
-        let num_peers = 19usize;
-        let trace = AggregationPipeline::new(FedAvg).trace(gradient_len, num_peers);
-        let lower_bound = (gradient_len as u64) * (num_peers as u64) * 4;
-        assert!(trace.estimated_memory_bytes >= lower_bound);
-    }
-
-    #[test]
-    fn pipeline_trace_zero_peers_zero_estimates() {
-        let trace = AggregationPipeline::new(FedAvg)
-            .with_compression(CompressionMethod::TopK { k_ratio: 0.2 })
-            .trace(0, 0);
-        assert_eq!(trace.estimated_memory_bytes, 0);
-        assert_eq!(trace.estimated_flops, 0);
-        assert_eq!(trace.estimated_compressed_bytes, Some(0));
-    }
-}
+#[cfg(all(test, feature = "alloc"))]
+#[path = "aggregation_tests.rs"]
+mod tests;

@@ -20,14 +20,12 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) (document hierarchy; drift controls)
 - [`SECURITY.md`](SECURITY.md) (security policy + supply chain gates)
 
-## Implementation Reality (2026-02-13)
+## Implementation Reality (Wave 9 — `v0.1.0-alpha.9`)
 
-- `swarm-torch` (top-level crate) is currently **std-only**.
-- `swarm-torch-core` provides the portable baseline and builds under:
-  - `no_std + alloc` (supported)
-  - minimal `no_std` build (compiles, limited utility)
-- Replay/auth enforcement is implemented (`M4-02`, `M4-02.5`).
-- Concrete TCP/UDP/BLE/LoRa/WiFi transport implementations are still planned (current net path is trait + mock transport).
+- `swarm-torch` (top-level orchestration crate) is currently **std-only**.
+- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport`).
+- Receiver-bound `SessionId` replay/auth enforcement (`ADR-0020`, `swarmtorch.envelope.v1`, expiry-indexed safe `BTreeMap` cache), hardened `Multi-Krum` and `Bulyan` (`BulyanProfile::IterativeKrumV1`, `ADR-0019`), bounded decompression + `ClassicResidual` / `EF21` error feedback (`ADR-0021`), additive `PacketTransport` / `SwarmTransport` traits + originator-authenticated gossip wrappers (`ADR-0022`), and contiguous `LinearModel` / `MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer` (`ADR-0024`) are implemented in Wave 9.
+- Concrete TCP/UDP/BLE/LoRa/WiFi transport backends and optional `Zenoh`/`Iroh` adapter crates remain planned (current net path provides `PacketTransport`, `SwarmTransport`, `LoopbackPacketTransport`, and `MockTransport`).
 
 -----
 
@@ -230,10 +228,8 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`std`               |Enable standard library support          |✅ Yes       |
 |`alloc`             |Enable allocator for dynamic memory      |✅ (with std)|
 |`tokio-runtime`     |Use Tokio runtime adapter                |✅ Yes       |
-|`embassy-runtime`   |Enable Embassy placeholder adapter (experimental; not in Rust 1.75 conformance gate)|❌ No|
-|`burn-backend`      |Use Burn backend integration scaffold    |✅ Yes       |
-|`tch-backend`       |Use LibTorch (`tch-rs`) integration scaffold|❌ No    |
-|`robust-aggregation`|Enable robust aggregation strategies     |✅ Yes       |
+|`embassy-runtime`   |Enable Embassy runtime adapter (`no_std`)|❌ No        |
+|`robust-aggregation`|Enable robust aggregation strategies (`krum`, `bulyan`)|✅ Yes|
 |`tcp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
 |`udp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
 |`ble-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
@@ -241,7 +237,7 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`telemetry`         |Core telemetry module re-exports         |❌ No        |
 |`python`            |Reserved marker for future Python boundary work|❌ No   |
 
-Roadmap-only items from ADRs (for example WGPU/CUDA backend wiring and PyO3 bindings) are not yet exposed as active Cargo features in `swarm-torch`.
+External framework bridges (such as Burn and Candle in `swarm-torch-backends`, WGPU/CUDA acceleration, and PyO3 bindings) are isolated to optional adapter crates and roadmap waves (`ADR-0015`, `ADR-0024`).
 
 **Embedded profile presets:**
 
@@ -267,26 +263,28 @@ The diagram mixes implemented components and roadmap targets.
 ┌─────────────────────────────────────────────────────────┐
 │            Application Layer (Your Code)                 │
 ├─────────────────────────────────────────────────────────┤
-│   Swarm Learning API (design target surface)            │
-│   • ParticleSwarm, AntColony, Firefly optimizers        │
-│   • Robust aggregators (Krum, Trimmed Mean, Median)     │
+│   Swarm Learning & Coordination Layer                   │
+│   • Robust aggregators (Median, Trimmed Mean,           │
+│     Krum / Multi-Krum, Bulyan IterativeKrumV1)          │
+│   • Compression & Error Feedback (ClassicResidual, EF21)│
+│   • Topology builders (Ring, FullMesh, Gossip, etc.)    │
 ├─────────────────────────────────────────────────────────┤
-│   Model Abstraction Layer                               │
-│   • Burn wrapper (placeholder)                          │
-│   • tch-rs bridge (LibTorch interop)                    │
-│   • Custom model traits                                 │
+│   Model & Optimization Layer (swarm-torch-models)       │
+│   • Reference LinearModel & contiguous MlpModel         │
+│   • Analytical MSE, Cross-Entropy, & Huber losses       │
+│   • SgdOptimizer & generic SwarmModel trait             │
 ├─────────────────────────────────────────────────────────┤
-│   Identity & Coordination Layer                         │
+│   Identity & Security Layer                             │
 │   • Gossip-based eventual consistency (NOT consensus)   │
-│   • Ed25519 identity with pluggable attestation         │
-│   • Byzantine-robust aggregation                        │
+│   • Ed25519 EnvelopeV1 + receiver-bound SessionId       │
+│   • Originator-signed gossip recipient wrappers         │
 ├─────────────────────────────────────────────────────────┤
 │   Transport Abstraction (swarm-torch-net)               │
-│   • Trait + mock transport (implemented)                │
-│   • TCP/UDP/BLE/LoRa backends (planned)                 │
+│   • Additive PacketTransport & SwarmTransport traits    │
+│   • Loopback & Mock transports (concrete I/O planned)   │
 ├─────────────────────────────────────────────────────────┤
-│   Runtime Abstraction                                   │
-│   • Tokio (implemented)  │  Embassy (placeholder)       │
+│   Runtime Abstraction (swarm-torch-runtime)             │
+│   • Tokio & PollLoop (std)  │  Embassy & Spin (no_std)  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -329,9 +327,10 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 |--------------------------|-----------------|------------------|-----------------------------|
 |**Coordinate-wise Median**|✅ High           |Low               |Low-dimensional models       |
 |**Trimmed Mean**          |✅ Medium-High    |Low               |Balanced performance         |
-|**Krum**                  |✅ High           |Medium            |Small-medium fleets          |
+|**Krum / Multi-Krum**     |✅ High           |Medium ($\mathcal{O}(n^2 d)$)|Small-medium fleets ($n \ge 2f + 3$)|
+|**Bulyan (`IterativeKrumV1`)**|✅ Very High  |Medium-High ($\mathcal{O}(n^2 d)$)|High-resilience cohorts ($n \ge 4f + 3$)|
 
-`Bulyan` and `Multi-Krum` are roadmap items, not implemented in the current crate surface.
+`CenteredClipping` (`CClip`) and Non-IID $s$-bucketing are specified in [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) and scheduled for Wave 11 (`W11-01`).
 
 **Important caveat:** Research shows that all robust aggregators can degrade under specific attack strategies, especially in high-dimensional settings. SwarmTorch provides:
 
@@ -430,46 +429,34 @@ cargo run -p swarm-torch --example artifact_pipeline
 
 ## Roadmap
 
-### v0.1.0 - Swarm Robotics MVP (Current)
+### v0.1.0 - Swarm Learning Core & Coordinator (Active — Wave 9 Complete)
 
-- ✅ Sequential execution engine MVP (single-process deterministic scheduler)
-- ⚠️ Distributed orchestration/execution remains in progress
-- ❌ TCP/UDP concrete transports (planned; trait + mock currently implemented)
-- ✅ Basic robust aggregators (Median, Trimmed Mean, Krum)
-- ❌ Burn backend integration (placeholder wrapper currently)
-- ⏳ ROS2 bridge (beta)
-- ⏳ 5 reference robotics examples
+- ✅ Sequential execution engine MVP & artifact/report bundle pipeline (Waves 6–8)
+- ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`EnvelopeV1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
+- ⏳ Wave 10 (`v0.1.0-alpha.10`): Unified Swarm Round Coordinator, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock, and deterministic multi-node simulation
+- ⏳ Wave 11 (`v0.1.0-rc.1`): `CenteredClipping` (`CClip`), Non-IID $s$-bucketing, verifiable `SharedSeedSparse` projection, 16-byte chunked packet reassembly (`CRC-16/IBM-3740`), and `SwarmTorchCheckpointV1` SafeTensors profile
+- ⏳ Wave 12 (`v0.1.0` Final): Optional `swarm-torch-backends` (Burn/Candle/LoRA), optional `swarm-torch-transport-zenoh` & `swarm-torch-transport-iroh`, `FedAsync` stale-delta mixing + durable Rényi DP accounting, and `wasmi` extension sandbox + columnar data runner
 
-### v0.2.0 - Edge ML Toolkit
+### v0.2.0 - Edge ML & Hardware Fleet Expansion
 
-- ✅ Wave 4 remediation sign-off gate (L-* + E-* semver batch) required before v0.2 feature rollout
-- ⏳ Embassy runtime support for `no_std` targets
-- ⏳ BLE and WiFi transport implementations
-- ⏳ Compressed gradient protocols (TopK, randomized sparsification)
-- ⏳ Memory-bounded participant roles (<256KB)
-- ⏳ ESP32 and STM32 reference implementations
-- ✅ F1: run-graph execution hints (`ExecutionHint`) for profile/device-aware planning
-- ✅ F2a/F2/F3/F4 batch: transform audit plumbing, `UpdateTransform`, composable aggregation pipeline, lightweight tracing
-- ✅ Wave 6 convergence: canon truth-sync + behavior-preserving `A6X-06` decomposition of artifact/report modules (no runtime/schema feature expansion)
-- ✅ Wave 7 delivery: reliability hardening, sequential scheduler MVP, typed `NodeV1` policy/resource fields, robustness harness baseline
+- ⏳ Concrete BLE, WiFi, and UDP/TCP hardware transport backends
+- ⏳ Memory-bounded participant profiles (<256KB) & ESP32 / STM32 reference deployments
+- ⏳ Portable GPU acceleration via WGPU (`ADR-0015`)
 
-### v0.3.0 - Production Hardening
+### v0.3.0 - Production Hardening & Tooling
 
 - ⏳ LoRa transport with duty-cycle management
-- ⏳ Advanced Byzantine defense (Bulyan, Multi-Krum)
-- ⏳ Attack simulation harness
-- ⏳ tch-rs backend for PyTorch model compatibility (model zoo only)
-- ⏳ ONNX export for inference interchange (import for inference, NOT training)
+- ⏳ Local-only read-only artifact HTTP server & desktop visualization surfaces (`ADR-0016`)
+- ⏳ ONNX export for inference interchange (import for inference, NOT training; `ADR-0010`)
 
 ### v1.0.0 - Enterprise Ready
 
 - ⏳ Audit logging and reproducibility tooling
 - ⏳ Compliance mode (HIPAA, GDPR)
-- ⏳ Python bindings (PyO3) with zero-copy data exchange
+- ⏳ Python bindings (PyO3) with zero-copy data exchange (`ADR-0009`)
 - ⏳ Formal verification of core protocols (TLA+)
-- ⏳ Commercial support and SLA
 
-See [ROADMAP.md](ROADMAP.md) for detailed milestones.
+See [ROADMAP.md](ROADMAP.md) for the canonical wave breakdown.
 
 -----
 
@@ -546,9 +533,9 @@ SwarmTorch is open-source (MPL-2.0 license) and welcomes contributions. We espec
 
 ### Security Disclosure
 
-Report vulnerabilities to **security@swarmtorch.dev** (see [SECURITY.md](SECURITY.md) for full disclosure policy)
+Report vulnerabilities privately via **[GitHub Security Advisories](https://github.com/swarmic/SwarmTorch/security/advisories/new)** or email **[swarmiclabs@gmail.com](mailto:swarmiclabs@gmail.com)** (see [SECURITY.md](SECURITY.md) for full disclosure policy).
 
-**Do not** open public issues for security bugs. We follow a 90-day disclosure policy.
+**Do not** open public issues for security bugs. We follow a 90-day coordinated disclosure policy.
 
 -----
 
@@ -568,7 +555,8 @@ If you use SwarmTorch in research, please cite:
 
 **Key academic foundations:**
 
-- Byzantine-resilient aggregation: [Blanchard et al., 2017](https://arxiv.org/abs/1703.02757)
+- Byzantine-resilient aggregation: [Blanchard et al., 2017](https://arxiv.org/abs/1703.02757), [El Mhamdi et al., 2018](https://arxiv.org/abs/1802.07927)
+- Error-feedback compression: [Richtárik et al., 2021 (EF21)](https://arxiv.org/abs/2106.05203)
 - Gossip learning: [Hegedűs et al., 2019](https://arxiv.org/abs/1901.08769)
 - Decentralized federated learning: [Lalitha et al., 2019](https://arxiv.org/abs/1805.09063)
 
@@ -591,12 +579,9 @@ SwarmTorch is licensed under the **Mozilla Public License 2.0 (MPL-2.0)**. See [
 
 ## Community & Support
 
-Public community channels are being prepared and will be linked here once live.
-
 - 🐞 **Issues:** [github.com/swarmic/SwarmTorch/issues](https://github.com/swarmic/SwarmTorch/issues)
-- 🔐 **Security Reports:** [security@swarmtorch.dev](mailto:security@swarmtorch.dev)
-
-**Commercial Support:** Enterprise licensing, training, and consulting available via [support@swarmtorch.dev](mailto:support@swarmtorch.dev)
+- 🔐 **Security Reports:** [GitHub Security Advisories](https://github.com/swarmic/SwarmTorch/security/advisories/new) or [swarmiclabs@gmail.com](mailto:swarmiclabs@gmail.com)
+- ✉️ **Architecture & Roadmap Collaboration:** [swarmiclabs@gmail.com](mailto:swarmiclabs@gmail.com) (see [CONTRIBUTING.md](CONTRIBUTING.md))
 
 -----
 

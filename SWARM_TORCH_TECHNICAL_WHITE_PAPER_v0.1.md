@@ -19,10 +19,7 @@ This document is intended to be a **canonical SwarmTorch reference**, co-equal w
 1. `ADRs.md` (architecture decisions)
 2. The `swarm-torch-*` crate source code (implementation truth)
 
-The following documents are **secondary** and must not be treated as SwarmTorch requirements:
-
-- `SWARMIC_NETWORK_WHITE_PAPER_v12.*.md` (integration context only; do not import mission-plane semantics into core)
-- `adr-with-updates.md` (historical notes; superseded by `ADRs.md`)
+See [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) for the public document hierarchy and external mission-plane boundary (`ADR-0008A` / `P2-18`).
 
 ### Claim -> Evidence Convention (Mandatory)
 
@@ -34,7 +31,7 @@ Every normative statement (**MUST/SHOULD/MAY**) must include a short evidence po
 - `Evidence: <crate>/src/<path>.rs`
 - `Evidence: tests/<path>.rs` or `Evidence: <command>`
 
-If a statement has no enforcement hook, downgrade it to **SHOULD**/**MAY** or move it to “Non-Normative Notes”.
+If a statement has no enforcement hook, downgrade it to **SHOULD**/**MAY** or move it to ΓÇ£Non-Normative NotesΓÇ¥.
 
 ### Change Control
 
@@ -57,7 +54,7 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Robustness | Robust aggregation algorithms | Evidence: swarm-torch-core/src/aggregation.rs, swarm-torch-core/tests/robustness_harness.rs | Partial | FedAvg/TrimmedMean/Median implemented; initial robustness harness implemented (not a release gate) |
 | Compression | Update compression primitives | Evidence: swarm-torch-core/src/compression.rs | Partial | TopK/Quantized implemented; convergence guarantees TBD |
 | Networking | Message envelope + transport trait | Evidence: swarm-torch-net/src/protocol.rs, swarm-torch-net/src/traits.rs | Partial | Real transports are placeholders |
-| Replay protection | Sequence/timestamp validation enforced (memory-only cache) | Evidence: swarm-torch-core/src/replay.rs, swarm-torch-net/src/protocol.rs, ADR-0008B | Implemented | LRU cache, ±60s skew window, 16-message out-of-order tolerance |
+| Replay protection | Sequence/timestamp validation enforced (memory-only cache) | Evidence: swarm-torch-core/src/replay.rs, swarm-torch-net/src/protocol.rs, ADR-0008B | Implemented | LRU cache, ┬▒60s skew window, 16-message out-of-order tolerance |
 | Message auth | Ed25519 signing/verification with domain-separated preimage | Evidence: ADR-0008, ADR-0008B, swarm-torch-core/src/crypto.rs | Implemented | Production Ed25519 path; sender field uses raw public key bytes |
 | Gradient validation | Bounds checking (NaN/Inf/L2/coordinate) | Evidence: swarm-torch-core/src/crypto.rs | Implemented | Used as a building block for verified zone |
 | Identity boundary | External identity provider boundary (Sybil resistance out-of-scope) | Evidence: ADR-0008A | Planned | IdentityProvider trait is not implemented in code yet |
@@ -93,7 +90,7 @@ SwarmTorch is a Rust-native distributed machine learning and swarm learning fram
 
 - Mission-plane traffic classes, RA/capability gating, PoSw/receipt systems
 - SwarmicOS runtime policy enforcement
-- Any system that requires “always-online” assumptions as a correctness dependency
+- Any system that requires ΓÇ£always-onlineΓÇ¥ assumptions as a correctness dependency
 
 ## System Model (SwarmTorch-Only)
 
@@ -158,7 +155,7 @@ Evidence: swarm-torch-core/src/algorithms.rs
 
 ### Threats (Design Target)
 
-SwarmTorch’s baseline threat model includes:
+SwarmTorchΓÇÖs baseline threat model includes:
 
 | Threat | In Scope | Notes |
 |--------|----------|-------|
@@ -199,7 +196,7 @@ auth + replay enforcement is implemented in current code.
 
 ## Run Graph + Artifact Spine (Normative)
 
-This chapter defines the SwarmTorch “spine”: a unified run DAG plus persisted artifacts that power notebook views and future UIs.
+This chapter defines the SwarmTorch ΓÇ£spineΓÇ¥: a unified run DAG plus persisted artifacts that power notebook views and future UIs.
 
 ### Unified Run Graph (`graph.json`)
 
@@ -259,7 +256,7 @@ runs/<run_id>/
   artifacts/
 ```
 
-For `edge_std` coordinators/gateways, Parquet/Arrow is the preferred “facts at rest” format:
+For `edge_std` coordinators/gateways, Parquet/Arrow is the preferred ΓÇ£facts at restΓÇ¥ format:
 
 - `metrics.parquet`, `events.parquet`, `spans.parquet`, `datasets/materializations.parquet`
 
@@ -305,8 +302,8 @@ The `swarm-torch` crate defines feature gates for:
   Evidence: swarm-torch/Cargo.toml
 - Runtime: `tokio-runtime`, `embassy-runtime`  
   Evidence: swarm-torch/Cargo.toml
-- Backends: `burn-backend`, `tch-backend`  
-  Evidence: swarm-torch/Cargo.toml
+- Models: Self-contained `no_std` reference models and analytical losses in `swarm-torch-models` (external ML framework adapters isolated per `ADR-0024`)  
+  Evidence: swarm-torch-models/Cargo.toml, ADR-0024
 - Transports: `tcp-transport`, `udp-transport`, `ble-transport`, `lora-transport`  
   Evidence: swarm-torch/Cargo.toml
 - Robust aggregation: `robust-aggregation`  
@@ -532,7 +529,7 @@ Evidence: `ROADMAP.md`.
 
 ### Appendix B: Conformance Hooks and Release Gates (Template)
 
-This appendix lists conformance hooks that keep the white paper’s normative claims honest.
+This appendix lists conformance hooks that keep the white paperΓÇÖs normative claims honest.
 
 **Legend:** `Implemented` means the hook exists and can be run today. `Planned` means the hook is specified but not yet present as a script/test/CI gate in this repo.
 
@@ -631,3 +628,71 @@ Tracked follow-up: `P2-20` (`Status: Planned`, Wave 8.3) publishes versioned JSO
 ### Appendix E: Bibliography
 
 See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md`.
+
+
+---
+
+## Post-Wave 8.1 Engineering Specifications & Ratified Canon (Waves 9–12 / ADR-0019..ADR-0025)
+
+This chapter records the normative mathematical, protocol, hardware, security, and verification contracts ratified in `ADR-0019` through `ADR-0025` (`ADRs.md`). Each slice progresses through four explicit states: `Contract Ratified` $\rightarrow$ `Implementation Landed` $\rightarrow$ `Conformance Passed` $\rightarrow$ `Profile Released`.
+
+### 1. Normative vs. Profiled Operational Matrix (Closes `P2-12`, `ADR-0002`, `ADR-0003`, `ADR-0022`, `ADR-0023`)
+
+SwarmTorch distinguishes between **normative protocol invariants** (enforced across all profiles) and **profiled deployment parameters** (tuned and verified per network/hardware class):
+
+| Profile | Target Hardware & Runtime Tier | Typical RAM & Compiler Profile | Codec-Visible Frame / Carrier | `round_timeout_ms` | `min_quorum_ratio` (subject to $n, f, m$ check) | `max_staleness_rounds` | `StalenessSchedule` (`FedAsync`) | Recommended Aggregator & Compressor |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | :--- | :--- |
+| **`EmbeddedLora`** (`no_std + alloc`, Experimental until `P2-06` 6-gate firmware conformance passes) | ARM Cortex-M4/M7, ESP32-C3/S3 (`EmbassyRuntime` + explicit wall-clock or session-lease provider) | 64 KiB – 512 KiB SRAM; verified Rust `1.75` core/models/net | LoRa (`250B` frame $\implies 234\text{B}$ stride), BLE ATT (`247B` MTU $\implies 244\text{B}$ notification / $228\text{B}$ stride), `max_chunks = 256` (~58–59 KiB cap) | `120_000` | `0.30` (re-verified against $2f+3$) | `16` | `Polynomial { a: 0.5 }` | `CenteredClipping` ($\mathcal{O}(Lnd)$ time, $\mathcal{O}(d)$ scratch) + `ClassicResidual(SharedSeedSparse)` |
+| **`TacticalMesh`** (`std` Edge / Gateway) | Jetson Orin Nano, Raspberry Pi 5, ROS 2 Robot (`TokioRuntime` `rt,time`) | 512 MiB – 8 GiB; adapter-specific compiler floor (`1.75` base, `1.80+` adapters) | UDP Gossip (`1200B` frame $\implies 1184\text{B}$ stride), `swarm-torch-transport-zenoh`, `swarm-torch-transport-iroh` (1-RTT QUIC stream) | `15_000` | `0.50` (re-verified against $B, f_B$) | `5` | `Hinge { a: 0.5, b: 2 }` | Conservative `$s$-Bucketing` ($n \bmod s = 0, f_B = \min(f, B)$) + One-Pass `Multi-Krum` ($1 \le m \le B - 2f_B - 2$) + `ClassicResidual` |
+| **`ClusterFast`** (`std` Server/Cloud) | x86_64 / ARM64 Host (`TokioRuntime` + `swarm-torch-backends`) | $\ge 16$ GiB | Length-prefixed TCP (`u32_le(len)`), Iroh 1-RTT QUIC, Zenoh | `2_000` | `0.80` (re-verified against $4f_B+3$) | `1` | `Constant` | Conservative `$s$-Bucketing` + `Bulyan` (`BulyanProfile::IterativeKrumV1`) + `ClassicResidual` / synchronized `EF21` |
+
+Evidence: ADR-0002, ADR-0003, ADR-0019, ADR-0021, ADR-0022, ADR-0023.  
+Grounding: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#FedAsync-2019, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#CenteredClipping-ICML21
+
+### 2. Threat-Model-to-Enforcement Mapping (Closes `P2-13`, `ADR-0019..ADR-0025`)
+
+| Threat Class | Concrete Enforcement Mechanism & Code Seam | Owner ADR / Slice | Verification Gate |
+| :--- | :--- | :--- | :--- |
+| **Byzantine `NaN`/`Inf` sort poisoning & finite-input `f32` overflow (`B2`)** | 1. Fail-closed `.is_finite()` validation on all coordinates (including unselected/trimmed) before sorting/arithmetic<br/>2. `f32::total_cmp` / `f64::total_cmp` + canonical peer-index tie-breaking<br/>3. Pre-operation `f64` widening for all sums, means, midpoints (`f32((f64(a)+f64(b))/2)`), and squared distances + checked byte/scratch/work budgets | `ADR-0019` (`W9-01`) | `cargo test -p swarm-torch-core --test robustness_harness` |
+| **High-dimensional & Non-IID Byzantine attacks (`B1`, `B6`, `B7`)** | 1. One-pass `Multi-Krum` ($n \ge 2f+3, k = n-f-2, 1 \le m \le n-f-2$, index self-exclusion)<br/>2. `Bulyan` Stage 2 averaging $\beta = n-4f$ values nearest to lower observed median (Stage 1 terminal pool gated)<br/>3. `CenteredClipping` & conservative `$s$-Bucketing` ($f_B = \min(f, B)$) | `ADR-0019` (`W9-01`, `W11-01`) | `swarm-torch-core::aggregation::tests` |
+| **Sybil replay eviction, same-second replay, & restart state loss (`B3`, `P2-04`)** | 1. `CohortAllowlist` production default (`P2-03`) + expiry-indexed safe `BTreeMap` cache (removing `lru`, retiring `RUSTSEC-2026-0002` & `RUSTSEC-2026-0253`)<br/>2. Full $A+F$ validity retention ($n > t_{\max} + A$) and fail-closed `CapacityExhausted`<br/>3. `RecoveryRequired` startup/restart state + directional handshake committing 256-bit receiver challenge into `session_id` + 6-stage atomic receive pipeline (`P2-01`, `P2-04`) | `ADR-0020` (`W9-02`) | `cargo test -p swarm-torch-net --test replay_integration` |
+| **Hostile wire metadata & adaptive post-seed sparse fabrication (`B4`, `B5`, `B6`)** | 1. Pre-allocation deserialization/shape/index/dequantization bounds on `compression.rs` wire types<br/>2. Transactional `ClassicResidual` default & gated per-peer `EF21` state sync (`StateAck`)<br/>3. Verifiable pre-seed Merkle/vector commitments (ordered *after* DP sanitization) + $\mathcal{O}(k)$ sparse sampling for `SharedSeedSparse` | `ADR-0021` (`W9-03`, `W11-02`) | `swarm-torch-core::compression::tests` |
+| **Pre-auth chunk fragmentation & cross-relay identity spoofing (`T1`)** | 1. Frozen 16-byte header (`[0x53, 0x54]`, `CRC-16/IBM-3740`, fixed stride $P$), observed-source pre-auth byte/count caps, and conflict quarantine up to hard monotonic deadline<br/>2. Originator-signed recipient wrappers binding `(inner_digest, recipient_session_id)` | `ADR-0022` (`W9-04`, `W10-03`, `W11-03`) | `swarm-torch-net::tests` |
+| **Artifact tampering, TOCTOU reopen, unlisted files, & concurrent writers (`C2`, `C3`, `P2-02`)** | 1. Write-once CAS checkpoints (`blobs/sha256/<digest>`) with checked `sync_all` + directory sync<br/>2. Exclusive OS-backed bundle lockfile (`P2-02`)<br/>3. `ManifestSignatureV1` (raw 16-byte `RunId`) + `TrustPolicy::Strict` default consuming only manifest-listed verified bytes | `ADR-0023` (`W10-01`, `W10-02`, `P2-10`) | `cargo test -p swarm-torch artifacts::tests` |
+| **Untrusted Wasm extension resource exhaustion (`T3`)** | Installed `wasmi` `store.limiter(|s| &mut s.limits)` + `trap_on_grow_failure(true)` + engine fuel active *before* instantiation/start functions + checked guest pointer bounds + zero WASI ambient authority | `ADR-0018`, `ADR-0025` (`W12-04`) | `swarm-torch::wasm_sandbox::tests` |
+| **Supply-chain advisories & unused default framework bloat (`D1`–`D4`, `P2-05`, `P2-11`)** | Remove `lru` (`W9-02`), remove `burn`/`tcp-transport` from defaults and sever `net/std -> tokio` (`W9-05`), isolate adapters (`swarm-torch-backends`, `zenoh`, `iroh`), and promote `cargo vet` to blocking before `W10` beta (`P2-05`) | `ADR-0002`, `ADR-0020`, `ADR-0024` | `cargo deny check && cargo audit && cargo vet` |
+
+Evidence: ADR-0002, ADR-0003, ADR-0019..ADR-0025, `SECURITY.md`.
+
+### 3. Standalone `graph.json` Schema Compatibility & JSON/Parquet Split (Closes `P2-14`, `P2-20a`/`P2-20b`, `ADR-0016`, `ADR-0017`, `ADR-0023`)
+
+- **Canonical Hashed Fields (`NodeDefCanonicalV1`, `postcard`-serialized for `node_def_hash_v1`):**
+  - `node_key` (`1..=256` UTF-8 bytes), `op_kind` (`Data | Train | Eval | Export`), `op_type` (`1..=128` bytes), `inputs` (`Vec<AssetRefV1>`), `outputs` (`Vec<AssetRefV1>`), `params` (`CanonParams` — `BTreeMap<String, CanonValue>`, rejecting non-finite `f64`), `code_ref`, `unsafe_surface`, and `execution_trust` (`Core | SandboxedExtension | UnsafeExtension`).
+- **Additive Operational Metadata Fields (Excluded from `node_def_hash_v1`):**
+  - `node_id` (`Option<NodeId>`, derived via `node_id_from_key`), `node_def_hash` (`Option<[u8; 32]>`), `execution_hint` (`Option<ExecutionHint>`), `cache_policy` (`Option<CachePolicyV1>`), `materialization_policy` (`Option<MaterializationPolicyV1>`), `resources` (`Option<ResourceRequestV1>`), and `op_hash` (`Option<[u8; 32]>`).
+  - **Compatibility & Cache Rule (`C2`):** Modifying operational metadata fields does not mutate `node_def_hash_v1` or `recipe_hash_v0`. However, a valid training/checkpoint cache hit in `scheduler.rs` requires both recipe-key equality AND verified physical CAS payload presence, digest match, `TrustPolicy::Strict` satisfaction, and state restoration (`CachePolicy::Bypass` forces execution).
+- **Schema Deliverables (`P2-20a` / `P2-20b`):** Versioned JSON Schema 2020-12 contracts (with streaming size bounds and lossless `u64` encodings) ship in `W10-02` (`P2-20a`), while Arrow/Parquet columnar schemas ship in `W12-04` (`P2-20b`).
+
+Evidence: ADR-0016, ADR-0017, ADR-0023, ADR-0025, `swarm-torch-core/src/run_graph.rs`.
+
+### 4. Compression Profiles, Wire Representations, & Qualified Convergence Contracts (Closes `P2-15`, `ADR-0021`)
+
+| Compression Profile (`compression.rs`) | Actual Wire Representation ($d$ floats) | Error Feedback Contract | Robust Aggregator Compatibility & Complexity | Qualified Convergence & Theorem Assumptions |
+| :--- | :--- | :--- | :--- | :--- |
+| `CompressionMethod::None` + `CompressedData::Dense(Vec<u8>)` | $4d$ LE `f32` bytes (all finite) | None | All aggregators in $\mathbb{R}^d$ | Baseline uncompressed distributed SGD / `ModelDeltaV1` |
+| `CompressionMethod::Quantized { scale }` + `CompressedData::Dense(Vec<u8>)` | $d$ signed `i8` bytes + 4B finite positive `scale` (widened dequantization check) | `ClassicResidual` recommended (truncating fixed-scale INT8 is not uniformly contractive near 0) | All aggregators in $\mathbb{R}^d$ | Bounded quantization residual under `ClassicResidual` |
+| `CompressionMethod::TopK { k_ratio }` + `CompressedData::Sparse { indices: Vec<u32>, values: Vec<u8> }` | $8k$ bytes ($k = \lceil d \cdot k_{\text{ratio}} \rceil$, strictly increasing `u32` indices + 4B LE `f32` values) | `ClassicResidual` (`W9-03` default, one-shot sender commit) or synchronized `EF21` ($\mathcal{O}(nd)$ receiver state + `StateAck`) | `FedAvg` / `CenteredClipping` (disjoint support causes zero-vector bias under `Krum`/`Median` unless `EF21` reconstructs dense $s_{t+1}^i$) | Contractive compressor assumptions per Richtárik et al. (NeurIPS 2021) / *Byz-EF21*; no blanket $\mathcal{O}(1/T)$ claimed for arbitrary nonlinear compositions |
+| `SharedSeedSparse { k_ratio, seed }` (`W11-02`) | $4k + 32$ bytes (equal to `TopK` at $k=8$, $\approx 2\times$ smaller asymptotically before wrapper/commitment proof bytes) | `ClassicResidual` over sanitized $z_t$ + pre-seed Merkle/vector commitments | Compatible in projected $\mathbb{R}^k$ ($\mathcal{O}(n^2 k)$ pairwise work, $\mathcal{O}(nk)$ stored vectors, $\mathcal{O}(k)$ sparse sampler) | Requires verifiable pre-seed coordinate commitments (or declared `TrustedCompressor`) and stated sparse-domain robustness assumptions (*RoSDHB*, AISTATS 2026) |
+
+Evidence: ADR-0021, `swarm-torch-core/src/compression.rs`.  
+Grounding: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#EF21-NeurIPS21, SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#RoSDHB-AISTATS26
+
+### 5. Mission-Plane Integration Boundary Specification (Closes `P2-18`, `ADR-0008A` Addendum)
+
+SwarmTorch enforces a strict architectural firewall between its swarm learning/DataOps plane and external mission, autonomy, or fleet-control planes:
+1. **Enrollment & Identity $\rightarrow$ `PeerAdmissionPolicy`:** External PKI, hardware attestation, or mission capability grants populate `PeerAdmissionPolicy` (`CohortAllowlist` default), Verified by the host integration adapter. External enrollment **never** bypasses originator Ed25519 signature verification, `ADR-0020` receiver-bound `session_id` establishment, replay protection, or `ADR-0023` one-contribution-per-round deduplication.
+2. **Learning Rounds & Checkpoints $\rightarrow$ Mission Actuation:** Committed SwarmTorch checkpoints establish only that the declared training/aggregation recipe executed over the authenticated contributions. They **do not** certify physical actuation safety or mission authorization; external control loops own safety interlocks and actuation decisions.
+3. **Transport Capabilities $\rightarrow$ Radio/Network QoS:** External traffic-class and link-key policies configure `PacketCapabilities` and stride $P$, but routing topics, radio addresses, or relay link authentication **never** grant contributor authority or override pre-authentication memory budgets.
+4. **Signed Artifacts $\rightarrow$ External Attestations:** `TrustPolicy::Strict` verifies the integrity and provenance of manifest-listed bundle files under external trust anchors; exported receipts **do not** attest to unlisted files, raw external sensor truth, or mission execution outcomes.
+
+Evidence: ADR-0008A Ratification Addendum, ADR-0002, ADR-0020, ADR-0022, ADR-0023.

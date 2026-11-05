@@ -10,8 +10,8 @@ use crate::Result;
 
 /// A model that can participate in swarm learning
 pub trait SwarmModel: Send + Sync {
-    /// The input type for the model
-    type Input;
+    /// The input type for the model (relaxed to `?Sized` for slice inputs like `[f32]`)
+    type Input: ?Sized;
     /// The output type for the model
     type Output;
     /// Model forward error type
@@ -74,8 +74,8 @@ pub trait UpdateTransform: Send + Sync {
 
 /// An optimizer that can be used in swarm learning
 pub trait SwarmOptimizer: Send + Sync {
-    /// Model type this optimizer updates.
-    type Model: SwarmModel<Input = (), Output = ()>;
+    /// Model type this optimizer updates (unconstrained `Input`/`Output` per ADR-0024).
+    type Model: SwarmModel;
     /// Optimizer error type.
     type Error: core::fmt::Debug;
 
@@ -95,8 +95,8 @@ pub trait SwarmOptimizer: Send + Sync {
 
 /// A fitness function for swarm optimization
 pub trait FitnessFunction: Send + Sync {
-    /// Model type this evaluator accepts.
-    type Model: SwarmModel<Input = (), Output = ()>;
+    /// Model type this evaluator accepts (unconstrained `Input`/`Output` per ADR-0024).
+    type Model: SwarmModel;
     /// Evaluation error type.
     type Error: core::fmt::Debug;
 
@@ -212,17 +212,21 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct DummyModel {
-        params: [f32; 1],
+    struct DummySliceModel {
+        params: [f32; 2],
     }
 
-    impl SwarmModel for DummyModel {
-        type Input = ();
-        type Output = ();
+    impl SwarmModel for DummySliceModel {
+        type Input = [f32];
+        type Output = f32;
         type Error = core::convert::Infallible;
 
-        fn forward(&self, _input: &Self::Input) -> core::result::Result<Self::Output, Self::Error> {
-            Ok(())
+        fn forward(&self, input: &Self::Input) -> core::result::Result<Self::Output, Self::Error> {
+            Ok(input
+                .iter()
+                .zip(self.params.iter())
+                .map(|(x, w)| x * w)
+                .sum())
         }
 
         fn parameters(&self) -> &[f32] {
@@ -242,7 +246,7 @@ mod tests {
     struct DummyOptimizer;
 
     impl SwarmOptimizer for DummyOptimizer {
-        type Model = DummyModel;
+        type Model = DummySliceModel;
         type Error = core::convert::Infallible;
 
         fn step(
@@ -264,26 +268,27 @@ mod tests {
     struct DummyFitness;
 
     impl FitnessFunction for DummyFitness {
-        type Model = DummyModel;
+        type Model = DummySliceModel;
         type Error = core::convert::Infallible;
 
-        fn evaluate(&self, _model: &Self::Model) -> core::result::Result<f32, Self::Error> {
-            Ok(1.0)
+        fn evaluate(&self, model: &Self::Model) -> core::result::Result<f32, Self::Error> {
+            model.forward(&[1.0, 2.0])
         }
     }
 
     #[test]
-    fn swarm_optimizer_associated_model_type_compiles() {
-        let mut model = DummyModel::default();
+    fn swarm_optimizer_associated_slice_model_type_compiles() {
+        let mut model = DummySliceModel::default();
         let mut opt = DummyOptimizer;
-        opt.step(&mut model, &[0.5]).unwrap();
-        assert_eq!(model.parameters(), &[0.5]);
+        opt.step(&mut model, &[0.5, 1.5]).unwrap();
+        assert_eq!(model.parameters(), &[0.5, 1.5]);
+        assert!((model.forward(&[2.0, 2.0]).unwrap() - 4.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn fitness_function_associated_model_type_compiles() {
-        let model = DummyModel::default();
+    fn fitness_function_associated_slice_model_type_compiles() {
+        let model = DummySliceModel { params: [1.0, 0.5] };
         let fitness = DummyFitness;
-        assert_eq!(fitness.evaluate(&model).unwrap(), 1.0);
+        assert!((fitness.evaluate(&model).unwrap() - 2.0).abs() < f32::EPSILON);
     }
 }

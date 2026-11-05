@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio", "std"]
+tokio = ["dep:tokio", "std", "tokio/rt", "tokio/rt-multi-thread", "tokio/time", "tokio/sync", "tokio/macros"]
 embassy = ["dep:embassy-executor", "dep:embassy-time"]
 std = []
 
@@ -29,4 +29,4 @@ embassy-executor = { workspace = true, optional = true }
 embassy-time = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }

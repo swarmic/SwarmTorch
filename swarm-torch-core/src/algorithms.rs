@@ -7,8 +7,7 @@
 #[derive(Debug, Clone)]
 #[deprecated(
     since = "0.1.0-alpha.6x",
-    note = "PSO execution is not implemented. This type will be feature-gated behind \
-            `experimental-pso` in a future breaking-change release."
+    note = "PSO execution is not implemented. Scheduled for removal in v0.1.0-beta.1 per ADR-0002."
 )]
 pub struct ParticleSwarmConfig {
     /// Number of particles in the swarm
@@ -40,7 +39,7 @@ impl Default for ParticleSwarmConfig {
 #[derive(Debug, Clone)]
 #[deprecated(
     since = "0.1.0-alpha.6x",
-    note = "PSO execution is not implemented. See `ParticleSwarmConfig` deprecation note."
+    note = "PSO execution is not implemented. Scheduled for removal in v0.1.0-beta.1 per ADR-0002."
 )]
 pub struct Particle {
     /// Current position (parameters)
@@ -67,6 +66,10 @@ impl Default for Particle {
 
 /// Ant Colony Optimization (ACO) configuration
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.1.0-alpha.9",
+    note = "ACO execution is not implemented. Scheduled for removal in v0.1.0-beta.1 per ADR-0002."
+)]
 pub struct AntColonyConfig {
     /// Number of ants
     pub num_ants: usize,
@@ -80,6 +83,7 @@ pub struct AntColonyConfig {
     pub beta: f32,
 }
 
+#[allow(deprecated)]
 impl Default for AntColonyConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +98,10 @@ impl Default for AntColonyConfig {
 
 /// Firefly Algorithm configuration
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.1.0-alpha.9",
+    note = "Firefly execution is not implemented. Scheduled for removal in v0.1.0-beta.1 per ADR-0002."
+)]
 pub struct FireflyConfig {
     /// Number of fireflies
     pub num_fireflies: usize,
@@ -105,6 +113,7 @@ pub struct FireflyConfig {
     pub alpha: f32,
 }
 
+#[allow(deprecated)]
 impl Default for FireflyConfig {
     fn default() -> Self {
         Self {

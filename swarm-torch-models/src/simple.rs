@@ -1,15 +1,30 @@
-//! Simple reference model implementations
+//! Simple reference model implementations (`ADR-0024`, `W9-04`, `W9-06`).
 //!
-//! These models are useful for testing and examples.
+//! Provides stack-allocated, `no_std`-compatible reference models with contiguous
+//! parameter buffers, widened `f64` forward/backward evaluation, and strict
+//! finiteness/dimension validation.
 
+pub use crate::mlp::{MlpModel, MlpModelWithCapacity, SimpleMLP};
 use swarm_torch_core::traits::SwarmModel;
-use swarm_torch_core::Result;
+use swarm_torch_core::{Error, Result};
 
-/// Error type for model creation
+/// Error type for model creation, forward inference, and backward gradient passes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
-    /// Model dimensions exceed supported size for fixed storage
+    /// Model dimensions exceed supported size for fixed storage.
     InvalidDimensions,
+    /// Input slice length does not match `input_dim`.
+    InputDimensionMismatch { expected: usize, got: usize },
+    /// Upstream output gradient length does not match `output_dim`.
+    GradOutputDimensionMismatch { expected: usize, got: usize },
+    /// Destination parameter gradient buffer length does not match `num_parameters()`.
+    GradParamsDimensionMismatch { expected: usize, got: usize },
+    /// Input contains `NaN` or `±Inf`.
+    NonFiniteInput,
+    /// Model parameters or upstream gradients contain `NaN` or `±Inf`.
+    NonFiniteParameter,
+    /// Computed activation or output overflowed to `NaN` or `±Inf`.
+    NonFiniteOutput,
 }
 
 impl core::fmt::Display for ModelError {
@@ -19,17 +34,76 @@ impl core::fmt::Display for ModelError {
                 f,
                 "model dimensions exceed supported size for fixed storage"
             ),
+            Self::InputDimensionMismatch { expected, got } => write!(
+                f,
+                "model input dimension mismatch: expected {expected}, got {got}"
+            ),
+            Self::GradOutputDimensionMismatch { expected, got } => write!(
+                f,
+                "model grad_output dimension mismatch: expected {expected}, got {got}"
+            ),
+            Self::GradParamsDimensionMismatch { expected, got } => write!(
+                f,
+                "model grad_params dimension mismatch: expected {expected}, got {got}"
+            ),
+            Self::NonFiniteInput => write!(f, "non-finite value in model input"),
+            Self::NonFiniteParameter => {
+                write!(
+                    f,
+                    "non-finite value in model parameters or upstream gradient"
+                )
+            }
+            Self::NonFiniteOutput => write!(f, "non-finite value produced during model evaluation"),
         }
     }
 }
 
+#[cfg(feature = "std")]
+impl std::error::Error for ModelError {}
+
+/// Stack-allocated output buffer returned by [`LinearModelWithCapacity`] and [`MlpModelWithCapacity`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearOutput<const MAX_OUTPUT: usize = 16> {
+    values: [f32; MAX_OUTPUT],
+    len: usize,
+}
+
+impl<const MAX_OUTPUT: usize> LinearOutput<MAX_OUTPUT> {
+    pub(crate) const fn new(values: [f32; MAX_OUTPUT], len: usize) -> Self {
+        Self { values, len }
+    }
+
+    /// Active output slice of length `output_dim`.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.values[..self.len]
+    }
+
+    /// Number of active output elements.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the active output is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const MAX_OUTPUT: usize> core::ops::Deref for LinearOutput<MAX_OUTPUT> {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-struct SplitMix64 {
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -41,25 +115,39 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    fn next_unit_f32(&mut self) -> f32 {
+    pub(crate) fn next_unit_f32(&mut self) -> f32 {
         // 53-bit precision path for stable [0, 1) generation.
         let u = self.next_u64() >> 11;
         (u as f64 * (1.0 / ((1u64 << 53) as f64))) as f32
     }
 }
 
+pub(crate) fn validate_finite_params(params: &[f32]) -> Result<()> {
+    for &p in params {
+        if p.is_nan() {
+            return Err(Error::NanDetected);
+        }
+        if p.is_infinite() {
+            return Err(Error::InfDetected);
+        }
+    }
+    Ok(())
+}
+
+/// Stack-allocated affine linear model $y = W x + b$.
 #[derive(Debug, Clone)]
 pub struct LinearModelWithCapacity<const MAX_PARAMS: usize = 144, const MAX_OUTPUT: usize = 16> {
-    /// Parameter buffer:
-    /// `[0..weight_count)` = weights, `[weight_count..weight_count+output_dim)` = bias.
+    /// Contiguous parameter buffer:
+    /// `[0..weight_count)` = row-major weights ($output\_dim \times input\_dim$),
+    /// `[weight_count..weight_count+output_dim)` = bias.
     params: [f32; MAX_PARAMS],
-    /// Input dimension
+    /// Input dimension.
     input_dim: usize,
-    /// Output dimension
+    /// Output dimension.
     output_dim: usize,
 }
 
-/// Backward-compatible default linear model type.
+/// Default linear model type (`MAX_PARAMS = 144`, `MAX_OUTPUT = 16`).
 pub type LinearModel = LinearModelWithCapacity<144, 16>;
 
 impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> Default
@@ -80,7 +168,7 @@ impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> Default
 impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize>
     LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>
 {
-    /// Create a new linear model
+    /// Create a new linear model.
     pub fn new(input_dim: usize, output_dim: usize) -> core::result::Result<Self, ModelError> {
         let weight_count = input_dim
             .checked_mul(output_dim)
@@ -118,9 +206,8 @@ impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize>
         self.output_dim
     }
 
-    /// Initialize with random weights
+    /// Initialize with deterministic seeded weights and biases.
     pub fn with_random_init(mut self, seed: u64) -> Self {
-        // E-02: SplitMix64 gives stronger deterministic seeded initialization than LCG.
         let mut rng = SplitMix64::new(seed);
         let weight_count = self.weight_count();
         for w in self.params[..weight_count].iter_mut() {
@@ -133,17 +220,96 @@ impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize>
         }
         self
     }
+
+    /// Compute analytical parameter gradients $\partial L / \partial W$ and $\partial L / \partial b$
+    /// into `grad_params_out` given `input` and upstream `grad_output` ($\partial L / \partial y$).
+    pub fn backward_into(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        grad_params_out: &mut [f32],
+    ) -> core::result::Result<(), ModelError> {
+        if input.len() != self.input_dim {
+            return Err(ModelError::InputDimensionMismatch {
+                expected: self.input_dim,
+                got: input.len(),
+            });
+        }
+        if grad_output.len() != self.output_dim {
+            return Err(ModelError::GradOutputDimensionMismatch {
+                expected: self.output_dim,
+                got: grad_output.len(),
+            });
+        }
+        let total_params = self.weight_count() + self.output_dim;
+        if grad_params_out.len() != total_params {
+            return Err(ModelError::GradParamsDimensionMismatch {
+                expected: total_params,
+                got: grad_params_out.len(),
+            });
+        }
+        if !input.iter().all(|v| v.is_finite()) {
+            return Err(ModelError::NonFiniteInput);
+        }
+        if !grad_output.iter().all(|v| v.is_finite()) {
+            return Err(ModelError::NonFiniteParameter);
+        }
+
+        let weight_count = self.weight_count();
+        for (o, &dy_f32) in grad_output.iter().enumerate().take(self.output_dim) {
+            let dy = dy_f32 as f64;
+            let row_offset = o * self.input_dim;
+            for (i, &x) in input.iter().enumerate().take(self.input_dim) {
+                let dw = (dy * (x as f64)) as f32;
+                if !dw.is_finite() {
+                    return Err(ModelError::NonFiniteOutput);
+                }
+                grad_params_out[row_offset + i] = dw;
+            }
+            grad_params_out[weight_count + o] = dy_f32;
+        }
+        Ok(())
+    }
 }
 
 impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> SwarmModel
     for LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>
 {
-    type Input = ();
-    type Output = ();
-    type Error = core::convert::Infallible;
+    type Input = [f32];
+    type Output = LinearOutput<MAX_OUTPUT>;
+    type Error = ModelError;
 
-    fn forward(&self, _input: &Self::Input) -> core::result::Result<Self::Output, Self::Error> {
-        Ok(())
+    fn forward(&self, input: &Self::Input) -> core::result::Result<Self::Output, Self::Error> {
+        if input.len() != self.input_dim {
+            return Err(ModelError::InputDimensionMismatch {
+                expected: self.input_dim,
+                got: input.len(),
+            });
+        }
+        if !input.iter().all(|v| v.is_finite()) {
+            return Err(ModelError::NonFiniteInput);
+        }
+        let active_params = self.parameters();
+        if !active_params.iter().all(|v| v.is_finite()) {
+            return Err(ModelError::NonFiniteParameter);
+        }
+
+        let mut values = [0.0f32; MAX_OUTPUT];
+        let weight_count = self.weight_count();
+        for (o, out_slot) in values.iter_mut().enumerate().take(self.output_dim) {
+            let row_offset = o * self.input_dim;
+            let mut acc = self.params[weight_count + o] as f64;
+            for (i, &x) in input.iter().enumerate().take(self.input_dim) {
+                acc += (self.params[row_offset + i] as f64) * (x as f64);
+            }
+            let out_f32 = acc as f32;
+            if !out_f32.is_finite() {
+                return Err(ModelError::NonFiniteOutput);
+            }
+            *out_slot = out_f32;
+        }
+
+        Ok(LinearOutput::new(values, self.output_dim))
     }
 
     fn parameters(&self) -> &[f32] {
@@ -159,126 +325,14 @@ impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> SwarmModel
     fn load_parameters(&mut self, params: &[f32]) -> Result<()> {
         let expected = self.weight_count() + self.output_dim;
         if params.len() != expected {
-            return Err(swarm_torch_core::Error::InvalidGradient);
+            return Err(Error::InvalidGradient);
         }
+        validate_finite_params(params)?;
         self.params[..expected].copy_from_slice(params);
         Ok(())
     }
 }
 
-/// A simple MLP (Multi-Layer Perceptron) for testing
-#[derive(Debug, Clone)]
-pub struct SimpleMLP {
-    /// First layer weights
-    pub layer1: LinearModel,
-    /// Second layer weights  
-    pub layer2: LinearModel,
-}
-
-impl SimpleMLP {
-    /// Create a new MLP with the given dimensions
-    pub fn new(
-        input_dim: usize,
-        hidden_dim: usize,
-        output_dim: usize,
-    ) -> core::result::Result<Self, ModelError> {
-        Ok(Self {
-            layer1: LinearModel::new(input_dim, hidden_dim)?,
-            layer2: LinearModel::new(hidden_dim, output_dim)?,
-        })
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn linear_model_new_rejects_oversized_dims() {
-        assert!(matches!(
-            LinearModel::new(100, 100),
-            Err(ModelError::InvalidDimensions)
-        ));
-        assert!(matches!(
-            LinearModel::new(8, 20),
-            Err(ModelError::InvalidDimensions)
-        ));
-        assert!(LinearModel::new(8, 16).is_ok());
-    }
-
-    #[test]
-    fn linear_model_parameters_include_bias() {
-        let model = LinearModel::new(8, 16).unwrap();
-        assert_eq!(model.parameters().len(), 8 * 16 + 16);
-    }
-
-    #[test]
-    fn linear_model_load_parameters_roundtrip_preserves_bias() {
-        let mut model = LinearModel::new(4, 3).unwrap();
-        let expected_len = 4 * 3 + 3;
-        let source: Vec<f32> = (0..expected_len).map(|i| i as f32 + 0.5).collect();
-        model.load_parameters(&source).unwrap();
-        assert_eq!(model.parameters(), source.as_slice());
-    }
-
-    #[test]
-    fn linear_model_forward_returns_ok_with_ref_input() {
-        let model = LinearModel::new(8, 16).unwrap();
-        let out = model.forward(&());
-        assert!(out.is_ok());
-    }
-
-    #[test]
-    fn linear_model_init_is_seed_deterministic() {
-        let a = LinearModel::new(8, 16).unwrap().with_random_init(42);
-        let b = LinearModel::new(8, 16).unwrap().with_random_init(42);
-        let c = LinearModel::new(8, 16).unwrap().with_random_init(43);
-
-        assert_eq!(a.parameters(), b.parameters());
-        assert_ne!(a.parameters(), c.parameters());
-    }
-
-    #[test]
-    fn linear_model_init_distribution_sanity() {
-        let model = LinearModel::new(8, 16).unwrap().with_random_init(1337);
-        let params = model.parameters();
-        let n = params.len() as f32;
-        let mean = params.iter().copied().sum::<f32>() / n;
-        let var = params
-            .iter()
-            .map(|v| {
-                let d = *v - mean;
-                d * d
-            })
-            .sum::<f32>()
-            / n;
-
-        assert!(mean.abs() < 0.1, "mean drift too large: {mean}");
-        assert!(var > 1.0e-4, "variance too small: {var}");
-        assert!(var < 0.2, "variance too large: {var}");
-    }
-
-    #[test]
-    fn linear_model_const_generic_capacity_bounds() {
-        type TinyLinear = LinearModelWithCapacity<32, 4>;
-
-        assert!(TinyLinear::new(7, 4).is_ok(), "7*4=28 fits");
-        assert!(
-            matches!(TinyLinear::new(8, 4), Err(ModelError::InvalidDimensions)),
-            "8*4=32 exceeds MAX_PARAMS-MAX_OUTPUT (28)"
-        );
-        assert!(
-            matches!(TinyLinear::new(7, 5), Err(ModelError::InvalidDimensions)),
-            "output_dim exceeds MAX_OUTPUT"
-        );
-    }
-
-    #[test]
-    fn linear_model_rejects_output_dim_exceeding_param_capacity() {
-        type WeirdLinear = LinearModelWithCapacity<8, 32>;
-        assert!(
-            matches!(WeirdLinear::new(0, 16), Err(ModelError::InvalidDimensions)),
-            "output region must fit inside MAX_PARAMS even when MAX_OUTPUT is larger"
-        );
-    }
-}
+#[path = "simple_tests.rs"]
+mod tests;

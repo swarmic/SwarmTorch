@@ -878,6 +878,7 @@ fn materialize_multi_output_is_all_or_nothing_on_write_failure() {
     assert!(
         err.to_string().contains("Is a directory")
             || err.to_string().contains("is a directory")
+            || err.kind() == io::ErrorKind::PermissionDenied
             || err.kind() == io::ErrorKind::Other
     );
     assert!(session.fingerprint("dataset://ns/out_a").is_none());

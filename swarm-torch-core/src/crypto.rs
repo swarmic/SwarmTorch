@@ -1,17 +1,70 @@
-//! Cryptographic utilities for authentication and verification
+//! Cryptographic utilities for authentication and verification (`ADR-0008`, `ADR-0021`, `W9-02`).
 //!
-//! This module provides Ed25519 signatures and message authentication.
+//! This module provides Ed25519 signatures, versioned domain-separated envelope signing
+//! (`swarmtorch.envelope.v0` and `swarmtorch.envelope.v1`), and receiver-challenged
+//! session-epoch recovery handshakes (`swarmtorch.session.handshake.v1`).
 
 use crate::traits::PeerId;
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Key pair for signing messages
+/// Domain separation tag for legacy v0 envelopes (`(0, 1)`).
+pub const ENVELOPE_DOMAIN_TAG_V0: &[u8] = b"swarmtorch.envelope.v0";
+
+/// Domain separation tag for scoped v1 envelopes (`(0, 2)`).
+pub const ENVELOPE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.envelope.v1";
+
+/// Domain separation tag for receiver-challenged session recovery handshakes.
+pub const SESSION_HANDSHAKE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.session.handshake.v1";
+
+/// Scoped envelope v1 signing metadata (`ADR-0021`, `W9-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeContextV1 {
+    /// Protocol version `(major, minor)`.
+    pub version: (u8, u8),
+    /// Swarm deployment / cohort instance identifier (16 bytes).
+    pub swarm_instance_id: [u8; 16],
+    /// Monotonically increasing sender session epoch.
+    pub session_epoch: u64,
+    /// Training / coordination round identifier.
+    pub round_id: u64,
+    /// Message type discriminator byte.
+    pub message_type: u8,
+    /// Per-epoch monotonic sequence number.
+    pub sequence: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: u32,
+}
+
+/// Receiver-challenged session recovery handshake statement (`ADR-0021`, `W9-02`).
+///
+/// Serde derives follow [`PeerId`]'s `alloc` gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "alloc", derive(Serialize, Deserialize))]
+pub struct SessionHandshakeChallenge {
+    /// Swarm deployment / cohort instance identifier.
+    pub swarm_instance_id: [u8; 16],
+    /// Receiver `PeerId` that issued the 256-bit challenge nonce.
+    pub receiver_peer: PeerId,
+    /// Restarting sender `PeerId` requesting epoch transition.
+    pub sender_peer: PeerId,
+    /// Requested new session epoch (`> current_epoch`).
+    pub requested_epoch: u64,
+    /// Initial sequence number in the new epoch.
+    pub initial_sequence: u64,
+    /// Receiver-generated 256-bit random challenge nonce.
+    pub challenge_nonce: [u8; 32],
+    /// Challenge issue timestamp in Unix seconds.
+    pub issued_at_secs: u32,
+}
+
+/// Key pair for signing messages.
 #[derive(Clone)]
 pub struct KeyPair {
-    /// Secret signing key
+    /// Secret signing key.
     secret: SigningKey,
-    /// Public key bytes (32 bytes) - kept for API compatibility
+    /// Public key bytes (32 bytes) - kept for API compatibility.
     pub public: [u8; 32],
 }
 
@@ -19,7 +72,6 @@ impl KeyPair {
     /// Generate a new key pair from seed bytes.
     ///
     /// Returns `Err(CryptoError::AllZeroSeed)` if `seed` is all zeros.
-    /// The caller must ensure the seed is cryptographically random.
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, CryptoError> {
         if seed == [0u8; 32] {
             return Err(CryptoError::AllZeroSeed);
@@ -29,50 +81,50 @@ impl KeyPair {
         Ok(Self { secret, public })
     }
 
-    /// Get the peer ID derived from this key pair
+    /// Get the peer ID derived from this key pair.
     ///
     /// Always uses the canonical SHA-256 hash derivation for cross-profile consistency.
     pub fn peer_id(&self) -> PeerId {
         PeerId::from_public_key(&self.public)
     }
 
-    /// Get the public key bytes
-    pub fn public_key(&self) -> &[u8; 32] {
+    /// Get the public key bytes.
+    pub const fn public_key(&self) -> &[u8; 32] {
         &self.public
     }
 }
 
-/// Signature bytes (64 bytes for Ed25519)
+/// Signature bytes (64 bytes for Ed25519).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signature(pub [u8; 64]);
 
 impl Signature {
-    /// Create from bytes
+    /// Create from bytes.
     pub const fn from_bytes(bytes: [u8; 64]) -> Self {
         Self(bytes)
     }
 
-    /// Get the signature bytes
+    /// Get the signature bytes.
     pub const fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }
 
-    /// Convert to internal Dalek signature
+    /// Convert to internal Dalek signature.
     pub fn to_dalek(&self) -> Result<DalekSignature, CryptoError> {
         DalekSignature::from_slice(&self.0).map_err(|_| CryptoError::InvalidSignatureEncoding)
     }
 }
 
-/// Errors that can occur during cryptographic operations
+/// Errors that can occur during cryptographic operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
-    /// All-zero seed passed to `KeyPair::from_seed`
+    /// All-zero seed passed to `KeyPair::from_seed`.
     AllZeroSeed,
-    /// Malformed signature bytes
+    /// Malformed signature bytes.
     InvalidSignatureEncoding,
-    /// Malformed or all-zero public key
+    /// Malformed or all-zero public key.
     InvalidPublicKey,
-    /// Signature verification failed
+    /// Signature verification failed.
     VerificationFailed,
 }
 
@@ -93,23 +145,75 @@ impl std::error::Error for CryptoError {}
 /// Legacy alias for backward compatibility.
 pub type VerifyError = CryptoError;
 
-/// Message authentication helper
+fn canonical_envelope_v0_digest(
+    public_key: &[u8; 32],
+    version: (u8, u8),
+    message_type: u8,
+    sequence: u64,
+    timestamp: u32,
+    payload: &[u8],
+) -> [u8; 32] {
+    let payload_hash = Sha256::digest(payload);
+    let mut hasher = Sha256::new();
+    hasher.update(ENVELOPE_DOMAIN_TAG_V0);
+    hasher.update([version.0, version.1]);
+    hasher.update(public_key);
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
+    hasher.update([message_type]);
+    hasher.update(payload_hash);
+    hasher.finalize().into()
+}
+
+fn canonical_envelope_v1_digest(
+    public_key: &[u8; 32],
+    ctx: &EnvelopeContextV1,
+    payload: &[u8],
+) -> [u8; 32] {
+    let payload_hash = Sha256::digest(payload);
+    let mut hasher = Sha256::new();
+    hasher.update(ENVELOPE_DOMAIN_TAG_V1);
+    hasher.update([ctx.version.0, ctx.version.1]);
+    hasher.update(ctx.swarm_instance_id);
+    hasher.update(ctx.session_epoch.to_le_bytes());
+    hasher.update(ctx.round_id.to_le_bytes());
+    hasher.update(public_key);
+    hasher.update(ctx.sequence.to_le_bytes());
+    hasher.update(ctx.timestamp.to_le_bytes());
+    hasher.update([ctx.message_type]);
+    hasher.update(payload_hash);
+    hasher.finalize().into()
+}
+
+fn canonical_session_handshake_digest(
+    public_key: &[u8; 32],
+    challenge: &SessionHandshakeChallenge,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_HANDSHAKE_DOMAIN_TAG_V1);
+    hasher.update(challenge.swarm_instance_id);
+    hasher.update(challenge.receiver_peer.as_bytes());
+    hasher.update(challenge.sender_peer.as_bytes());
+    hasher.update(public_key);
+    hasher.update(challenge.requested_epoch.to_le_bytes());
+    hasher.update(challenge.initial_sequence.to_le_bytes());
+    hasher.update(challenge.challenge_nonce);
+    hasher.update(challenge.issued_at_secs.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Message authentication helper.
 pub struct MessageAuth {
     key_pair: KeyPair,
 }
 
 impl MessageAuth {
-    /// Create a new message authenticator
+    /// Create a new message authenticator.
     pub fn new(key_pair: KeyPair) -> Self {
         Self { key_pair }
     }
 
-    /// Sign a message envelope's components
-    ///
-    /// Binds the signature to the protocol version, metadata, and payload.
-    ///
-    /// `timestamp` is Unix seconds as `u32`; this overflows at
-    /// 2106-02-07T06:28:15Z. Migration to `u64` is tracked for protocol v2.
+    /// Sign a legacy v0 message envelope (`swarmtorch.envelope.v0`).
     pub fn sign(
         &self,
         version: (u8, u8),
@@ -118,33 +222,19 @@ impl MessageAuth {
         timestamp: u32,
         payload: &[u8],
     ) -> Signature {
-        // Domain separation tag
-        let tag = b"swarmtorch.envelope.v0";
-
-        // 1. Hash the payload first
-        let payload_hash = Sha256::digest(payload);
-
-        // 2. Construct canonical preimage
-        let mut hasher = Sha256::new();
-        hasher.update(tag);
-        hasher.update([version.0, version.1]);
-        hasher.update(self.key_pair.public); // Bind to sender (self)
-        hasher.update(sequence.to_le_bytes());
-        hasher.update(timestamp.to_le_bytes());
-        hasher.update([message_type]);
-        hasher.update(payload_hash);
-
-        let canonical = hasher.finalize();
-
-        // 3. Sign the canonical hash
+        let canonical = canonical_envelope_v0_digest(
+            &self.key_pair.public,
+            version,
+            message_type,
+            sequence,
+            timestamp,
+            payload,
+        );
         let sig = self.key_pair.secret.sign(&canonical);
         Signature(sig.to_bytes())
     }
 
-    /// Verify a signature against envelope components
-    ///
-    /// `timestamp` is Unix seconds as `u32`; this overflows at
-    /// 2106-02-07T06:28:15Z. Migration to `u64` is tracked for protocol v2.
+    /// Verify a legacy v0 signature against envelope components (`swarmtorch.envelope.v0`).
     pub fn verify(
         public_key: &[u8; 32],
         version: (u8, u8),
@@ -154,53 +244,90 @@ impl MessageAuth {
         payload: &[u8],
         signature: &Signature,
     ) -> Result<(), CryptoError> {
-        // Parse public key
+        if *public_key == [0u8; 32] {
+            return Err(CryptoError::InvalidPublicKey);
+        }
         let key =
             VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
-
-        // Parse signature
         let sig = signature.to_dalek()?;
-
-        // Reconstruct canonical preimage
-        let tag = b"swarmtorch.envelope.v0";
-        let payload_hash = Sha256::digest(payload);
-
-        let mut hasher = Sha256::new();
-        hasher.update(tag);
-        hasher.update([version.0, version.1]);
-        hasher.update(public_key);
-        hasher.update(sequence.to_le_bytes());
-        hasher.update(timestamp.to_le_bytes());
-        hasher.update([message_type]);
-        hasher.update(payload_hash);
-
-        let canonical = hasher.finalize();
-
-        // Strict verification
+        let canonical = canonical_envelope_v0_digest(
+            public_key,
+            version,
+            message_type,
+            sequence,
+            timestamp,
+            payload,
+        );
         key.verify_strict(&canonical, &sig)
             .map_err(|_| CryptoError::VerificationFailed)
     }
 
-    /// Get the key pair
-    pub fn key_pair(&self) -> &KeyPair {
+    /// Sign a scoped v1 message envelope (`swarmtorch.envelope.v1`, `ADR-0021`, `W9-02`).
+    pub fn sign_v1(&self, ctx: &EnvelopeContextV1, payload: &[u8]) -> Signature {
+        let canonical = canonical_envelope_v1_digest(&self.key_pair.public, ctx, payload);
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
+    }
+
+    /// Verify a scoped v1 signature (`swarmtorch.envelope.v1`, `ADR-0021`, `W9-02`).
+    pub fn verify_v1(
+        public_key: &[u8; 32],
+        ctx: &EnvelopeContextV1,
+        payload: &[u8],
+        signature: &Signature,
+    ) -> Result<(), CryptoError> {
+        if *public_key == [0u8; 32] {
+            return Err(CryptoError::InvalidPublicKey);
+        }
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_envelope_v1_digest(public_key, ctx, payload);
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Sign a receiver-challenged session recovery handshake (`swarmtorch.session.handshake.v1`).
+    pub fn sign_session_handshake(&self, challenge: &SessionHandshakeChallenge) -> Signature {
+        let canonical = canonical_session_handshake_digest(&self.key_pair.public, challenge);
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
+    }
+
+    /// Verify a receiver-challenged session recovery handshake (`swarmtorch.session.handshake.v1`).
+    pub fn verify_session_handshake(
+        public_key: &[u8; 32],
+        challenge: &SessionHandshakeChallenge,
+        signature: &Signature,
+    ) -> Result<(), CryptoError> {
+        let derived_sender = PeerId::try_from_public_key_bytes(public_key)?;
+        if derived_sender != challenge.sender_peer || challenge.challenge_nonce == [0u8; 32] {
+            return Err(CryptoError::VerificationFailed);
+        }
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_session_handshake_digest(public_key, challenge);
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Get the key pair.
+    pub const fn key_pair(&self) -> &KeyPair {
         &self.key_pair
     }
 }
 
 /// Configuration surface for security features.
-///
-/// Current enforcement reality (Wave 8):
-/// - This struct is not yet wired into `swarm-torch-net` verifier/runtime policy paths.
-/// - Values here are configuration intent only until follow-on enforcement wiring lands.
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
-    /// Require message signatures (declarative; not currently verifier-enforced via this struct)
+    /// Require message signatures.
     pub require_signatures: bool,
-    /// Encrypt network traffic (declarative; transport security is not implemented yet)
+    /// Encrypt network traffic.
     pub encrypt_transport: bool,
-    /// Validate gradient bounds (declarative; not currently wired as a runtime toggle)
+    /// Validate gradient bounds.
     pub validate_gradients: bool,
-    /// Maximum clock skew for replay protection (seconds; declarative in this config surface)
+    /// Maximum clock skew for replay protection (seconds).
     pub max_clock_skew_secs: u32,
 }
 
@@ -215,12 +342,12 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Gradient validator for bounds checking
+/// Gradient validator for bounds checking.
 #[derive(Debug, Clone)]
 pub struct GradientValidator {
-    /// Maximum L2 norm for gradient updates
+    /// Maximum L2 norm for gradient updates.
     pub max_gradient_norm: f32,
-    /// Maximum absolute value for any coordinate
+    /// Maximum absolute value for any coordinate.
     pub max_coordinate_value: f32,
 }
 
@@ -234,9 +361,8 @@ impl Default for GradientValidator {
 }
 
 impl GradientValidator {
-    /// Validate a gradient vector
+    /// Validate a gradient vector.
     pub fn validate(&self, gradients: &[f32]) -> Result<(), GradientValidationError> {
-        // Check for NaN/Inf
         for (i, &g) in gradients.iter().enumerate() {
             if g.is_nan() {
                 return Err(GradientValidationError::NaN { index: i });
@@ -254,8 +380,10 @@ impl GradientValidator {
             }
         }
 
-        // Check L2 norm
-        let norm_sq: f32 = gradients.iter().map(|g| g * g).sum();
+        let norm_sq = gradients
+            .iter()
+            .map(|&g| (g as f64) * (g as f64))
+            .sum::<f64>() as f32;
         let norm = sqrt_f32(norm_sq);
         if norm > self.max_gradient_norm {
             return Err(GradientValidationError::NormTooLarge {
@@ -269,12 +397,6 @@ impl GradientValidator {
 }
 
 /// Software square root for gradient L2-norm validation only.
-///
-/// Uses `std::f32::sqrt` when available, otherwise 8 Newton-Raphson
-/// iterations from initial guess `x`. Relative error < 1e-7 for inputs
-/// in `[1e-30, 1e+30]`.
-///
-/// **NOT** used in canonical hashing or deterministic artifact paths.
 #[inline]
 fn sqrt_f32(x: f32) -> f32 {
     #[cfg(feature = "std")]
@@ -283,12 +405,10 @@ fn sqrt_f32(x: f32) -> f32 {
     }
     #[cfg(not(feature = "std"))]
     {
-        // Newton-Raphson iterations: good enough for validation thresholds.
         if x <= 0.0 {
             return 0.0;
         }
         let mut y = x;
-        // Fixed iteration count for determinism.
         for _ in 0..8 {
             y = 0.5 * (y + (x / y));
         }
@@ -296,381 +416,19 @@ fn sqrt_f32(x: f32) -> f32 {
     }
 }
 
-/// Gradient validation error
+/// Gradient validation error.
 #[derive(Debug, Clone)]
 pub enum GradientValidationError {
-    /// NaN value found
+    /// NaN value found.
     NaN { index: usize },
-    /// Infinite value found
+    /// Infinite value found.
     Infinite { index: usize },
-    /// Coordinate value too large
+    /// Coordinate value too large.
     CoordinateTooLarge { index: usize, value: f32, max: f32 },
-    /// Gradient norm too large
+    /// Gradient norm too large.
     NormTooLarge { norm: f32, max: f32 },
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Helper to change one byte in a slice
-    fn tamper(bytes: &mut [u8]) {
-        bytes[0] ^= 0xFF;
-    }
-
-    #[test]
-    fn signature_verification_succeeds_for_valid_keypair() {
-        let seed = [1u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test payload";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        assert!(
-            MessageAuth::verify(pair.public_key(), version, msg_type, seq, ts, payload, &sig)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn signature_verification_fails_for_tampered_payload() {
-        let seed = [2u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test payload";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Tamper payload
-        let mut bad_payload = payload.to_vec();
-        tamper(&mut bad_payload);
-
-        let result = MessageAuth::verify(
-            pair.public_key(),
-            version,
-            msg_type,
-            seq,
-            ts,
-            &bad_payload,
-            &sig,
-        );
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn signature_verification_fails_for_wrong_key() {
-        let seed1 = [3u8; 32];
-        let pair1 = KeyPair::from_seed(seed1).expect("non-zero seed");
-        let auth1 = MessageAuth::new(pair1);
-
-        let seed2 = [4u8; 32];
-        let pair2 = KeyPair::from_seed(seed2).expect("non-zero seed");
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test payload";
-
-        // Sign with key1
-        let sig = auth1.sign(version, msg_type, seq, ts, payload);
-
-        // Verify with key2
-        let result = MessageAuth::verify(
-            pair2.public_key(),
-            version,
-            msg_type,
-            seq,
-            ts,
-            payload,
-            &sig,
-        );
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn signature_is_deterministic_for_fixed_seed_and_message() {
-        let seed = [5u8; 32];
-        let pair1 = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth1 = MessageAuth::new(pair1);
-
-        // Recreate same keypair
-        let pair2 = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth2 = MessageAuth::new(pair2);
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"variable payload";
-
-        let sig1 = auth1.sign(version, msg_type, seq, ts, payload);
-        let sig2 = auth2.sign(version, msg_type, seq, ts, payload);
-
-        assert_eq!(sig1.0, sig2.0);
-    }
-
-    #[test]
-    fn verification_fails_on_modified_sequence() {
-        let seed = [6u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Modify sequence
-        let result = MessageAuth::verify(
-            pair.public_key(),
-            version,
-            msg_type,
-            seq + 1,
-            ts,
-            payload,
-            &sig,
-        );
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn verification_fails_on_modified_timestamp() {
-        let seed = [7u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Modify timestamp
-        let result = MessageAuth::verify(
-            pair.public_key(),
-            version,
-            msg_type,
-            seq,
-            ts + 1,
-            payload,
-            &sig,
-        );
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn verification_fails_on_modified_sender() {
-        let seed = [8u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Modify sender (use wrong public key)
-        let mut wrong_public = *pair.public_key();
-        tamper(&mut wrong_public);
-
-        // This might fail as InvalidPublicKey if we tamper too much, or VerificationFailed
-        // if the key is structurally valid but wrong.
-        // Compressed points must be on curve. A random bit flip likely makes it off-curve.
-        // Let's expect either InvalidPublicKey OR VerificationFailed, or check specifically.
-        // Ideally we want to test "valid key but wrong one" (authentication failure)
-        // versus "invalid key bytes" (parsing failure).
-        // Let's generate a valid DIFFERENT key for authentication failure test (already done above).
-        // This test is specifically modifying the bytes to be potentially invalid.
-
-        let result = MessageAuth::verify(&wrong_public, version, msg_type, seq, ts, payload, &sig);
-        // It's likely InvalidPublicKey, but could be failed verification.
-        // Let's assert it is an Error.
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn verification_fails_on_modified_message_type() {
-        let seed = [9u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        let result = MessageAuth::verify(
-            pair.public_key(),
-            version,
-            msg_type + 1,
-            seq,
-            ts,
-            payload,
-            &sig,
-        );
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn verification_fails_on_modified_version() {
-        let seed = [10u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Modify version
-        let result =
-            MessageAuth::verify(pair.public_key(), (1, 1), msg_type, seq, ts, payload, &sig);
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    #[test]
-    fn verification_fails_on_invalid_public_key_bytes() {
-        let seed = [11u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-        let auth = MessageAuth::new(pair.clone());
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-        let sig = auth.sign(version, msg_type, seq, ts, payload);
-
-        // Use obviously invalid public key
-        // [0xFF; 32] was seemingly accepted by from_bytes (likely interpreted as valid Y)
-        // but rejected by verify_strict.
-        // We accept either InvalidPublicKey OR VerificationFailed as acceptable fail-closed behavior.
-        // Fail-closed is what matters.
-        let invalid_key = [0xFFu8; 32];
-
-        let result = MessageAuth::verify(&invalid_key, version, msg_type, seq, ts, payload, &sig);
-        // Either error means we rejected it.
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidPublicKey) | Err(CryptoError::VerificationFailed)
-        ));
-    }
-
-    #[test]
-    fn invalid_signature_encoding_rejected() {
-        let seed = [12u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-
-        let version = (0, 1);
-        let msg_type = 1;
-        let seq = 100;
-        let ts = 1234567890;
-        let payload = b"test";
-
-        // Create a signature with invalid encoding logic (s >= L)
-        // This is caught by verify_strict, returning VerificationFailed (SignatureError).
-        let bad_sig = Signature([0xFF; 64]);
-
-        let result = MessageAuth::verify(
-            pair.public_key(),
-            version,
-            msg_type,
-            seq,
-            ts,
-            payload,
-            &bad_sig,
-        );
-        // VerificationFailed is the correct error for s >= L, as from_bytes is infallible for [u8; 64]
-        assert_eq!(result, Err(CryptoError::VerificationFailed));
-    }
-
-    /// H-01 regression: `KeyPair::peer_id()` must produce the exact same
-    /// `PeerId` as `PeerId::from_public_key()`.
-    ///
-    /// Before fix, `peer_id()` returned raw public-key bytes under `no_std`
-    /// and SHA-256-hashed bytes under `std`, causing cross-profile identity
-    /// mismatches.
-    #[test]
-    fn h01_peer_id_matches_from_public_key() {
-        let seed = [42u8; 32];
-        let pair = KeyPair::from_seed(seed).expect("non-zero seed");
-
-        let via_method = pair.peer_id();
-        let via_factory = PeerId::from_public_key(pair.public_key());
-
-        assert_eq!(
-            via_method, via_factory,
-            "KeyPair::peer_id() must agree with PeerId::from_public_key()"
-        );
-
-        // Also verify that PeerId is NOT the raw public key (it's a hash).
-        assert_ne!(
-            *via_method.as_bytes(),
-            *pair.public_key(),
-            "PeerId must be a SHA-256 hash of the public key, not the raw key"
-        );
-    }
-
-    #[test]
-    fn from_seed_rejects_zero_seed() {
-        let result = KeyPair::from_seed([0u8; 32]);
-        assert!(
-            matches!(result, Err(CryptoError::AllZeroSeed)),
-            "from_seed must reject all-zero seed"
-        );
-    }
-
-    #[test]
-    fn from_seed_accepts_nonzero_seed() {
-        let result = KeyPair::from_seed([1u8; 32]);
-        assert!(result.is_ok());
-    }
-
-    /// L-06: verify sqrt_f32 precision relative error.
-    #[test]
-    fn sqrt_f32_precision_within_1e6_relative_error() {
-        let test_values: &[f32] = &[
-            0.001, 0.01, 0.1, 1.0, 2.0, 4.0, 9.0, 16.0, 100.0, 1000.0, 1e6, 1e-6, 1e10, 1e-10,
-            1e20, 1e-20, 1e30, 1e-30,
-        ];
-        for &x in test_values {
-            let ours = sqrt_f32(x);
-            let reference = x.sqrt();
-            let rel_err = ((ours - reference) / reference).abs();
-            assert!(
-                rel_err < 1e-6,
-                "sqrt_f32({}) = {} vs std {} (relative error {})",
-                x,
-                ours,
-                reference,
-                rel_err
-            );
-        }
-    }
-}
+#[path = "crypto_tests.rs"]
+mod tests;

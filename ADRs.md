@@ -45,6 +45,16 @@
 
 - [ADR-0015: GPU Acceleration Strategy (WGPU-first, CUDA Optional)](#adr-0015-gpu-acceleration-strategy-wgpu-first-cuda-optional)
 
+### Post-Wave 8.1 Remediation, Convergence, & Next-Gen Swarm Architecture (Waves 9–12)
+
+- [ADR-0019: Byzantine-Resilient Aggregation Hardening, Multi-Krum, Bulyan, Centered Clipping (CClip), and Non-IID s-Bucketing](#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing)
+- [ADR-0020: Bounded-State Replay Protection, Receiver-Bound Context Recovery, and Cohort Admission Policy](#adr-0020-bounded-state-replay-protection-receiver-bound-context-recovery-and-cohort-admission-policy)
+- [ADR-0021: Source-Accurate Compression Validation, Stateful Error Feedback (ClassicResidual & EF21), and Verifiable Shared-Seed Sparse Co-Design](#adr-0021-source-accurate-compression-validation-stateful-error-feedback-classicresidual--ef21-and-verifiable-shared-seed-sparse-co-design)
+- [ADR-0022: Additive Transport Traits, Observed-Source Pre-Auth Reassembly, Originator-Authenticated Gossip Wrappers, and Zenoh/Iroh Adapter Crates](#adr-0022-additive-transport-traits-observed-source-pre-auth-reassembly-originator-authenticated-gossip-wrappers-and-zenohiroh-adapter-crates)
+- [ADR-0023: Unified Swarm Round Coordinator, Physical CAS Checkpoints, Strict Manifest Trust Policy, Cross-Process Bundle Locking, FedAsync, and Durable RDP Accounting](#adr-0023-unified-swarm-round-coordinator-physical-cas-checkpoints-strict-manifest-trust-policy-cross-process-bundle-locking-fedasync-and-durable-rdp-accounting)
+- [ADR-0024: Reference Models, Analytical Losses, SafeTensors Checkpoint Profile, and Isolated Framework Backend Adapters](#adr-0024-reference-models-analytical-losses-safetensors-checkpoint-profile-and-isolated-framework-backend-adapters)
+- [ADR-0025: Deterministic WebAssembly Extension Sandbox (wasmi) and Columnar Data Runner](#adr-0025-deterministic-webassembly-extension-sandbox-wasmi-and-columnar-data-runner)
+
 -----
 
 ## ADR-0000: ADR Process and Template
@@ -600,6 +610,24 @@ pub mod prelude {
 - [Embassy Documentation](https://embassy.dev/book/)
 - [no_std Rust](https://docs.rust-embedded.org/book/intro/no-std.html)
 
+### Ratification Addendum (2026-11-02): Feature Graph Isolation, Compiler Profiles, Metaheuristic Retirement, and Mission Boundary
+
+**Roadmap Items:** `W9-04`, `W9-05`, `W9-API-01`, `W11-04`, `W12-01`, `W12-02`, `P2-11`, `P2-18`
+
+1. **Strict Feature Edge Hygiene & Removal of Unused Defaults (`W9-05`, `D1`–`D5`):**
+   - `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` default builds MUST NOT pull in external ML frameworks (`burn`, `candle`, `tch`) or concrete async network runtimes (`tokio`).
+   - Every crate whose `std` implementation relies on heap-allocated types (including `swarm-torch-models`) MUST declare `std = ["alloc", ...]` so `ModelState` and `alloc`-gated APIs remain active under `std`.
+   - `swarm-torch-net`'s `std` feature MUST be runtime-neutral (`std = ["alloc", "swarm-torch-core/std"]`); `tokio` is activated only by concrete host transport features (`tcp-transport`, `udp-transport`) with narrow sub-features (`net`, `io-util`, `time`, `sync`), and workspace-wide `tokio = { features = ["full"] }` is removed.
+2. **Adapter Crate Boundaries & Truthful Compiler Support Matrix (`W9-05`, `W11-04`, `W12-01`, `W12-02`):**
+   - Heavy external integrations with independent lifecycles and higher compiler floors are placed behind dedicated optional adapter crates (`swarm-torch-backends` for Burn/Candle, `swarm-torch-transport-zenoh`, `swarm-torch-transport-iroh`, and an optional SafeTensors checkpoint codec boundary if retaining a strict 1.75 floor for `swarm-torch-models`).
+   - Rust `1.75` is preserved and tested as the compatibility target for the portable core, reference models, and base network traits (`cargo +1.75 check --locked` per package/profile), while development/benchmark graphs (`criterion` $\rightarrow$ `half 2.7.1` at `1.81`, `rayon 1.11.0` at `1.80`) and optional adapter crates declare and test their own verified compiler requirements. If modern adapter crates prevent old Cargo from loading the base workspace, they MUST reside in a companion workspace with an isolated lockfile.
+3. **Retirement of Unsupported Metaheuristic Scaffolding (`W9-API-01`):**
+   - `ParticleSwarmConfig`, `Particle` (already deprecated), `AntColonyConfig`, `FireflyConfig`, and the empty `experimental-pso` feature in `swarm-torch-core/src/algorithms.rs` have no execution engine and MUST be deprecated in `W9` and removed at the subsequent breaking prerelease (no later than the `W10` beta cutoff).
+   - `Topology` and its validation constructors/constants remain supported and re-exported at their established paths.
+   - Any future `swarm-torch-metaheuristics` crate is conditional on a concrete workload proposal specifying search space, objective direction, evaluation budget, reproducible RNG, cancellation/checkpointing, non-finite fitness handling, and baseline evidence.
+4. **Cross-Reference to Mission-Plane Boundary (`P2-18`):**
+   - Integration between SwarmTorch's learning/artifact plane and external mission/control planes is governed by the normative boundary specification in [ADR-0008A Ratification Addendum](#ratification-addendum-2026-11-02-mission-plane-integration-boundary-specification-p2-18).
+
 -----
 
 ## ADR-0003: Runtime Abstraction (Embassy ↔ Tokio)
@@ -868,6 +896,33 @@ impl MockRuntime {
 
 - [Tokio Documentation](https://tokio.rs/)
 - [Embassy Book](https://embassy.dev/book/)
+
+### Ratification Addendum (2026-11-02): Embedded Runtime Conformance, Clock Domains, and Deterministic Simulation (`P2-06` / `D5` / `W9-04` / `W10-03`)
+
+**Roadmap Items:** `P2-06`, `W9-04`, `W10-03`
+
+1. **Separate Timing from Executor-Specific Task Admission:**
+   - The shared timing interface MUST support local embedded execution (`Instant` and timer futures via named associated future types) without universally requiring `Send + Sync`. Multithreaded callers may require `Send` on the timer future; embedded callers may use local futures.
+   - Task spawning is an explicit, bounded capability (`Spawner` / task pool admission). A timer provider need not offer unrestricted `spawn(F)`.
+   - Admission failures MUST be observable (`Result<(), SpawnError>`). Exhausted task capacity MUST return an error or prevent admission; silently dropping accepted futures (as in the legacy `EmbassyRuntime::spawn` and `MockRuntime::spawn` stubs) is strictly forbidden.
+   - `default_runtime()` MUST NOT implicitly select `TokioRuntime` merely because Cargo feature unification enabled `tokio-runtime`; runtime construction must be explicit.
+2. **Clock Domains, Conversion Rules, and Test-Clock Consistency:**
+   - Distinguish three time/epoch domains:
+     1. **Monotonic Time:** Used for frame reassembly expiration, quarantine deadlines, retry backoff, scheduling, and local timeout measurement. Hard reassembly deadlines remain fixed once established (`ADR-0022`).
+     2. **Protocol Wall-Clock Time:** Used for `MessageEnvelope` timestamp freshness checks (`ADR-0020`), requiring an explicit synchronized wall-clock provider (`Unix` timescale) and declared error/skew policy. Elapsed time since boot (`embassy-time`) MUST NOT silently stand in for wall-clock time; clockless deployments must use an explicitly configured monotonic session-lease profile.
+     3. **Session/Epoch Identity:** Used for restart and rejoin isolation under `ADR-0020`.
+   - **Numerical & Conversion Rules:**
+     - Validate and clamp the `u128` result of `Duration::as_millis()` before converting to `u64` (`u64::try_from(d.as_millis()).unwrap_or(u64::MAX)`).
+     - Reject unrepresentable future deadlines rather than saturating into an immediate timeout.
+     - Round positive sub-tick delays upward so a timer never fires earlier than requested.
+     - Document hardware counter wrap behavior and whether time advances during supported low-power sleep modes.
+   - **Tokio Clock Domain Consistency:** `TokioRuntime::now()`, deadlines, and `sleep()` MUST use a single declared clock domain (`tokio::time::Instant`) so virtual-time tests using `tokio::time::pause()` remain consistent (`std::time::Instant` must not be mixed with `tokio::time::sleep`).
+3. **Atomic Portability & Deterministic Host Simulation (`W9-04`, `W10-03`):**
+   - Unconditional `core::sync::atomic::AtomicU64` usage in `swarm-torch-runtime` is forbidden on targets lacking 64-bit atomics (`#[cfg(target_has_atomic = "64")]`). Put the host deterministic scheduler behind an explicit `std` test-support profile and keep embedded timing independent of host mock storage (or use target-appropriate critical-section / portable-atomic storage).
+   - At least one advertised embedded target without native 64-bit atomics (e.g., `thumbv6m-none-eabi`) MUST be included in the compile verification matrix.
+   - For `W10-03`, `MockRuntime` MUST provide a real deterministic task and timer scheduler that polls accepted futures, wakes sleepers at exact virtual deadlines with deterministic tie-breaking, and enforces task/timer/poll budgets.
+4. **Six-Gate Conformance Evidence Required Before Removing Experimental Label (`P2-06`):**
+   - `Feature/API conformance` (minimal, `alloc`, `std`, and combined builds preserve contracts), `Target compilation`, `Firmware linkage` (real HAL, time driver, executor, panic handler, allocator), `Runtime behavior` (timers wait, tasks run, cancellation and capacity errors work, monotonic clock), `Integrated participant behavior` (crypto, replay, compression, transport on target), and `Resource evidence` (flash, static RAM, stack, peak heap, task/timer capacities).
 - [async-trait](https://docs.rs/async-trait)
 - [static_cell](https://docs.rs/static_cell) - For Embassy static allocation
 
@@ -3220,9 +3275,9 @@ pub trait IdentityProvider: Send + Sync {
 /// Built-in: accepts any valid signature
 pub struct SignatureOnlyProvider;
 
-/// Integration with Swarmic Network
+/// External mission/control-plane attestation provider
 pub struct SwarmicNetworkProvider {
-    // References: SWARMIC_NETWORK_WHITE_PAPER_v12.2.md
+    // External enrollment and attestation adapter (see Ratification Addendum P2-18 below)
 }
 ```
 
@@ -3237,7 +3292,21 @@ pub struct SwarmicNetworkProvider {
 
 ### References
 
-- SWARMIC_NETWORK_WHITE_PAPER_v12.2.md (internal)
+- ADR-0008 (Cryptographic Identity and Attestation)
+- ADR-0020 / ADR-0021 (Cohort Admission Policy and Bounded Replay Protection)
+
+### Ratification Addendum (2026-11-02): Mission-Plane Integration Boundary Specification (`P2-18`)
+
+**Roadmap Items:** `P2-18` (Architecture Boundary Specification & Recurring Release Gate)
+
+SwarmTorch is a distributed swarm learning and DataOps runtime, not a mission-control or autonomous actuation authority. Every external mission-plane integration MUST adhere to the following explicit boundary mappings and verification obligations:
+
+| SwarmTorch-Owned Contract | External Integration Responsibility | Trusted Input & Verifying Component | Policy / Capability Affected | Explicit Non-Claims & Failure Propagation |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Authenticated Update Originators & Admission Hooks** (`ADR-0020`, `ADR-0022`) | Device enrollment, PKI/hardware attestation, external credentials, or mission capability grants | External enrollment roster / revocation list verified by the host integration adapter before constructing or updating `PeerAdmissionPolicy` | Populates `PeerAdmissionPolicy::CohortAllowlist` or `OpenWithPinnedCohort` and pins authorized `PeerId`s in `ReplayProtection` | External enrollment **never** bypasses SwarmTorch originator Ed25519 signature verification, receiver-bound `session_id` handshake (`ADR-0020`), replay sequence checks, or one-contribution-per-round deduplication (`ADR-0023`). Revocation or enrollment failure fails closed (`VerifyError::UnauthorizedPeer`). |
+| **2. Learning Rounds, Models, Updates, & Checkpoints** (`ADR-0019`, `ADR-0023`, `ADR-0024`) | Mission objectives, task assignment, vehicle/robot actuation, safety interlocks, and domain-specific control loops | Authenticated round contributions and validated `SwarmTorchCheckpointV1` / CAS checkpoints verified by `SwarmRoundCoordinator` and `TrustPolicy::Strict` | Updates candidate and committed model generations (`w_candidate -> w_committed`) and records lineage/provenance in the run bundle | A committed SwarmTorch checkpoint establishes only that the declared training/aggregation recipe ran over the recorded contributions. It **does not** certify safety-critical actuation fitness or physical mission authorization. Round or quorum failure retains the previous committed model generation. |
+| **3. Generic Transport Capabilities & Resource Limits** (`ADR-0022`) | Deployment-specific radio traffic classes, QoS prioritization, link-layer key management, and hardware-selection policy | Link capability descriptors (`max_frame_bytes`, `max_message_bytes`, verified link principal) validated by the transport adapter and `FrameReassembler` | Configures per-transfer chunk stride $P$, global/per-source reassembly byte budgets, pacing, and carrier selection | Routing topics, radio addresses, or relay link authentication **never** grant contributor identity or override global memory/verification caps. Transport saturation or conflict fails closed (`CapacityExhausted` / transfer quarantine) without corrupting active rounds. |
+| **4. Artifact Integrity, Provenance, & Learning Metrics** (`ADR-0016`, `ADR-0023`) | External compliance receipts, fleet attestations, mission dashboards, and regulatory audit interpretations | Signed `ManifestV1` (`ManifestSignatureV1`) and content-addressed artifact digests verified by `TrustPolicy::Strict` | Authorizes report loading, checkpoint restoration, cache reuse, and downstream audit export | Exported receipts establish only the integrity and provenance of the listed SwarmTorch bundle files under the configured external trust anchor. They **do not** attest to unlisted files, raw external sensor truth, or broader mission execution outcomes. Verification failure aborts consumer ingestion. |
 
 -----
 
@@ -3575,6 +3644,27 @@ runs/<run_id>/
 - [W3C Trace Context](https://www.w3.org/TR/trace-context/)
 - [Apache Parquet](https://parquet.apache.org/)
 
+### Ratification Addendum (2026-11-02 / Amended 2026-11-03): Schema Split (`P2-20a`/`P2-20b`), Zero-Port MCP Inspection Adapter (`swarm-torch-mcp`), and Local Reader / Desktop Wrapper Readiness Gates (`P2-16` / `P2-17`)
+
+**Roadmap Items:** `P2-16`, `P2-17`, `P2-20a` (`W10-02`), `P2-20b` (`W12-04`)
+
+1. **Explicit JSON vs. Parquet Schema Deliverable Split (`P2-20`):**
+   - **`P2-20a` (JSON Schemas — `W10-02` / `ADR-0023`):** Publish versioned JSON Schema 2020-12 files with stable `$id` URIs, local `$ref` resolution, bounded streaming decode rules, lossless `u64` timestamp/sequence handling, and positive/negative conformance fixtures for `manifest.json` (`ManifestV1` + `ManifestSignatureV1`), `run.json`, `graph.json`, `datasets/registry.json`, `datasets/lineage.json`, and `spans.ndjson` / `events.ndjson` / `metrics.ndjson` / `datasets/materializations.ndjson`.
+   - **`P2-20b` (Parquet / Columnar Schemas — `W12-04` / `ADR-0025`):** Track the Arrow/Parquet columnar schema definitions and fixture obligations separately under `W12-04`. The parent `P2-20` obligation remains open until both `P2-20a` and `P2-20b` pass conformance.
+   - **Optional Zero-Port MCP Artifact Inspection Adapter (`swarm-torch-mcp` — Post-`W10-02` / `W12-05`):** Package a standalone, optional host/operator adapter crate `swarm-torch-mcp` built on the official Model Context Protocol Rust SDK (`rmcp` from `modelcontextprotocol/rust-sdk`) over zero-port `stdio` (`transport-io`) by default. Because `rmcp` requires `edition = "2024"`, `rust-version = "1.88"`, and `tokio`, `swarm-torch-mcp` MUST remain an isolated optional host adapter crate with its own tested compiler profile (`1.88+`) and MUST NEVER enter `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, `swarm-torch-runtime`, or the default `swarm-torch` dependency graph (`Rust 1.75` MSRV / `no_std + alloc`). `swarm-torch-mcp` exposes read-only MCP Resources (`swarmtorch://runs/{run_id}/...`) and Tools (`inspect_run_report`, `audit_graph_trust_and_cycles`, `predict_node_outputs`, `trace_aggregation_budget`) backed strictly by `TrustPolicy::Strict` verified bundle loading (`W10-02`) and `P2-20a` JSON Schema contracts, with zero bundle mutation, training actuation, or extension execution authority (`ADR-0008A` / `P2-18`). Remote HTTP MCP (`transport-streamable-http-server`) remains gated behind the `v0.3+` `P2-16` security controls below.
+2. **Local Read-Only HTTP Artifact Reader (`P2-16` — Design Retained, Implementation Deferred to `v0.3+`):**
+   - Retain the design obligation for an offline-first, local read-only artifact reader with zero default tracking database.
+   - **Mandatory Readiness Gates Before `v0.3+` Implementation Admission:**
+     - Mature `TrustPolicy::Strict` verification (`W10-02`) and `P2-20a` schema validation in place.
+     - Explicit local loopback binding (`127.0.0.1`), authentication/CSRF/CORS protections, and local-browser access policy.
+     - Strict bounds on request size, canonical bundle path traversal prevention, and response streaming.
+     - Documented privacy/redaction export policy.
+     - Architectural isolation separating read-only report inspection from any endpoint that trains, mutates bundles, or executes extensions.
+3. **Desktop Wrapper (`P2-17` — Threat Model Retained, Implementation Deferred to `v0.3+`):**
+   - Retain the threat-model addendum and bounded packaging plan; defer Tauri/Iced/native implementation to `v0.3+` after `P2-16` and the artifact verification contracts stabilize.
+   - The threat model MUST cover filesystem scope isolation, IPC command validation, strict sanitization when rendering untrusted artifact strings/metadata, and signed update/packaging provenance.
+   - Track "Design / Threat Model Complete" separately from "Implementation Shipped" so deferral never erases planning obligations and planning completion never implies a shipped UI binary.
+
 -----
 
 ## ADR-0017: Data Pipeline DSL and Asset Model
@@ -3894,3 +3984,474 @@ Wave 5 trust path contract (implemented):
 - ADR-0017 (Data Pipeline DSL and Asset Model)
 - ADR-0016 (Run Artifacts and Visualization Surface)
 - [WASI](https://wasi.dev/)
+
+
+-----
+
+## ADR-0019: Byzantine-Resilient Aggregation Hardening, Multi-Krum, Bulyan, Centered Clipping (CClip), and Non-IID $s$-Bucketing
+
+**Status:** Accepted (`W9-01` Implemented in Wave 9; `W11-01` Planned for Wave 11)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Extends:** ADR-0007, ADR-0007A, ADR-0013  
+**Roadmap Items:** `W9-01` (Wave 9), `W11-01` (Wave 11)
+
+### Context
+
+Hardening [`swarm-torch-core/src/aggregation.rs`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch-core/src/aggregation.rs) for production edge deployments requires strict numerical and resource invariants across all robust aggregation rules:
+
+1. **Complete Input Validation & Total Ordering (`W9-01`):**
+   - Every coordinate of every contributor update must be validated for finiteness (`.is_finite()`) before sorting or arithmetic so non-finite values (`NaN`, `±Inf`) cannot poison total ordering or unselected coordinate columns.
+   - Coordinate and score sorting must use `f32::total_cmp` / `f64::total_cmp` with deterministic tie-breaking by canonical peer index.
+2. **Widened `f64` Accumulation & Checked Resource Budgets (`W9-01`):**
+   - Sums, midpoints, and pairwise squared Euclidean distances must widen to `f64` prior to arithmetic so large finite `f32` inputs cannot overflow intermediate accumulators before division.
+   - Quadratic distance aggregators (`Krum`, `Bulyan`) must enforce checked arithmetic and explicit upper bounds on contributor count, total input bytes, scratch bytes, and pair-coordinate work (`n * (n - 1) / 2 * d`).
+3. **Pinned `Multi-Krum` and `Bulyan` Profiles (`W9-01`):**
+   - `Krum` with `num_selected > 1` (`Multi-Krum`) requires averaging the top $m$ scored updates over the admissible resilience domain $n \ge 2f + 3$, $1 \le m \le n - f - 2$.
+   - `Bulyan` (El Mhamdi et al., ICML 2018) requires both fixed-$f$ iterative Krum selection preserving quorum ($r \ge 2f + 3$ at every step, selecting $\theta = n - 2f - 2$ candidates for $n \ge 4f + 3$) and Stage 2 coordinate-wise averaging of the $\beta = \theta - 2f = n - 4f - 2$ values nearest in absolute distance to the coordinate median.
+4. **Non-IID $s$-Bucketing & Linear-Cost Centered Clipping (`W11-01`):**
+   - Under Non-IID data distributions, coordinate-wise and geometric rules benefit from $s$-bucketing (Karimireddy et al., ICLR 2022) with conservative post-bucketing fault accounting $f_B = \min(f, B)$, as well as $\mathcal{O}(L \cdot n \cdot d)$ `CenteredClipping` (`CClip`, Karimireddy et al., ICML 2021) for high-dimensional models on constrained gateways.
+
+### Decision
+
+#### 1. Common Validation, Widened `f64` Arithmetic, & Resource Budgets (`W9-01` — Implemented)
+
+Every aggregator (`FedAvg`, `TrimmedMean`, `CoordinateMedian`, `Krum`, `Bulyan`, and planned `CenteredClipping`) MUST enforce:
+1. **Complete Input Validation Before Sorting or Arithmetic:** Validate every coordinate of every input update (including updates that may later be trimmed or unselected). Reject `NaN` with `Err(Error::NanDetected)` and `±Inf` with `Err(Error::InfDetected)`. Require consistent, non-empty dimensions matching the negotiated model/layout size.
+2. **Pre-Operation `f64` Widening & Output Finiteness Check:** Convert `f32` operands to `f64` **before** addition, subtraction, squaring, midpoint calculation, and accumulation:
+   - Even-length `CoordinateMedian` MUST compute $\operatorname{f32}\!\left(\frac{\operatorname{f64}(a) + \operatorname{f64}(b)}{2.0}\right)$.
+   - Pairwise squared distance MUST compute $D_{i,j} = \sum_{c=0}^{d-1} (\operatorname{f64}(g_i[c]) - \operatorname{f64}(g_j[c]))^2$ for $j \ne i$.
+   - Check intermediate results and verify that the final narrowing conversion to `f32` is `.is_finite()`.
+3. **Total Ordering & Canonical Tie-Breaking:** Use `f32::total_cmp` / `f64::total_cmp` everywhere (`partial_cmp(...).unwrap_or(Ordering::Equal)` is forbidden). Break equal scores/distances deterministically by **canonical peer index** derived from a stable ordering of eligible, authenticated, unique contributors (never network arrival order).
+4. **Invocation-Time Config & Checked Resource Arithmetic:** Re-validate configuration at invocation as well as construction (since public struct fields can be mutated). Use checked integer arithmetic (`checked_mul`, `checked_add`) for quorum formulas ($2f+3$, $4f+3$), dimensions, pair counts, allocation sizes, and work estimates. Alongside the 50-peer cap on `Krum` and `Bulyan`, enforce explicit checked limits on total input bytes (`MAX_KRUM_INPUT_BYTES`), scratch buffer bytes (`MAX_KRUM_SCRATCH_BYTES`), and pair-coordinate work (`MAX_KRUM_PAIR_COORDINATE_WORK`) before allocating or starting quadratic loops.
+
+#### 2. Pinned One-Pass `Multi-Krum` Profile (`W9-01` — Implemented)
+
+- **Reference:** Blanchard et al., NeurIPS 2017; SRDS Multi-Krum resilience domain.
+- **Admissible Parameter Domain:**
+  $$n \ge 2f + 3, \qquad k = n - f - 2, \qquad 1 \le m \le n - f - 2$$
+  Configurations outside this domain return `Err(Error::InvalidThreshold)` or `Err(Error::InsufficientPeers)`.
+- **One-Pass Algorithm:**
+  1. Validate inputs and resource budgets.
+  2. For every original input $i \in \{0, \dots, n-1\}$, compute $D_{i,j}$ against all $j \ne i$ (explicitly excluding self by index $j \ne i$, never by removing the first zero-distance entry, which fails when distinct peers submit identical vectors).
+  3. Sum the $k = n - f - 2$ smallest distances for each peer $i$ against the **same original cohort** to obtain score $S(i)$.
+  4. Sort peers by `(S(i).total_cmp(&S(j)), canonical_peer_index_i.cmp(&canonical_peer_index_j))`.
+  5. Average the first $m$ vectors coordinate-wise in `f64`, validate finiteness, and convert to `f32`.
+
+#### 3. `Bulyan` Versioned Profile (`BulyanProfile::IterativeKrumV1` — `W9-01` — Implemented)
+
+- **Versioned Profile Identifier & Preconditions (`BulyanProfile::IterativeKrumV1`):** Require $f \ge 1$ and $n \ge 4f + 3$ (validated with checked arithmetic before allocation alongside finite-value, shape, peer-count, byte, and work limits). Derive $\theta = n - 2f - 2$ and $\beta = \theta - 2f = n - 4f - 2$ internally within the profile so callers cannot choose incompatible Stage 1 and Stage 2 counts (per El Mhamdi et al., *Distributed Momentum for Byzantine-resilient Learning*, §2.2.3, specialized to $m = 1$ ordinary Krum). At the minimum admitted population $n = 4f + 3$, $\theta = 2f + 1$ and $\beta = 1$, so Stage 2 returns the coordinate median of the selected vectors at that boundary.
+- **Stage 2 (Normative — Nearest-to-Median Selection):**
+  - For each coordinate $c \in \{0, \dots, d-1\}$ across the selected set $\mathcal{S}$ ($|\mathcal{S}| = \theta$):
+    1. Sort the $\theta$ values by `(val.total_cmp(&other_val), canonical_peer_index)`.
+    2. Select the coordinate median $M_c$, pinned to the **lower observed median** at index $(\theta - 1) / 2$ when $\theta$ is even.
+    3. Compute absolute distances $|\operatorname{f64}(y_i[c]) - \operatorname{f64}(M_c)|$ in `f64` for all $i \in \mathcal{S}$.
+    4. Sort candidates by `(abs_dist.total_cmp(&other_dist), canonical_peer_index)` and average the first $\beta = \texttt{selected.len()} - 2f = n - 4f - 2$ values in `f64`, validating finite `f32` output. Expose `bulyan_stage2_nearest_to_median` as a standalone reusable component.
+    5. Reuse a single column scratch buffer `Vec<(f32, usize)>` of capacity $\theta$ across all $d$ coordinates.
+- **Stage 1 (Normative — Fixed-$f$, Single-Winner Iterative Krum Preserving Quorum):**
+  - Precompute the pairwise `f64` squared-distance table once and maintain original candidate indices throughout selection. For each of $\theta = n - 2f - 2$ iterations: let $R$ be the remaining candidate set and $r = |R|$; retain the configured $f$ unchanged; set neighbor count $k = r - f - 2$; for each $i \in R$, sum its $k$ smallest squared distances to other remaining candidates $j \in R, j \ne i$ ($S_R(i) = \sum_{j \in N_R(i, k)} D_{i,j}^2$); select the minimum-distance-score winner $i^\star = \arg\min_{i \in R}(S_R(i), \operatorname{canonical\_index}(i))$; append $i^\star$ to the selection set and remove $i^\star$ from $R$ (recomputing scores against the reduced $R$ after each removal). Because $\theta = n - 2f - 2$, the final selection occurs at $r_{\mathrm{last}} = n - (\theta - 1) = 2f + 3$ with neighbor count $k_{\mathrm{last}} = f + 1$, preserving Krum's $r \ge 2f + 3$ quorum on every step. Golden selection-semantics conformance fixture: for scalar updates `[0, 1, 2, 3, 4, 5, 6]` with $n = 7, f = 1$ ($\theta = 3, \beta = 1$, scored pools $r \in \{7, 6, 5\}$ with $k \in \{4, 3, 2\}$), `BulyanProfile::IterativeKrumV1` selects original indices `[2, 4, 1]` in selection order and produces final result `2.0`.
+
+#### 4. `CenteredClipping` (`CClip`) & Conservative $s$-Bucketing (`W11-01` — Planned Contract)
+
+- **Conservative $s$-Bucketing (`BucketingConfig`):**
+  1. Require $s \ge 1$ and **require $n \bmod s == 0$ for the initial production profile** (if a floor-bucketing profile $\lfloor n/s \rfloor$ is enabled, it must shuffle the frozen authenticated roster, use exactly $B \cdot s$ contributors, and record the omitted remainder as an explicit participation policy).
+  2. Compute usable bucket count $B = n / s$ and enforce the conservative post-bucketing Byzantine bound:
+     $$f_B = \min(f, B)$$
+  3. Re-validate the downstream aggregator's quorum against $(B, f_B)$ before aggregation (and again after any peer dropouts):
+     - `Krum`: $B \ge 2f_B + 3$
+     - `Multi-Krum`: $1 \le m \le B - f_B - 2$
+     - `Bulyan`: $B \ge 4f_B + 3$
+  4. Represent buckets with internal round-scoped `BucketId` and member provenance rather than synthetic network-authenticated `PeerId`s.
+- **`CenteredClipping` (`CClip`) Initialization & History Contract:**
+  1. Recurrence:
+     $$v_{\ell+1} = v_\ell + \frac{1}{n} \sum_{i=1}^n (x_i - v_\ell) \min\!\left(1, \frac{\tau}{\|x_i - v_\ell\|_2}\right)$$
+     with finite $\tau > 0$, bounded $1 \le L \le 32$, explicit zero-norm branch ($1.0$ when $\|x_i - v_\ell\|_2 == 0$), widened `f64` norm/accumulation, and finite output validation.
+  2. Default center $v_0$ is the previous committed round's aggregate.
+  3. State complexity is $\mathcal{O}(L \cdot n \cdot d)$ time and $\mathcal{O}(d)$ auxiliary workspace, excluding stored inputs and persistent $\mathcal{O}(d)$ center history.
+
+-----
+
+## ADR-0020: Bounded-State Replay Protection, Receiver-Bound Context Recovery, and Cohort Admission Policy
+
+**Status:** Accepted (`W9-02` Implemented in Wave 9)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Supersedes:** Replay cache storage implementation notes in ADR-0008 / M4-02.5  
+**Extends:** ADR-0006, ADR-0008, ADR-0008A, ADR-0008B  
+**Roadmap Items:** `W9-02` (Wave 9), `P2-01`, `P2-03`, `P2-04`, and `P2-11` (`lru` removal)
+
+### Context
+
+Hardening [`swarm-torch-core/src/replay.rs`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch-core/src/replay.rs) and [`swarm-torch-net/src/protocol.rs`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch-net/src/protocol.rs) for adversarial edge networks addresses three core requirements:
+1. **Zero-`unsafe` Bounded Replay Storage (`P2-11` `lru` removal):** Replacing `lru` (`RUSTSEC-2026-0002`, `RUSTSEC-2026-0253`) with a 100% safe `BTreeMap` structure eliminates third-party unsafe cache internals while enforcing deterministic capacity and expiry invariants.
+2. **Full Validity-Horizon Retention ($A + F$) & Probationary Saturation:** A packet accepted at maximum future skew $+F$ remains timestamp-valid for up to $A + F$ seconds ($120\,\text{s}$ for $\pm 60\,\text{s}$ skew). Unpinned probationary records must be retained for their full validity horizon ($n \le t_{\max} + A$) and fail closed on saturation (`ReplayError::CapacityExhausted`) without evicting pinned cohort members.
+3. **Restart & State-Loss Replay Protection (`P2-04`, RFC 8613 §7.5, RFC 9175):** When a receiver restarts or loses its inbound replay window, previously captured envelopes must not be replayable. Establishing a receiver-bound directional `SessionId` derived from a fresh 256-bit receiver challenge ensures pre-restart envelopes cannot be replayed into a post-restart session.
+
+### Decision
+
+#### 1. Receiver-Bound Security Contexts & Restart Recovery (`W9-02` / `P2-04` — Implemented)
+
+1. **Startup & State-Loss State (`RecoveryRequired`):**
+   - After startup, reboot, or loss of replay state, directional contexts `(sender A -> receiver B)` begin in `RecoveryRequired` (including pinned cohort members). Application data envelopes are inadmissible in `RecoveryRequired`.
+   - `AuthenticatedEnvelopeVerifier` does not expose raw mutable access to clear live replay state without transitioning the verifier into `RecoveryRequired`.
+2. **Directional Handshake & Transcript-Derived `SessionId`:**
+   - Before application data from $A$ is accepted by $B$, $A$ and $B$ establish a directional security context whose fixed-size `SessionId` (`[u8; 32]`) is derived from a canonical, role-bound handshake transcript (`SessionTranscriptV1`) committing to:
+     - Protocol version and handshake domain (`"swarmtorch.session.handshake.v1"`)
+     - Deployment / cohort / run scope identifier
+     - Sender identity (`PeerId` + Ed25519 verifying key) and Receiver identity (`PeerId` + Ed25519 verifying key)
+     - Sender incarnation counter/nonce
+     - **Fresh 256-bit receiver challenge** generated by $B$ from an injected CSPRNG / protected entropy source (`ChallengeSource`)
+     - Negotiated security-policy version
+   - Consuming the single-use expiring receiver challenge and activating the new replay window for `SessionId` is a single atomic transition. Invalid or replayed handshake responses leave the active context unchanged.
+   - One active context per `(peer, direction)` is maintained in `W9` with no overlapping-epoch grace period; activating a new context atomically retires the previous context.
+3. **Envelope v1 Signature Binding:**
+   - `swarmtorch.envelope.v1` binds the canonical Ed25519 signature preimage over: envelope domain/version, scope identifier, sender and intended receiver, `session_id`, `sequence`, `round_id`, `timestamp_secs`, `message_type`, and `payload_digest`. Legacy context-free v0 envelopes are rejected (`EnvelopeError::UnsupportedVersion`).
+4. **Role of Optional Snapshots (`P2-04`):**
+   - Mandatory `P2-04` closure is achieved via fresh receiver-bound context establishment on restart.
+
+#### 2. Complete Validity Retention ($A + F$), Clock Continuity, & Expiry-Indexed Safe Cache (`W9-02` / `P2-11` — Implemented)
+
+1. **Timestamp Acceptance & Retention Deadline:**
+   - Let $A$ be maximum accepted past age (`max_age_secs`, default `60`), $F$ be maximum permitted future skew (`max_future_skew_secs`, default `60`), $t$ be the signed packet timestamp, and $n$ be the receiver's effective current time.
+   - Timestamp validity requires (using checked/widened arithmetic):
+     $$t \le n + F \quad \land \quad n \le t + A$$
+   - Each `ReplayRecord` tracks $t_{\max} = \max(\text{timestamps of authenticated, accepted messages in context})$. Timestamp-based reclamation of an unpinned probationary record is permitted **only when strict inequality holds**:
+     $$\boxed{n > t_{\max} + A}$$
+     Invalid signatures, denied peers, or duplicates never extend $t_{\max}$.
+2. **Clock Continuity Contract:**
+   - Freshness validation and expiry reclamation use the same effective non-regressing acceptance clock within a context; any backward wall-clock jump retires active contexts into `RecoveryRequired` (`EnvelopeError::ClockRegression`).
+3. **Expiry-Indexed `BTreeMap` Cache (Replacing `lru`):**
+   - `lru` is removed from `Cargo.toml` and `Cargo.lock` (retiring `RUSTSEC-2026-0002` and `RUSTSEC-2026-0253`).
+   - Replay state is stored in 100% safe `alloc::collections::BTreeMap`:
+     ```rust
+     records: BTreeMap<RecordKey, ReplayRecord>,
+     probationary_expiry: BTreeMap<(ExpiresAt, RecordKey), ()>,
+     ```
+4. **Production Admission Defaults & Fail-Closed Saturation (`P2-03`):**
+   - Production default is `PeerAdmissionPolicy::CohortAllowlist` with reserved/pinned capacity (`pinned` records never enter `probationary_expiry`), mandatory signatures, and mandatory replay enforcement.
+   - When probationary admission is explicitly enabled and probationary capacity contains only unexpired records ($n \le t_{\max} + A$), new probationary admissions fail closed with `Err(ReplayError::CapacityExhausted)` while existing admitted and pinned contexts continue operating normally.
+
+#### 3. Six-Stage Atomic Receive Pipeline (`W9-02` / `P2-01` — Implemented)
+
+1. **Stage 1 (Bounded Parse):** Validate frame size, field lengths, protocol version, and message kind before heap allocation.
+2. **Stage 2 (Read-Only Pre-Check):** Check `PeerAdmissionPolicy`, active context state, and preliminary read-only duplicate check (`precheck_admissible`). Reject unauthorized peers before Ed25519 verification.
+3. **Stage 3 (Verification Budget):** Apply global and per-link/source Ed25519 verification rate/concurrency budgets (`VerificationBudget`).
+4. **Stage 4 (Ed25519 Verification):** Verify signature over the complete canonical v1 preimage.
+5. **Stage 5 (Atomic Recheck & Commit):** Atomically recheck admission, context generation, timestamp validity, sequence window (no wrapping on `u64::MAX`), and capacity; then commit the sequence bit, $t_{\max}$, and expiry index update in one atomic step (`commit_verified`). **An invalid signature naming an allowed `PeerId` mutates zero replay, pin, context, or expiry state.**
+6. **Stage 6 (Application Delivery):** Deliver to application processing. Post-delivery application errors do not roll back replay commitment.
+
+-----
+
+## ADR-0021: Source-Accurate Compression Validation, Stateful Error Feedback (`ClassicResidual` & `EF21`), and Verifiable Shared-Seed Sparse Co-Design
+
+**Status:** Accepted (`W9-03` Implemented in Wave 9; `W11-02` Planned for Wave 11)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Extends:** ADR-0005, ADR-0007, ADR-0013, ADR-0019  
+**Roadmap Items:** `W9-03` (Wave 9), `W11-02` (Wave 11), `P2-15` (Wave 8.3 closure)
+
+### Context
+
+Hardening [`swarm-torch-core/src/compression.rs`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch-core/src/compression.rs) for untrusted network payloads and communication-compressed swarm learning requires:
+1. **Pre-Allocation Wire & Decompression Validation (`W9-03`):** `CompressedGradient::decode_bounded` and `decompress_with_limit` must bound encoded frame size, tensor rank (`shape.len()`), `num_elements`, and `product(shape)` *before* allocating dense output buffers, verify strictly ascending in-range sparse indices, reject non-finite floats, and widen `Quantized { scale }` dequantization to `f64` before checking finite `f32` range.
+2. **Protocol Semantics of `ClassicResidual` vs. `EF21` (`W9-03`):**
+   - `ClassicResidual` transmits an independently decodable error-compensated update $c_t = \mathcal{C}(v_t + e_t)$ with transactional sender state commitment (`PreparedResidualStep::commit`) so transport fanout or retries do not double-advance $e_t$.
+   - `EF21` (Richtárik et al., NeurIPS 2021) transmits state innovations $\delta_t = D(\mathcal{C}(v_t - s_t))$; because nonlinear robust aggregators do not commute with addition, the receiver must maintain $\mathcal{O}(nd)$ per-peer reconstructed states $s_t^i$ under an explicit state-version synchronization protocol.
+3. **Verifiable Commitments & Resource Accounting for `SharedSeedSparse` (`W11-02`):**
+   - Projecting from $d$ to $k$ shared coordinates gives $\mathcal{O}(n^2 k)$ pairwise distance work and $\mathcal{O}(nk)$ stored vectors, and requires verifiable pre-seed coordinate commitments (or an explicitly declared trusted-compressor profile) so a Byzantine peer cannot adaptively fabricate its $k$ coordinates after observing the round seed.
+
+### Decision
+
+#### 1. Bounded Wire Decoding & Source-Accurate Validation (`W9-03` — Implemented)
+
+1. **Bound Deserialization Before Allocation:** Enforce wire-decoder limits (`DecompressLimits`) on encoded byte length, `shape.len()` (`max_rank`), `num_elements <= max_elements`, sparse entry count, and byte-vector lengths *before* allocating dense output buffers.
+2. **Pre-Allocation Shape & Method Checks in `CompressedGradient::decompress`:**
+   - Verify `method` / `data` pairing; reject `UnsupportedMethod` or mismatched pairs before allocating.
+   - Check `self.num_elements <= max_elements`, compute `shape_product` via checked multiplication, require `shape_product == self.num_elements`, and require agreement with any expected model layout dimension.
+   - Use saturating/checked arithmetic in size-reporting helpers (`compressed_size`, `original_size`, `checked_compressed_size`, `checked_original_size`).
+3. **Method-Specific Contracts:**
+   - `None + Dense(bytes)`: Require `bytes.len() == self.num_elements.checked_mul(4)` and every decoded LE `f32` to be `.is_finite()`.
+   - `TopK { k_ratio } + Sparse { indices, values }`: Require finite `k_ratio` in `(0.0, 1.0]`, bounded index count, `values.len() == indices.len().checked_mul(4)`, strictly increasing indices (`idx > prev_idx` and `idx < self.num_elements`), and every decoded LE `f32` value `.is_finite()`.
+   - `Quantized { scale } + Dense(bytes)`: Require finite `scale > 0.0`, `bytes.len() == self.num_elements`, signed `i8` interpretation, and widened multiplication `let val = (b as i8 as f64) * (scale as f64)` checked to fit within finite `f32`.
+
+#### 2. `ClassicResidual` Default & Explicit `EF21` Synchronization Gate (`W9-03` — Implemented)
+
+1. **`ClassicResidual` (Default W9-03 Error-Feedback Mode):**
+   - Recurrence over declared input units $v_t$:
+     $$u_t = v_t + e_t, \qquad c_t = \mathcal{C}(u_t), \qquad q_t = D(c_t), \qquad e_{t+1} = u_t - q_t$$
+   - **Transactional Sender Commit:** `ClassicResidualCompressor::prepare` computes and validates $(c_t, q_t, e_{t+1})$ without mutating committed state; `PreparedResidualStep::commit` advances $e_{t+1}$ **exactly once per logical round update creation**. The immutable encoded $c_t$ is reused across all recipient wrappers (`ADR-0022`) and transport retries. Excluded Krum updates are *not* compression errors and are never added back into $e_t$. `ResidualBinding` binds $e_t$ to `(run_id, model_id, schema_hash, compressor_config, update_kind)`.
+2. **`EF21` (Gated Behind Coordinator Synchronization Capability):**
+   - Recurrence: $\delta_t = D(\mathcal{C}(v_t - s_t)), \; s_{t+1} = s_t + \delta_t$.
+   - Receiver maintains per-peer reconstruction state $s_t^i$ ($\mathcal{O}(nd)$ RAM) bound to authenticated `(originator, run_id, schema_hash, compressor_config, state_generation, base_version, new_version)` (`Ef21PeerState`, `Ef21InnovationEnvelope`, `Ef21StateAck`).
+   - **Operational State Protocol:** Requires agreed initialization or authenticated full-state snapshot; atomic application on exact `base_version` match; idempotent handling of duplicate deliveries; explicit conflict rejection (`CompressionError::StateConflict`) on mismatched content for the same version; no silent zero-initialization on missing base; and a dedicated `Ef21StateAck` confirming state reconstruction independently of whether Krum selected the peer's vector for the model step.
+
+#### 3. Verifiable `SharedSeedSparse` Projection (`W11-02` — Planned Contract)
+
+1. **Projection Operator & Sparse Sampling:**
+   - Baseline unscaled projection $C_S(x) = P_S x$ for uniformly sampled subset $S \subset \{0, \dots, d-1\}$ of size $|S| = k$.
+   - Sampling MUST use an $\mathcal{O}(k)$ auxiliary-space algorithm sorted in $\mathcal{O}(k \log k)$ with unbiased bounded-integer generation and golden vectors—never allocating an $\mathcal{O}(d)$ permutation array.
+2. **Pre-Seed Verifiable Commitment Protocol:**
+   - Freeze eligible roster and collect authenticated commitments to pre-projection vectors $u_t^i = v_t^i + e_t^i$ (after any DP sanitization per `ADR-0023`), bind round parameters into the round transcript, obtain fresh unpredictable round randomness, derive domain-separated projection and bucketing seeds, and verify disclosed $k$ coordinates against commitments via Merkle/vector commitment openings (or an explicitly declared `TrustedCompressor` deployment assumption).
+3. **Resource & Bandwidth Accounting:**
+   - Pairwise distance work is $\mathcal{O}(n^2 k)$, stored projected updates are $\mathcal{O}(nk)$, optional cached distance table is $\mathcal{O}(n^2)$, row sorting is $\mathcal{O}(n^2 \log n)$, `CenteredClipping` is $\mathcal{O}(Lnk)$, and persistent residual/center state is $\mathcal{O}(d)$.
+
+-----
+
+## ADR-0022: Additive Transport Traits, Observed-Source Pre-Auth Reassembly, Originator-Authenticated Gossip Wrappers, and Zenoh/Iroh Adapter Crates
+
+**Status:** Accepted (`W9-04` & `W9-05` Implemented in Wave 9; `W10-03`, `W11-03`, `W12-02` Planned)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Supersedes:** Conditional `#[cfg(feature = "std")]` trait split in `swarm-torch-net/src/traits.rs` (ADR-0004)  
+**Extends:** ADR-0002, ADR-0004, ADR-0005, ADR-0020  
+**Roadmap Items:** `W9-04`, `W9-05` (Wave 9), `W10-03` (Wave 10), `W11-03` (Wave 11), `W12-02` (Wave 12)
+
+### Context
+
+Hardening [`swarm-torch-net`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch-net/src/traits.rs) across embedded and standard targets establishes five architectural requirements:
+1. `SwarmTransport` must be strictly additive under Cargo feature unification (`alloc` vs. `std`), and enabling `std` in `swarm-torch-net` must not implicitly activate `tokio`.
+2. Packet-level radio/UDP transports must separate observed network source endpoints, verified carrier link principals, and authenticated envelope/wrapper originators (`PeerId`).
+3. Multi-chunk packet reassembly (`W11-03`) requires a frozen 16-byte chunk header (`[0x53, 0x54]`), positive `u16` chunk counts, fixed per-transfer stride $P$, `CRC-16/IBM-3740`, and pre-authentication observed-source memory budgets.
+4. Multi-hop gossip dissemination (`W9-04` / `W10-03`) must preserve `ADR-0020`'s receiver-bound `SessionId` recovery contract via originator-signed recipient wrappers over an immutable inner update.
+5. `Zenoh` and `Iroh` (`W12-02`) must be packaged in separate optional adapter crates (`swarm-torch-transport-zenoh`, `swarm-torch-transport-iroh`) with independent compiler and dependency profiles.
+
+### Decision
+
+#### 1. Additive Transport Traits & Three-Layer Identity Separation (`W9-04` — Implemented)
+
+1. **Identity Separation on Receive:** Every transport path distinguishes:
+   - **Observed Source:** Socket address, radio address, or connection handle (used for pre-auth resource accounting).
+   - **Verified Link Principal:** Identity established by an authenticated carrier (e.g., TLS/QUIC endpoint identity), when available.
+   - **Authenticated Originator:** Contributor `PeerId` established by the SwarmTorch envelope or recipient-wrapper Ed25519 signature.
+2. **`PacketTransport` (Allocation-Free, Non-Blocking, Caller-Buffered):**
+   ```rust
+   pub trait PacketTransport {
+       type Endpoint;
+       type Error;
+
+       fn try_send_frame(
+           &mut self,
+           destination: &Self::Endpoint,
+           frame: &[u8],
+       ) -> Result<(), PacketSendError<Self::Error>>;
+
+       fn try_recv_frame(
+           &mut self,
+           buffer: &mut [u8],
+       ) -> Result<Option<ReceivedFrame<Self::Endpoint>>, PacketRecvError<Self::Error>>;
+
+       fn capabilities(&self) -> PacketCapabilities;
+   }
+   ```
+   - Uses `&mut self` without mandatory `Send + Sync` (supporting single-threaded embedded drivers).
+   - `WouldBlock` means the frame was not accepted; oversized outgoing frames fail before transmission (`PacketSendError::OversizedFrame`); truncated datagrams fail with `PacketRecvError::TruncatedFrame` rather than returning partial frames; queues bound both frame count and bytes.
+   - `PacketCapabilities` separates `max_frame_bytes` (codec-visible bytes after lower-layer headers) from `max_message_bytes` (maximum reassembled delivery), multicast support, reliability class, and verified-link capability.
+3. **`SwarmTransport` (`alloc`, Runtime-Neutral, Unchanged by `std`):**
+   - Exposes asynchronous complete-message operations under `alloc` using **named associated future types** (`SendFuture<'a>`, `RecvFuture<'a>`, `BroadcastFuture<'a>`) so embedded callers can use local futures while multithreaded callers can require `+ Send` bounds on Rust 1.75.
+   - Enabling `std` in `swarm-torch-net` enables `alloc` and `swarm-torch-core/std` **without activating `tokio`**.
+
+#### 2. Frozen 16-Byte Chunk Header, Fixed Stride $P$, & Pre-Auth Reassembly (`W11-03` — Planned Contract)
+
+1. **16-Byte Header Layout:**
+   | Offset | Bytes | Field | Normative Contract |
+   | ---: | ---: | :--- | :--- |
+   | `0` | `2` | `magic` | Exact byte vector **`[0x53, 0x54]`** (`0x5453` LE `u16`) |
+   | `2` | `1` | `version` | `0x01` |
+   | `3` | `1` | `flags` | Bit 0: `first` (`chunk_idx == 0`); Bit 1: `last` (`chunk_idx == total_chunks - 1`); Bits 2..7 MUST be `0` |
+   | `4` | `4` | `transfer_id` | LE `u32` from framing-specific allocator (decoupled from `envelope.sequence`) |
+   | `8` | `2` | `chunk_idx` | LE `u16` (`0 <= chunk_idx < total_chunks`) |
+   | `10` | `2` | `total_chunks` | LE `u16` (`1 <= total_chunks <= configured_max_chunks <= 65_535`) |
+   | `12` | `2` | `payload_len` | LE `u16` (`received_frame_length == 16 + payload_len`, non-empty) |
+   | `14` | `2` | `crc16` | LE `u16` **CRC-16/IBM-3740** (`width=16, poly=0x1021, init=0xFFFF, refin=false, refout=false, xorout=0x0000`, `check("123456789") = 0x29B1`) over `header[0..14] || chunk_payload` |
+   - **Golden Vector:** For `transfer_id = 0x01020304`, single chunk (`flags = 0x03`), payload `[0xAA, 0xBB, 0xCC]`, the exact 19-byte frame is `53 54 01 03 04 03 02 01 00 00 01 00 03 00 7D A5 AA BB CC`.
+2. **Fixed Stride $P$ & Reservation Rule:**
+   - For codec-visible frame capacity $M$, stride $P = M - 16$ is fixed for the transfer: every non-final chunk has `payload_len == P`, the final chunk has `1 <= payload_len <= P`, and chunk $i$ writes to checked offset $i \cdot P$.
+   - Before allocating, verify $(N - 1)P + 1 \le L_{\max}$ and reserve $\min(N \cdot P, L_{\max})$ bytes.
+3. **Observed-Source Pre-Auth Budgets & Conflict Quarantine:**
+   - Key transfers by `(ingress_adapter_gen, observed_source, transfer_id)`—never by unauthenticated claimed `PeerId`.
+   - Enforce global and per-link/source caps on reserved buffer bytes, active transfers, source table entries, quarantine tombstones, and post-reassembly verification queues.
+   - Invalid CRC/header drops without mutating existing transfers; identical duplicate chunk is an idempotent no-op; conflicting bytes/length/metadata at the same transfer key immediately aborts the transfer and records a bounded quarantine tombstone until the transfer's hard absolute monotonic deadline.
+4. **TCP Stream Framing:**
+   - `TcpTransport` uses direct length-prefixed framing (`u32_le(delivery_length) || serialized_delivery`) with pre-allocation length checks, cancellation-safe read state, and connection closure on malformed frames.
+
+#### 3. Originator-Authenticated Gossip Recipient Wrappers (`W9-04` Implemented / `W10-03` Planned)
+
+1. **Encode Inner Update Once (`InnerUpdateV1`):**
+   - Canonical inner object binds: `originator`, `scope_id`, `round_id`, `contribution_id`, `base_checkpoint_digest`, `payload_kind`, `compression_schema_version`, `num_elements`, and `encoded_payload`.
+   - Compute `inner_digest = SHA256("swarmtorch.update.v1" || u64_le(inner_length) || exact_canonical_inner_bytes)`.
+2. **Originator-Signed Recipient Wrapper (`RecipientWrapperV1`, `BundledGossipDeliveryV1`):**
+   - To disseminate over gossip/relays while honoring `ADR-0020` receiver-bound `SessionId`, the **original contributor** signs a recipient wrapper over `(domain, version, originator, intended_recipient, scope_id, recipient_session_id, delivery_seq, timestamp_secs, message_type, inner_digest, inner_length)`.
+   - Relays may forward the bundled `(recipient_wrapper, inner_update)` unchanged, but relay link authentication never grants authority to mint contributor wrappers.
+
+#### 4. Separate Optional `Zenoh` and `Iroh` Adapter Crates (`W12-02` — Planned Contract)
+
+- Package as separate crates (`swarm-torch-transport-zenoh`, `swarm-torch-transport-iroh`) with independently verified compiler profiles (`iroh 1.4.1` declares Rust `1.91` / edition 2024; `zenoh 1.10.2` declares `1.75.0` with its own dependency graph).
+- **Iroh Identity & 1-RTT Stream Contract:** Allow distinct transport (`EndpointId`) and application (`PeerId`) keys by default. Use reliable QUIC streams with length-prefixed delivery framing, ALPN matching the versioned delivery protocol, and completed TLS handshake enforcement (rejecting 0-RTT / 0.5-RTT early data from mutating replay, EF, model, or DP state).
+- **Zenoh Routing vs. Auth:** Zenoh topic keys guide routing only; admission, pinning, and memory budgets rely strictly on verified wrappers/sessions, and native ROS 2 `rmw_zenoh` CDR interop is explicitly distinguished from SwarmTorch's Zenoh carrier topic hierarchy.
+
+-----
+
+## ADR-0023: Unified Swarm Round Coordinator, Physical CAS Checkpoints, Strict Manifest Trust Policy, Cross-Process Bundle Locking, `FedAsync`, and Durable RDP Accounting
+
+**Status:** Contract Ratified (2026-11-02; Planned for Wave 10 & Wave 12)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Extends:** ADR-0004B, ADR-0006A, ADR-0014, ADR-0016, ADR-0017, ADR-0018  
+**Roadmap Items:** `W10-01`, `W10-02` (Wave 10), `W12-03` (Wave 12), `P2-02`, `P2-07`..`P2-10`, `P2-12`, `P2-20a`
+
+### Context
+
+Advancing [`swarm-torch`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Industries/Products/Software/SwarmTorch/SwarmTorch/swarm-torch/src/lib.rs) from single-process orchestration metadata to durable, verifiable distributed round coordination requires:
+1. Moving from metadata-only recipe tracking to content-addressed physical checkpoint storage (`blobs/sha256/<digest>`), cross-process bundle locking, and strict manifest verification (`TrustPolicy::Strict`).
+2. Separating the lifecycles of model round commit, differential privacy budget release, and error-feedback state acknowledgment (`StateAck`), since a model rollback cannot erase an observed privacy release or reverse an issued `StateAck`.
+
+### Decision
+
+#### 1. Typed Learning Transition, Round Admission, & Session Ergonomics (`W10-01` — Planned Contract)
+
+1. **Typed Update Semantics (`ModelDeltaV1` Default, `GradientV1` Separate):**
+   - For multi-step local training / `FedProx`, `ModelDeltaV1` is the default profile:
+     $$\Delta_i = w_i^{\mathrm{local}} - w_{\mathrm{parent}}, \qquad a = \operatorname{Aggregate}(\Delta_1, \dots, \Delta_n), \qquad w_{\mathrm{candidate}} = w_{\mathrm{parent}} + \eta_{\mathrm{server}} a \quad (\eta_{\mathrm{server}} = 1.0)$$
+   - **Single Owner for `FedProx`:** The local training objective layer computes $\nabla F_i(w) + \mu(w - w_{\mathrm{parent}})$ **exactly once**; the local optimizer steps with $\eta_{\mathrm{local}}$; the coordinator mixes the resulting $\Delta_i$. (`GradientV1` is a separate profile that aggregates single-step gradients and invokes the server optimizer once.)
+2. **Authenticated Round Context & One Contribution Per Peer:**
+   - Bind `(run_scope, round_id, eligible_cohort, parent_commit_id, parent_checkpoint_digest, model_id, schema_hash, update_kind, recipe_hash, aggregator_config, f, compressor_config, ef_state_gen_version, contribution_id)`.
+   - Originator identity comes strictly from the verified `ADR-0022` recipient wrapper. Reject future rounds *before* unsigned staleness subtraction.
+   - **Deduplication & Equivocation Policy:** Same logical contribution & digest from the same peer is an idempotent ack (counted once in quorum); a different contribution digest from an already-admitted peer in the same round is rejected and recorded as an **equivocation conflict** (never silently replacing the first). Freeze input buffers before aggregation so concurrent `EF21` innovations cannot mutate active round inputs. Re-verify $(n, f, m)$ quorum after timeouts/dropouts.
+3. **Explicit Fallible `DataOpsSession` Lifecycle:**
+   - Provide explicit `open` / `create` / `resume` constructors and a fallible `commit_and_close` / `finish` method returning the durable receipt or recoverable error.
+   - Enforce generation/write-capability guards on shared `Arc<RunArtifactSink>` handles so stale handles cannot mutate a sealed generation. Keep `Drop` limited to resource release and best-effort private staging cleanup.
+
+#### 2. Physical CAS Checkpoints, Authoritative Commit, & Validated Cache Reuse (`W10-01` — Planned Contract)
+
+1. **Separate Three Identities:**
+   - **Recipe / Cache Key:** Identifies the requested computation, inputs, initial model, config, seed, numeric/backend profile, and algorithm state.
+   - **Content Digest:** SHA-256 of the actual serialized physical checkpoint bytes.
+   - **Resume-State Identity:** Complete operational state required to continue training (keeping private recovery state, signing keys, raw residuals, and DP noise seeds strictly separate from public distributable model weights).
+2. **Write-Once Object Publication & Durable Commit Point:**
+   - Serialize and validate under size bounds $\rightarrow$ hash canonical bytes $\rightarrow$ write to a unique staging file on the destination filesystem $\rightarrow$ check `sync_all()` errors (and parent directory sync on POSIX) $\rightarrow$ atomically link/rename under `blobs/sha256/<digest>` without overwriting conflicts $\rightarrow$ verify existing object length and digest before reuse.
+   - Converge candidate checkpoint objects, round provenance records, and the signed manifest on a single authoritative commit point under the bundle writer lock and expected-parent check. Crash before commit retains the previous generation; post-commit retries return the existing receipt.
+3. **Cache Hit Verification:**
+   - Preserve and validate actual runner output instances in `scheduler.rs` (exact declared output keys, verified content digests, sizes, schemas).
+   - A training/checkpoint cache hit requires: eligible `CachePolicy` (honoring `Bypass`), matching computation identity, **present and digest-verified physical checkpoint bytes**, satisfied `TrustPolicy`, compatible layout/resume state, and successful state restoration.
+
+#### 3. `TrustPolicy::Strict`, Cross-Process Bundle Lock (`P2-02`), & JSON Schemas (`P2-20a`) (`W10-02` — Planned Contract)
+
+1. **`TrustPolicy::Strict` as Verified-Consumer Default (`P2-10`):**
+   - Verified report loading (`report/load.rs`), checkpoint restoration, and cache admission default to `TrustPolicy::Strict`, requiring external trusted verifying keys authorized for the scope/role, bounded manifest decoding, valid `ManifestSignatureV1` over raw 16-byte `RunId` bytes (`"swarmtorch.manifest.sig.v1" || u32_le(schema_version) || run_id_raw_16_bytes || u64_le(signed_unix_nanos) || entries_hash`), expected run/model/head context (external freshness anchor against rollback), and verified digests/lengths for all consumed files.
+   - **Authenticated Input Set:** Strict consumers derive their input set exclusively from the authenticated manifest (ignoring unlisted optional files on disk) and consume the exact verified bytes in memory/staging rather than validating and reopening paths.
+   - `TrustPolicy::LegacyPermissive` is an explicit historical-inspection mode returning a machine-readable unverified status that cannot flow into verified restore/cache APIs.
+2. **Cross-Process Exclusive Bundle Lock (`P2-02`):**
+   - Guard all mutations across `RunArtifactBundle` (covering expected-parent check through manifest publication) with a stable lockfile and an OS-backed exclusive file lock with a retained handle (using a Rust 1.75-compatible lock abstraction). Contention returns `BundleBusy` or follows a bounded wait; PID/timestamps are diagnostic only; lock/staging files are excluded from signed manifest entries.
+3. **Executable JSON Schemas (`P2-20a`):**
+   - Publish JSON Schema 2020-12 contracts and positive/negative fixtures in `W10-02` (with streaming read-time size bounds and lossless `u64` handling), while tracking `P2-20b` (Parquet/columnar schemas) under `W12-04` / `ADR-0025`.
+
+#### 4. Exact `FedAsync` Stale-Delta Mixing & Durable Rényi DP Accounting (`W12-03` — Planned Contract)
+
+1. **`FedAsync` Transition on Stale Deltas:**
+   - Reference transition: $w_{\mathrm{new}} = (1 - \alpha_t) w_{\mathrm{current}} + \alpha_t w_{\mathrm{local}}$ with $\alpha_t = \alpha_0 s(t - t_{\mathrm{base}})$.
+   - When the wire carries a delta $\Delta = w_{\mathrm{local}} - w_{\mathrm{base}}$ relative to an earlier base $w_{\mathrm{base}}$, the coordinator MUST apply the exact equivalent rule:
+     $$w_{\mathrm{new}} = w_{\mathrm{current}} + \alpha_t \left(w_{\mathrm{base}} - w_{\mathrm{current}} + \Delta\right)$$
+     (never $w_{\mathrm{current}} + \alpha_t \Delta$, which drops the base-drift correction whenever $w_{\mathrm{base}} \ne w_{\mathrm{current}}$).
+2. **Complete DP Mechanism Profile & Durable Pre-Release Accounting:**
+   - Every DP profile MUST declare: privacy unit (example vs. client), adjacency (add/remove vs. replacement), protected observer, clipping boundary ($C$), sensitivity, sampling regime, CSPRNG noise generation location, Rényi DP (RDP) accountant orders $\alpha > 1$:
+     $$\varepsilon(\delta) \le \min_{\alpha > 1} \left[\sum_t \rho_t(\alpha) + \frac{\log(1/\delta)}{\alpha - 1}\right]$$
+     and observable transcript scope.
+   - **Durable Pre-Release Commit:** Privacy budget spending MUST be durably committed across the privacy scope **before** the first externally observable release. Aborted model rounds or checkpoint rollbacks never refund spent budget; retransmissions of the same sanitized payload reference the existing release record.
+   - **Ordering with `EF` and `SharedSeedSparse` Commitments:** Local DP sanitization produces $z_t$ **first**; `ErrorFeedbackCompressor` and pre-seed Merkle/vector commitments operate solely on sanitized $z_t$ and public/sanitized history so that commitments, openings, and compressed packets are pure post-processing of the DP mechanism.
+
+-----
+
+## ADR-0024: Reference Models, Analytical Losses, SafeTensors Checkpoint Profile, and Isolated Framework Backend Adapters
+
+**Status:** Accepted (`W9-04`, `W9-05`, `W9-06` Implemented in Wave 9; `W11-04`, `W12-01` Planned)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Extends:** ADR-0001, ADR-0002, ADR-0009, ADR-0010  
+**Roadmap Items:** `W9-04`, `W9-05`, `W9-06` (Wave 9), `W11-04` (Wave 11), `W12-01` (Wave 12), `P2-11` (`bincode` / `burn` removal)
+
+### Context
+
+Review of the model, loss, and framework adapter boundaries across `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch` established four architectural requirements:
+1. **Remove Unused Default `burn` Scaffold (`W9-05` / `P2-11`):** Removing the unimplemented `BurnModelWrapper` scaffold and default `burn` / `burn-ndarray` dependency path eliminates 88 transitive packages from `Cargo.lock` (including `bincode 2.0.0-rc.3` `RUSTSEC-2025-0141`) while isolating future framework bridges to an optional adapter crate (`W12-01`).
+2. **Unsized Model Inputs & Contiguous Parameter Buffers (`W9-04`, `W9-06`):** Relaxing `SwarmModel::Input: ?Sized`, removing restrictive `<Input = (), Output = ()>` constraints from `SwarmOptimizer` and `FitnessFunction`, and storing `MlpModelWithCapacity` parameters in a single contiguous buffer allow reference models to implement `SwarmModel` directly under both `no_std` and `alloc`.
+3. **Additive SafeTensors Checkpoint Profile (`W11-04`):** SafeTensors interoperability requires an additive dependency profile (`safetensors >= 0.7.0`) and strict pre-parse header/tensor validation before applying weights.
+4. **LoRA Factor Aggregation Algebra (`W12-01`):** Because $\operatorname{mean}(B) \times \operatorname{mean}(A) \ne \operatorname{mean}(B \times A)$, LoRA adapter aggregation requires an explicit mathematical profile.
+
+### Decision
+
+#### 1. Dependency Isolation & Truthful MSRV / Advisory Accounting (`W9-05` / `P2-11` — Implemented)
+
+1. **Remove Unused Default `burn` & Fix Feature Edges:**
+   - `W9-05` removes the unused `burn = "0.14"` and `burn-ndarray = "0.14"` dependency path from the workspace (`Cargo.toml`), `swarm-torch-models`, and facade (`swarm-torch`), including the associated feature forwarding (`burn`, `burn-backend`) and the unimplemented public integration scaffold (`swarm-torch-models/src/burn_integration.rs`). Removing `burn` retires `bincode 2.0.0-rc.3` (`RUSTSEC-2025-0141`) from `Cargo.lock` and `deny.toml` while preserving historical closure evidence (`EX-2026-04-05-03`) in `supply-chain/exemption-rationale.md`. Burn may be reintroduced in `W12-01` through an optional `swarm-torch-backends` crate once a working bridge, interoperability tests, reviewed dependencies, and a tested compiler profile are delivered.
+   - `swarm-torch-models/Cargo.toml` defines `std = ["alloc", "swarm-torch-core/std"]`.
+   - Rust `1.75` is preserved as the verified compatibility target for `swarm-torch-core`, `swarm-torch-models`, and base `swarm-torch-net`.
+
+#### 2. Generic Model Contract, Contiguous Parameter Layout, & Analytical Losses (`W9-04`, `W9-06` — Implemented)
+
+1. **Repair `SwarmModel`, `SwarmOptimizer`, and `FitnessFunction`:**
+   - Relax `type Input: ?Sized;` on `SwarmModel`, remove `<Input = (), Output = ()>` constraints from `SwarmOptimizer` and `FitnessFunction`, and **preserve `SwarmOptimizer::Error`** (`fn step(&mut self, model: &mut Self::Model, gradients: &[f32]) -> Result<(), Self::Error>`).
+   - `LinearModelWithCapacity<MAX_PARAMS, MAX_OUTPUT>` and `MlpModelWithCapacity<MAX_PARAMS, MAX_HIDDEN, MAX_OUTPUT>` in `swarm-torch-models` implement `SwarmModel<Input = [f32], Output = LinearOutput<MAX_OUTPUT>, Error = ModelError>` directly, and `MlpModelWithCapacity` stores parameters in a **single contiguous parameter buffer** with checked layer offsets so `parameters()` / `parameters_mut()` safely cover the entire network.
+2. **Bounded Analytical Loss & Optimizer Package (`W9-06`):**
+   - **Linear / ReLU MLP:** Checked shapes, defined active output lengths, contiguous layout, explicit ReLU derivative at `0.0` (`0.0`), and deterministic non-degenerate initialization (`init_deterministic`).
+   - **MSE Loss:** Mean and sum reductions (`Reduction::Mean`, `Reduction::Sum`) with factor-of-$2/N$ gradient convention, verified against scalar finite-difference oracles.
+   - **Cross-Entropy Loss:** Operates on raw logits using numerically stable log-sum-exp ($\log \sum_c \exp(z_c - z_{\max}) + z_{\max}$), checked class indices, explicit batch reduction, and verified `no_std` `exp`/`log` support (via `libm` when `std` is disabled).
+   - **Huber Loss:** Requires finite positive $\delta > 0$, pinning exact piecewise quadratic/linear scaling ($0.5 r^2$ for $|r| \le \delta$, $\delta(|r| - 0.5\delta)$ for $|r| > \delta$), verified on both sides of $|r| = \delta$.
+   - **SGD Optimizer:** Explicit learning-rate domain ($\eta > 0$, finite), momentum initialization/reset semantics, weight-decay convention and update order, and multi-step state restore.
+
+#### 3. `SwarmTorchCheckpointV1` SafeTensors Profile (`W11-04` — Planned Contract)
+
+- Package SafeTensors interoperability in an optional format adapter crate or feature boundary using an additive release (`safetensors >= 0.7.0`, MSRV `1.80`).
+- Define **`SwarmTorchCheckpointV1`** profile over SafeTensors:
+  1. Enforce strict pre-parse bounds on header JSON size, tensor count, tensor name length, rank, and total byte size, with checked shape-product and byte-offset arithmetic and duplicate-name rejection.
+  2. Restrict allowed `Dtype`s (`F32`, plus explicitly declared quantized/half profiles) and **validate that every loaded floating-point parameter is `.is_finite()`** before applying any parameter to a target model (transactional all-or-nothing model application).
+  3. Compute canonical `model_schema_hash` using an unambiguous **length-delimited binary encoding**:
+     $$\text{schema\_hash} = \text{SHA-256}\!\left(\texttt{"swarmtorch.schema.v1"} \;\|\; \text{u32\_le}(N_{\text{tensors}}) \;\|\; \bigoplus_{i=1}^{N_{\text{tensors}}} \left(\text{u32\_le}(\text{name\_len}) \;\|\; \text{name} \;\|\; \text{u8}(\text{dtype\_tag}) \;\|\; \text{u8}(\text{trainable}) \;\|\; \text{u32\_le}(\text{rank}) \;\|\; \bigoplus_{r} \text{u64\_le}(\text{dim}_r)\right)\right)$$
+  4. Bind SafeTensors weight blobs to optimizer state, EF state, round/base identity, and RNG/config metadata via the signed `ADR-0023` manifest.
+
+#### 4. External Framework Bridges & LoRA Update Algebra (`W12-01` — Planned Contract)
+
+- Place working Burn and Candle bridges in `swarm-torch-backends` with explicit host/device transfer methods and independent compiler profiles.
+- **LoRA Aggregation Contract:** Require a common immutable base model hash, fixed rank $r$ and scaling $\alpha / r$, deterministic factor initialization, and an explicit aggregation rule: either (a) single-factor training (freezing $A$ and aggregating $\Delta B$), (b) small-step factor-delta averaging with documented approximation bounds, or (c) **FLoRA** (Wang et al., NeurIPS 2024) block-diagonal factor stacking for exact cross-term preservation $\frac{1}{n}\sum_i B_i A_i$.
+
+-----
+
+## ADR-0025: Deterministic WebAssembly Extension Sandbox (`wasmi`) and Columnar Data Runner
+
+**Status:** Contract Ratified (2026-11-02; Planned for Wave 12)  
+**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Deciders:** Core Team  
+**Extends:** ADR-0016, ADR-0017, ADR-0018, ADR-0023  
+**Roadmap Items:** `W12-04` (Wave 12), `P2-20b` (Parquet/Columnar Schema Conformance)
+
+### Context
+
+Specification of the `wasmi` extension sandbox and physical columnar data runner (`W12-04`) requires:
+1. Installing `store.limiter(|state| &mut state.limits)` and engine fuel on the `Store` *before* module instantiation and start-function execution so memory and table limits are actively enforced.
+2. Configuring `trap_on_grow_failure(true)` and single-memory/single-table store bounds so failed allocations trap deterministically rather than returning `-1` to guest code.
+3. Isolating `wasmi` (`wasmi 2.0.0` requires Rust `1.86`) in an optional crate or feature boundary with `validate` and deterministic float semantics so base Rust `1.75` crates remain unaffected.
+
+### Decision
+
+#### 1. Installed `wasmi` Resource Enforcement & Execution Boundary (`W12-04` — Planned Contract)
+
+1. **Ownership & Admission Gate:** `ADR-0025` owns the Wasm sandbox host and columnar data runner; `ADR-0023` requires an admitted sandbox execution profile before any extension output can enter the coordinator, CAS checkpoint store, or signed manifest provenance graph.
+2. **Mandatory Limiter & Fuel Installation Before Instantiation:**
+   - Configure `StoreLimitsBuilder::new().memory_size(max_memory_bytes).memories(1).tables(1).table_elements(max_table_elements).instances(1).trap_on_grow_failure(true).build()`.
+   - **Attach the limiter to `Store` before instantiation or start-function execution:**
+     ```rust
+     store.limiter(|state| &mut state.limits);
+     ```
+   - Enable engine fuel (`config.consume_fuel(true)`), configure recursion/value-stack limits, and supply bounded fuel (`store.set_fuel(max_fuel_units)`) before instantiation so start functions cannot spin unboundedly.
+3. **Complete Boundary Controls & Zero Ambient Authority:**
+   - Bound raw `.wasm` module bytes, parsing/validation/translation work, allowed Wasm proposals, and concurrent store count.
+   - Verify `SHA-256(wasm_bytes)` against `SandboxedExtensionPolicy::allowed_module_hashes` before parsing.
+   - Link **zero** ambient WASI filesystem, network, clock, environment, or credential imports.
+   - Validate all guest pointer/length pairs `(ptr, len)` using checked `u32`/`usize` arithmetic against the active linear memory slice bounds, and bound host callback work and host input/output allocations.
+   - Failed or trapped executions MUST leave zero committed outputs in CAS or `DataOpsSession`.
+4. **Toolchain, Feature, & Hardware Profile Pinning:**
+   - Explicitly pin the `wasmi` version, enabled features (`validate` + `deterministic` NaN/float profile), and verified compiler floor (`wasmi 2.0.0` requires Rust `1.86`; isolate in a dedicated optional crate or feature profile with its own CI job so base Rust `1.75` crates remain unaffected).
+   - Label the `16 MiB` guest linear memory default as a gateway/host profile (`TacticalMesh` / `ClusterFast`), with measured host overhead documented.
+
+#### 2. Physical Data Execution in `NativeOpRunner` & Parquet Schemas (`W12-04` / `P2-20b` — Planned Contract)
+
+- Upgrade `NativeOpRunner` (`passthrough`, `filter_rows`, `union`) to read and write physical NDJSON / Arrow-IPC / Parquet payloads under `runs/<run_id>/artifacts/`, validate output schemas and row/byte cardinalities before CAS publication, and close `P2-20b` by publishing versioned Parquet/Arrow schema contracts and cross-consumer test fixtures.

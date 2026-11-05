@@ -15,13 +15,13 @@ name = "swarm_torch_net"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "tcp-transport"]
-std = ["alloc", "swarm-torch-core/std", "tokio", "async-trait"]
+default = ["std"]
+std = ["alloc", "swarm-torch-core/std"]
 alloc = ["swarm-torch-core/alloc"]
 
-# Transport implementations
-tcp-transport = ["std"]
-udp-transport = ["std"]
+# Transport implementations (narrow Tokio sub-features only when transport is enabled)
+tcp-transport = ["std", "dep:tokio", "tokio/net", "tokio/io-util", "tokio/time", "tokio/sync"]
+udp-transport = ["std", "dep:tokio", "tokio/net", "tokio/time", "tokio/sync"]
 ble-transport = []
 lora-transport = []
 wifi-transport = []
@@ -31,14 +31,11 @@ swarm-torch-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true }
 
-# Async trait for transport trait (std only)
-async-trait = { version = "0.1", optional = true }
-
-# Async runtime (optional, for std builds)
-tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
+# Async runtime (optional, only activated by tcp-transport / udp-transport)
+tokio = { workspace = true, optional = true }
 
 # For embedded transports
 embassy-time = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

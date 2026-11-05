@@ -2,87 +2,69 @@
 
 ## Vulnerability Disclosure
 
-**Preferred:** GitHub private vulnerability reporting  
+**Preferred:** [GitHub Private Vulnerability Reporting](https://github.com/swarmic/SwarmTorch/security/advisories/new)  
+**Direct Contact:** `swarmiclabs@gmail.com`  
 **Response Time:** Initial acknowledgment within 48 hours  
 **Disclosure Policy:** 90-day coordinated disclosure
 
 ### Reporting Process
 
-1. **Do NOT open public issues** for security vulnerabilities
-2. Use [GitHub Security Advisories](https://github.com/swarmic/SwarmTorch/security/advisories/new) for private reporting
-3. Optionally email security@swarmtorch.dev (if you prefer) with:
-   - Description of vulnerability
-   - Steps to reproduce
-   - Affected versions
-   - Suggested fix (if any)
+1. **Do NOT open public issues or pull requests** for security vulnerabilities.
+2. Submit a private report via [GitHub Security Advisories](https://github.com/swarmic/SwarmTorch/security/advisories/new) (preferred), or email **`swarmiclabs@gmail.com`** with:
+   - Description of the vulnerability and affected component/crate
+   - Steps or minimal test case to reproduce
+   - Affected versions / commit SHA and feature profile
+   - Suggested remediation (if any)
 
 ### Scope
 
-- `swarm-torch-*` crates and their dependencies
-- Build/CI configuration
-- Cryptographic implementations
+- `swarm-torch-*` crates (`swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, `swarm-torch-runtime`, `swarm-torch`) and their locked dependency graph
+- Cryptographic authentication, replay protection, cohort admission, and Byzantine aggregation logic
+- Artifact manifest verification and path-confinement logic
+- Build/CI configuration (`.github/workflows/`, `deny.toml`, `supply-chain/`)
 
 ---
 
-## Current Security Posture (Reality Check)
+## Current Security Posture (Wave 9 / `v0.1.0-alpha.9` Reality Check)
 
-SwarmTorch is pre-1.0 and actively building out its security posture. Core security primitives are implemented:
+SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its implemented layers:
 
-- **Message Authentication:** ✅ Ed25519 signatures (M4-01)
-- **Sender Identity Contract:** ✅ `MessageEnvelope.sender` is raw Ed25519 public key bytes (ADR-0008B)
-- **Replay Protection:** ✅ Sequence monotonicity and timestamp validation (M4-02)
-- **Gradient Validation:** ✅ Bounds checking and NaN/Inf detection
+- **Domain-Separated Message Authentication (`ADR-0008B`, `ADR-0021`, `W9-02`):**
+  - `MessageEnvelope` (`ProtocolVersion::V1_0`) binds protocol version (`1.0`), `message_type`, sender Ed25519 public key (`[u8; 32]`), `sequence`, `timestamp`, `round_id`, `swarm_id`, `session_nonce`, and `SHA-256(payload)` under domain tag `"swarmtorch.envelope.v1"` (`KeyPair::sign_with_domain` / `verify_with_domain`).
+- **Six-Stage Atomic Receive Pipeline (`ADR-0021`, `W9-02`):**
+  - `MessageEnvelope::decode_and_verify_payload` enforces `MAX_FRAME_BYTES = 65_536` *before* deserialization, validates version/key/timestamp bounds, checks cohort allowlist and sequence window read-only before Ed25519 signature verification, commits replay state only after signature verification succeeds, and decodes the inner payload last. Unauthenticated frames cannot mutate replay or peer state.
+- **Safe `BTreeMap` Replay Protection, `CohortAllowlist`, & Restart Recovery (`ADR-0020` / `ADR-0021`, `W9-02`):**
+  - Replay state uses a 100% safe, deterministic dual-tree `BTreeMap` store (`entries_by_peer` + `expiry_index`) with bounded per-peer and total capacity (`max_tracked_peers`, `max_entries_per_peer`), eliminating `lru` from the dependency tree.
+  - Supports pinned cohort admission (`CohortAllowlist`) and explicit startup/restart recovery gating (`RecoveryRequired`) cleared via a fresh receiver-issued challenge handshake (`SessionHandshakeChallenge`, domain `"swarmtorch.handshake.v1"`).
+- **Byzantine Aggregation & Compression Validation (`ADR-0019`, `ADR-0020`, `W9-01`, `W9-03`):**
+  - All aggregators (`FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, and `Bulyan` `BulyanProfile::IterativeKrumV1`) validate every coordinate of every update for `.is_finite()`, enforce `MAX_COHORT_SIZE = 1024`, sort via `total_cmp`, and widen sums/midpoints/distances to `f64` before narrowing to finite `f32`.
+  - Compression codecs (`compression.rs`) validate hyperparameters and finiteness prior to buffer mutation, and `dataops.rs` enforces `MAX_RAW_SOURCE_URI_LEN = 4096` before URI redaction allocation.
+- **Artifact Bundle Path Confinement (`ADR-0016`, Wave 8.0/8.1):**
+  - Manifest verification rejects relative path traversal (`..`), absolute paths, and symlink escapes on both Unix and Windows CI lanes.
 
-**Known Limitations:**
+### Known Current Boundaries & Planned Hardening (Waves 10–12)
 
-- Replay cache is **memory-only** (non-persistent). Node restart resets the cache, creating a brief replay window (≤ max_clock_skew_secs, default 60s).
-- Replay cache uses bounded LRU capacity. Under extreme peer churn, an evicted peer can be re-admitted as a fresh replay state entry.
-- Transport security (TLS/DTLS) is planned but not yet implemented.
-- Sybil resistance requires external identity providers (see ADR-0008A).
+- **Concrete Network Transports & Low-MTU Framing:** Current `swarm-torch-net` provides `PacketTransport`, `SwarmTransport`, `MockTransport`, and `MessageEnvelope` v1 verification. Low-MTU chunk reassembly (`ChunkedFrameCodec`, `W11-03`) and optional QUIC/Zenoh adapters (`W12-02`) are planned.
+- **Signed Artifact Manifests & Cross-Process Bundle Locking:** Cryptographic manifest signatures (`ManifestSignatureV1`), `TrustPolicy::Strict` default report/checkpoint loading, and OS-backed exclusive bundle lockfiles (`P2-02`, `P2-10`) are scheduled for Wave 10 (`W10-02`).
+- **Sandboxed Extension Host (`wasmi`):** Pipeline extension sandboxing with installed memory/table limiters and engine fuel (`ADR-0018`, `ADR-0025`) is scheduled for Wave 12 (`W12-04`).
 
-**Operational controls for replay limitations (current wave policy):**
+---
 
-- Treat process restart as a replay-boundary event and avoid rejoining an untrusted mesh until `max_clock_skew_secs` has elapsed.
-- Keep sender sequence generation monotonic per peer key and avoid sequence resets across rolling restarts.
-- Use capacity sizing (`ReplayProtection::try_with_config`) appropriate for expected active-peer cardinality to reduce LRU-eviction replay exposure.
+## Supply-Chain Security (`P2-05`, `P2-11`)
 
-**SecurityConfig enforcement scope (current reality):**
+### Dependency Auditing & Wave 9 Diet
 
-- `swarm_torch_core::crypto::SecurityConfig` is currently a configuration surface, not a runtime enforcement hook in `swarm-torch-net` verifier flow.
-- Do not treat `SecurityConfig` fields as active policy toggles for transport auth/replay decisions in this release.
-- Enforcement wiring is tracked as near-term follow-on work in `docs/plans/v0.1.0-alpha.8x-phase2-remediation-roadmap.md`.
+CI enforces supply-chain checks on every push and pull request:
 
-See `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md` for the complete threat model and implementation status.
+| Tool | Purpose | Config | Mode |
+|------|---------|--------|------|
+| `cargo deny` (`0.19.0`) | License, ban, and advisory enforcement | [`deny.toml`](deny.toml) | **Blocking** |
+| `cargo audit` (`0.22.1`) | RustSec advisory database | Built-in | **Blocking** |
+| `cargo vet` (`0.10.2`) | Human audit & exemption tracking | [`supply-chain/`](supply-chain/) | Advisory (promoted to blocking in `W10-02`) |
 
-## Supply-Chain Security
+In Wave 9 (`W9-02`, `W9-05`), SwarmTorch removed `lru 0.12.5`, `burn 0.14`, `burn-ndarray 0.14`, `bincode 2.0.0-rc.3`, and `async-trait` from the workspace dependency graph, retiring `RUSTSEC-2025-0141`, `RUSTSEC-2026-0002`, and `RUSTSEC-2026-0253`, and closing exemptions `EX-2026-04-05-02` and `EX-2026-04-05-03` in [`supply-chain/exemption-rationale.md`](supply-chain/exemption-rationale.md).
 
-### Dependency Auditing
-
-CI now includes a dedicated supply-chain job. Wave 8.1 policy:
-
-| Tool | Purpose | Config |
-|------|---------|--------|
-| `cargo audit` | RustSec advisory database | Built-in |
-| `cargo deny` | License/ban/advisory enforcement | [`deny.toml`](deny.toml) |
-| `cargo vet` | Human audit tracking | [`supply-chain/`](supply-chain/) |
-
-Enforcement mode:
-- `cargo deny`: blocking in CI
-- `cargo audit`: blocking in CI
-- `cargo vet`: advisory for one wave (Wave 8.1), then promoted to blocking once audit baseline is stabilized
-
-Pinned tool baseline for Wave 8.1 CI:
-- `cargo-deny` `0.19.0`
-- `cargo-audit` `0.22.1`
-- `cargo-vet` `0.10.2`
-
-Current `cargo audit` state at Wave 8.1:
-- Vulnerability failures: none (blocking gate passes).
-- Non-failing warnings remain on transitive dependencies (`bincode 2.0.0-rc.3` unmaintained via `burn`, `lru 0.12.5` unsound warning).
-- `cargo deny` tracks `RUSTSEC-2025-0141` as an explicit temporary ignore in `deny.toml` with Wave 8.2 closure target (`P2-11`).
-- `cargo vet` baseline now includes first-party audits for critical crates (`ed25519-dalek`, `sha2`, `postcard`) and reduced exemption count from the initial bootstrap.
-
-Maintainers should still run the following locally before merging:
+Maintainers and contributors can run the supply-chain checks locally:
 
 ```bash
 cargo deny check
@@ -90,77 +72,18 @@ cargo audit
 cargo vet
 ```
 
-Exemption governance:
-- New `cargo vet` exemptions must include explicit rationale in [`supply-chain/exemption-rationale.md`](supply-chain/exemption-rationale.md).
-- PRs that add `[[exemptions.*]]` without rationale updates are rejected by CI policy.
-- Exemptions must include an owner and removal target.
+### Exemption Governance
 
-### Policy
-
-- **No unvetted dependencies** may be merged without explicit sign-off
-- **License policy violations** are blocked by [`deny.toml`](deny.toml) checks in CI (project license is MPL-2.0; strong copyleft dependencies like GPL/AGPL remain disallowed).
+- Any PR that adds a new `[[exemptions.*]]` entry in [`supply-chain/config.toml`](supply-chain/config.toml) **must** include an explicit rationale entry, owner, and removal target in [`supply-chain/exemption-rationale.md`](supply-chain/exemption-rationale.md) (enforced automatically by `.github/workflows/rust.yml`).
+- Project license is **MPL-2.0**; incompatible strong-copyleft dependencies (GPL/AGPL) are rejected by [`deny.toml`](deny.toml).
 
 ---
 
-## CI/CD Hardening
+## CI/CD, Review Isolation, & Unsafe Code Policy
 
-### Workflow Permissions
-
-**Planned CI default:**
-
-```yaml
-permissions:
-  contents: read        # Default least-privilege
-  id-token: write       # Required for attestations
-  attestations: write   # Required for artifact signing
-```
-
-### Action Pinning
-
-Third-party actions in `.github/workflows/rust.yml` are pinned to full-length commit SHAs, not tags.
-
-### Cross-Platform Trust-Boundary Checks
-
-CI now includes a dedicated Windows lane that runs artifact manifest trust-boundary tests (`validate_manifest_*`) and report-loader trust checks (`load_report_*`) to reduce platform-specific path-validation blind spots.
-
----
-
-## Release Integrity
-
-### Artifact Attestations
-
-**Planned release posture:** releases should include Sigstore-backed attestations:
-- Build provenance (SLSA Level 2+)
-- Dependency manifest snapshot
-- Reproducible build verification
-
-### Verification
-
-```bash
-gh attestation verify swarm-torch-*.tar.gz --owner swarmic
-```
-
----
-
-## Docs.rs Constraints
-
-Docs.rs builds are sandboxed:
-- **Network access blocked** — no build-time fetching
-- **Constrained environment** (CPU/memory/time), so docs must build reliably
-- Build scripts and proc-macros run under these constraints and must not assume network access or arbitrary filesystem writes
-
-Our crates must build documentation without network dependencies.
-
----
-
-## Unsafe Code Policy
-
-All SwarmTorch crates currently set `#![forbid(unsafe_code)]`.
-
-If/when `unsafe` is introduced (FFI, SIMD, sandboxing hosts), it must be:
-
-- isolated behind a narrow crate boundary or module
-- documented with a safety rationale
-- accompanied by tests and (where relevant) fuzzing
-
-All `unsafe` blocks require safety documentation.
+1. **Workflow Least Privilege & Action Pinning:**
+   - `.github/workflows/rust.yml` runs under `permissions: contents: read`, uses `pull_request` (never `pull_request_target` on untrusted code), and pins all third-party GitHub Actions to full 40-character commit SHAs.
+2. **External Contribution Isolation:**
+   - External pull requests are reviewed and executed in isolated environments without maintainer credentials or release authority. Changes to `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, `build.rs`, `.github/**`, `supply-chain/**`, `CODEOWNERS`, or agent instruction files require explicit maintainer review (`@swarmic`).
+3. **Zero Unsafe Code (`#![forbid(unsafe_code)]`):**
+   - All workspace crates enforce `#![forbid(unsafe_code)]`.

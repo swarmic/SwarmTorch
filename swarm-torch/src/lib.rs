@@ -37,8 +37,7 @@
 //!
 //! - `std` (default): Standard library support
 //! - `tokio-runtime` (default): Use Tokio for async
-//! - `embassy-runtime`: Enable Embassy placeholder adapter (experimental; not in Rust 1.75 conformance gate)
-//! - `burn-backend` (default): Burn ML framework integration
+//! - `embassy-runtime`: Enable Embassy runtime adapter (experimental; not in Rust 1.75 conformance gate)
 //! - `robust-aggregation` (default): Byzantine-resilient aggregators
 //!
 //! ## Crate Structure
@@ -46,7 +45,7 @@
 //! - [`swarm_torch_core`]: Core algorithms and traits (no_std compatible)
 //! - [`swarm_torch_net`]: Network transport abstractions
 //! - [`swarm_torch_runtime`]: Async runtime glue (Tokio/Embassy)
-//! - [`swarm_torch_models`]: Model utilities and backend integrations
+//! - [`swarm_torch_models`]: Reference models, analytical losses, and optimizers
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -72,7 +71,10 @@ pub use swarm_torch_core::{
 
 pub use swarm_torch_net::{
     protocol::{MessageEnvelope, MessageType},
-    traits::{SwarmTransport, TransportCapabilities},
+    traits::{
+        PacketCapabilities, PacketRecvError, PacketSendError, PacketTransport, ReceivedFrame,
+        SwarmTransport, TransportCapabilities,
+    },
 };
 
 /// Artifact bundle writing/validation (std-only).

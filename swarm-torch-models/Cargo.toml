@@ -1,35 +1,27 @@
 [package]
 name = "swarm-torch-models"
-description = "Model utilities and backend integrations for SwarmTorch"
+description = "Reference models, analytical losses, and optimizers for SwarmTorch"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.81"
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords = ["machine-learning", "models", "burn", "pytorch"]
-categories = ["science", "machine-learning"]
+keywords = ["machine-learning", "models", "federated-learning", "no_std"]
+categories = ["science", "machine-learning", "no-std"]
 
 [lib]
 name = "swarm_torch_models"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "burn"]
-std = ["swarm-torch-core/std"]
+default = ["std"]
+std = ["alloc", "swarm-torch-core/std"]
 alloc = ["swarm-torch-core/alloc"]
-
-# Backend integrations
-burn = ["dep:burn", "dep:burn-ndarray"]
-tch = []  # tch-rs integration (optional, requires libtorch)
 
 [dependencies]
 swarm-torch-core = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
-
-# Burn ML framework
-burn = { workspace = true, optional = true }
-burn-ndarray = { workspace = true, optional = true }
 
 [dev-dependencies]

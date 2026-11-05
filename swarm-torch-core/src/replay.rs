@@ -1,47 +1,131 @@
-//! Replay protection for message envelopes
+//! Replay protection, cohort allowlists, and session-epoch recovery (`ADR-0008`, `ADR-0021`, `W9-02`).
 //!
-//! This module enforces sequence monotonicity and timestamp freshness to defend
-//! against replay and reorder attacks, as specified in ADR-0008.
+//! Replaces `lru::LruCache` with a 100% safe, deterministic `BTreeMap` replay store
+//! indexed by `(SwarmInstanceId, PeerId, SessionEpoch)` and a secondary expiry index
+//! `BTreeMap<(ExpiresAt, ReplayRecordKey), ()>`.
 //!
-//! ## Design
+//! ## Security Invariants (`ADR-0021`)
 //!
-//! - **Per-peer state**: Isolated sequence tracking prevents cross-peer attacks
-//! - **LRU cache**: Bounded memory (default 1000 peers)
-//! - **Timestamp validation**: Clock skew tolerance (default ±60s)
-//! - **Sequence window**: Small out-of-order tolerance (16 messages) for network reordering
-//!
-//! ## Known Limitations
-//!
-//! **Memory-only cache (non-persistent):**
-//! - Node restart resets the replay cache
-//! - Brief replay vulnerability window after restart (≤ max_clock_skew_secs)
-//! - Acceptable for alpha; persistent cache requires storage backend (future work)
-//!
-//! ## Assumptions
-//!
-//! - Loosely synchronized clocks via NTP (±60s default tolerance)
-//! - Monotonic sequence numbers per peer
-//! - Timestamp in Unix seconds (u32)
+//! 1. **No In-Window Eviction**: Active records whose timestamp window has not expired
+//!    ($\text{now} \le t_{\max} + A$) are **never** evicted when capacity is reached;
+//!    admission fails closed with [`ReplayError::CacheFull`].
+//! 2. **Expiry-Indexed Reclamation**: Once $\text{now} > t_{\max} + A$, any replay of a
+//!    prior message with $t \le t_{\max}$ is already rejected by the stateless timestamp
+//!    check $|\text{now} - t| \le A$, so the record can be safely reclaimed in $O(\log N)$ time.
+//! 3. **Cohort Allowlist Gate**: When a [`CohortAllowlist`] is configured, unauthorized peers
+//!    are rejected before any state allocation with [`ReplayError::UnauthorizedPeer`].
+//! 4. **Receiver-Challenged Epoch Recovery**: A peer that restarts with a higher `session_epoch`
+//!    must complete a signed 256-bit receiver challenge handshake (`swarmtorch.session.handshake.v1`);
+//!    unauthenticated epoch jumps are rejected with [`ReplayError::RecoveryRequired`].
 
+#[cfg(feature = "alloc")]
+use crate::crypto::{MessageAuth, SessionHandshakeChallenge, Signature};
 use crate::traits::PeerId;
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::collections::BTreeSet;
-#[cfg(feature = "alloc")]
-use lru::LruCache;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 /// Default sequence tolerance window size (messages).
-///
-/// Allows minor out-of-order delivery while bounding replay risk.
-/// Set to 0 for strict monotonic enforcement.
-const DEFAULT_SEQUENCE_TOLERANCE_WINDOW: usize = 16;
+pub const DEFAULT_SEQUENCE_TOLERANCE_WINDOW: usize = 16;
 /// Upper bound for configurable tolerance window.
-const MAX_SEQUENCE_TOLERANCE_WINDOW: usize = 256;
-const DEFAULT_CACHE_CAPACITY: usize = 1000;
-const DEFAULT_MAX_CLOCK_SKEW_SECS: u32 = 60;
+pub const MAX_SEQUENCE_TOLERANCE_WINDOW: usize = 256;
+/// Default replay cache capacity (records).
+pub const DEFAULT_CACHE_CAPACITY: usize = 1000;
+/// Default clock skew tolerance (seconds).
+pub const DEFAULT_MAX_CLOCK_SKEW_SECS: u32 = 60;
+
+/// 16-byte swarm deployment / cohort instance identifier (`ADR-0021`).
+pub type SwarmInstanceId = [u8; 16];
+
+/// Monotonically increasing sender session epoch (`ADR-0021`).
+pub type SessionEpoch = u64;
+
+/// Composite replay record key `(SwarmInstanceId, PeerId, SessionEpoch)` (`ADR-0008`, `ADR-0021`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplayRecordKey {
+    /// Swarm deployment / cohort identifier.
+    pub swarm_instance_id: SwarmInstanceId,
+    /// Canonical sender `PeerId`.
+    pub peer: PeerId,
+    /// Sender session epoch.
+    pub session_epoch: SessionEpoch,
+}
+
+impl ReplayRecordKey {
+    /// Create a scoped replay record key.
+    pub const fn new(
+        swarm_instance_id: SwarmInstanceId,
+        peer: PeerId,
+        session_epoch: SessionEpoch,
+    ) -> Self {
+        Self {
+            swarm_instance_id,
+            peer,
+            session_epoch,
+        }
+    }
+
+    /// Default single-swarm key (`swarm_instance_id = [0; 16]`, `session_epoch = 0`).
+    pub const fn default_for_peer(peer: PeerId) -> Self {
+        Self {
+            swarm_instance_id: [0u8; 16],
+            peer,
+            session_epoch: 0,
+        }
+    }
+}
+
+/// Authorized cohort peer allowlist (`ADR-0008`, `ADR-0021`, `W9-02`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CohortAllowlist {
+    allowed_peers: BTreeSet<PeerId>,
+}
+
+#[cfg(feature = "alloc")]
+impl CohortAllowlist {
+    /// Create an empty cohort allowlist.
+    pub const fn new() -> Self {
+        Self {
+            allowed_peers: BTreeSet::new(),
+        }
+    }
+
+    /// Construct a cohort allowlist from an iterator of authorized `PeerId`s.
+    pub fn from_peers<I: IntoIterator<Item = PeerId>>(peers: I) -> Self {
+        Self {
+            allowed_peers: peers.into_iter().collect(),
+        }
+    }
+
+    /// Admit a `PeerId` to the cohort allowlist.
+    pub fn insert(&mut self, peer: PeerId) -> bool {
+        self.allowed_peers.insert(peer)
+    }
+
+    /// Remove a `PeerId` from the cohort allowlist.
+    pub fn remove(&mut self, peer: &PeerId) -> bool {
+        self.allowed_peers.remove(peer)
+    }
+
+    /// Check whether `peer` is a member of the cohort allowlist.
+    pub fn contains(&self, peer: &PeerId) -> bool {
+        self.allowed_peers.contains(peer)
+    }
+
+    /// Number of authorized peers in the cohort.
+    pub fn len(&self) -> usize {
+        self.allowed_peers.len()
+    }
+
+    /// Returns `true` if no peers are registered in the allowlist.
+    pub fn is_empty(&self) -> bool {
+        self.allowed_peers.is_empty()
+    }
+}
 
 /// Replay protection configuration errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,39 +155,41 @@ impl core::fmt::Display for ReplayConfigError {
 #[cfg(feature = "std")]
 impl std::error::Error for ReplayConfigError {}
 
-/// Replay protection state
-///
-/// Tracks per-peer sequence numbers and validates timestamp freshness.
+/// Safe expiry-indexed replay protection state (`ADR-0008`, `ADR-0021`, `W9-02`).
 #[derive(Debug)]
 #[cfg(feature = "alloc")]
 pub struct ReplayProtection {
-    /// Per-peer replay state (LRU eviction)
-    peer_state: LruCache<PeerId, PeerReplayState>,
-    /// Maximum clock skew tolerance (seconds)
+    /// Scoped per-peer replay state (`BTreeMap`, zero `unsafe`).
+    records: BTreeMap<ReplayRecordKey, PeerReplayState>,
+    /// Active session epoch per `(SwarmInstanceId, PeerId)`.
+    peer_epochs: BTreeMap<(SwarmInstanceId, PeerId), SessionEpoch>,
+    /// Secondary expiry index `(expires_at_secs, key)` for $O(\log N)$ post-window reclamation.
+    expiry_index: BTreeMap<(u64, ReplayRecordKey), ()>,
+    /// Outstanding receiver-issued session recovery challenges keyed by `(SwarmInstanceId, PeerId)`.
+    pending_challenges: BTreeMap<(SwarmInstanceId, PeerId), SessionHandshakeChallenge>,
+    /// Optional cohort membership allowlist.
+    cohort_allowlist: Option<CohortAllowlist>,
+    /// Maximum number of active replay records.
+    capacity: usize,
+    /// Maximum clock skew tolerance (seconds).
     max_clock_skew_secs: u32,
-    /// Sequence tolerance window (messages). Out-of-order delivery
-    /// within this window is accepted; beyond it is rejected as `TooOld`.
+    /// Sequence tolerance window (messages).
     tolerance_window: usize,
 }
 
 #[cfg(feature = "alloc")]
 impl ReplayProtection {
-    /// Create with default configuration
-    ///
-    /// - Capacity: 1000 peers
-    /// - Clock skew: 60 seconds
+    /// Create with default configuration (`capacity = 1000`, `max_clock_skew_secs = 60`, `window = 16`).
     pub fn new() -> Self {
-        match core::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY) {
-            Some(capacity) => Self {
-                peer_state: LruCache::new(capacity),
-                max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
-                tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
-            },
-            None => Self {
-                peer_state: LruCache::new(core::num::NonZeroUsize::MIN),
-                max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
-                tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
-            },
+        Self {
+            records: BTreeMap::new(),
+            peer_epochs: BTreeMap::new(),
+            expiry_index: BTreeMap::new(),
+            pending_challenges: BTreeMap::new(),
+            cohort_allowlist: None,
+            capacity: DEFAULT_CACHE_CAPACITY,
+            max_clock_skew_secs: DEFAULT_MAX_CLOCK_SKEW_SECS,
+            tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
         }
     }
 
@@ -112,30 +198,22 @@ impl ReplayProtection {
         capacity: usize,
         max_clock_skew_secs: u32,
     ) -> Result<Self, ReplayConfigError> {
-        let non_zero_capacity =
-            core::num::NonZeroUsize::new(capacity).ok_or(ReplayConfigError::ZeroCapacity)?;
-        Ok(Self {
-            peer_state: LruCache::new(non_zero_capacity),
+        Self::try_with_tolerance_window(
+            capacity,
             max_clock_skew_secs,
-            tolerance_window: DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
-        })
+            DEFAULT_SEQUENCE_TOLERANCE_WINDOW,
+        )
     }
 
     /// Create with custom configuration including tolerance window (fallible).
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum number of peers to track (LRU eviction)
-    /// * `max_clock_skew_secs` - Maximum allowed clock skew in seconds
-    /// * `tolerance_window` - Sequence tolerance window (0 = strict monotonic,
-    ///   max [`MAX_SEQUENCE_TOLERANCE_WINDOW`] = 256)
     pub fn try_with_tolerance_window(
         capacity: usize,
         max_clock_skew_secs: u32,
         tolerance_window: usize,
     ) -> Result<Self, ReplayConfigError> {
-        let non_zero_capacity =
-            core::num::NonZeroUsize::new(capacity).ok_or(ReplayConfigError::ZeroCapacity)?;
+        if capacity == 0 {
+            return Err(ReplayConfigError::ZeroCapacity);
+        }
         if tolerance_window > MAX_SEQUENCE_TOLERANCE_WINDOW {
             return Err(ReplayConfigError::ToleranceWindowTooLarge {
                 window: tolerance_window,
@@ -143,18 +221,29 @@ impl ReplayProtection {
             });
         }
         Ok(Self {
-            peer_state: LruCache::new(non_zero_capacity),
+            records: BTreeMap::new(),
+            peer_epochs: BTreeMap::new(),
+            expiry_index: BTreeMap::new(),
+            pending_challenges: BTreeMap::new(),
+            cohort_allowlist: None,
+            capacity,
             max_clock_skew_secs,
             tolerance_window,
         })
     }
 
-    /// Create with custom configuration
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum number of peers to track (LRU eviction)
-    /// * `max_clock_skew_secs` - Maximum allowed clock skew in seconds
+    /// Attach a [`CohortAllowlist`] so unauthorized peers are rejected before state mutation.
+    pub fn with_cohort_allowlist(mut self, allowlist: CohortAllowlist) -> Self {
+        self.cohort_allowlist = Some(allowlist);
+        self
+    }
+
+    /// Set or replace the [`CohortAllowlist`].
+    pub fn set_cohort_allowlist(&mut self, allowlist: Option<CohortAllowlist>) {
+        self.cohort_allowlist = allowlist;
+    }
+
+    /// Create with custom configuration (deprecated panicking wrapper).
     #[deprecated(
         since = "0.1.0-alpha.6x",
         note = "Use `try_with_config` instead. This constructor panics on invalid input."
@@ -169,9 +258,7 @@ impl ReplayProtection {
         }
     }
 
-    /// Check timestamp validity without mutating state (fail-fast optimization)
-    ///
-    /// Validates that the message timestamp is within the acceptable clock skew window.
+    /// Check timestamp validity without mutating state (fail-fast optimization).
     pub fn check_timestamp_only(&self, ts: u32, now: u32) -> Result<(), ReplayError> {
         if !self.is_timestamp_valid(ts, now) {
             return Err(ReplayError::Expired {
@@ -183,24 +270,119 @@ impl ReplayProtection {
         Ok(())
     }
 
-    /// Validate sequence number and update state
-    ///
-    /// Checks for duplicate or retrograde sequences and updates peer state.
-    pub fn validate_sequence(&mut self, peer: &PeerId, seq: u64) -> Result<(), ReplayError> {
-        let tw = self.tolerance_window;
-        match self.peer_state.get_mut(peer) {
-            Some(state) => state.validate_and_update(seq, *peer, tw),
-            None => {
-                // First message from this peer
-                self.peer_state.put(*peer, PeerReplayState::new(seq));
-                Ok(())
+    /// Check cohort allowlist authorization without mutating state.
+    pub fn check_peer_authorized(&self, peer: &PeerId) -> Result<(), ReplayError> {
+        if let Some(ref allowlist) = self.cohort_allowlist {
+            if !allowlist.contains(peer) {
+                return Err(ReplayError::UnauthorizedPeer { peer: *peer });
             }
         }
+        Ok(())
     }
 
-    /// Full validation: timestamp + sequence
-    ///
-    /// This is a convenience method that combines timestamp and sequence checks.
+    /// Check session-epoch continuity for `key` without mutating state.
+    pub fn check_epoch_continuity(&self, key: &ReplayRecordKey) -> Result<(), ReplayError> {
+        if let Some(&active_epoch) = self.peer_epochs.get(&(key.swarm_instance_id, key.peer)) {
+            if key.session_epoch < active_epoch {
+                return Err(ReplayError::StaleSessionEpoch {
+                    peer: key.peer,
+                    current_epoch: active_epoch,
+                    received_epoch: key.session_epoch,
+                });
+            }
+            if key.session_epoch > active_epoch {
+                return Err(ReplayError::RecoveryRequired {
+                    peer: key.peer,
+                    current_epoch: active_epoch,
+                    requested_epoch: key.session_epoch,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reclaim all replay records whose maximum observed timestamp window has expired
+    /// ($\text{current\_time} > t_{\max} + A$).
+    pub fn reclaim_expired(&mut self, current_time: u32) -> usize {
+        let now_u64 = current_time as u64;
+        let mut reclaimed = 0usize;
+
+        while let Some((&(expires_at, key), _)) = self.expiry_index.iter().next() {
+            if expires_at >= now_u64 {
+                break;
+            }
+            self.expiry_index.remove(&(expires_at, key));
+            self.records.remove(&key);
+            if self.peer_epochs.get(&(key.swarm_instance_id, key.peer)) == Some(&key.session_epoch)
+            {
+                self.peer_epochs.remove(&(key.swarm_instance_id, key.peer));
+            }
+            reclaimed += 1;
+        }
+        reclaimed
+    }
+
+    /// Validate sequence number and update scoped state at `(timestamp, current_time)`.
+    pub fn validate_sequence_scoped_at(
+        &mut self,
+        key: &ReplayRecordKey,
+        seq: u64,
+        timestamp: u32,
+        current_time: u32,
+    ) -> Result<(), ReplayError> {
+        self.check_peer_authorized(&key.peer)?;
+        self.check_epoch_continuity(key)?;
+        self.reclaim_expired(current_time);
+
+        let tw = self.tolerance_window;
+        let skew = self.max_clock_skew_secs;
+
+        if let Some(state) = self.records.get_mut(key) {
+            let old_expires = state.expires_at;
+            state.validate_and_update(seq, key.peer, tw)?;
+            if timestamp > state.max_timestamp_seen {
+                state.max_timestamp_seen = timestamp;
+                state.expires_at = (timestamp as u64).saturating_add(skew as u64);
+                self.expiry_index.remove(&(old_expires, *key));
+                self.expiry_index.insert((state.expires_at, *key), ());
+            }
+            return Ok(());
+        }
+
+        if self.records.len() >= self.capacity {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
+
+        let state = PeerReplayState::new(seq, timestamp, skew);
+        let expires_at = state.expires_at;
+        self.records.insert(*key, state);
+        self.peer_epochs
+            .insert((key.swarm_instance_id, key.peer), key.session_epoch);
+        self.expiry_index.insert((expires_at, *key), ());
+        Ok(())
+    }
+
+    /// Validate sequence number and update state (default single-swarm scope).
+    pub fn validate_sequence(&mut self, peer: &PeerId, seq: u64) -> Result<(), ReplayError> {
+        let key = ReplayRecordKey::default_for_peer(*peer);
+        self.validate_sequence_scoped_at(&key, seq, 0, 0)
+    }
+
+    /// Full scoped validation: timestamp + allowlist + epoch continuity + sequence.
+    pub fn validate_scoped(
+        &mut self,
+        key: &ReplayRecordKey,
+        sequence: u64,
+        timestamp: u32,
+        current_time: u32,
+    ) -> Result<(), ReplayError> {
+        self.check_timestamp_only(timestamp, current_time)?;
+        self.validate_sequence_scoped_at(key, sequence, timestamp, current_time)
+    }
+
+    /// Full validation: timestamp + sequence (default single-swarm scope).
     pub fn validate(
         &mut self,
         peer: &PeerId,
@@ -208,24 +390,99 @@ impl ReplayProtection {
         timestamp: u32,
         current_time: u32,
     ) -> Result<(), ReplayError> {
-        // 1. Check timestamp (cheap, no state mutation)
-        self.check_timestamp_only(timestamp, current_time)?;
+        let key = ReplayRecordKey::default_for_peer(*peer);
+        self.validate_scoped(&key, sequence, timestamp, current_time)
+    }
 
-        // 2. Validate sequence (stateful)
-        self.validate_sequence(peer, sequence)?;
-
+    /// Register a receiver-generated 256-bit challenge for a restarting peer (`ADR-0021`, `W9-02`).
+    pub fn register_recovery_challenge(
+        &mut self,
+        challenge: SessionHandshakeChallenge,
+    ) -> Result<(), ReplayError> {
+        self.check_peer_authorized(&challenge.sender_peer)?;
+        if challenge.challenge_nonce == [0u8; 32] {
+            return Err(ReplayError::HandshakeVerificationFailed);
+        }
+        if let Some(&active_epoch) = self
+            .peer_epochs
+            .get(&(challenge.swarm_instance_id, challenge.sender_peer))
+        {
+            if challenge.requested_epoch <= active_epoch {
+                return Err(ReplayError::StaleSessionEpoch {
+                    peer: challenge.sender_peer,
+                    current_epoch: active_epoch,
+                    received_epoch: challenge.requested_epoch,
+                });
+            }
+        }
+        self.pending_challenges.insert(
+            (challenge.swarm_instance_id, challenge.sender_peer),
+            challenge,
+        );
         Ok(())
     }
 
-    /// Check if timestamp is within acceptable window
-    fn is_timestamp_valid(&self, ts: u32, now: u32) -> bool {
-        let diff = now.abs_diff(ts);
-        diff <= self.max_clock_skew_secs
+    /// Complete a receiver-challenged session recovery handshake (`swarmtorch.session.handshake.v1`).
+    pub fn complete_recovery_handshake(
+        &mut self,
+        swarm_instance_id: SwarmInstanceId,
+        sender_public_key: &[u8; 32],
+        signature: &Signature,
+        current_time: u32,
+    ) -> Result<ReplayRecordKey, ReplayError> {
+        let sender_peer = PeerId::try_from_public_key_bytes(sender_public_key)
+            .map_err(|_| ReplayError::HandshakeVerificationFailed)?;
+        self.check_peer_authorized(&sender_peer)?;
+
+        let challenge = self
+            .pending_challenges
+            .get(&(swarm_instance_id, sender_peer))
+            .copied()
+            .ok_or(ReplayError::HandshakeVerificationFailed)?;
+
+        self.check_timestamp_only(challenge.issued_at_secs, current_time)?;
+        MessageAuth::verify_session_handshake(sender_public_key, &challenge, signature)
+            .map_err(|_| ReplayError::HandshakeVerificationFailed)?;
+
+        self.pending_challenges
+            .remove(&(swarm_instance_id, sender_peer));
+
+        if let Some(old_epoch) = self.peer_epochs.remove(&(swarm_instance_id, sender_peer)) {
+            let old_key = ReplayRecordKey::new(swarm_instance_id, sender_peer, old_epoch);
+            if let Some(old_state) = self.records.remove(&old_key) {
+                self.expiry_index.remove(&(old_state.expires_at, old_key));
+            }
+        }
+
+        self.reclaim_expired(current_time);
+        let new_key =
+            ReplayRecordKey::new(swarm_instance_id, sender_peer, challenge.requested_epoch);
+        if self.records.len() >= self.capacity {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
+
+        let state = PeerReplayState::new(
+            challenge.initial_sequence,
+            current_time,
+            self.max_clock_skew_secs,
+        );
+        let expires_at = state.expires_at;
+        self.records.insert(new_key, state);
+        self.peer_epochs
+            .insert((swarm_instance_id, sender_peer), challenge.requested_epoch);
+        self.expiry_index.insert((expires_at, new_key), ());
+        Ok(new_key)
     }
 
-    /// Get current cache size (for testing/monitoring)
+    fn is_timestamp_valid(&self, ts: u32, now: u32) -> bool {
+        now.abs_diff(ts) <= self.max_clock_skew_secs
+    }
+
+    /// Get current active record count (for testing/monitoring).
     pub fn cache_size(&self) -> usize {
-        self.peer_state.len()
+        self.records.len()
     }
 }
 
@@ -236,23 +493,25 @@ impl Default for ReplayProtection {
     }
 }
 
-/// Per-peer replay state
 #[cfg(feature = "alloc")]
+#[derive(Debug)]
 struct PeerReplayState {
-    /// Highest sequence number seen
     last_sequence: u64,
-    /// Recent sequences within tolerance window (for out-of-order detection)
     recent_sequences: BTreeSet<u64>,
+    max_timestamp_seen: u32,
+    expires_at: u64,
 }
 
 #[cfg(feature = "alloc")]
 impl PeerReplayState {
-    fn new(initial_seq: u64) -> Self {
+    fn new(initial_seq: u64, timestamp: u32, max_clock_skew_secs: u32) -> Self {
         let mut recent_sequences = BTreeSet::new();
         recent_sequences.insert(initial_seq);
         Self {
             last_sequence: initial_seq,
             recent_sequences,
+            max_timestamp_seen: timestamp,
+            expires_at: (timestamp as u64).saturating_add(max_clock_skew_secs as u64),
         }
     }
 
@@ -262,12 +521,10 @@ impl PeerReplayState {
         peer: PeerId,
         tolerance_window: usize,
     ) -> Result<(), ReplayError> {
-        // Check if already seen (duplicate)
         if self.recent_sequences.contains(&seq) {
             return Err(ReplayError::Replay { peer, seq });
         }
 
-        // Check if too old (beyond tolerance window)
         let max_acceptable_oldness = seq.saturating_add(tolerance_window as u64);
         if max_acceptable_oldness <= self.last_sequence {
             return Err(ReplayError::TooOld {
@@ -277,52 +534,78 @@ impl PeerReplayState {
             });
         }
 
-        // Valid - update state
         self.recent_sequences.insert(seq);
         if seq > self.last_sequence {
             self.last_sequence = seq;
         }
 
-        // Prune against the highest seen sequence so window is anchored to current frontier.
         self.prune_old_sequences(self.last_sequence.saturating_sub(tolerance_window as u64));
-
         Ok(())
     }
 
     fn prune_old_sequences(&mut self, threshold: u64) {
-        // Remove sequences below threshold to bound memory
         self.recent_sequences.retain(|&s| s > threshold);
     }
 }
 
-/// Replay protection errors
+/// Replay protection errors (`ADR-0008`, `ADR-0021`, `W9-02`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayError {
-    /// Timestamp outside acceptable window
+    /// Timestamp outside acceptable window.
     Expired {
-        /// Received timestamp
+        /// Received timestamp.
         ts: u32,
-        /// Current time
+        /// Current time.
         now: u32,
-        /// Maximum allowed skew
+        /// Maximum allowed skew.
         window: u32,
     },
-    /// Sequence number already seen (duplicate)
+    /// Sequence number already seen (duplicate).
     Replay {
-        /// Peer ID
+        /// Peer ID.
         peer: PeerId,
-        /// Duplicate sequence
+        /// Duplicate sequence.
         seq: u64,
     },
-    /// Sequence number too far in past
+    /// Sequence number too far in past.
     TooOld {
-        /// Peer ID
+        /// Peer ID.
         peer: PeerId,
-        /// Old sequence
+        /// Old sequence.
         seq: u64,
-        /// Last seen sequence
+        /// Last seen sequence.
         last_seen: u64,
     },
+    /// Active replay cache is full and no entries have expired past `t_max + A`.
+    CacheFull {
+        /// Configured maximum active record capacity.
+        capacity: usize,
+    },
+    /// Sender peer is not present in the configured [`CohortAllowlist`].
+    UnauthorizedPeer {
+        /// Rejected peer ID.
+        peer: PeerId,
+    },
+    /// Sender attempted to advance `session_epoch` without completing a recovery handshake.
+    RecoveryRequired {
+        /// Peer ID.
+        peer: PeerId,
+        /// Currently active session epoch.
+        current_epoch: SessionEpoch,
+        /// Requested session epoch.
+        requested_epoch: SessionEpoch,
+    },
+    /// Sender presented a stale `session_epoch < current_epoch`.
+    StaleSessionEpoch {
+        /// Peer ID.
+        peer: PeerId,
+        /// Currently active session epoch.
+        current_epoch: SessionEpoch,
+        /// Received stale session epoch.
+        received_epoch: SessionEpoch,
+    },
+    /// Session recovery handshake challenge or signature verification failed.
+    HandshakeVerificationFailed,
 }
 
 impl core::fmt::Display for ReplayError {
@@ -349,6 +632,41 @@ impl core::fmt::Display for ReplayError {
                     peer, seq, last_seen
                 )
             }
+            ReplayError::CacheFull { capacity } => {
+                write!(
+                    f,
+                    "replay cache full at capacity={} (no expired entries)",
+                    capacity
+                )
+            }
+            ReplayError::UnauthorizedPeer { peer } => {
+                write!(f, "unauthorized peer not in cohort allowlist: {:?}", peer)
+            }
+            ReplayError::RecoveryRequired {
+                peer,
+                current_epoch,
+                requested_epoch,
+            } => {
+                write!(
+                    f,
+                    "session recovery handshake required: peer={:?}, current_epoch={}, requested_epoch={}",
+                    peer, current_epoch, requested_epoch
+                )
+            }
+            ReplayError::StaleSessionEpoch {
+                peer,
+                current_epoch,
+                received_epoch,
+            } => {
+                write!(
+                    f,
+                    "stale session epoch: peer={:?}, current_epoch={}, received_epoch={}",
+                    peer, current_epoch, received_epoch
+                )
+            }
+            ReplayError::HandshakeVerificationFailed => {
+                write!(f, "session recovery handshake verification failed")
+            }
         }
     }
 }
@@ -356,428 +674,6 @@ impl core::fmt::Display for ReplayError {
 #[cfg(feature = "std")]
 impl std::error::Error for ReplayError {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_peer(id: u8) -> PeerId {
-        PeerId::new([id; 32])
-    }
-
-    #[test]
-    fn validate_accepts_first_message_from_peer() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 1, now, now).is_ok());
-    }
-
-    #[test]
-    fn try_with_config_rejects_zero_capacity() {
-        let result = ReplayProtection::try_with_config(0, 60);
-        assert!(matches!(result, Err(ReplayConfigError::ZeroCapacity)));
-    }
-
-    #[test]
-    fn try_with_config_accepts_valid_capacity() {
-        let result = ReplayProtection::try_with_config(32, 60);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_monotonic_sequence() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 1, now, now).is_ok());
-        assert!(guard.validate(&peer, 2, now, now).is_ok());
-        assert!(guard.validate(&peer, 3, now, now).is_ok());
-        assert!(guard.validate(&peer, 100, now, now).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_sequence() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 1, now, now).is_ok());
-
-        let result = guard.validate(&peer, 1, now, now);
-        assert_eq!(result, Err(ReplayError::Replay { peer, seq: 1 }));
-    }
-
-    #[test]
-    fn validate_rejects_retrograde_sequence() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 100, now, now).is_ok());
-
-        // Sequence too far in past (beyond window)
-        let result = guard.validate(&peer, 50, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::TooOld {
-                peer,
-                seq: 50,
-                last_seen: 100,
-            })
-        );
-    }
-
-    #[test]
-    fn validate_accepts_out_of_order_within_window() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 20, now, now).is_ok());
-        // Within tolerance window (20 - 16 = 4, so seq >= 5 is ok)
-        assert!(guard.validate(&peer, 10, now, now).is_ok());
-        assert!(guard.validate(&peer, 5, now, now).is_ok());
-    }
-
-    #[test]
-    fn sequence_window_check_no_overflow_at_u64_max() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(42);
-        let now = 1000;
-
-        let near_max = u64::MAX - 5;
-        assert!(guard.validate(&peer, near_max, now, now).is_ok());
-        assert!(guard.validate(&peer, u64::MAX - 3, now, now).is_ok());
-        assert!(guard.validate(&peer, u64::MAX, now, now).is_ok());
-
-        let old_seq = near_max.saturating_sub(20);
-        let result = guard.validate(&peer, old_seq, now, now);
-        assert!(matches!(result, Err(ReplayError::TooOld { .. })));
-    }
-
-    #[test]
-    fn validate_rejects_timestamp_too_old() {
-        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
-        let now = 1000;
-        let old_ts = now - 100; // Beyond 60s window
-
-        let result = guard.check_timestamp_only(old_ts, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::Expired {
-                ts: old_ts,
-                now,
-                window: 60,
-            })
-        );
-    }
-
-    #[test]
-    fn validate_rejects_timestamp_too_new() {
-        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
-        let now = 1000;
-        let future_ts = now + 100; // Beyond 60s window
-
-        let result = guard.check_timestamp_only(future_ts, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::Expired {
-                ts: future_ts,
-                now,
-                window: 60,
-            })
-        );
-    }
-
-    #[test]
-    fn validate_accepts_timestamp_within_skew_window() {
-        let guard = ReplayProtection::try_with_config(100, 60).unwrap();
-        let now = 1000;
-
-        assert!(guard.check_timestamp_only(now - 50, now).is_ok());
-        assert!(guard.check_timestamp_only(now, now).is_ok());
-        assert!(guard.check_timestamp_only(now + 50, now).is_ok());
-        assert!(guard.check_timestamp_only(now - 60, now).is_ok());
-        assert!(guard.check_timestamp_only(now + 60, now).is_ok());
-    }
-
-    #[test]
-    fn lru_eviction_respects_capacity() {
-        let mut guard = ReplayProtection::try_with_config(10, 60).unwrap();
-        let now = 1000;
-
-        // Fill cache with 10 peers
-        for i in 0..10 {
-            let peer = make_peer(i);
-            assert!(guard.validate(&peer, 1, now, now).is_ok());
-        }
-        assert_eq!(guard.cache_size(), 10);
-
-        // 11th peer should trigger eviction
-        let peer_11 = make_peer(11);
-        assert!(guard.validate(&peer_11, 1, now, now).is_ok());
-        assert_eq!(guard.cache_size(), 10); // Still 10 due to LRU eviction
-
-        // Peer 0 should be evicted (LRU), so replaying seq=1 should succeed as new peer
-        let peer_0 = make_peer(0);
-        assert!(guard.validate(&peer_0, 1, now, now).is_ok());
-    }
-
-    #[test]
-    fn peer_state_isolation() {
-        let mut guard = ReplayProtection::new();
-        let peer_a = make_peer(1);
-        let peer_b = make_peer(2);
-        let now = 1000;
-
-        // Peer A and B have independent sequence tracking
-        assert!(guard.validate(&peer_a, 10, now, now).is_ok());
-        assert!(guard.validate(&peer_b, 5, now, now).is_ok());
-
-        // Peer A cannot replay seq=10, but Peer B can use seq=10
-        assert!(guard.validate(&peer_a, 10, now, now).is_err());
-        assert!(guard.validate(&peer_b, 10, now, now).is_ok());
-    }
-
-    #[test]
-    fn sequence_window_prunes_correctly() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-        let now = 1000;
-
-        // Add sequences within window
-        for seq in 1..=20 {
-            assert!(guard.validate(&peer, seq, now, now).is_ok());
-        }
-
-        // Advance sequence far ahead to trigger pruning
-        assert!(guard.validate(&peer, 100, now, now).is_ok());
-
-        // Old sequences (< 100 - 16 = 84) should be pruned
-        // Attempting to replay should fail as TooOld, not Replay
-        let result = guard.validate(&peer, 50, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::TooOld {
-                peer,
-                seq: 50,
-                last_seen: 100,
-            })
-        );
-    }
-
-    #[test]
-    fn deterministic_btreeset_ordering() {
-        // BTreeSet ensures deterministic iteration order
-        let mut state = PeerReplayState::new(1);
-        let peer = make_peer(1);
-
-        // Insert out of order
-        assert!(state
-            .validate_and_update(5, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
-            .is_ok());
-        assert!(state
-            .validate_and_update(3, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
-            .is_ok());
-        assert!(state
-            .validate_and_update(4, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
-            .is_ok());
-        assert!(state
-            .validate_and_update(2, peer, DEFAULT_SEQUENCE_TOLERANCE_WINDOW)
-            .is_ok());
-
-        // BTreeSet maintains sorted order
-        let sequences: Vec<u64> = state.recent_sequences.iter().copied().collect();
-        assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn check_timestamp_only_does_not_mutate_state() {
-        let guard = ReplayProtection::new();
-        let now = 1000;
-
-        // Multiple calls should all succeed (no state mutation)
-        assert!(guard.check_timestamp_only(now, now).is_ok());
-        assert!(guard.check_timestamp_only(now, now).is_ok());
-        assert!(guard.check_timestamp_only(now - 30, now).is_ok());
-        assert_eq!(guard.cache_size(), 0); // No peers added
-    }
-
-    #[test]
-    fn validate_sequence_mutates_state() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(1);
-
-        assert!(guard.validate_sequence(&peer, 1).is_ok());
-        assert_eq!(guard.cache_size(), 1);
-
-        // Duplicate should be rejected
-        assert!(guard.validate_sequence(&peer, 1).is_err());
-    }
-
-    #[test]
-    fn display_error_formats_correctly() {
-        let peer = make_peer(1);
-
-        let expired = ReplayError::Expired {
-            ts: 900,
-            now: 1000,
-            window: 60,
-        };
-        assert_eq!(
-            format!("{}", expired),
-            "timestamp expired: ts=900, now=1000, window=60s"
-        );
-
-        let replay = ReplayError::Replay { peer, seq: 42 };
-        assert!(format!("{}", replay).contains("replay detected"));
-        assert!(format!("{}", replay).contains("seq=42"));
-
-        let too_old = ReplayError::TooOld {
-            peer,
-            seq: 10,
-            last_seen: 100,
-        };
-        assert!(format!("{}", too_old).contains("sequence too old"));
-        assert!(format!("{}", too_old).contains("seq=10"));
-        assert!(format!("{}", too_old).contains("last_seen=100"));
-    }
-
-    /// C-01 regression: boundary sequence must not be replayed after pruning.
-    ///
-    /// Before fix, `validate_and_update()` accepted `seq` when
-    /// `seq + SEQUENCE_TOLERANCE_WINDOW == last_sequence` (strict `<`),
-    /// then `prune_old_sequences()` dropped that exact boundary value via
-    /// `retain(|s| s > threshold)`. Resubmitting the same `seq` succeeded.
-    ///
-    /// After fix (`<=`), the boundary sequence is rejected as `TooOld`.
-    #[test]
-    fn c01_boundary_sequence_rejected_on_second_submission() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(99);
-        let now = 1000;
-
-        // Set last_sequence to N by submitting a high sequence.
-        let n: u64 = 100;
-        assert!(guard.validate(&peer, n, now, now).is_ok());
-
-        // The boundary sequence: seq = N - DEFAULT_SEQUENCE_TOLERANCE_WINDOW.
-        let boundary_seq = n - DEFAULT_SEQUENCE_TOLERANCE_WINDOW as u64;
-
-        // First submission of boundary_seq must be rejected as TooOld
-        // because seq + WINDOW <= last_sequence (boundary is now excluded).
-        let result = guard.validate(&peer, boundary_seq, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::TooOld {
-                peer,
-                seq: boundary_seq,
-                last_seen: n,
-            }),
-            "boundary sequence must be rejected as TooOld"
-        );
-    }
-
-    /// C-01 complementary: sequence just inside the window is still accepted.
-    #[test]
-    fn c01_sequence_inside_window_still_accepted() {
-        let mut guard = ReplayProtection::new();
-        let peer = make_peer(98);
-        let now = 1000;
-
-        let n: u64 = 100;
-        assert!(guard.validate(&peer, n, now, now).is_ok());
-
-        // seq = N - WINDOW + 1 is strictly inside the window.
-        let inside_seq = n - DEFAULT_SEQUENCE_TOLERANCE_WINDOW as u64 + 1;
-        assert!(
-            guard.validate(&peer, inside_seq, now, now).is_ok(),
-            "sequence one inside the window must be accepted"
-        );
-
-        // Second submission of the same seq must be rejected as duplicate.
-        let result = guard.validate(&peer, inside_seq, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::Replay {
-                peer,
-                seq: inside_seq,
-            }),
-            "duplicate of accepted sequence must be Replay"
-        );
-    }
-
-    /// M-03: Smaller configurable tolerance window rejects further out-of-order.
-    #[test]
-    fn configurable_tolerance_window_smaller_rejects_further_out_of_order() {
-        // Window of 4 instead of default 16.
-        let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 4).unwrap();
-        let peer = make_peer(200);
-        let now = 1000;
-
-        // Advance to seq 50.
-        assert!(guard.validate(&peer, 50, now, now).is_ok());
-
-        // seq 47 is within window (50 - 4 + 1 = 47).
-        assert!(guard.validate(&peer, 47, now, now).is_ok());
-
-        // seq 45 is outside window (50 - 4 = 46, boundary excluded).
-        let result = guard.validate(&peer, 45, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::TooOld {
-                peer,
-                seq: 45,
-                last_seen: 50,
-            })
-        );
-    }
-
-    /// M-03: Zero tolerance window enforces strict monotonic ordering.
-    #[test]
-    fn configurable_tolerance_window_zero_enforces_strict_monotonic() {
-        let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 0).unwrap();
-        let peer = make_peer(201);
-        let now = 1000;
-
-        assert!(guard.validate(&peer, 10, now, now).is_ok());
-
-        // Any sequence <= 10 must be rejected (zero tolerance = strict monotonic).
-        let result = guard.validate(&peer, 10, now, now);
-        assert!(
-            result.is_err(),
-            "duplicate at zero tolerance must be rejected"
-        );
-
-        let result = guard.validate(&peer, 9, now, now);
-        assert_eq!(
-            result,
-            Err(ReplayError::TooOld {
-                peer,
-                seq: 9,
-                last_seen: 10,
-            })
-        );
-
-        // Forward sequence is still accepted.
-        assert!(guard.validate(&peer, 11, now, now).is_ok());
-    }
-
-    /// M-03: Tolerance window exceeding maximum is rejected.
-    #[test]
-    fn tolerance_window_too_large_rejected() {
-        let result = ReplayProtection::try_with_tolerance_window(100, 60, 257);
-        assert_eq!(
-            result.unwrap_err(),
-            ReplayConfigError::ToleranceWindowTooLarge {
-                window: 257,
-                max: MAX_SEQUENCE_TOLERANCE_WINDOW,
-            }
-        );
-
-        // Max value should be accepted.
-        assert!(ReplayProtection::try_with_tolerance_window(100, 60, 256).is_ok());
-    }
-}
+#[cfg(all(test, feature = "alloc"))]
+#[path = "replay_tests.rs"]
+mod tests;

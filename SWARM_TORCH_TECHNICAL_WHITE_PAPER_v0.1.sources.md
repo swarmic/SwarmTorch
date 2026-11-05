@@ -325,3 +325,132 @@
 - Used for: WP sparsification + correction families
 - Notes: Momentum correction and thresholding for high compression.
 - Last checked: 2026-02-08
+
+
+## CenteredClipping-ICML21
+- Title: Learning from History for Byzantine Robust Optimization
+- URL: https://proceedings.mlr.press/v139/karimireddy21a.html
+- Type: Paper (ICML 2021)
+- Used for: ADR-0019 / WP `CenteredClipping` (`CClip`) algorithm and worker momentum defense against time-coupled Byzantine attacks in O(n * d) time and O(d) memory
+- Notes: Proves memoryless aggregators fail against time-coupled attacks; introduces iterative L2 centered clipping relative to previous aggregate state.
+- Last checked: 2026-11-01
+
+## Bucketing-ICLR22
+- Title: Byzantine-Robust Learning on Heterogeneous Datasets via Bucketing
+- URL: https://openreview.net/forum?id=jXKKDEi5vJt
+- Type: Paper (ICLR 2022)
+- Used for: ADR-0019 / WP pre-aggregation `s-Bucketing` (`BucketingConfig`) to mitigate Non-IID variance before Krum/Bulyan/CenteredClipping
+- Notes: Demonstrates standard Byzantine aggregators fail on heterogeneous data and proves random s-bucketing reduces cross-client variance by 1/s.
+- Last checked: 2026-11-01
+
+## EF21-NeurIPS21
+- Title: EF21: A New, Simpler, Theoretically Better, and Practically Faster Error Feedback
+- URL: https://proceedings.neurips.cc/paper/2021/hash/231141b34c82aa95e48810a9d1b33a79-Abstract.html
+- Type: Paper (NeurIPS 2021)
+- Used for: ADR-0021 / WP `ErrorFeedbackCompressor` stateful compression convergence guarantees without bounded-gradient assumptions
+- Notes: Compresses local state differences c_t^i = C(g_t^i - s_t^i), guaranteeing O(1/T) smooth non-convex convergence for contractive compressors like TopK.
+- Last checked: 2026-11-01
+
+## GAS-ICML23
+- Title: Byzantine-Robust Learning on Heterogeneous Data via Gradient Splitting
+- URL: https://proceedings.mlr.press/v202/liu23am.html
+- Type: Paper (ICML 2023)
+- Used for: ADR-0021 / WP compressed-domain & high-dimensional heterogeneous Byzantine defense (`SharedSeedSparse`)
+- Notes: Addresses the curse of dimensionality and sparse support mismatch when combining gradient sparsification with Byzantine-robust aggregation.
+- Last checked: 2026-11-01
+
+## FedAsync-2019
+- Title: Asynchronous Federated Optimization
+- URL: https://arxiv.org/abs/1903.03934
+- Type: Paper
+- Used for: ADR-0023 / WP `StalenessPolicy` and `StalenessSchedule` (Constant, Polynomial, Hinge decay functions)
+- Notes: Formalizes staleness-decayed mixing alpha_t = alpha * s(t - tau) for asynchronous edge updates.
+- Last checked: 2026-11-01
+
+## LoRA-ICLR22
+- Title: LoRA: Low-Rank Adaptation of Large Language Models
+- URL: https://openreview.net/forum?id=nZeVKeeFYf9
+- Type: Paper (ICLR 2022)
+- Used for: ADR-0024 / WP `TrainableParamFilter::PrefixAllowlist` adapter-only delta synchronization
+- Notes: Freezes base model weights and synchronizes low-rank update matrices A, B to reduce communication payload by 10x-100x.
+- Last checked: 2026-11-01
+
+## Safetensors
+- Title: Safetensors Rust Crate & Format Specification (0.5.3 vs 0.7.0 / 0.8.0)
+- URL: https://github.com/safetensors/safetensors/blob/v0.8.0/safetensors/Cargo.toml
+- Type: Crate / Format Spec
+- Used for: ADR-0024 / WP `SwarmTorchCheckpointV1` profile over additive `safetensors` (`0.7+` / `0.8+`)
+- Notes: In 0.5.3, enabling both `std` and `alloc` triggers a `compile_error!`; in 0.7.0/0.8.0, `alloc` is additive (always available, `alloc` retained as no-op compatibility feature) with declared MSRV 1.80. Upstream format permits NaN/Inf, so `SwarmTorchCheckpointV1` enforces explicit finiteness and length-delimited schema checks before transactional model application.
+- Last checked: 2026-11-02
+
+## Wasmi
+- Title: Wasmi Deterministic WebAssembly Interpreter (`wasmi` 2.0.0 Store & StoreLimitsBuilder)
+- URL: https://docs.rs/wasmi/2.0.0/wasmi/struct.Store.html
+- Type: Crate / Official Docs
+- Used for: ADR-0025 / WP `ExecutionTrust::SandboxedExtension` deterministic execution with `Config::consume_fuel(true)`, `StoreLimitsBuilder::trap_on_grow_failure(true)`, and `store.limiter(|s| &mut s.limits)` installed before instantiation
+- Notes: `wasmi 2.0.0` declares MSRV 1.86 and separates `validate` and `deterministic` features; constructing `StoreLimits` without calling `store.limiter(...)` does not enforce memory/table caps.
+- Last checked: 2026-11-02
+
+## Zenoh
+- Title: Eclipse Zenoh: Zero Overhead Pub/Sub, Store/Query, and Compute Protocol (`zenoh` 1.10.2 & `rmw_zenoh`)
+- URL: https://github.com/ros2/rmw_zenoh/blob/rolling/docs/design.md
+- Type: Protocol Spec / Rust Crate (`zenoh`)
+- Used for: ADR-0022 / WP `swarm-torch-transport-zenoh` optional adapter crate
+- Notes: Routing topics do not establish contributor authentication; native ROS 2 `rmw_zenoh` uses CDR serialization and type-hash key expressions distinct from SwarmTorch's signed wrapper carrier topics.
+- Last checked: 2026-11-02
+
+## Iroh
+- Title: Iroh: Peer-to-Peer QUIC Networking (`iroh` 1.4.1 `EndpointId` & `Accepting` 0-RTT/0.5-RTT Security Notes)
+- URL: https://docs.rs/iroh/latest/iroh/endpoint/struct.Accepting.html
+- Type: Rust Crate (`iroh`)
+- Used for: ADR-0022 / WP `swarm-torch-transport-iroh` optional adapter crate
+- Notes: `iroh 1.4.1` declares Rust 1.91 (edition 2024), exposes verified TLS peer identity as `EndpointId` (kept distinct from SwarmTorch originator `PeerId`), and requires completed 1-RTT handshake enforcement so 0-RTT/0.5-RTT early data cannot mutate replay, EF, model, or DP state.
+- Last checked: 2026-11-02
+
+## Rust-TotalCmp
+- Title: Rust `core::primitive::f32::total_cmp` (IEEE 754-2008 `totalOrder` predicate)
+- URL: https://doc.rust-lang.org/core/primitive.f32.html#method.total_cmp
+- Type: Rust Standard Library Specification
+- Used for: ADR-0019 / WP deterministic total ordering in coordinate/distance sorting
+- Notes: Stabilized in Rust 1.62; establishes canonical total ordering across all float bit patterns (paired with mandatory pre-sort `.is_finite()` validation).
+- Last checked: 2026-11-02
+
+## RoSDHB-AISTATS26
+- Title: Reconciling Communication Compression and Byzantine-Robustness in Distributed Learning (RoSDHB)
+- URL: https://proceedings.mlr.press/v300/gupta26a.html
+- Type: Paper (AISTATS 2026)
+- Used for: ADR-0021 / WP benchmark baseline for coordinated sparse compression + momentum + Byzantine aggregation (`W11-02`)
+- Notes: Together with Li et al. (AISTATS 2026, `https://proceedings.mlr.press/v300/li26e.html`, Byz-DM21 / Byz-VR-DM21), establishes exact theoretical assumptions required when composing compression and Byzantine-robust aggregation.
+- Last checked: 2026-11-02
+
+## Bareilles-MultiKrum26
+- Title: Byzantine Machine Learning: MultiKrum and an Optimal Notion of Robustness
+- URL: https://arxiv.org/html/2602.03899v1
+- Type: Paper (2026)
+- Used for: ADR-0019 / WP comparison baseline for Multi-Krum neighborhood definitions vs. Blanchard et al. (NeurIPS 2017) one-pass `k = n - f - 2` scoring
+- Notes: Highlights why the exact Multi-Krum neighborhood and `1 <= m <= n - f - 2` domain must be pinned explicitly.
+- Last checked: 2026-11-02
+
+## FLoRA-NeurIPS24
+- Title: FLoRA: Federated Fine-Tuning Large Language Models with Heterogeneous Low-Rank Adaptations
+- URL: https://papers.nips.cc/paper_files/paper/2024/hash/28312c9491d60ed0c77f7fff4ad86dd1-Abstract-Conference.html
+- Type: Paper (NeurIPS 2024)
+- Used for: ADR-0024 / WP exact LoRA factor aggregation semantics (`W12-01`)
+- Notes: Proves `mean(B) * mean(A) != mean(B * A)` cross-term interference in naive Federated LoRA averaging and introduces stacking-based exact aggregation.
+- Last checked: 2026-11-02
+
+## RFC-8613-9175-4303-8085
+- Title: IETF RFC 8613 §7.5 (OSCORE Replay Recovery), RFC 9175 (Echo/Freshness Across Reboot), RFC 4303 (IPsec ESP Anti-Replay Atomic Commit), and RFC 8085 (UDP Usage Guidelines)
+- URL: https://www.rfc-editor.org/rfc/rfc8613.html
+- Type: IETF Standards Track RFCs
+- Used for: ADR-0020 / ADR-0022 restart recovery via fresh receiver-bound challenge context, clock continuity across reboot, pre-commit signature verification, and UDP congestion/MTU guidelines
+- Notes: Grounds the 6-stage atomic receive pipeline and `RecoveryRequired` fresh handshake state after replay window loss.
+- Last checked: 2026-11-02
+
+## RUSTSEC-2026-0253
+- Title: RustSec Advisory `RUSTSEC-2026-0253` (`lru` panic safety in `pop`) & `RUSTSEC-2026-0002` (`lru::IterMut` aliasing unsoundness)
+- URL: https://rustsec.org/advisories/RUSTSEC-2026-0253.html
+- Type: Security Advisory
+- Used for: ADR-0020 / `P2-11a` retirement of `lru` crate in favor of safe expiry-indexed `BTreeMap`
+- Notes: Both advisories are retired when `lru` is removed from `Cargo.toml` and `Cargo.lock` in `W9-02`.
+- Last checked: 2026-11-02

@@ -25,14 +25,10 @@ categories = ["science", "embedded", "asynchronous", "network-programming"]
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 
-# Async runtimes
-tokio = { version = "1.35", features = ["full"] }
+# Async runtimes (narrow feature selection per crate; no workspace-wide "full")
+tokio = { version = "1.35", default-features = false }
 embassy-executor = { version = "0.5", default-features = false }
 embassy-time = { version = "0.3", default-features = false }
-
-# ML backends
-burn = { version = "0.14", default-features = false }
-burn-ndarray = { version = "0.14" }
 
 # Cryptography
 ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }

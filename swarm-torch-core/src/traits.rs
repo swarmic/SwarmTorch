@@ -113,7 +113,7 @@ impl PeerId {
     /// Create a new PeerId from bytes.
     ///
     /// **Unchecked** — does not validate the bytes. Prefer
-    /// [`try_from_public_key_bytes`] at network entry points.
+    /// [`Self::try_from_public_key_bytes`] at network entry points.
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }

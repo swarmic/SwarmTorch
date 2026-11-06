@@ -14,6 +14,10 @@ docs/adr/
 docs/internal/
 docs/plans/
 docs/audits/
+.agents/
+.agent/
+AGENTS.md
+GEMINI.md
 
 # -----------------------------------------------------------------------------
 # Rust Build Artifacts

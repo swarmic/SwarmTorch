@@ -18,7 +18,8 @@ path = "src/lib.rs"
 default = ["tokio"]
 tokio = ["dep:tokio", "std", "tokio/rt", "tokio/rt-multi-thread", "tokio/time", "tokio/sync", "tokio/macros"]
 embassy = ["dep:embassy-executor", "dep:embassy-time"]
-std = []
+std = ["alloc"]
+alloc = []
 
 [dependencies]
 # Tokio runtime (for std builds)

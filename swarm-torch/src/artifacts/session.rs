@@ -1,21 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use swarm_torch_core::crypto::KeyPair;
 use swarm_torch_core::dataops::{
     cache_hit_from_decision, cache_key_v0, dataset_fingerprint_v0, derived_source_fingerprint_v0,
     no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, sanitize_source_descriptor_v0,
-    schema_hash_v0, source_fingerprint_v0, CacheDecisionV0, DatasetEntryV1, DatasetLineageV1,
-    DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV2, MaterializationStatusV0,
-    OutputSpecCore, PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TransformAuditV0,
-    TrustClass, UnsafeReasonV0, DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
+    schema_hash_v0, source_fingerprint_v0, AuthModeMarker, CacheDecisionV0, DatasetEntryV1,
+    DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordCompat,
+    MaterializationRecordV2, MaterializationStatusV0, OutputSpecCore, PredictedOutput,
+    SchemaDescriptorV0, SourceDescriptorV0, TransformAuditV0, TrustClass, UnsafeReasonV0,
+    DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
 };
 use swarm_torch_core::execution::AssetInstanceV1;
-use swarm_torch_core::run_graph::{node_def_hash_v1, node_id_from_key, ExecutionTrust, NodeV1};
+use swarm_torch_core::observe::RunId;
+use swarm_torch_core::run_graph::{
+    node_def_hash_v1, node_id_from_key, CachePolicyV0, ExecutionTrust, NodeV1,
+};
 
-use super::io::{hex_lower, sha256_file, write_json_pretty_atomic};
-use super::{RunArtifactSink, SnapshotProfile};
+use super::bundle::ManifestV1;
+use super::cas::{
+    parse_cas_uri_digest, read_verified_round_resume_state, verify_cas_uri_exists,
+    RoundResumeStateV1,
+};
+use super::io::{
+    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, read_bytes_bounded, sha256_file,
+    write_json_pretty_atomic, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
+};
+use super::lock::{BundleLockGuard, LockAcquisitionPolicy};
+use super::{ArtifactWriteProfile, RunArtifactBundle, RunArtifactSink, SnapshotProfile};
 
 /// Error type for `DataOpsSession::predict()`.
 ///
@@ -40,6 +55,14 @@ pub struct OutputSpec {
     pub bytes: Option<u64>,
 }
 
+/// Receipt returned when a [`DataOpsSession`] is durably committed and sealed (`ADR-0023` §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCommitReceiptV1 {
+    pub run_id: RunId,
+    pub sealed_generation: u64,
+    pub manifest: ManifestV1,
+}
+
 const SNAPSHOT_PAIR_SCHEMA_V1: u32 = 1;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -50,16 +73,8 @@ struct SnapshotPairCommitV1 {
     lineage_sha256: String,
 }
 
-/// DataOps session: manages registry/lineage with trust propagation and crash-safe persistence.
-///
-/// **Limitation (v0.1):** Single-process writer per run directory.
-/// The `RunArtifactSink` mutex is in-process only; concurrent processes writing to the
-/// same bundle will corrupt NDJSON files.
-///
-/// **Manifest behavior:** manifest freshness is controlled by `ArtifactWriteProfile`.
-/// With `ManifestRefreshPolicy::FinalOnly`, call `finalize()` before reading the bundle
-/// with report tools (which validate manifest hashes). `Always` and `IntervalN`
-/// can keep manifests fresh mid-run at the cost of extra hashing I/O.
+/// DataOps session: manages registry/lineage with trust propagation, cross-process lock
+/// coordination, physical CAS verification, and crash-safe persistence (`ADR-0023` §2).
 #[derive(Debug)]
 pub struct DataOpsSession {
     sink: Arc<RunArtifactSink>,
@@ -100,6 +115,152 @@ impl DataOpsSession {
         }
     }
 
+    /// Create a new run bundle on disk, acquire an exclusive `.bundle.lock`, and return
+    /// an active [`DataOpsSession`] (`ADR-0023` §2.1, `W10-01`).
+    pub fn create(
+        base_dir: impl AsRef<Path>,
+        run_id: RunId,
+        profile: ArtifactWriteProfile,
+        lock_policy: LockAcquisitionPolicy,
+    ) -> io::Result<Self> {
+        let bundle = RunArtifactBundle::create(base_dir, run_id)?;
+        let lock_guard = bundle.acquire_lock(lock_policy)?;
+        let snapshot_profile = profile.snapshot_profile;
+        let sink = Arc::new(RunArtifactSink::with_profile_and_lock(
+            bundle, profile, lock_guard,
+        ));
+        Ok(Self::with_profile(sink, snapshot_profile))
+    }
+
+    /// Open an existing run bundle directory, acquire an exclusive `.bundle.lock`, and
+    /// replay persisted registry, lineage, and materialization state (`ADR-0023` §2.1, `W10-01`).
+    pub fn open(
+        run_dir: impl AsRef<Path>,
+        profile: ArtifactWriteProfile,
+        lock_policy: LockAcquisitionPolicy,
+    ) -> io::Result<Self> {
+        let run_dir = run_dir.as_ref();
+        let lock_guard = BundleLockGuard::acquire(run_dir, lock_policy).map_err(io::Error::from)?;
+        let bundle = RunArtifactBundle::open(run_dir)?;
+        let snapshot_profile = profile.snapshot_profile;
+
+        let datasets_dir = run_dir.join("datasets");
+        let reg_snap_bytes = read_bytes_bounded(
+            &datasets_dir.join("registry.json"),
+            MAX_SINGLE_ARTIFACT_BYTES,
+        )?;
+        let reg_snap: DatasetRegistryV1 = parse_json_slice(&reg_snap_bytes)?;
+
+        let reg_updates_path = datasets_dir.join("registry_updates.ndjson");
+        let reg_updates: Vec<DatasetEntryV1> = if reg_updates_path.exists() {
+            let bytes = read_bytes_bounded(&reg_updates_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+            parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?
+        } else {
+            Vec::new()
+        };
+
+        let mut registry = BTreeMap::new();
+        for entry in reg_snap.datasets {
+            registry.insert(entry.asset_key.clone(), entry);
+        }
+        for entry in reg_updates {
+            registry.insert(entry.asset_key.clone(), entry);
+        }
+
+        let lin_snap_bytes = read_bytes_bounded(
+            &datasets_dir.join("lineage.json"),
+            MAX_SINGLE_ARTIFACT_BYTES,
+        )?;
+        let lin_snap: DatasetLineageV1 = parse_json_slice(&lin_snap_bytes)?;
+
+        let lin_updates_path = datasets_dir.join("lineage_edges.ndjson");
+        let lin_updates: Vec<LineageEdgeV1> = if lin_updates_path.exists() {
+            let bytes = read_bytes_bounded(&lin_updates_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+            parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?
+        } else {
+            Vec::new()
+        };
+
+        let mut lineage = BTreeMap::new();
+        for edge in lin_snap.edges.into_iter().chain(lin_updates.into_iter()) {
+            let key = (
+                edge.input_fingerprint_v0.clone(),
+                edge.output_fingerprint_v0.clone(),
+                edge.node_id.to_string(),
+            );
+            lineage.insert(key, edge);
+        }
+
+        let mat_path = datasets_dir.join("materializations.ndjson");
+        let mut max_seq = 0u64;
+        if mat_path.exists() {
+            let bytes = read_bytes_bounded(&mat_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+            let rows: Vec<MaterializationRecordCompat> =
+                parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+            for (idx, row) in rows.into_iter().enumerate() {
+                let v2 = row.into_v2();
+                let seq = if v2.record_seq == 0 {
+                    (idx as u64) + 1
+                } else {
+                    v2.record_seq
+                };
+                max_seq = max_seq.max(seq);
+            }
+        }
+
+        let pair_marker_path = datasets_dir.join("snapshot_pair_commit.json");
+        let next_snapshot_pair_seq = if pair_marker_path.exists() {
+            let bytes = read_bytes_bounded(&pair_marker_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+            let marker: SnapshotPairCommitV1 = parse_json_slice(&bytes)?;
+            marker.pair_seq.saturating_add(1)
+        } else {
+            1
+        };
+
+        let sink = Arc::new(RunArtifactSink::with_profile_and_lock(
+            bundle, profile, lock_guard,
+        ));
+        Ok(Self {
+            sink,
+            registry,
+            lineage,
+            next_record_seq: max_seq.saturating_add(1),
+            snapshot_profile,
+            next_snapshot_pair_seq,
+            dataops_write_count: 0,
+            pending_transform_audits: Vec::new(),
+        })
+    }
+
+    /// Open an existing run bundle and load its verified [`RoundResumeStateV1`] if present
+    /// (`ADR-0023` §2.2, `W10-01`).
+    pub fn resume(
+        run_dir: impl AsRef<Path>,
+        profile: ArtifactWriteProfile,
+        lock_policy: LockAcquisitionPolicy,
+    ) -> io::Result<(Self, Option<RoundResumeStateV1>)> {
+        let run_dir_ref = run_dir.as_ref();
+        let session = Self::open(run_dir_ref, profile, lock_policy)?;
+        let resume_state = read_verified_round_resume_state(run_dir_ref)?;
+        Ok((session, resume_state))
+    }
+
+    /// Flush snapshots, sync required v1 files, finalize (and optionally sign) `manifest.json`,
+    /// seal the underlying [`RunArtifactSink`] against late writes from cloned `Arc` handles,
+    /// and release `.bundle.lock` (`ADR-0023` §2.1, `W10-01`).
+    pub fn commit_and_close(
+        mut self,
+        signer: Option<&KeyPair>,
+    ) -> io::Result<SessionCommitReceiptV1> {
+        self.flush_snapshots()?;
+        let (sealed_generation, manifest) = self.sink.seal_and_finalize(signer)?;
+        Ok(SessionCommitReceiptV1 {
+            run_id: self.sink.bundle().run_id(),
+            sealed_generation,
+            manifest,
+        })
+    }
+
     /// Record an applied update transform for the next materialization emission.
     ///
     /// These audits are attached to the next `materialize_node_outputs` call and then cleared.
@@ -119,6 +280,35 @@ impl DataOpsSession {
         self.registry
             .get(asset_key)
             .and_then(|e| hex_to_bytes(&e.fingerprint_v0))
+    }
+
+    /// Attach a verified physical CAS URI (`cas://sha256/<64_hex>`) to an already-materialized
+    /// asset in the registry so downstream consumers and `verify_cache_hit` can verify its
+    /// content-addressed backing blob (`ADR-0023` §2.2–2.3).
+    pub fn bind_output_cas_uri(
+        &mut self,
+        asset_key: &str,
+        cas_uri: &str,
+        content_type: &str,
+    ) -> io::Result<()> {
+        let run_dir = self.sink.bundle().run_dir();
+        verify_cas_uri_exists(run_dir, cas_uri, None)?;
+        let entry = self.registry.get(asset_key).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot bind CAS URI to unknown asset {asset_key}"),
+            )
+        })?;
+        let mut updated = entry;
+        updated.source = Some(SourceDescriptorV0 {
+            uri: cas_uri.to_string(),
+            content_type: content_type.to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        });
+        self.sink.append_registry_update(&updated)?;
+        self.registry.insert(asset_key.to_string(), updated);
+        self.record_dataops_mutation()
     }
 
     /// Register a source dataset (no upstream; uses ingest_node for recipe_hash).
@@ -164,26 +354,12 @@ impl DataOpsSession {
             pii_tags: Vec::new(),
         };
 
-        self.registry.insert(asset_key.to_string(), entry.clone());
         self.sink.append_registry_update(&entry)?;
+        self.registry.insert(asset_key.to_string(), entry);
         self.record_dataops_mutation()
     }
 
     /// Materialize node outputs: derives fingerprints, propagates trust, emits records, flushes.
-    ///
-    /// **Correctness guarantees (alpha.6+):**
-    /// - Returns `Err` if any `node.inputs[].asset_key` is missing from registry (fail closed)
-    /// - Returns `Err` if any input fingerprint is invalid hex
-    /// - Returns `Err` if any `OutputSpec.asset_key` is not declared in `node.outputs[]`
-    /// - Returns `Err` if any declared `node.outputs[]` asset key is missing from `outputs`
-    /// - Returns `Err` if `node.outputs[]` itself contains duplicate `asset_key` values
-    /// - Returns `Err` if `outputs` contains duplicate `asset_key` values
-    /// - Lineage edges reference pre-mutation input fingerprints (not post-insert state)
-    ///
-    /// Safety taxonomy:
-    /// - `unsafe_reasons` includes `UntrustedInput` when any input trust is untrusted.
-    /// - `unsafe_reasons` includes `UnsafeExtension` when `execution_trust != Core`.
-    /// - `unsafe_surface` is derived from reasons (`!unsafe_reasons.is_empty()`).
     pub fn materialize_node_outputs(
         &mut self,
         node: &NodeV1,
@@ -194,7 +370,6 @@ impl DataOpsSession {
     ) -> io::Result<()> {
         // ── PRE-VALIDATION ──────────────────────────────────────────────
 
-        // 1. Reject duplicate output keys, and capture provided output set.
         let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
             for output in outputs {
@@ -207,9 +382,6 @@ impl DataOpsSession {
             }
         }
 
-        // 2. Enforce output contract:
-        //    - every provided OutputSpec must be declared in node.outputs[]
-        //    - every declared node output must be present in outputs
         {
             let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
             for node_output in &node.outputs {
@@ -249,11 +421,9 @@ impl DataOpsSession {
 
         // ── SNAPSHOT INPUTS (pre-mutation) ───────────────────────────────
 
-        // 3. Fail closed: every declared input MUST exist with a valid fingerprint.
-        //    Capture snapshots before any registry mutation.
         let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
         let mut any_untrusted_input = false;
-        let mut input_snapshots: Vec<(String, String)> = Vec::new(); // (asset_key, fp_hex)
+        let mut input_snapshots: Vec<(String, String)> = Vec::new();
 
         for input in &node.inputs {
             let entry = self.registry.get(&input.asset_key).ok_or_else(|| {
@@ -283,11 +453,9 @@ impl DataOpsSession {
 
         // ── DERIVE + EMIT ───────────────────────────────────────────────
 
-        // 4. Compute recipe_hash_v0(node, upstream_fps)
         let recipe = recipe_hash_v0(node, &upstream_fps)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // 5. Derive unsafe reasons and output trust classification.
         let mut unsafe_reasons = Vec::new();
         if any_untrusted_input {
             unsafe_reasons.push(UnsafeReasonV0::UntrustedInput);
@@ -316,7 +484,6 @@ impl DataOpsSession {
         let cache_key = cache_key_v0(node, &upstream_fps, execution_profile)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Derive node_id
         let node_id = node
             .node_id
             .unwrap_or_else(|| node_id_from_key(&node.node_key));
@@ -338,7 +505,6 @@ impl DataOpsSession {
         let mut staged_edge_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
         let mut next_record_seq = self.next_record_seq;
 
-        // 6. For each output: compute fingerprint, staged entry/lineage/materialization.
         for output in outputs {
             let schema_fp = match output.schema.as_ref() {
                 Some(s) => schema_hash_v0(s)
@@ -353,6 +519,15 @@ impl DataOpsSession {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let fp_hex = hex_lower(&dataset_fp);
 
+            // Preserve existing source descriptor if this is a verified cache hit on the same fingerprint.
+            let preserved_source = self.registry.get(&output.asset_key).and_then(|existing| {
+                if existing.fingerprint_v0 == fp_hex {
+                    existing.source.clone()
+                } else {
+                    None
+                }
+            });
+
             let entry = DatasetEntryV1 {
                 asset_key: output.asset_key.clone(),
                 fingerprint_v0: fp_hex.clone(),
@@ -360,14 +535,13 @@ impl DataOpsSession {
                 schema_hash_v0: hex_lower(&schema_fp),
                 recipe_hash_v0: hex_lower(&recipe),
                 trust: output_trust,
-                source: None,
+                source: preserved_source,
                 schema: output.schema.clone(),
                 license_flags: Vec::new(),
                 pii_tags: Vec::new(),
             };
             staged_entries.push(entry);
 
-            // 7. Lineage edges from pre-mutation input snapshots (not live registry)
             for (_, in_fp) in &input_snapshots {
                 let edge_key = (in_fp.clone(), fp_hex.clone(), node_id_str.clone());
                 let edge = LineageEdgeV1 {
@@ -383,7 +557,6 @@ impl DataOpsSession {
                 }
             }
 
-            // 8. Append MaterializationRecordV2
             let mat = MaterializationRecordV2 {
                 schema_version: MATERIALIZATION_SCHEMA_V2,
                 record_seq: next_record_seq,
@@ -413,7 +586,6 @@ impl DataOpsSession {
             next_record_seq = next_record_seq.saturating_add(1);
         }
 
-        // 9. Persist staged writes before mutating in-memory state.
         for entry in &staged_entries {
             self.sink.append_registry_update(entry)?;
         }
@@ -424,7 +596,6 @@ impl DataOpsSession {
             self.sink.append_materialization_v2(mat)?;
         }
 
-        // 10. Commit in-memory state only after all writes succeed.
         for entry in staged_entries {
             self.registry.insert(entry.asset_key.clone(), entry);
         }
@@ -434,7 +605,6 @@ impl DataOpsSession {
         self.next_record_seq = next_record_seq;
         self.pending_transform_audits.clear();
 
-        // 11. Snapshot compaction (strict or streaming cadence).
         self.record_dataops_mutation()
     }
 
@@ -474,14 +644,12 @@ impl DataOpsSession {
 
     /// Flush registry.json + lineage.json atomically (crash-safe).
     fn flush_snapshots(&mut self) -> io::Result<()> {
-        // Registry: sorted by asset_key (BTreeMap iteration is already sorted)
         let registry = DatasetRegistryV1 {
             schema_version: DATAOPS_SCHEMA_V1,
             datasets: self.registry.values().cloned().collect(),
         };
         self.sink.write_dataset_registry(&registry)?;
 
-        // Lineage: sorted by key (BTreeMap iteration is already sorted)
         let lineage = DatasetLineageV1 {
             schema_version: DATAOPS_SCHEMA_V1,
             edges: self.lineage.values().cloned().collect(),
@@ -501,7 +669,6 @@ impl DataOpsSession {
         write_json_pretty_atomic(&datasets_dir.join("snapshot_pair_commit.json"), &marker)?;
         self.next_snapshot_pair_seq = self.next_snapshot_pair_seq.saturating_add(1);
 
-        // Keep manifest freshness aligned when snapshot pair markers change.
         if !matches!(
             self.sink.profile().manifest_policy,
             super::ManifestRefreshPolicy::FinalOnly
@@ -668,19 +835,9 @@ impl DataOpsSession {
         Ok(())
     }
 
-    // ── Cache-hit prediction (alpha.6+) ─────────────────────────────
+    // ── Cache-hit prediction & CAS verification (alpha.6+ / Wave 10) ──
 
     /// Predict output fingerprints for a node before execution.
-    ///
-    /// **Fail closed:** returns `Err(PredictError::MissingInput)` if any
-    /// `node.inputs[].asset_key` is absent from the registry, and
-    /// `Err(PredictError::InvalidFingerprint)` if a registered fingerprint
-    /// is malformed.
-    ///
-    /// **Output contract enforcement:** returns `Err(PredictError::OutputContract)` if
-    /// `outputs` violates node output declarations (undeclared/missing/duplicate keys).
-    ///
-    /// The orchestrator must treat errors as "no cache optimization".
     pub fn predict(
         &self,
         node: &NodeV1,
@@ -740,15 +897,49 @@ impl DataOpsSession {
     }
 
     /// Asset-key scoped cache hit check.
-    ///
-    /// Returns `true` iff `asset_key` exists in the registry **and** its
-    /// current fingerprint matches `predicted_fp`. This prevents false positives
-    /// from fingerprint collisions across different asset keys.
     pub fn is_cache_hit(&self, asset_key: &str, predicted_fp: &str) -> bool {
         self.registry
             .get(asset_key)
             .map(|e| e.fingerprint_v0 == predicted_fp)
             .unwrap_or(false)
+    }
+
+    /// Evaluate whether `node` can reuse all of its declared `outputs` from cache
+    /// (`ADR-0023` §2.3, `W10-01`).
+    ///
+    /// - Respects [`CachePolicyV0::Bypass`] by returning [`CacheDecisionV0::Bypass`].
+    /// - Requires `node.outputs` to be non-empty and every predicted output to match the current
+    ///   registry entry's `fingerprint_v0`.
+    /// - If a registered asset has a `cas://sha256/...` or `blobs/sha256/...` URI in its
+    ///   [`SourceDescriptorV0`], verifies that the physical CAS blob exists on disk and its
+    ///   SHA-256 matches before returning [`CacheDecisionV0::Hit`].
+    pub fn verify_cache_hit(&self, node: &NodeV1, outputs: &[OutputSpecCore]) -> CacheDecisionV0 {
+        if matches!(node.cache_policy, Some(CachePolicyV0::Bypass)) {
+            return CacheDecisionV0::Bypass;
+        }
+        if outputs.is_empty() {
+            return CacheDecisionV0::Miss;
+        }
+        let Ok(predicted) = self.predict(node, outputs) else {
+            return CacheDecisionV0::Miss;
+        };
+        let run_dir = self.sink.bundle().run_dir();
+        for pred in &predicted {
+            let Some(entry) = self.registry.get(&pred.asset_key) else {
+                return CacheDecisionV0::Miss;
+            };
+            if entry.fingerprint_v0 != pred.fingerprint_v0 {
+                return CacheDecisionV0::Miss;
+            }
+            if let Some(ref src) = entry.source {
+                if parse_cas_uri_digest(&src.uri).is_some()
+                    && verify_cas_uri_exists(run_dir, &src.uri, None).is_err()
+                {
+                    return CacheDecisionV0::Miss;
+                }
+            }
+        }
+        CacheDecisionV0::Hit
     }
 
     #[cfg(test)]

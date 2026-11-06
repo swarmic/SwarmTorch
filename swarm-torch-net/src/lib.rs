@@ -4,6 +4,7 @@
 //!
 //! This crate provides:
 //! - Unified `SwarmTransport` trait for all transports
+//! - Originator-authenticated gossip inner updates and recipient wrappers (`gossip`)
 //! - Mock transport/network implementations for integration testing
 //! - Placeholder feature flags for TCP/UDP/BLE/LoRa/WiFi backends (planned)
 //! - Multi-transport policy surface with fallback error semantics
@@ -15,6 +16,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod gossip;
 pub mod protocol;
 pub mod traits;
 
@@ -30,9 +32,12 @@ mod mock;
 pub use mock::MockTransport;
 #[cfg(feature = "alloc")]
 pub use mock::{MockNetwork, MockTransportError};
+#[cfg(feature = "std")]
+pub use mock::{MockNetworkHub, MockPeerTransport, Topology};
 
 /// Prelude for convenient imports
 pub mod prelude {
+    pub use crate::gossip::*;
     pub use crate::protocol::*;
     pub use crate::traits::*;
 }

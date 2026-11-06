@@ -212,6 +212,256 @@ impl MockNetwork {
     }
 }
 
+/// Deterministic network topology for [`MockNetworkHub`] (`ADR-0022` §3, `W10-03`).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Topology {
+    /// Every peer can send directly to every other peer.
+    FullMesh,
+    /// Bidirectional ring topology ($i \leftrightarrow (i \pm 1) \bmod N$).
+    Ring,
+    /// Star topology where all spokes communicate through `hub`.
+    Star { hub: PeerId },
+    /// Deterministic $k$-regular gossip ring ($i \to (i + 1 \dots i + \text{fanout}) \bmod N$).
+    Gossip { fanout: usize },
+}
+
+#[cfg(feature = "std")]
+struct HubInner {
+    peers: Vec<PeerId>,
+    topology: Topology,
+    max_queue_depth: usize,
+    blocked_links: std::collections::BTreeSet<(PeerId, PeerId)>,
+    drop_budgets: std::collections::BTreeMap<(PeerId, PeerId), usize>,
+    messages: VecDeque<(PeerId, PeerId, Vec<u8>)>,
+}
+
+/// Multi-peer deterministic network hub with configurable topology and link fault injection
+/// (`ADR-0022` §3, `W10-03`).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub struct MockNetworkHub {
+    inner: std::sync::Arc<std::sync::Mutex<HubInner>>,
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Debug for MockNetworkHub {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MockNetworkHub").finish()
+    }
+}
+
+#[cfg(feature = "std")]
+impl MockNetworkHub {
+    /// Create a new [`MockNetworkHub`] over `peers` with `topology` and `max_queue_depth`.
+    pub fn new(peers: Vec<PeerId>, topology: Topology, max_queue_depth: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(HubInner {
+                peers,
+                topology,
+                max_queue_depth,
+                blocked_links: std::collections::BTreeSet::new(),
+                drop_budgets: std::collections::BTreeMap::new(),
+                messages: VecDeque::new(),
+            })),
+        }
+    }
+
+    /// Create a [`MockPeerTransport`] handle bound to `local_peer`.
+    pub fn peer_transport(&self, local_peer: PeerId) -> MockPeerTransport {
+        MockPeerTransport {
+            local_peer,
+            hub: self.clone(),
+        }
+    }
+
+    /// Block or unblock the directed link `(from, to)`.
+    pub fn set_link_blocked(&self, from: PeerId, to: PeerId, blocked: bool) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if blocked {
+                guard.blocked_links.insert((from, to));
+            } else {
+                guard.blocked_links.remove(&(from, to));
+            }
+        }
+    }
+
+    /// Drop the next `count` frames transmitted over the directed link `(from, to)`.
+    pub fn set_drop_next(&self, from: PeerId, to: PeerId, count: usize) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if count == 0 {
+                guard.drop_budgets.remove(&(from, to));
+            } else {
+                guard.drop_budgets.insert((from, to), count);
+            }
+        }
+    }
+
+    /// Return the adjacent outgoing neighbors of `peer` according to [`Topology`] and active link blocks.
+    pub fn neighbors(&self, peer: PeerId) -> Vec<PeerId> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        Self::neighbors_locked(&guard, peer)
+    }
+
+    fn neighbors_locked(guard: &HubInner, peer: PeerId) -> Vec<PeerId> {
+        let n = guard.peers.len();
+        let Some(idx) = guard.peers.iter().position(|&p| p == peer) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match guard.topology {
+            Topology::FullMesh => {
+                for &other in &guard.peers {
+                    if other != peer && !guard.blocked_links.contains(&(peer, other)) {
+                        out.push(other);
+                    }
+                }
+            }
+            Topology::Ring => {
+                if n > 1 {
+                    let prev = guard.peers[(idx + n - 1) % n];
+                    let next = guard.peers[(idx + 1) % n];
+                    for cand in [prev, next] {
+                        if cand != peer
+                            && !out.contains(&cand)
+                            && !guard.blocked_links.contains(&(peer, cand))
+                        {
+                            out.push(cand);
+                        }
+                    }
+                }
+            }
+            Topology::Star { hub } => {
+                if peer == hub {
+                    for &other in &guard.peers {
+                        if other != hub && !guard.blocked_links.contains(&(peer, other)) {
+                            out.push(other);
+                        }
+                    }
+                } else if !guard.blocked_links.contains(&(peer, hub)) {
+                    out.push(hub);
+                }
+            }
+            Topology::Gossip { fanout } => {
+                let k = fanout.min(n.saturating_sub(1));
+                for step in 1..=k {
+                    let cand = guard.peers[(idx + step) % n];
+                    if cand != peer
+                        && !out.contains(&cand)
+                        && !guard.blocked_links.contains(&(peer, cand))
+                    {
+                        out.push(cand);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Send a message from `from` to `to` if permitted by topology and queue bounds.
+    pub fn send_from(&self, from: PeerId, to: PeerId, payload: &[u8]) -> crate::Result<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| crate::Error::TransportUnavailable)?;
+        let neighbors = Self::neighbors_locked(&guard, from);
+        if !neighbors.contains(&to) {
+            return Err(crate::Error::PeerNotFound);
+        }
+        if let Some(rem) = guard.drop_budgets.get_mut(&(from, to)) {
+            if *rem > 0 {
+                *rem -= 1;
+                return Ok(());
+            }
+        }
+        if guard.messages.len() >= guard.max_queue_depth {
+            return Err(crate::Error::SendFailed);
+        }
+        guard.messages.push_back((from, to, payload.to_vec()));
+        Ok(())
+    }
+
+    /// Pop the next queued message addressed to `recipient`.
+    pub fn recv_for(&self, recipient: PeerId) -> crate::Result<(PeerId, Vec<u8>)> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| crate::Error::TransportUnavailable)?;
+        let Some(pos) = guard
+            .messages
+            .iter()
+            .position(|(_, to, _)| *to == recipient)
+        else {
+            return Err(crate::Error::Timeout);
+        };
+        let (from, _, payload) = guard.messages.remove(pos).ok_or(crate::Error::Timeout)?;
+        Ok((from, payload))
+    }
+}
+
+/// Per-peer [` crate::traits::SwarmTransport`] handle backed by a shared [`MockNetworkHub`].
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct MockPeerTransport {
+    local_peer: PeerId,
+    hub: MockNetworkHub,
+}
+
+#[cfg(feature = "std")]
+impl MockPeerTransport {
+    /// Local peer identity of this transport endpoint.
+    pub const fn local_peer(&self) -> PeerId {
+        self.local_peer
+    }
+}
+
+#[cfg(feature = "std")]
+impl crate::traits::SwarmTransport for MockPeerTransport {
+    type SendFuture<'a> = core::future::Ready<crate::Result<()>>;
+    type RecvFuture<'a> = core::future::Ready<crate::Result<(PeerId, Vec<u8>)>>;
+    type BroadcastFuture<'a> = core::future::Ready<crate::Result<crate::traits::BroadcastStats>>;
+    type DiscoverFuture<'a> = core::future::Ready<crate::Result<Vec<PeerId>>>;
+
+    fn send<'a>(&'a self, peer: PeerId, msg: &'a [u8]) -> Self::SendFuture<'a> {
+        core::future::ready(self.hub.send_from(self.local_peer, peer, msg))
+    }
+
+    fn recv(&self) -> Self::RecvFuture<'_> {
+        core::future::ready(self.hub.recv_for(self.local_peer))
+    }
+
+    fn broadcast<'a>(&'a self, msg: &'a [u8]) -> Self::BroadcastFuture<'a> {
+        let neighbors = self.hub.neighbors(self.local_peer);
+        let mut stats = crate::traits::BroadcastStats {
+            peers_sent: neighbors.len(),
+            confirmed: 0,
+            failed: 0,
+        };
+        for peer in neighbors {
+            match self.hub.send_from(self.local_peer, peer, msg) {
+                Ok(()) => stats.confirmed += 1,
+                Err(_) => stats.failed += 1,
+            }
+        }
+        core::future::ready(Ok(stats))
+    }
+
+    fn discover(&self) -> Self::DiscoverFuture<'_> {
+        core::future::ready(Ok(self.hub.neighbors(self.local_peer)))
+    }
+
+    fn capabilities(&self) -> TransportCapabilities {
+        TransportCapabilities {
+            reliability: ReliabilityClass::Reliable,
+            bandwidth_class: BandwidthClass::High,
+            max_message_size: 1_048_576,
+            supports_multicast: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod packet_tests {
     use super::*;

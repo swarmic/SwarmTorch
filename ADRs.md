@@ -4199,7 +4199,7 @@ Hardening [`swarm-torch-core/src/compression.rs`](file:///c:/Users/Swarmic/Deskt
 
 ## ADR-0022: Additive Transport Traits, Observed-Source Pre-Auth Reassembly, Originator-Authenticated Gossip Wrappers, and Zenoh/Iroh Adapter Crates
 
-**Status:** Accepted (`W9-04` & `W9-05` Implemented in Wave 9; `W10-03`, `W11-03`, `W12-02` Planned)  
+**Status:** Accepted (`W9-04`, `W9-05`, & `W10-03` Implemented in Waves 9–10; `W11-03`, `W12-02` Planned)  
 **Date:** 2026-11-01 (Amended 2026-11-02)  
 **Deciders:** Core Team  
 **Supersedes:** Conditional `#[cfg(feature = "std")]` trait split in `swarm-torch-net/src/traits.rs` (ADR-0004)  
@@ -4274,7 +4274,7 @@ Hardening [`swarm-torch-net`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%2
 4. **TCP Stream Framing:**
    - `TcpTransport` uses direct length-prefixed framing (`u32_le(delivery_length) || serialized_delivery`) with pre-allocation length checks, cancellation-safe read state, and connection closure on malformed frames.
 
-#### 3. Originator-Authenticated Gossip Recipient Wrappers (`W9-04` Implemented / `W10-03` Planned)
+#### 3. Originator-Authenticated Gossip Recipient Wrappers (`W9-04` & `W10-03` — Implemented)
 
 1. **Encode Inner Update Once (`InnerUpdateV1`):**
    - Canonical inner object binds: `originator`, `scope_id`, `round_id`, `contribution_id`, `base_checkpoint_digest`, `payload_kind`, `compression_schema_version`, `num_elements`, and `encoded_payload`.
@@ -4293,7 +4293,7 @@ Hardening [`swarm-torch-net`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%2
 
 ## ADR-0023: Unified Swarm Round Coordinator, Physical CAS Checkpoints, Strict Manifest Trust Policy, Cross-Process Bundle Locking, `FedAsync`, and Durable RDP Accounting
 
-**Status:** Contract Ratified (2026-11-02; Planned for Wave 10 & Wave 12)  
+**Status:** Accepted (`W10-01` & `W10-02` Implemented in Wave 10; `W12-03` Planned for Wave 12)  
 **Date:** 2026-11-01 (Amended 2026-11-02)  
 **Deciders:** Core Team  
 **Extends:** ADR-0004B, ADR-0006A, ADR-0014, ADR-0016, ADR-0017, ADR-0018  
@@ -4307,7 +4307,7 @@ Advancing [`swarm-torch`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Ind
 
 ### Decision
 
-#### 1. Typed Learning Transition, Round Admission, & Session Ergonomics (`W10-01` — Planned Contract)
+#### 1. Typed Learning Transition, Round Admission, & Session Ergonomics (`W10-01` — Implemented)
 
 1. **Typed Update Semantics (`ModelDeltaV1` Default, `GradientV1` Separate):**
    - For multi-step local training / `FedProx`, `ModelDeltaV1` is the default profile:
@@ -4321,7 +4321,7 @@ Advancing [`swarm-torch`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Ind
    - Provide explicit `open` / `create` / `resume` constructors and a fallible `commit_and_close` / `finish` method returning the durable receipt or recoverable error.
    - Enforce generation/write-capability guards on shared `Arc<RunArtifactSink>` handles so stale handles cannot mutate a sealed generation. Keep `Drop` limited to resource release and best-effort private staging cleanup.
 
-#### 2. Physical CAS Checkpoints, Authoritative Commit, & Validated Cache Reuse (`W10-01` — Planned Contract)
+#### 2. Physical CAS Checkpoints, Authoritative Commit, & Validated Cache Reuse (`W10-01` — Implemented)
 
 1. **Separate Three Identities:**
    - **Recipe / Cache Key:** Identifies the requested computation, inputs, initial model, config, seed, numeric/backend profile, and algorithm state.
@@ -4334,7 +4334,7 @@ Advancing [`swarm-torch`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Ind
    - Preserve and validate actual runner output instances in `scheduler.rs` (exact declared output keys, verified content digests, sizes, schemas).
    - A training/checkpoint cache hit requires: eligible `CachePolicy` (honoring `Bypass`), matching computation identity, **present and digest-verified physical checkpoint bytes**, satisfied `TrustPolicy`, compatible layout/resume state, and successful state restoration.
 
-#### 3. `TrustPolicy::Strict`, Cross-Process Bundle Lock (`P2-02`), & JSON Schemas (`P2-20a`) (`W10-02` — Planned Contract)
+#### 3. `TrustPolicy::Strict`, Cross-Process Bundle Lock (`P2-02`), & JSON Schemas (`P2-20a`) (`W10-02` — Implemented)
 
 1. **`TrustPolicy::Strict` as Verified-Consumer Default (`P2-10`):**
    - Verified report loading (`report/load.rs`), checkpoint restoration, and cache admission default to `TrustPolicy::Strict`, requiring external trusted verifying keys authorized for the scope/role, bounded manifest decoding, valid `ManifestSignatureV1` over raw 16-byte `RunId` bytes (`"swarmtorch.manifest.sig.v1" || u32_le(schema_version) || run_id_raw_16_bytes || u64_le(signed_unix_nanos) || entries_hash`), expected run/model/head context (external freshness anchor against rollback), and verified digests/lengths for all consumed files.

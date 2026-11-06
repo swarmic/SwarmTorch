@@ -93,6 +93,10 @@ pub mod native_runner;
 #[cfg(feature = "std")]
 pub mod scheduler;
 
+/// Unified Swarm Round Coordinator (std-only).
+#[cfg(feature = "std")]
+pub mod coordinator;
+
 /// Prelude module for convenient imports
 ///
 /// ```rust,ignore

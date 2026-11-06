@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/graph.schema.json",
+  "title": "GraphV1",
+  "description": "SwarmTorch v1 executable run graph contract (graph.json, ADR-0017).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "nodes", "edges"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "nodes": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/NodeV1"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/EdgeV1"
+      }
+    }
+  },
+  "$defs": {
+    "AssetRefV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_key"],
+      "properties": {
+        "asset_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "ExecutionHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preferred_profile": {
+          "type": "string",
+          "enum": ["embedded_min", "embedded_alloc", "edge_std"]
+        },
+        "device_affinity": {
+          "type": "string",
+          "enum": ["coordinator", "any_participant"]
+        },
+        "memory_budget_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "ResourceHintsV0": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu_millis": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "memory_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "accelerator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "NodeV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_key", "op_kind", "op_type", "inputs", "outputs", "params", "unsafe_surface", "execution_trust"],
+      "properties": {
+        "node_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "op_kind": {
+          "type": "string",
+          "enum": ["data", "train", "comms", "governance", "system"]
+        },
+        "op_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "inputs": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/AssetRefV1"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/AssetRefV1"
+          }
+        },
+        "params": {
+          "type": "object"
+        },
+        "code_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "unsafe_surface": {
+          "type": "boolean"
+        },
+        "execution_trust": {
+          "type": "string",
+          "enum": ["core", "sandboxed_extension", "unsafe_extension"]
+        },
+        "node_def_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "execution_hint": {
+          "$ref": "#/$defs/ExecutionHint"
+        },
+        "cache_policy": {
+          "type": "string",
+          "enum": ["auto", "prefer_reuse", "bypass"]
+        },
+        "materialization_policy": {
+          "type": "string",
+          "enum": ["full", "metadata_only", "lazy"]
+        },
+        "resources": {
+          "$ref": "#/$defs/ResourceHintsV0"
+        },
+        "op_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "EdgeV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_node_id", "to_node_id"],
+      "properties": {
+        "from_node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "to_node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "asset_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
+  }
+}

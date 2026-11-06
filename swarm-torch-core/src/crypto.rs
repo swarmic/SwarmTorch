@@ -18,6 +18,18 @@ pub const ENVELOPE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.envelope.v1";
 /// Domain separation tag for receiver-challenged session recovery handshakes.
 pub const SESSION_HANDSHAKE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.session.handshake.v1";
 
+/// Domain separation tag for `ManifestSignatureV1` (`ADR-0023` §3.1, `W10-02`).
+pub const MANIFEST_SIGNATURE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.manifest.sig.v1";
+
+/// Domain separation tag for `ManifestV1` canonical entry list hashing (`ADR-0023` §3.1, `W10-02`).
+pub const MANIFEST_ENTRIES_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.manifest.entries.v1";
+
+/// Domain separation tag for canonical inner update digests (`ADR-0022` §3.1, `W10-03`).
+pub const INNER_UPDATE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.update.v1";
+
+/// Domain separation tag for originator-signed gossip recipient wrappers (`ADR-0022` §3.2, `W10-03`).
+pub const RECIPIENT_WRAPPER_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.gossip.wrapper.v1";
+
 /// Scoped envelope v1 signing metadata (`ADR-0021`, `W9-02`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeContextV1 {
@@ -202,6 +214,44 @@ fn canonical_session_handshake_digest(
     hasher.finalize().into()
 }
 
+/// Compute the canonical `ManifestSignatureV1` preimage digest (`ADR-0023` §3.1, `W10-02`):
+/// `"swarmtorch.manifest.sig.v1" || u32_le(schema_version) || run_id_raw_16_bytes || u64_le(signed_unix_nanos) || entries_hash`.
+pub fn canonical_manifest_sig_v1_digest(
+    schema_version: u32,
+    run_id_raw_16_bytes: &[u8; 16],
+    signed_unix_nanos: u64,
+    entries_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MANIFEST_SIGNATURE_DOMAIN_TAG_V1);
+    hasher.update(schema_version.to_le_bytes());
+    hasher.update(run_id_raw_16_bytes);
+    hasher.update(signed_unix_nanos.to_le_bytes());
+    hasher.update(entries_hash);
+    hasher.finalize().into()
+}
+
+/// Compute the canonical SHA-256 digest of a slice sequence (`W10-03`).
+pub fn sha256_slices(slices: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for s in slices {
+        hasher.update(s);
+    }
+    hasher.finalize().into()
+}
+
+fn canonical_prehashed_domain_digest(
+    domain_tag: &[u8],
+    public_key: &[u8; 32],
+    content_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain_tag);
+    hasher.update(public_key);
+    hasher.update(content_digest);
+    hasher.finalize().into()
+}
+
 /// Message authentication helper.
 pub struct MessageAuth {
     key_pair: KeyPair,
@@ -308,6 +358,74 @@ impl MessageAuth {
             VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
         let sig = signature.to_dalek()?;
         let canonical = canonical_session_handshake_digest(public_key, challenge);
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Sign a `ManifestSignatureV1` preimage (`"swarmtorch.manifest.sig.v1"`, `ADR-0023` §3.1, `W10-02`).
+    pub fn sign_manifest_v1(
+        &self,
+        schema_version: u32,
+        run_id_raw_16_bytes: &[u8; 16],
+        signed_unix_nanos: u64,
+        entries_hash: &[u8; 32],
+    ) -> Signature {
+        let canonical = canonical_manifest_sig_v1_digest(
+            schema_version,
+            run_id_raw_16_bytes,
+            signed_unix_nanos,
+            entries_hash,
+        );
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
+    }
+
+    /// Verify a `ManifestSignatureV1` signature (`"swarmtorch.manifest.sig.v1"`, `ADR-0023` §3.1, `W10-02`).
+    pub fn verify_manifest_v1(
+        public_key: &[u8; 32],
+        schema_version: u32,
+        run_id_raw_16_bytes: &[u8; 16],
+        signed_unix_nanos: u64,
+        entries_hash: &[u8; 32],
+        signature: &Signature,
+    ) -> Result<(), CryptoError> {
+        let _ = PeerId::try_from_public_key_bytes(public_key)?;
+        if run_id_raw_16_bytes.iter().all(|&b| b == 0) {
+            return Err(CryptoError::VerificationFailed);
+        }
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_manifest_sig_v1_digest(
+            schema_version,
+            run_id_raw_16_bytes,
+            signed_unix_nanos,
+            entries_hash,
+        );
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Sign a pre-hashed 32-byte digest under a specific domain separation tag (`ADR-0022` §3, `W10-03`).
+    pub fn sign_prehashed_domain(&self, domain_tag: &[u8], content_digest: &[u8; 32]) -> Signature {
+        let canonical =
+            canonical_prehashed_domain_digest(domain_tag, &self.key_pair.public, content_digest);
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
+    }
+
+    /// Verify a pre-hashed 32-byte digest under a specific domain separation tag (`ADR-0022` §3, `W10-03`).
+    pub fn verify_prehashed_domain(
+        public_key: &[u8; 32],
+        domain_tag: &[u8],
+        content_digest: &[u8; 32],
+        signature: &Signature,
+    ) -> Result<(), CryptoError> {
+        let _ = PeerId::try_from_public_key_bytes(public_key)?;
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_prehashed_domain_digest(domain_tag, public_key, content_digest);
         key.verify_strict(&canonical, &sig)
             .map_err(|_| CryptoError::VerificationFailed)
     }

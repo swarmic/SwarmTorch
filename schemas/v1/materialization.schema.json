@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/materialization.schema.json",
+  "title": "MaterializationRecordCompat",
+  "description": "SwarmTorch v1/v2 NDJSON materialization record line contract (datasets/materializations.ndjson, ADR-0016, ADR-0017).",
+  "oneOf": [
+    { "$ref": "#/$defs/MaterializationRecordV2" },
+    { "$ref": "#/$defs/MaterializationRecordV1" }
+  ],
+  "$defs": {
+    "MaterializationRecordV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "ts_unix_nanos",
+        "asset_key",
+        "fingerprint_v0",
+        "node_id",
+        "node_def_hash",
+        "unsafe_surface"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "ts_unix_nanos": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "asset_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fingerprint_v0": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "node_def_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "rows": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "cache_hit": {
+          "type": ["boolean", "null"]
+        },
+        "duration_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "quality_flags": {
+          "type": ["array", "null"],
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "unsafe_surface": {
+          "type": "boolean"
+        }
+      }
+    },
+    "MaterializationRecordV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "record_seq",
+        "ts_unix_nanos",
+        "asset_key",
+        "fingerprint_v0",
+        "node_id",
+        "node_def_hash",
+        "op_type",
+        "cache_decision",
+        "unsafe_surface",
+        "status"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "record_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "ts_unix_nanos": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "asset_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fingerprint_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "node_def_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "op_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "input_asset_keys": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "input_fingerprints_v0": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "cache_decision": {
+          "type": "string",
+          "enum": ["hit", "miss", "bypass", "unknown"]
+        },
+        "cache_reason": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "cache_key_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cache_hit": {
+          "type": "boolean"
+        },
+        "unsafe_surface": {
+          "type": "boolean"
+        },
+        "unsafe_reasons": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "enum": ["untrusted_input", "unsafe_extension", "missing_provenance"]
+          }
+        },
+        "applied_transforms": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/TransformAuditV0"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "error", "skipped"]
+        },
+        "error_code": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "quality": {
+          "$ref": "#/$defs/QualitySummaryV0"
+        }
+      }
+    },
+    "TransformAuditV0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transform_name", "core_trusted", "round_id"],
+      "properties": {
+        "transform_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "core_trusted": {
+          "type": "boolean"
+        },
+        "round_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "QualitySummaryV0": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "null_rate": {
+          "type": "number"
+        },
+        "row_count_delta": {
+          "type": "integer"
+        },
+        "schema_changed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

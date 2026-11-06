@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/span.schema.json",
+  "title": "SpanRecord",
+  "description": "SwarmTorch v1 NDJSON span record line contract (spans.ndjson, ADR-0016).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace_id", "span_id", "parent_span_id", "name", "start_unix_nanos", "end_unix_nanos", "attrs"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "span_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "parent_span_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "start_unix_nanos": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "end_unix_nanos": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "attrs": {
+      "type": "object"
+    }
+  }
+}

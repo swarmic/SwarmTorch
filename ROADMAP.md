@@ -6,8 +6,8 @@ For a high-level project overview and usage guide, see [`README.md`](README.md).
 
 | Version | Focus | Status |
 |---------|-------|--------|
-| `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Current (Implemented & Verified) |
-| `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Planned |
+| `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Completed |
+| `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Current (Implemented & Verified) |
 | `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Planned |
 | `v0.2.0` | Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & `wasmi` Sandbox (Wave 12) | Planned |
 | `v0.3.0+` | Production Hardening, Local Artifact Reader (`P2-16`), & Optional Desktop Wrapper (`P2-17`) | Future |
@@ -18,7 +18,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-## Completed Milestones (Waves 4–9)
+## Completed Milestones (Waves 4–10)
 
 ### Waves 4–6: Remediation & Artifact/Report Canon Lock
 - Completed `E-01..E-05` semver batch, `F1` execution hints (`ExecutionHint`), `F2a/F2/F3/F4` (`TransformAuditV0`, `UpdateTransform`, composable aggregation pipeline, lightweight tracing), and behavior-preserving `A6X-06` decomposition of artifact/report modules.
@@ -39,20 +39,24 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
    - Removes unused `burn = "0.14"`, `burn-ndarray = "0.14"`, `bincode 2.0.0-rc.3`, `async-trait`, and `lru` from the workspace (`RUSTSEC-2025-0141` and `EX-2026-04-05-02`/`03` closed).
    - Relaxes `SwarmModel::Input: ?Sized`, upgrades `LinearModelWithCapacity` and contiguous-buffer `MlpModelWithCapacity`, adds analytical `MseLoss`, `CrossEntropyLoss` (with zero-dependency `no_std` IEEE-754 `exp_f64`/`ln_f64`), `HuberLoss`, `FedProxRegularizer`, and `SgdOptimizer`, splits `PacketTransport` and GAT-based `SwarmTransport`, and splits `SwarmClock` / `SwarmRuntime` with 32-bit portable `MockRuntime`.
 
+### Wave 10 (`v0.1.0-beta.1` — Landed & Conformance Verified)
+1. **Strict Artifact Trust, Cross-Process Bundle Locking, & JSON Schema 2020-12 Contracts (`W10-02`, `ADR-0016`, `ADR-0023` §3, `P2-02`, `P2-05`, `P2-10`, `P2-20a`):**
+   - Adds cross-process exclusive `.bundle.lock` guard (`BundleLockGuard`), unique `.staging.*` atomic writes with checked `sync_all()?` and POSIX parent-directory fsync, `ManifestSignatureV1` over raw 16-byte `RunId` preimages, single-pass zero-TOCTOU `VerifiedBundleV1` and `load_report_strict` (`TrustPolicy::Strict`), 9 canonical JSON Schema Draft 2020-12 files in `schemas/v1/*.schema.json` with lossless `u64` conformance tests, and promotes `cargo vet` to blocking in CI.
+2. **Physical CAS Checkpoints, Explicit `DataOpsSession` Lifecycle, & `SwarmRoundCoordinator` (`W10-01`, `ADR-0023` §1–2, `P2-07`..`P2-09`, `P2-12`):**
+   - Implements write-once CAS model checkpoints (`blobs/sha256/<digest>`) separating `CheckpointRecipeKeyV1`, `CheckpointContentDigestV1`, and `RoundResumeStateV1`, adds atomic generation/seal fencing on `RunArtifactSink`, explicit `DataOpsSession::{create, open, resume, commit_and_close}`, physical CAS cache-hit verification and runner output `Vec<AssetInstanceV1>` preservation in `scheduler.rs`, and unified `SwarmRoundCoordinator` (`ModelDeltaV1` / `GradientV1`, `WeightingPolicyV1::EqualPeerVote` / `RegistryCertified`, future-round rejection before unsigned subtraction, 1-per-peer idempotent duplicate ack vs. equivocation revocation, frozen input buffers, and authoritative CAS commit).
+3. **Deterministic `MockRuntime` Scheduler, Originator-Authenticated Gossip Wrappers, & Multi-Node Simulation (`W10-03`, `ADR-0003`, `ADR-0014`, `ADR-0022` §3):**
+   - Adds bounded FIFO task scheduling and deadline-ordered timer wakers (`std::task::Wake`) to `MockRuntime`, `InnerUpdateV1` + `RecipientWrapperV1` + `BundledGossipDeliveryV1` and topology-aware `MockNetworkHub` in `swarm-torch-net`, and the 6-scenario multi-node honest & Byzantine training simulation suite (`swarm-torch/tests/federated_round_simulation.rs`).
+
 ---
 
-## Upcoming Ratified Waves (Waves 10–12)
+## Upcoming Ratified Waves (Waves 11–12)
 
-1. **Wave 10 (`v0.1.0-beta.1` — Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust):**
-   - `W10-01` (`ADR-0023`): `SwarmRoundCoordinator` (`ModelDeltaV1` default, single-owner local `FedProx`, one contribution per `(run, round, verified_originator)`), content-addressed checkpoints (`blobs/sha256/<digest>`) with checked `sync_all`, validated cache hits in `scheduler.rs`, and explicit fallible `DataOpsSession` lifecycle.
-   - `W10-02` (`ADR-0023`, `ADR-0016`): `ManifestSignatureV1` (raw 16-byte `RunId`), `TrustPolicy::Strict` verified-consumer default, OS-backed exclusive bundle lockfile (`P2-02`), versioned JSON Schema 2020-12 contracts (`P2-20a`), and promotion of `cargo vet` to blocking (`P2-05`).
-   - `W10-03` (`ADR-0022`, `ADR-0003`, `ADR-0014`): Deterministic task/timer scheduler in `MockRuntime`, multi-peer `MockNetworkHub` with originator-signed recipient wrappers, and reproducible benchmark harness.
-2. **Wave 11 (`v0.1.0` RC — Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile):**
+1. **Wave 11 (`v0.1.0` RC — Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile):**
    - `W11-01` (`ADR-0019`): `CenteredClipping` (`CClip`) and conservative `$s$-Bucketing` ($n \bmod s = 0, f_B = \min(f, B)$) with post-bucketing quorum re-checks.
    - `W11-02` (`ADR-0021`): `SharedSeedSparse` with $\mathcal{O}(k)$ sparse sampling and verifiable pre-seed Merkle/vector commitments.
    - `W11-03` (`ADR-0022`): Frozen 16-byte `ChunkedFrameCodec` (`[0x53, 0x54]`, `CRC-16/IBM-3740`, fixed stride $P$, observed-source pre-auth budgets) and concrete `TcpTransport`/`UdpGossipTransport`.
    - `W11-04` (`ADR-0024`): `SwarmTorchCheckpointV1` profile over additive `safetensors` (`0.7+`/`0.8+`) in an optional codec boundary.
-3. **Wave 12 (`v0.2.0` — Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & Installed `wasmi` Sandbox):**
+2. **Wave 12 (`v0.2.0` — Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & Installed `wasmi` Sandbox):**
    - `W12-01` (`ADR-0024`): Optional `swarm-torch-backends` (Burn/Candle adapters) and explicit LoRA / FLoRA delta aggregation.
    - `W12-02` (`ADR-0022`): Separate optional `swarm-torch-transport-zenoh` and `swarm-torch-transport-iroh` crates (1-RTT QUIC streams, distinct link `EndpointId` vs. originator `PeerId`).
    - `W12-03` (`ADR-0023`): Stale-delta `FedAsync` mixing and durable pre-release Rényi DP accounting.
@@ -61,16 +65,17 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-## Conformance Lock (A6X-05 / Wave 9)
+## Conformance Lock (A6X-05 / Wave 10)
 
 | Area | Current State | Evidence |
 |------|---------------|----------|
 | MSRV policy | Tiered by crate: `swarm-torch-core`, `swarm-torch-models`, and base `swarm-torch-net` preserve `no_std` portability; top-level/dev-dependency graphs use newer compiler floor | `Cargo.toml`, `swarm-torch-core/Cargo.toml`, `swarm-torch-models/Cargo.toml`, `swarm-torch-net/Cargo.toml` |
 | Top-level crate portability | `swarm-torch` is std-only (fail-fast without `std`) | `swarm-torch/src/lib.rs` |
 | Core & model portability | `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` pass unit tests under `--no-default-features` | `.github/workflows/rust.yml`, crate `src/lib.rs` |
-| Runtime abstraction | `SwarmClock` and `SwarmRuntime` split; `TokioRuntime` and 32-bit portable `MockRuntime` implemented; `EmbassyRuntime` gated on `embassy` + `embassy-time-driver` | `swarm-torch-runtime/src/lib.rs` |
-| Transport layer | Allocation-free `PacketTransport` and GAT-based `SwarmTransport` + `MockTransport` implemented; concrete TCP/UDP/BLE/LoRa backends planned | `swarm-torch-net/src/traits.rs`, `swarm-torch-net/src/mock.rs` |
+| Runtime abstraction | `SwarmClock` and `SwarmRuntime` split; `TokioRuntime` and 32-bit portable `MockRuntime` with deterministic task/timer scheduler implemented; `EmbassyRuntime` gated on `embassy` + `embassy-time-driver` | `swarm-torch-runtime/src/lib.rs` |
+| Transport layer | Allocation-free `PacketTransport`, GAT-based `SwarmTransport`, originator-signed `BundledGossipDeliveryV1`, and `MockNetworkHub` implemented; concrete TCP/UDP/BLE/LoRa backends planned | `swarm-torch-net/src/traits.rs`, `swarm-torch-net/src/gossip.rs`, `swarm-torch-net/src/mock.rs` |
 | Replay/auth security | `MessageEnvelope` v1.0 domain-separated Ed25519 signatures, 6-stage `decode_and_verify_payload`, safe `BTreeMap` replay store, `CohortAllowlist`, and `RecoveryRequired` challenge handshake implemented | `swarm-torch-core/src/replay.rs`, `swarm-torch-net/src/protocol.rs`, `swarm-torch-net/tests/replay_integration.rs` |
+| Coordinator, CAS, & strict artifacts | `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `.bundle.lock`, `ManifestSignatureV1`, `TrustPolicy::Strict`, and 9 Draft 2020-12 JSON Schemas implemented | `swarm-torch/src/coordinator.rs`, `swarm-torch/src/artifacts/`, `schemas/v1/`, `swarm-torch/tests/federated_round_simulation.rs` |
 
 ### Baseline Command Set (must remain green)
 

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, BufRead};
+use std::io;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -11,7 +10,10 @@ use swarm_torch_core::dataops::{
 use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::GraphV1;
 
-use crate::artifacts::RunArtifactBundle;
+use crate::artifacts::{
+    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, RunArtifactBundle, TrustPolicy,
+    VerifiedBundleV1, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,
+};
 
 use super::model::Report;
 
@@ -36,35 +38,68 @@ struct SnapshotPairCommitV1 {
 
 const SNAPSHOT_PAIR_SCHEMA_V1: u32 = 1;
 
-pub fn load_report_with_warnings(
+/// Load a report enforcing [`TrustPolicy::Strict`] (`ADR-0023` §3.1, `P2-10`, `W10-02`).
+///
+/// Fails closed if `policy` is not [`TrustPolicy::Strict`] or if the bundle's
+/// [`crate::artifacts::ManifestSignatureV1`] is missing or unauthorized.
+pub fn load_report_strict(
     run_dir: impl AsRef<Path>,
+    policy: &TrustPolicy,
 ) -> io::Result<(Report, Vec<LoadWarning>)> {
-    let run_dir = run_dir.as_ref().to_path_buf();
-    let bundle = RunArtifactBundle::open(&run_dir)?;
+    if !matches!(policy, TrustPolicy::Strict { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "load_report_strict requires TrustPolicy::Strict",
+        ));
+    }
+    load_report_with_policy(run_dir, policy)
+}
+
+/// Load a report under the caller-specified [`TrustPolicy`], consuming only verified
+/// manifest-listed bytes in a single pass with zero path reopens (`ADR-0023` §3.1).
+pub fn load_report_with_policy(
+    run_dir: impl AsRef<Path>,
+    policy: &TrustPolicy,
+) -> io::Result<(Report, Vec<LoadWarning>)> {
+    let bundle = RunArtifactBundle::open(run_dir.as_ref())?;
+    let verified = bundle.verify_and_load(policy)?;
+    load_report_from_verified(&verified)
+}
+
+/// Parse a [`Report`] exclusively from an already-verified [`VerifiedBundleV1`] snapshot.
+///
+/// Never touches the filesystem or consults files absent from `verified.manifest().entries`.
+pub fn load_report_from_verified(
+    verified: &VerifiedBundleV1,
+) -> io::Result<(Report, Vec<LoadWarning>)> {
     let mut warnings = Vec::new();
 
-    // Enforce tamper-evidence by default.
-    bundle.validate_manifest()?;
-
-    let mut graph: GraphV1 = read_json(run_dir.join("graph.json"))?;
+    let mut graph: GraphV1 = parse_json_slice(verified.require_bytes("graph.json")?)?;
     graph = graph
         .normalize()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let registry_updates: Vec<DatasetEntryV1> =
-        read_ndjson_if_exists(run_dir.join("datasets").join("registry_updates.ndjson"))?;
-    let lineage_updates: Vec<LineageEdgeV1> =
-        read_ndjson_if_exists(run_dir.join("datasets").join("lineage_edges.ndjson"))?;
-    let datasets_dir = run_dir.join("datasets");
+    let registry_updates: Vec<DatasetEntryV1> = match verified
+        .get_bytes("datasets/registry_updates.ndjson")
+    {
+        Some(bytes) => parse_ndjson_slice_bounded(bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?,
+        None => Vec::new(),
+    };
+    let lineage_updates: Vec<LineageEdgeV1> = match verified
+        .get_bytes("datasets/lineage_edges.ndjson")
+    {
+        Some(bytes) => parse_ndjson_slice_bounded(bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?,
+        None => Vec::new(),
+    };
 
-    let pair_mismatch = snapshot_pair_mismatch_reason(&datasets_dir)?;
+    let pair_mismatch = snapshot_pair_mismatch_reason(verified)?;
     let (registry_snapshot, lineage_snapshot) = if let Some(message) = pair_mismatch {
         warnings.push(LoadWarning::SnapshotPairMismatch { message });
         (DatasetRegistryV1::default(), DatasetLineageV1::default())
     } else {
         (
-            read_json(datasets_dir.join("registry.json"))?,
-            read_json(datasets_dir.join("lineage.json"))?,
+            parse_json_slice(verified.require_bytes("datasets/registry.json")?)?,
+            parse_json_slice(verified.require_bytes("datasets/lineage.json")?)?,
         )
     };
 
@@ -83,11 +118,26 @@ pub fn load_report_with_warnings(
         }
     }
 
-    let spans: Vec<SpanRecord> = read_ndjson(run_dir.join("spans.ndjson"))?;
-    let events: Vec<EventRecord> = read_ndjson(run_dir.join("events.ndjson"))?;
-    let metrics: Vec<MetricRecord> = read_ndjson(run_dir.join("metrics.ndjson"))?;
-    let materializations_raw: Vec<MaterializationRecordCompat> =
-        read_ndjson(run_dir.join("datasets").join("materializations.ndjson"))?;
+    let spans: Vec<SpanRecord> = parse_ndjson_slice_bounded(
+        verified.require_bytes("spans.ndjson")?,
+        MAX_NDJSON_LINE_BYTES,
+        MAX_NDJSON_LINES,
+    )?;
+    let events: Vec<EventRecord> = parse_ndjson_slice_bounded(
+        verified.require_bytes("events.ndjson")?,
+        MAX_NDJSON_LINE_BYTES,
+        MAX_NDJSON_LINES,
+    )?;
+    let metrics: Vec<MetricRecord> = parse_ndjson_slice_bounded(
+        verified.require_bytes("metrics.ndjson")?,
+        MAX_NDJSON_LINE_BYTES,
+        MAX_NDJSON_LINES,
+    )?;
+    let materializations_raw: Vec<MaterializationRecordCompat> = parse_ndjson_slice_bounded(
+        verified.require_bytes("datasets/materializations.ndjson")?,
+        MAX_NDJSON_LINE_BYTES,
+        MAX_NDJSON_LINES,
+    )?;
     let mut materializations: Vec<MaterializationRecordV2> = materializations_raw
         .into_iter()
         .enumerate()
@@ -103,7 +153,7 @@ pub fn load_report_with_warnings(
 
     Ok((
         Report {
-            run_dir,
+            run_dir: verified.run_dir().to_path_buf(),
             graph,
             registry,
             lineage,
@@ -116,13 +166,20 @@ pub fn load_report_with_warnings(
     ))
 }
 
-fn snapshot_pair_mismatch_reason(datasets_dir: &Path) -> io::Result<Option<String>> {
-    let marker_path = datasets_dir.join("snapshot_pair_commit.json");
-    if !marker_path.exists() {
-        return Ok(None);
-    }
+pub fn load_report_with_warnings(
+    run_dir: impl AsRef<Path>,
+) -> io::Result<(Report, Vec<LoadWarning>)> {
+    load_report_with_policy(run_dir, &TrustPolicy::LegacyPermissive)
+}
 
-    let marker: SnapshotPairCommitV1 = read_json(&marker_path)?;
+fn snapshot_pair_mismatch_reason(verified: &VerifiedBundleV1) -> io::Result<Option<String>> {
+    // Only consult `datasets/snapshot_pair_commit.json` if it was explicitly listed and
+    // digest-verified in `manifest.json` (`ADR-0023` §3.1).
+    let Some(marker_bytes) = verified.get_bytes("datasets/snapshot_pair_commit.json") else {
+        return Ok(None);
+    };
+
+    let marker: SnapshotPairCommitV1 = parse_json_slice(marker_bytes)?;
     if marker.schema_version != SNAPSHOT_PAIR_SCHEMA_V1 {
         return Ok(Some(format!(
             "unsupported snapshot_pair_commit schema_version: {}",
@@ -130,10 +187,10 @@ fn snapshot_pair_mismatch_reason(datasets_dir: &Path) -> io::Result<Option<Strin
         )));
     }
 
-    let registry_path = datasets_dir.join("registry.json");
-    let lineage_path = datasets_dir.join("lineage.json");
-    let actual_registry = hash_file_sha256_hex(&registry_path)?;
-    let actual_lineage = hash_file_sha256_hex(&lineage_path)?;
+    let registry_bytes = verified.require_bytes("datasets/registry.json")?;
+    let lineage_bytes = verified.require_bytes("datasets/lineage.json")?;
+    let actual_registry = hex_lower(&Sha256::digest(registry_bytes));
+    let actual_lineage = hex_lower(&Sha256::digest(lineage_bytes));
 
     if marker.registry_sha256 != actual_registry || marker.lineage_sha256 != actual_lineage {
         return Ok(Some(
@@ -141,57 +198,6 @@ fn snapshot_pair_mismatch_reason(datasets_dir: &Path) -> io::Result<Option<Strin
         ));
     }
     Ok(None)
-}
-
-fn hash_file_sha256_hex(path: &Path) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
-    Ok(hex_lower(&digest))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> io::Result<T> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-fn read_ndjson<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> io::Result<Vec<T>> {
-    let f = std::fs::File::open(path)?;
-    let reader = io::BufReader::new(f);
-    let mut out = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v = serde_json::from_str::<T>(&line).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid ndjson at line {}: {}", i + 1, e),
-            )
-        })?;
-        out.push(v);
-    }
-    Ok(out)
-}
-
-fn read_ndjson_if_exists<T: serde::de::DeserializeOwned>(
-    path: impl AsRef<Path>,
-) -> io::Result<Vec<T>> {
-    let path = path.as_ref();
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    read_ndjson(path)
 }
 
 fn apply_registry_updates(

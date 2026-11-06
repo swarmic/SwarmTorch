@@ -1,23 +1,24 @@
-//! Sequential graph scheduler (Wave 7, alpha.7x-wave1).
+//! Sequential graph scheduler (Wave 7 / Wave 10).
 //!
-//! This module provides a deterministic, single-process executor for `GraphV1`.
-//! Scope is intentionally narrow:
+//! This module provides a deterministic, single-process executor for `GraphV1`:
 //! - topological scheduling with cycle detection
 //! - policy checks before runner invocation
 //! - fail-closed handling for missing inputs
+//! - verified cache-hit short-circuiting (`ADR-0023` §2.3, `W10-01`)
+//! - preservation of runner `Vec<AssetInstanceV1>` outputs and physical CAS URIs
 //! - status materialization records for failed/skipped nodes
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 
-use swarm_torch_core::dataops::CacheDecisionV0;
+use swarm_torch_core::dataops::{CacheDecisionV0, OutputSpecCore};
 use swarm_torch_core::execution::{AssetInstanceV1, ExecutionPolicy, PolicyDecision};
 use swarm_torch_core::observe::{AttrMap, AttrValue, EventRecord, RunEventEmitter, RunId, TraceId};
 use swarm_torch_core::run_graph::{
     node_id_from_key, validate_graph_v1, GraphV1, GraphValidationError, NodeId, NodeV1,
 };
 
-use crate::artifacts::{DataOpsSession, OutputSpec};
+use crate::artifacts::{parse_cas_uri_digest, DataOpsSession, OutputSpec};
 use crate::native_runner::{ExecutionContext, NativeOpRunner};
 
 #[derive(Debug)]
@@ -76,8 +77,10 @@ impl From<GraphValidationError> for SchedulerError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerReport {
     pub executed_nodes: Vec<String>,
+    pub cached_nodes: Vec<String>,
     pub failed_nodes: Vec<String>,
     pub skipped_nodes: Vec<String>,
+    pub runner_outputs: BTreeMap<String, Vec<AssetInstanceV1>>,
 }
 
 /// Return nodes in deterministic topological order (`node_key` tie-break).
@@ -213,7 +216,7 @@ pub fn topological_sort_nodes(graph: &GraphV1) -> Result<Vec<NodeV1>, SchedulerE
     Ok(ordered)
 }
 
-/// Execute a graph sequentially with fail-closed semantics.
+/// Execute a graph sequentially with fail-closed semantics and verified cache-hit reuse.
 pub fn execute_graph_sequential(
     graph: &GraphV1,
     session: &mut DataOpsSession,
@@ -276,25 +279,14 @@ pub fn execute_graph_sequential(
             continue;
         }
 
-        let runner_result =
-            runner.run_with_context(&context, &node, &inputs, session.sink().as_ref());
-        let finished = (clock_nanos)();
-        let duration_ms = finished.saturating_sub(started) / 1_000_000;
-        if let Err(error) = runner_result {
-            let error_code = format!("runner_error:{error}");
-            session.record_node_error(&node, finished, duration_ms, error_code.clone())?;
-            emit_scheduler_event(
-                session.sink().as_ref(),
-                trace_id,
-                finished,
-                "scheduler/node_failed",
-                &node.node_key,
-                Some(&error_code),
-            )?;
-            report.failed_nodes.push(node.node_key.clone());
-            continue;
-        }
-
+        let core_specs: Vec<OutputSpecCore> = node
+            .outputs
+            .iter()
+            .map(|output| OutputSpecCore {
+                asset_key: output.asset_key.clone(),
+                schema: None,
+            })
+            .collect();
         let output_specs: Vec<OutputSpec> = node
             .outputs
             .iter()
@@ -305,11 +297,87 @@ pub fn execute_graph_sequential(
                 bytes: None,
             })
             .collect();
+
+        let cache_decision = session.verify_cache_hit(&node, &core_specs);
+        if cache_decision == CacheDecisionV0::Hit {
+            let finished = (clock_nanos)();
+            if let Err(error) = session.materialize_node_outputs(
+                &node,
+                &output_specs,
+                finished,
+                CacheDecisionV0::Hit,
+                0,
+            ) {
+                let error_code = format!("materialization_error:{error}");
+                session.record_node_error(&node, finished, 0, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    finished,
+                    "scheduler/node_failed",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
+
+            let resolved_outputs: Vec<AssetInstanceV1> = node
+                .outputs
+                .iter()
+                .filter_map(|o| session.resolve_asset_instance(&o.asset_key))
+                .collect();
+            report
+                .runner_outputs
+                .insert(node.node_key.clone(), resolved_outputs);
+            emit_scheduler_event(
+                session.sink().as_ref(),
+                trace_id,
+                finished,
+                "scheduler/node_cached",
+                &node.node_key,
+                Some("cache_hit"),
+            )?;
+            emit_scheduler_event(
+                session.sink().as_ref(),
+                trace_id,
+                finished,
+                "scheduler/node_succeeded",
+                &node.node_key,
+                None,
+            )?;
+            report.cached_nodes.push(node.node_key.clone());
+            report.executed_nodes.push(node.node_key.clone());
+            continue;
+        }
+
+        let runner_result =
+            runner.run_with_context(&context, &node, &inputs, session.sink().as_ref());
+        let finished = (clock_nanos)();
+        let duration_ms = finished.saturating_sub(started) / 1_000_000;
+        let runner_instances = match runner_result {
+            Ok(instances) => instances,
+            Err(error) => {
+                let error_code = format!("runner_error:{error}");
+                session.record_node_error(&node, finished, duration_ms, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    finished,
+                    "scheduler/node_failed",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
+        };
+
         let materialize = session.materialize_node_outputs(
             &node,
             &output_specs,
             finished,
-            CacheDecisionV0::Miss,
+            cache_decision,
             duration_ms,
         );
         if let Err(error) = materialize {
@@ -326,6 +394,27 @@ pub fn execute_graph_sequential(
             report.failed_nodes.push(node.node_key.clone());
             continue;
         }
+
+        // Preserve any verified CAS URI returned by the runner on declared outputs.
+        for instance in &runner_instances {
+            if let Some(ref uri) = instance.uri {
+                if parse_cas_uri_digest(uri).is_some()
+                    && node
+                        .outputs
+                        .iter()
+                        .any(|declared| declared.asset_key == instance.asset_key)
+                {
+                    session.bind_output_cas_uri(
+                        &instance.asset_key,
+                        uri,
+                        "application/octet-stream",
+                    )?;
+                }
+            }
+        }
+        report
+            .runner_outputs
+            .insert(node.node_key.clone(), runner_instances);
 
         emit_scheduler_event(
             session.sink().as_ref(),
@@ -382,7 +471,9 @@ mod tests {
 
     use swarm_torch_core::dataops::{MaterializationStatusV0, SourceDescriptorV0, TrustClass};
     use swarm_torch_core::execution::{CoreOnlyPolicy, PermissivePolicy};
-    use swarm_torch_core::run_graph::{AssetRefV1, CanonParams, EdgeV1, ExecutionTrust, OpKind};
+    use swarm_torch_core::run_graph::{
+        AssetRefV1, CachePolicyV0, CanonParams, EdgeV1, ExecutionTrust, OpKind,
+    };
 
     use crate::artifacts::{RunArtifactBundle, RunArtifactSink};
     use crate::report::load_report;
@@ -642,6 +733,134 @@ mod tests {
 
         assert_eq!(report.executed_nodes, vec!["node/one", "node/two"]);
         assert!(session.fingerprint("dataset://ns/b").is_some());
+        assert_eq!(report.runner_outputs.len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scheduler_verified_cache_hit_and_cas_deletion_invalidation() {
+        use crate::artifacts::put_checkpoint_model;
+        use swarm_torch_models::simple::LinearModel;
+
+        let (base, mut session) = create_session("cache_hit_and_cas_invalidation");
+        register_source(&mut session, "dataset://ns/raw");
+
+        let node = make_node(
+            "node/cacheable",
+            "passthrough",
+            &["dataset://ns/raw"],
+            &["dataset://ns/cached_out"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("cache-test".to_string()),
+            nodes: vec![node.clone()],
+            edges: vec![],
+        };
+
+        // First run: CacheDecisionV0::Miss
+        let r1 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x12; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r1.cached_nodes.is_empty());
+
+        // Bind a physical CAS blob to dataset://ns/cached_out
+        use swarm_torch_core::traits::SwarmModel;
+        let mut model = LinearModel::new(2, 1).unwrap();
+        model.load_parameters(&[1.0, 2.0, 0.5]).unwrap();
+        let (digest, cas_uri, _) =
+            put_checkpoint_model(session.sink().bundle().run_dir(), &model).unwrap();
+        session
+            .bind_output_cas_uri(
+                "dataset://ns/cached_out",
+                &cas_uri,
+                "application/octet-stream",
+            )
+            .unwrap();
+
+        // Second run with CAS blob intact: CacheDecisionV0::Hit!
+        let r2 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x12; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r2.cached_nodes, vec!["node/cacheable"]);
+
+        // Delete the physical CAS blob on disk -> must invalidate cache hit and force Miss!
+        let blob_path = session
+            .sink()
+            .bundle()
+            .run_dir()
+            .join("blobs")
+            .join("sha256")
+            .join(digest.to_hex());
+        fs::remove_file(&blob_path).unwrap();
+
+        let r3 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x12; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(
+            r3.cached_nodes.is_empty(),
+            "deleting physical CAS blob must force CacheDecisionV0::Miss"
+        );
+
+        // CachePolicyV0::Bypass -> must force CacheDecisionV0::Bypass even when fingerprint matches!
+        let mut bypass_node = node;
+        bypass_node.cache_policy = Some(CachePolicyV0::Bypass);
+        let bypass_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("bypass-test".to_string()),
+            nodes: vec![bypass_node],
+            edges: vec![],
+        };
+        let r4 = execute_graph_sequential(
+            &bypass_graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x12; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r4.cached_nodes.is_empty());
+
+        session.finalize().unwrap();
+        let loaded = load_report(session.sink().bundle().run_dir()).unwrap();
+        assert_eq!(loaded.materializations.len(), 4);
+        assert_eq!(
+            loaded.materializations[0].cache_decision,
+            CacheDecisionV0::Miss
+        );
+        assert_eq!(
+            loaded.materializations[1].cache_decision,
+            CacheDecisionV0::Hit
+        );
+        assert_eq!(
+            loaded.materializations[2].cache_decision,
+            CacheDecisionV0::Miss
+        );
+        assert_eq!(
+            loaded.materializations[3].cache_decision,
+            CacheDecisionV0::Bypass
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

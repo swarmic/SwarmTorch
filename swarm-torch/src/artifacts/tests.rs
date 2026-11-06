@@ -3299,3 +3299,134 @@ fn materialization_schema_stable_after_artifacts_module_split() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+// -------------------------------------------------------------------------
+// Wave 10 Slice 10A (W10-02): BundleLockGuard, ManifestSignatureV1, TrustPolicy
+// -------------------------------------------------------------------------
+
+#[test]
+fn bundle_lock_guard_rejects_concurrent_acquisition_with_bundle_busy() {
+    let base = temp_dir("bundle_lock_contention");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0x61; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let guard_1 = bundle
+        .acquire_lock(LockAcquisitionPolicy::FailFast)
+        .expect("first lock acquisition should succeed");
+    assert!(guard_1.lock_path().exists());
+
+    let err = BundleLockGuard::acquire(bundle.run_dir(), LockAcquisitionPolicy::FailFast)
+        .expect_err("second concurrent lock acquisition must fail closed");
+    assert!(
+        matches!(err, BundleLockError::BundleBusy { .. }),
+        "expected BundleBusy error, got: {err:?}"
+    );
+
+    drop(guard_1);
+    let guard_2 = bundle
+        .acquire_lock(LockAcquisitionPolicy::FailFast)
+        .expect("lock acquisition after drop should succeed");
+    drop(guard_2);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn validate_manifest_strict_verifies_ed25519_signature_and_rejects_tampering() {
+    use swarm_torch_core::crypto::KeyPair;
+
+    let base = temp_dir("manifest_strict_signature");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0x62; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    let signer = KeyPair::from_seed([0x77; 32]).unwrap();
+    let untrusted = KeyPair::from_seed([0x88; 32]).unwrap();
+
+    let signed_manifest = bundle
+        .finalize_signed_manifest(&signer)
+        .expect("signing manifest should succeed");
+    assert!(signed_manifest.signature.is_some());
+
+    // 1. Strict policy with signer's public key succeeds.
+    let strict_ok = TrustPolicy::Strict {
+        trusted_public_keys: vec![*signer.public_key()],
+        expected_run_id: Some(run_id),
+        min_signed_unix_nanos: Some(1),
+    };
+    let verified = bundle
+        .verify_and_load(&strict_ok)
+        .expect("strict verification with trusted signer should succeed");
+    assert!(matches!(
+        verified.status(),
+        VerificationStatus::VerifiedStrict { .. }
+    ));
+
+    // 2. Strict policy with untrusted public key fails closed.
+    let strict_untrusted = TrustPolicy::Strict {
+        trusted_public_keys: vec![*untrusted.public_key()],
+        expected_run_id: Some(run_id),
+        min_signed_unix_nanos: None,
+    };
+    let err = bundle
+        .verify_and_load(&strict_untrusted)
+        .expect_err("untrusted signer key must be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    // 3. Tamper with an entry's required flag in manifest.json without re-signing -> fails closed.
+    let manifest_path = bundle.run_dir().join("manifest.json");
+    let mut raw_manifest: ManifestV1 = read_json(&manifest_path).unwrap();
+    raw_manifest.entries[0].required = !raw_manifest.entries[0].required;
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&raw_manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = bundle
+        .verify_and_load(&strict_ok)
+        .expect_err("tampered manifest entry must fail signature verification");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn validate_manifest_strict_rejects_unsigned_manifest() {
+    use swarm_torch_core::crypto::KeyPair;
+
+    let base = temp_dir("manifest_strict_rejects_unsigned");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0x63; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    bundle.finalize_manifest().unwrap();
+
+    let signer = KeyPair::from_seed([0x79; 32]).unwrap();
+    let strict_policy = TrustPolicy::Strict {
+        trusted_public_keys: vec![*signer.public_key()],
+        expected_run_id: Some(run_id),
+        min_signed_unix_nanos: None,
+    };
+
+    let err = bundle
+        .verify_and_load(&strict_policy)
+        .expect_err("unsigned manifest must be rejected under TrustPolicy::Strict");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    // LegacyPermissive still accepts unsigned manifest with Explicit status.
+    let permissive = bundle
+        .verify_and_load(&TrustPolicy::LegacyPermissive)
+        .expect("LegacyPermissive should accept unsigned manifest");
+    assert_eq!(
+        permissive.status(),
+        VerificationStatus::UnverifiedLegacyPermissive
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

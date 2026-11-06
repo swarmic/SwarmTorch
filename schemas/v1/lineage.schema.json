@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/lineage.schema.json",
+  "title": "DatasetLineageV1",
+  "description": "SwarmTorch v1 dataset lineage graph snapshot (datasets/lineage.json, ADR-0016, ADR-0017).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "edges"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "edges": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/LineageEdgeV1"
+      }
+    }
+  },
+  "$defs": {
+    "LineageEdgeV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_fingerprint_v0", "output_fingerprint_v0", "node_id", "op_kind"],
+      "properties": {
+        "input_fingerprint_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "output_fingerprint_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "op_kind": {
+          "type": "string",
+          "enum": ["data", "train", "comms", "governance", "system"]
+        }
+      }
+    }
+  }
+}

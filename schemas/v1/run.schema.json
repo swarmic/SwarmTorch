@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/run.schema.json",
+  "title": "RunFileV1",
+  "description": "SwarmTorch v1 run metadata descriptor (run.json, ADR-0016).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "created_unix_nanos", "swarmtorch_version"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "created_unix_nanos": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615,
+      "$comment": "Exact u64 Unix nanosecond timestamp."
+    },
+    "swarmtorch_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}

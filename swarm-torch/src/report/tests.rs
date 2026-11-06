@@ -787,3 +787,93 @@ fn load_report_with_warnings_prefers_replay_on_snapshot_pair_mismatch() {
         "inconsistent snapshot should be ignored in replay-preferred mode"
     );
 }
+
+#[test]
+fn load_report_ignores_unlisted_snapshot_pair_commit_and_prevents_toctou() {
+    use crate::artifacts::{TrustPolicy, VerificationStatus};
+    use swarm_torch_core::crypto::KeyPair;
+
+    #[derive(serde::Serialize)]
+    struct SnapshotPairCommitV1 {
+        schema_version: u32,
+        pair_seq: u64,
+        registry_sha256: String,
+        lineage_sha256: String,
+    }
+
+    let base = temp_dir("load_report_unlisted_marker_ignored");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([92u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    bundle
+        .write_dataset_registry(&DatasetRegistryV1 {
+            schema_version: 1,
+            datasets: vec![DatasetEntryV1 {
+                asset_key: "dataset://ns/trusted_snap".to_string(),
+                fingerprint_v0: "1".repeat(64),
+                source_fingerprint_v0: "2".repeat(64),
+                schema_hash_v0: "3".repeat(64),
+                recipe_hash_v0: "4".repeat(64),
+                trust: TrustClass::Trusted,
+                source: None,
+                schema: None,
+                license_flags: vec![],
+                pii_tags: vec![],
+            }],
+        })
+        .unwrap();
+
+    let signer = KeyPair::from_seed([0x33; 32]).unwrap();
+    bundle.finalize_signed_manifest(&signer).unwrap();
+
+    // Inject an UNLISTED `datasets/snapshot_pair_commit.json` AFTER manifest signing!
+    let marker_path = bundle
+        .run_dir()
+        .join("datasets")
+        .join("snapshot_pair_commit.json");
+    std::fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&SnapshotPairCommitV1 {
+            schema_version: 1,
+            pair_seq: 99,
+            registry_sha256: "deadbeef".to_string(),
+            lineage_sha256: "deadbeef".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let policy = TrustPolicy::Strict {
+        trusted_public_keys: vec![*signer.public_key()],
+        expected_run_id: Some(run_id),
+        min_signed_unix_nanos: None,
+    };
+
+    let verified = bundle.verify_and_load(&policy).unwrap();
+    assert!(matches!(
+        verified.status(),
+        VerificationStatus::VerifiedStrict { .. }
+    ));
+
+    // Delete on-disk graph.json AFTER `verify_and_load` to prove `load_report_from_verified`
+    // never reopens paths from the filesystem (zero TOCTOU).
+    std::fs::remove_file(bundle.run_dir().join("graph.json")).unwrap();
+
+    let (report, warnings) = load_report_from_verified(&verified).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "unlisted snapshot_pair_commit.json must be ignored: {warnings:?}"
+    );
+    assert!(
+        report
+            .registry
+            .datasets
+            .iter()
+            .any(|d| d.asset_key == "dataset://ns/trusted_snap"),
+        "trusted snapshot must not be discarded by unlisted marker"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

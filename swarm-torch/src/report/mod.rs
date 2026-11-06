@@ -9,7 +9,10 @@ mod load;
 mod model;
 mod render;
 
-pub use load::{load_report, load_report_with_warnings, LoadWarning};
+pub use load::{
+    load_report, load_report_from_verified, load_report_strict, load_report_with_policy,
+    load_report_with_warnings, LoadWarning,
+};
 pub use model::{is_node_unsafe, Report};
 pub use render::{generate_report, generate_report_html};
 

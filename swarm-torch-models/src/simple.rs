@@ -156,11 +156,9 @@ impl<const MAX_PARAMS: usize, const MAX_OUTPUT: usize> Default
     fn default() -> Self {
         let output_dim = MAX_OUTPUT.min(16).min(MAX_PARAMS);
         let max_weight_capacity = MAX_PARAMS.saturating_sub(MAX_OUTPUT);
-        let input_dim = if output_dim == 0 {
-            0
-        } else {
-            (max_weight_capacity / output_dim).min(8)
-        };
+        let input_dim = max_weight_capacity
+            .checked_div(output_dim)
+            .map_or(0, |per_output| per_output.min(8));
         Self::new(input_dim, output_dim).expect("default dimensions are valid for model capacity")
     }
 }

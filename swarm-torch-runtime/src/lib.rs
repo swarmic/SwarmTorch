@@ -276,11 +276,21 @@ pub mod mock_runtime {
 
         fn saturating_add(&self, delta: u64) {
             use core::sync::atomic::Ordering;
-            let _ = self
-                .ms
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                    Some(cur.saturating_add(delta))
-                });
+            // Explicit CAS loop: `fetch_update` is deprecated in favour of
+            // `try_update` on newer toolchains, but `try_update` is unavailable
+            // on the 1.75 MSRV. This loop is semantically identical on both.
+            let mut cur = self.ms.load(Ordering::SeqCst);
+            loop {
+                match self.ms.compare_exchange_weak(
+                    cur,
+                    cur.saturating_add(delta),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
         }
     }
 

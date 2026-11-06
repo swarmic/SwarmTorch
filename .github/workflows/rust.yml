@@ -108,7 +108,9 @@ jobs:
         run: cargo deny check
 
       - name: cargo audit (blocking)
-        run: cargo audit
+        # Isolated DB path: cargo-deny leaves a non-git advisory layout under
+        # ~/.cargo that cargo-audit (gix) refuses to clone into.
+        run: cargo audit --db "${RUNNER_TEMP}/rustsec-advisory-db"
 
       - name: cargo vet (blocking)
         run: cargo vet

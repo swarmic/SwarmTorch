@@ -182,7 +182,7 @@ impl DataOpsSession {
         };
 
         let mut lineage = BTreeMap::new();
-        for edge in lin_snap.edges.into_iter().chain(lin_updates.into_iter()) {
+        for edge in lin_snap.edges.into_iter().chain(lin_updates) {
             let key = (
                 edge.input_fingerprint_v0.clone(),
                 edge.output_fingerprint_v0.clone(),

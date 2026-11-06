@@ -195,7 +195,7 @@ pub(crate) fn render_timeline(report: &Report) -> String {
                 unsafe_reasons,
                 transforms,
                 m.node_id,
-                &m.node_def_hash
+                m.node_def_hash
             ),
         });
     }

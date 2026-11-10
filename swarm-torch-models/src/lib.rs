@@ -17,12 +17,16 @@ extern crate alloc;
 pub mod loss;
 pub mod mlp;
 pub mod optim;
+#[cfg(feature = "alloc")]
+pub mod safetensors_v1;
 pub mod simple;
 
 /// Prelude for convenient imports
 pub mod prelude {
     pub use crate::loss::*;
     pub use crate::optim::*;
+    #[cfg(feature = "alloc")]
+    pub use crate::safetensors_v1::*;
     pub use crate::simple::*;
 }
 

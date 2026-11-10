@@ -14,13 +14,18 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 #[cfg(feature = "alloc")]
-use crate::compression::{CompressedGradient, CompressionError, CompressionMethod};
+use crate::compression::{
+    sample_shared_indices_v1, verify_shared_seed_openings_v1, CompressedGradient, CompressionError,
+    CompressionMethod, MerkleOpeningBatchV1, PreSeedVectorCommitmentV1, SharedSeedSparsePayloadV1,
+};
 #[cfg(feature = "alloc")]
 use crate::dataops::TransformAuditV0;
-use crate::traits::GradientUpdate;
 #[cfg(feature = "alloc")]
 use crate::traits::UpdateTransform;
+use crate::traits::{GradientUpdate, PeerId};
 use crate::{Error, Result};
+#[cfg(feature = "alloc")]
+use sha2::{Digest, Sha256};
 
 /// Maximum gradient vector dimension accepted by default (`10,000,000` coordinates).
 pub const MAX_GRADIENT_DIM: usize = 10_000_000;
@@ -829,6 +834,793 @@ impl RobustAggregator for Bulyan {
     }
 }
 
+/// Maximum inner refinement iterations allowed for [`CenteredClipping`] (`ADR-0019` §4, `W11-01`).
+pub const MAX_CCLIP_ITERATIONS: usize = 32;
+
+/// Domain separation tag for deterministic `$s$-Bucketing` cohort permutation (`ADR-0019` §4, `W11-01`).
+pub const S_BUCKETING_PERM_DOMAIN_V1: &[u8] = b"swarmtorch.sbucketing.perm.v1";
+
+/// Domain separation tag for synthetic bucket provenance identifiers (`ADR-0019` §4, `W11-01`).
+pub const S_BUCKETING_ID_DOMAIN_V1: &[u8] = b"swarmtorch.bucket.id.v1";
+
+/// Stateful / iterative Centered Clipping (`CClip`) aggregator
+/// (Karimireddy et al., ICML 2021; `ADR-0019` §4, `W11-01`).
+///
+/// Computes $L = \text{max\_iterations}$ fixed-point refinement steps starting from the previous
+/// round's center $v_0$:
+/// $$v_{\ell+1} = v_\ell + \frac{1}{n} \sum_{i=1}^n (x_i - v_\ell) \min\!\left(1, \frac{\tau}{\|x_i - v_\ell\|_2}\right)$$
+/// with widened `f64` norm and coordinate accumulation.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CenteredClipping {
+    /// Strictly positive finite clipping radius ($\tau > 0$).
+    pub tau: f32,
+    /// Number of inner refinement iterations ($1 \le L \le 32$).
+    pub max_iterations: usize,
+    /// Default center $v_0$ used when invoked via the stateless [`RobustAggregator::aggregate`]
+    /// trait method. If empty, defaults to $\mathbf{0}^d$.
+    pub initial_center: Vec<f32>,
+}
+
+#[cfg(feature = "alloc")]
+impl CenteredClipping {
+    /// Fallible constructor enforcing all normative `ADR-0019` §4 domain invariants.
+    pub fn try_new(tau: f32, max_iterations: usize, initial_center: Vec<f32>) -> Result<Self> {
+        if tau.is_nan() {
+            return Err(Error::NanDetected);
+        }
+        if tau.is_infinite() {
+            return Err(Error::InfDetected);
+        }
+        if tau <= 0.0 || max_iterations == 0 || max_iterations > MAX_CCLIP_ITERATIONS {
+            return Err(Error::InvalidThreshold);
+        }
+        for &c in &initial_center {
+            if c.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if c.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+        }
+        Ok(Self {
+            tau,
+            max_iterations,
+            initial_center,
+        })
+    }
+
+    /// Create a `CenteredClipping` aggregator with a zero default center ($\mathbf{0}^d$).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tau` is non-finite or $\le 0.0$, or if `max_iterations` is outside `1..=32`.
+    pub fn new(tau: f32, max_iterations: usize) -> Self {
+        Self::try_new(tau, max_iterations, Vec::new())
+            .expect("CenteredClipping requires finite tau > 0 and 1 <= max_iterations <= 32")
+    }
+
+    /// Attach an explicit initial center $v_0$.
+    pub fn with_center(mut self, initial_center: Vec<f32>) -> Result<Self> {
+        for &c in &initial_center {
+            if c.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if c.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+        }
+        self.initial_center = initial_center;
+        Ok(self)
+    }
+
+    fn validate_config(&self) -> Result<()> {
+        if self.tau.is_nan() {
+            return Err(Error::NanDetected);
+        }
+        if self.tau.is_infinite() {
+            return Err(Error::InfDetected);
+        }
+        if self.tau <= 0.0 || self.max_iterations == 0 || self.max_iterations > MAX_CCLIP_ITERATIONS
+        {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(())
+    }
+
+    /// Execute $L$-step centered clipping around an explicit reference center $v_0$ (`center`)
+    /// with bounded work validation against `budget`.
+    pub fn aggregate_with_center_bounded(
+        &self,
+        updates: &[GradientUpdate],
+        center: &[f32],
+        budget: &AggregationBudget,
+    ) -> Result<Vec<f32>> {
+        self.validate_config()?;
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        if center.len() != dim {
+            return Err(Error::InvalidGradient);
+        }
+        for &c in center {
+            if c.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if c.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+        }
+
+        let n = updates.len();
+        if n > budget.max_peers || dim > budget.max_dimension {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+        // Workspace is O(d) f64 (two d-vectors: v and delta_sum).
+        let scratch_bytes = dim
+            .checked_mul(2)
+            .and_then(|two_d| two_d.checked_mul(core::mem::size_of::<f64>()))
+            .ok_or(Error::ResourceExhausted)?;
+        if scratch_bytes > budget.max_scratch_bytes {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+        let work_ops = self
+            .max_iterations
+            .checked_mul(n)
+            .and_then(|ln| ln.checked_mul(dim))
+            .ok_or(Error::ResourceExhausted)?;
+        if work_ops > budget.max_work_ops {
+            return Err(Error::ResourceBudgetExceeded);
+        }
+
+        let tau_f64 = self.tau as f64;
+        let inv_n = 1.0f64 / (n as f64);
+        let mut v: Vec<f64> = center.iter().map(|&c| c as f64).collect();
+        let mut delta_sum: Vec<f64> = alloc::vec![0.0f64; dim];
+
+        for _ in 0..self.max_iterations {
+            delta_sum.fill(0.0);
+
+            for update in updates {
+                let mut dist_sq = 0.0f64;
+                for (&x_j, &v_j) in update.gradients.iter().zip(v.iter()) {
+                    let diff = (x_j as f64) - v_j;
+                    dist_sq += diff * diff;
+                }
+                if dist_sq.is_nan() {
+                    return Err(Error::NanDetected);
+                }
+                if dist_sq.is_infinite() {
+                    return Err(Error::InfDetected);
+                }
+
+                let dist = crate::num::sqrt_f64(dist_sq);
+                // Explicit zero-norm and within-radius branch: no division when dist <= tau.
+                let scale = if dist == 0.0 || dist <= tau_f64 {
+                    1.0f64
+                } else {
+                    tau_f64 / dist
+                };
+
+                for ((slot, &x_j), &v_j) in delta_sum
+                    .iter_mut()
+                    .zip(update.gradients.iter())
+                    .zip(v.iter())
+                {
+                    *slot += ((x_j as f64) - v_j) * scale;
+                }
+            }
+
+            for (v_j, &d_j) in v.iter_mut().zip(delta_sum.iter()) {
+                *v_j += d_j * inv_n;
+                if v_j.is_nan() {
+                    return Err(Error::NanDetected);
+                }
+                if v_j.is_infinite() {
+                    return Err(Error::InfDetected);
+                }
+            }
+        }
+
+        let out: Vec<f32> = v.into_iter().map(|val| val as f32).collect();
+        validate_finite_output(&out)?;
+        Ok(out)
+    }
+
+    /// Execute $L$-step centered clipping around an explicit reference center $v_0$ (`center`)
+    /// using the default aggregation budget.
+    pub fn aggregate_with_center(
+        &self,
+        updates: &[GradientUpdate],
+        center: &[f32],
+    ) -> Result<Vec<f32>> {
+        let budget = AggregationBudget {
+            max_peers: 10_000,
+            max_dimension: MAX_GRADIENT_DIM,
+            max_scratch_bytes: 256 * 1024 * 1024,
+            max_work_ops: 500_000_000,
+        };
+        self.aggregate_with_center_bounded(updates, center, &budget)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl RobustAggregator for CenteredClipping {
+    fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
+        self.validate_config()?;
+        let dim = validate_gradient_shapes_and_finiteness(updates)?;
+        if self.initial_center.is_empty() {
+            let zero_center = alloc::vec![0.0f32; dim];
+            self.aggregate_with_center(updates, &zero_center)
+        } else {
+            self.aggregate_with_center(updates, &self.initial_center)
+        }
+    }
+
+    fn byzantine_tolerance(&self) -> f32 {
+        0.5
+    }
+
+    fn complexity(&self) -> AggregatorComplexity {
+        AggregatorComplexity::Linear
+    }
+}
+
+/// Logical identifier for an `$s$-Bucketing` pre-aggregation bucket (`ADR-0019` §4, `W11-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub struct BucketId(pub u32);
+
+/// Remainder handling policy when cohort size $n$ is not an exact multiple of bucket size $s$.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub enum BucketRemainderPolicy {
+    /// Strict contract (`ADR-0019` §4 default): require `n % s == 0` and reject otherwise.
+    #[default]
+    StrictExactMultiple,
+    /// Deterministically shuffle the canonical cohort, form $\lfloor n / s \rfloor$ full buckets
+    /// of exact size $s$, and drop the remaining $n \bmod s$ tail peers (recording them in
+    /// [`BucketExecutionReport::dropped_remainder_peers`]).
+    DropRemainderDeterministic,
+}
+
+/// Configuration for conservative `$s$-Bucketing` pre-aggregation (Karimireddy et al., ICLR 2022;
+/// `ADR-0019` §4, `W11-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub struct BucketingConfig {
+    /// Number of peers averaged per bucket ($s \ge 1$).
+    pub bucket_size: usize,
+    /// Maximum tolerated Byzantine peers in the pre-bucketing cohort ($f$).
+    pub byzantine_count: usize,
+    /// Deterministic round seed binding the bucket permutation.
+    pub round_seed: [u8; 32],
+    /// Policy when $n \bmod s \ne 0$.
+    pub remainder_policy: BucketRemainderPolicy,
+}
+
+/// Provenance record for a single pre-aggregation bucket (`ADR-0019` §4, `W11-01`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketProvenance {
+    /// Logical bucket index.
+    pub bucket_id: BucketId,
+    /// Authenticated peer IDs assigned to this bucket.
+    pub members: Vec<PeerId>,
+    /// Uniform intra-bucket weight ($1 / s$) applied to every member.
+    pub uniform_weight: f64,
+}
+
+/// Audit report emitted by `$s$-Bucketing` pre-aggregation (`ADR-0019` §4, `W11-01`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketExecutionReport {
+    /// Number of buckets formed ($B = \lfloor n / s \rfloor$).
+    pub num_buckets: usize,
+    /// Bucket size ($s$).
+    pub bucket_size: usize,
+    /// Conservative post-bucketing Byzantine bound $f_B = \min(f, B)$.
+    pub effective_byzantine_bound: usize,
+    /// Per-bucket membership provenance.
+    pub buckets: Vec<BucketProvenance>,
+    /// Peers dropped when [`BucketRemainderPolicy::DropRemainderDeterministic`] is active.
+    pub dropped_remainder_peers: Vec<PeerId>,
+}
+
+/// Downstream aggregation rule applied to bucket means after `$s$-Bucketing` (`ADR-0019` §4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub enum PostBucketingRule {
+    /// Single-winner Krum ($B \ge 2f_B + 3$).
+    #[cfg(feature = "krum")]
+    Krum,
+    /// Multi-Krum ($B \ge 2f_B + 3$ and $1 \le m \le B - f_B - 2$).
+    #[cfg(feature = "krum")]
+    MultiKrum { m: usize },
+    /// Iterative Krum + Trimmed Median Bulyan ($f_B \ge 1$ and $B \ge 4f_B + 3$).
+    #[cfg(feature = "bulyan")]
+    Bulyan,
+    /// Coordinate-wise Trimmed Mean ($\lfloor B \cdot \text{trim\_ratio} \rfloor \ge f_B$).
+    TrimmedMean { trim_ratio: f32 },
+    /// Coordinate-wise Median ($B > 2f_B$).
+    CoordinateMedian,
+    /// Stateful / iterative Centered Clipping ($B > 2f_B$).
+    CenteredClipping { tau: f32, max_iterations: usize },
+}
+
+#[cfg(feature = "alloc")]
+struct DeterministicSha256WordStream {
+    domain: &'static [u8],
+    seed: [u8; 32],
+    param_a: u64,
+    param_b: u64,
+    counter: u64,
+    block: [u8; 32],
+    offset: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl DeterministicSha256WordStream {
+    fn new(domain: &'static [u8], seed: [u8; 32], param_a: u64, param_b: u64) -> Self {
+        Self {
+            domain,
+            seed,
+            param_a,
+            param_b,
+            counter: 0,
+            block: [0u8; 32],
+            offset: 32,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if self.offset + 4 > 32 {
+            let mut hasher = Sha256::new();
+            hasher.update(self.domain);
+            hasher.update(self.seed);
+            hasher.update(self.param_a.to_le_bytes());
+            hasher.update(self.param_b.to_le_bytes());
+            hasher.update(self.counter.to_le_bytes());
+            self.counter = self.counter.wrapping_add(1);
+            let digest = hasher.finalize();
+            self.block.copy_from_slice(&digest);
+            self.offset = 0;
+        }
+        let word = u32::from_le_bytes([
+            self.block[self.offset],
+            self.block[self.offset + 1],
+            self.block[self.offset + 2],
+            self.block[self.offset + 3],
+        ]);
+        self.offset += 4;
+        word
+    }
+
+    /// Unbiased integer in `0..bound` ($bound \ge 1$) via Lemire's divisionless rejection method.
+    fn uniform_u32_bounded(&mut self, bound: u32) -> u32 {
+        debug_assert!(bound >= 1);
+        if bound == 1 {
+            return 0;
+        }
+        let s = bound as u64;
+        let threshold = s.wrapping_neg() % s;
+        loop {
+            let x = self.next_u32() as u64;
+            let m = x * s;
+            let l = m as u32 as u64;
+            if l >= threshold {
+                return (m >> 32) as u32;
+            }
+        }
+    }
+}
+
+/// Validate that the post-bucketing bucket count $B$ satisfies the downstream aggregator's
+/// quorum bound under the conservative worst-case fault bound $f_B = \min(f, B)$ (`ADR-0019` §4).
+pub fn validate_post_bucketing_quorum(
+    num_buckets: usize,
+    effective_f: usize,
+    rule: PostBucketingRule,
+) -> Result<()> {
+    if num_buckets == 0 {
+        return Err(Error::InsufficientPeers);
+    }
+    match rule {
+        #[cfg(feature = "krum")]
+        PostBucketingRule::Krum => {
+            let min_b = effective_f
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(3))
+                .ok_or(Error::ResourceExhausted)?;
+            if num_buckets < min_b {
+                return Err(Error::InsufficientPeers);
+            }
+            Ok(())
+        }
+        #[cfg(feature = "krum")]
+        PostBucketingRule::MultiKrum { m } => {
+            if m == 0 {
+                return Err(Error::InvalidThreshold);
+            }
+            let min_b = effective_f
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(3))
+                .ok_or(Error::ResourceExhausted)?;
+            if num_buckets < min_b {
+                return Err(Error::InsufficientPeers);
+            }
+            let max_m = num_buckets - effective_f - 2;
+            if m > max_m {
+                return Err(Error::InsufficientPeers);
+            }
+            Ok(())
+        }
+        #[cfg(feature = "bulyan")]
+        PostBucketingRule::Bulyan => {
+            if effective_f == 0 {
+                return Err(Error::InvalidThreshold);
+            }
+            let min_b = effective_f
+                .checked_mul(4)
+                .and_then(|v| v.checked_add(3))
+                .ok_or(Error::ResourceExhausted)?;
+            if num_buckets < min_b {
+                return Err(Error::InsufficientPeers);
+            }
+            Ok(())
+        }
+        PostBucketingRule::TrimmedMean { trim_ratio } => {
+            if !trim_ratio.is_finite() || !(0.0..0.5).contains(&trim_ratio) {
+                return Err(Error::InvalidThreshold);
+            }
+            let trim_count = ((num_buckets as f32) * trim_ratio) as usize;
+            let two_trim = trim_count.checked_mul(2).ok_or(Error::ResourceExhausted)?;
+            if trim_count < effective_f || two_trim >= num_buckets {
+                return Err(Error::InsufficientPeers);
+            }
+            Ok(())
+        }
+        PostBucketingRule::CoordinateMedian => {
+            if effective_f > 0 {
+                let min_b = effective_f
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add(1))
+                    .ok_or(Error::ResourceExhausted)?;
+                if num_buckets < min_b {
+                    return Err(Error::InsufficientPeers);
+                }
+            }
+            Ok(())
+        }
+        PostBucketingRule::CenteredClipping {
+            tau,
+            max_iterations,
+        } => {
+            if tau.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if tau.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+            if tau <= 0.0 || max_iterations == 0 || max_iterations > MAX_CCLIP_ITERATIONS {
+                return Err(Error::InvalidThreshold);
+            }
+            if effective_f > 0 {
+                let min_b = effective_f
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add(1))
+                    .ok_or(Error::ResourceExhausted)?;
+                if num_buckets < min_b {
+                    return Err(Error::InsufficientPeers);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Partition authenticated peer updates into $B = \lfloor n / s \rfloor$ uniform-weight buckets
+/// of exact size $s$ using a canonical `PeerId`-ordered deterministic shuffle (`ADR-0019` §4, `W11-01`).
+///
+/// Key security properties (`F-02`):
+/// 1. Input updates are canonically ordered by `(PeerId, original_index)` before applying the
+///    `round_seed` permutation, making bucket membership strictly invariant to network arrival order.
+/// 2. Every peer inside a bucket receives exact uniform weight $1 / s$; self-reported
+///    `num_samples` on the wire are ignored so a Byzantine peer cannot hijack a bucket mean by
+///    claiming `u32::MAX` training examples.
+/// 3. The post-bucketing Byzantine bound is conservatively set to $f_B = \min(f, B)$.
+#[cfg(feature = "alloc")]
+pub fn bucket_updates_v1(
+    updates: &[GradientUpdate],
+    config: &BucketingConfig,
+) -> Result<(Vec<GradientUpdate>, BucketExecutionReport)> {
+    if config.bucket_size == 0 {
+        return Err(Error::InvalidThreshold);
+    }
+    let dim = validate_gradient_shapes_and_finiteness(updates)?;
+    let n = updates.len();
+    let s = config.bucket_size;
+
+    if n < s {
+        return Err(Error::InsufficientPeers);
+    }
+    if n > u32::MAX as usize {
+        return Err(Error::ResourceExhausted);
+    }
+    if config.remainder_policy == BucketRemainderPolicy::StrictExactMultiple && (n % s != 0) {
+        return Err(Error::InvalidGradient);
+    }
+
+    // 1. Canonical sort by PeerId (with index tie-break) for arrival-order invariance.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        updates[a]
+            .sender
+            .cmp(&updates[b].sender)
+            .then_with(|| a.cmp(&b))
+    });
+
+    // 2. Deterministic Fisher-Yates shuffle seeded by (S_BUCKETING_PERM_DOMAIN_V1, round_seed, n, s).
+    let mut rng = DeterministicSha256WordStream::new(
+        S_BUCKETING_PERM_DOMAIN_V1,
+        config.round_seed,
+        n as u64,
+        s as u64,
+    );
+    for i in (1..n).rev() {
+        let j = rng.uniform_u32_bounded((i + 1) as u32) as usize;
+        order.swap(i, j);
+    }
+
+    let num_buckets = n / s;
+    let used_peers = num_buckets * s;
+    let inv_s = 1.0f64 / (s as f64);
+    let mut bucket_updates = Vec::with_capacity(num_buckets);
+    let mut buckets_meta = Vec::with_capacity(num_buckets);
+
+    for b in 0..num_buckets {
+        let slice = &order[(b * s)..((b + 1) * s)];
+        let mut mean = alloc::vec![0.0f32; dim];
+        let mut members = Vec::with_capacity(s);
+
+        for &idx in slice {
+            members.push(PeerId::new(updates[idx].sender));
+        }
+
+        for (coord, slot) in mean.iter_mut().enumerate().take(dim) {
+            let mut sum = 0.0f64;
+            for &idx in slice {
+                sum += updates[idx].gradients[coord] as f64;
+            }
+            *slot = (sum * inv_s) as f32;
+        }
+        validate_finite_output(&mean)?;
+
+        let mut id_hasher = Sha256::new();
+        id_hasher.update(S_BUCKETING_ID_DOMAIN_V1);
+        id_hasher.update(config.round_seed);
+        id_hasher.update((b as u32).to_le_bytes());
+        let id_digest = id_hasher.finalize();
+        let mut pseudo_peer = [0u8; 32];
+        pseudo_peer.copy_from_slice(&id_digest);
+
+        bucket_updates.push(GradientUpdate {
+            sender: pseudo_peer,
+            sequence: b as u64,
+            gradients: mean,
+            round_id: updates[slice[0]].round_id,
+        });
+
+        buckets_meta.push(BucketProvenance {
+            bucket_id: BucketId(b as u32),
+            members,
+            uniform_weight: inv_s,
+        });
+    }
+
+    let dropped_remainder_peers: Vec<PeerId> = order[used_peers..]
+        .iter()
+        .map(|&idx| PeerId::new(updates[idx].sender))
+        .collect();
+
+    let effective_byzantine_bound = config.byzantine_count.min(num_buckets);
+    let report = BucketExecutionReport {
+        num_buckets,
+        bucket_size: s,
+        effective_byzantine_bound,
+        buckets: buckets_meta,
+        dropped_remainder_peers,
+    };
+
+    Ok((bucket_updates, report))
+}
+
+/// Execute conservative `$s$-Bucketing` followed by quorum-verified downstream robust aggregation
+/// (`ADR-0019` §4, `W11-01`).
+#[cfg(feature = "alloc")]
+pub fn aggregate_with_bucketing_v1(
+    updates: &[GradientUpdate],
+    config: &BucketingConfig,
+    rule: PostBucketingRule,
+    cclip_center: Option<&[f32]>,
+    budget: &AggregationBudget,
+) -> Result<(Vec<f32>, BucketExecutionReport)> {
+    let (bucket_updates, report) = bucket_updates_v1(updates, config)?;
+    let f_b = report.effective_byzantine_bound;
+    validate_post_bucketing_quorum(report.num_buckets, f_b, rule)?;
+
+    let dim = bucket_updates[0].gradients.len();
+    let aggregated = match rule {
+        #[cfg(feature = "krum")]
+        PostBucketingRule::Krum => {
+            budget.check(report.num_buckets, dim, true)?;
+            Krum::new(f_b).aggregate(&bucket_updates)?
+        }
+        #[cfg(feature = "krum")]
+        PostBucketingRule::MultiKrum { m } => {
+            budget.check(report.num_buckets, dim, true)?;
+            Krum::try_multi(f_b, m)?.aggregate(&bucket_updates)?
+        }
+        #[cfg(feature = "bulyan")]
+        PostBucketingRule::Bulyan => Bulyan::try_new(f_b, BulyanProfile::IterativeKrumV1)?
+            .with_budget(*budget)
+            .aggregate(&bucket_updates)?,
+        PostBucketingRule::TrimmedMean { trim_ratio } => {
+            budget.check(report.num_buckets, dim, false)?;
+            TrimmedMean::try_new(trim_ratio)?.aggregate(&bucket_updates)?
+        }
+        PostBucketingRule::CoordinateMedian => {
+            budget.check(report.num_buckets, dim, false)?;
+            CoordinateMedian.aggregate(&bucket_updates)?
+        }
+        PostBucketingRule::CenteredClipping {
+            tau,
+            max_iterations,
+        } => {
+            let cclip = CenteredClipping::try_new(tau, max_iterations, Vec::new())?;
+            if let Some(center) = cclip_center {
+                cclip.aggregate_with_center_bounded(&bucket_updates, center, budget)?
+            } else {
+                let zero_center = alloc::vec![0.0f32; dim];
+                cclip.aggregate_with_center_bounded(&bucket_updates, &zero_center, budget)?
+            }
+        }
+    };
+
+    Ok((aggregated, report))
+}
+
+/// Execute robust aggregation directly in the $k$-dimensional shared-seed subspace
+/// (`ADR-0021` §3, `W11-02`).
+///
+/// Because every peer projects onto the identical ascending coordinate subset
+/// $S = \text{sample\_shared\_indices\_v1}(d, k, \text{seed})$, pairwise distances and
+/// coordinate-wise order statistics on the $d$-dimensional sparse vectors are preserved
+/// identically on the $k$-dimensional dense value slices. This reduces Krum/Multi-Krum/Bulyan
+/// work from $\mathcal{O}(n^2 d)$ to $\mathcal{O}(n^2 k)$ and `CenteredClipping` work from
+/// $\mathcal{O}(Lnd)$ to $\mathcal{O}(Lnk)$ without allocating $n$ full $d$-vectors.
+#[cfg(feature = "alloc")]
+pub fn aggregate_shared_seed_sparse_v1(
+    submissions: &[(PeerId, SharedSeedSparsePayloadV1)],
+    aggregator: &dyn RobustAggregator,
+    budget: &AggregationBudget,
+) -> Result<Vec<f32>> {
+    if submissions.is_empty() {
+        return Err(Error::InsufficientUpdates);
+    }
+
+    let first = &submissions[0].1;
+    let d = first.original_len as usize;
+    let k = first.k as usize;
+    if d == 0 || d > MAX_GRADIENT_DIM || k == 0 || k > d {
+        return Err(Error::InvalidGradient);
+    }
+    if d > budget.max_dimension {
+        return Err(Error::ResourceBudgetExceeded);
+    }
+
+    let indices =
+        sample_shared_indices_v1(d, k, &first.seed).map_err(|_| Error::InvalidGradient)?;
+    let n = submissions.len();
+    let pairwise = matches!(
+        aggregator.complexity(),
+        AggregatorComplexity::Quadratic | AggregatorComplexity::Cubic
+    );
+    // Budget check uses compressed dimension k for work_ops and scratch_bytes!
+    budget.check(n, k, pairwise)?;
+
+    let mut subspace_updates = Vec::with_capacity(n);
+    for (idx, (peer, payload)) in submissions.iter().enumerate() {
+        if payload.original_len != first.original_len
+            || payload.k != first.k
+            || payload.seed != first.seed
+            || payload.scaling != first.scaling
+            || payload.values.len() != k
+        {
+            return Err(Error::InvalidGradient);
+        }
+        for &val in &payload.values {
+            if val.is_nan() {
+                return Err(Error::NanDetected);
+            }
+            if val.is_infinite() {
+                return Err(Error::InfDetected);
+            }
+        }
+        subspace_updates.push(GradientUpdate {
+            sender: *peer.as_bytes(),
+            sequence: idx as u64,
+            gradients: payload.values.clone(),
+            round_id: 0,
+        });
+    }
+
+    let subspace_aggregate = aggregator.aggregate(&subspace_updates)?;
+    if subspace_aggregate.len() != k {
+        return Err(Error::AggregationFailed);
+    }
+
+    let mut dense_out = alloc::vec![0.0f32; d];
+    for (coord_idx, &val) in indices.into_iter().zip(subspace_aggregate.iter()) {
+        dense_out[coord_idx as usize] = val;
+    }
+    validate_finite_output(&dense_out)?;
+    Ok(dense_out)
+}
+
+/// Verify each peer's pre-seed [`PreSeedVectorCommitmentV1`] and [`MerkleOpeningBatchV1`] against
+/// `expected_round_seed` before executing $\mathcal{O}(n^2 k)$ / $\mathcal{O}(Lnk)$ compressed-subspace
+/// robust aggregation (`ADR-0021` §3, `W11-02`).
+#[cfg(feature = "alloc")]
+pub fn aggregate_verifiable_shared_seed_sparse_v1(
+    submissions: &[(
+        PeerId,
+        PreSeedVectorCommitmentV1,
+        SharedSeedSparsePayloadV1,
+        MerkleOpeningBatchV1,
+    )],
+    expected_round_seed: &[u8; 32],
+    aggregator: &dyn RobustAggregator,
+    budget: &AggregationBudget,
+) -> Result<Vec<f32>> {
+    if submissions.is_empty() {
+        return Err(Error::InsufficientUpdates);
+    }
+
+    let mut verified_payloads = Vec::with_capacity(submissions.len());
+    for (peer, commitment, payload, openings) in submissions {
+        if &payload.seed != expected_round_seed {
+            return Err(Error::VerificationFailed);
+        }
+        verify_shared_seed_openings_v1(commitment, payload, openings).map_err(|err| match err {
+            CompressionError::NonFiniteValue => Error::NanDetected,
+            _ => Error::VerificationFailed,
+        })?;
+        verified_payloads.push((*peer, payload.clone()));
+    }
+
+    aggregate_shared_seed_sparse_v1(&verified_payloads, aggregator, budget)
+}
+
+/// Wave 12 (`W12-01`) extension descriptor for bounded-staleness asynchronous aggregation
+/// (`FedAsync` mixing profile).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+pub struct FedAsyncStalenessDescriptorV1 {
+    /// Base mixing step size $\alpha_0 \in (0, 1]$.
+    pub base_alpha: f32,
+    /// Maximum admitted round staleness $\tau_{\max} = r_{\text{current}} - r_{\text{base}}$.
+    pub max_staleness_rounds: u64,
+    /// Polynomial decay exponent $a \ge 0$ for $s(\tau) = (1 + \tau)^{-a}$.
+    pub polynomial_decay_exponent: f32,
+}
+
+/// Wave 12 (`W12-01`) extension trait for staleness-weighted asynchronous model mixing.
+pub trait StalenessWeightingPolicy {
+    /// Compute the effective mixing weight $\alpha(\tau) \in [0, 1]$ for an update trained against
+    /// `base_round_id` arriving at `current_round_id`, or `Err(Error::InvalidThreshold)` if
+    /// staleness exceeds policy bounds.
+    fn compute_mixing_alpha(&self, base_round_id: u64, current_round_id: u64) -> Result<f32>;
+}
+
 /// Configuration for robust aggregation
 #[derive(Debug, Clone)]
 pub enum RobustAggregation {
@@ -853,6 +1645,8 @@ pub enum RobustAggregation {
         max_byzantine: usize,
         profile: BulyanProfile,
     },
+    /// Stateful / iterative Centered Clipping (`CClip`, `ADR-0019` §4, `W11-01`).
+    CenteredClipping { tau: f32, max_iterations: usize },
 }
 
 impl Default for RobustAggregation {

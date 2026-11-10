@@ -18,10 +18,11 @@ pub use bundle::{
     VerificationStatus, VerifiedBundleV1, SCHEMA_VERSION_V1,
 };
 pub use cas::{
-    get_verified_checkpoint_model, parse_cas_uri_digest, put_checkpoint_model,
-    read_verified_round_resume_state, verify_cas_uri_exists, write_round_resume_state,
-    CheckpointContentDigestV1, CheckpointRecipeKeyV1, RoundResumeStateV1,
-    CHECKPOINT_RECIPE_DOMAIN_TAG_V1, ROUND_RESUME_STATE_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
+    get_verified_checkpoint_model, get_verified_safetensors_checkpoint_v1, parse_cas_uri_digest,
+    put_checkpoint_model, put_safetensors_checkpoint_v1, read_verified_round_resume_state,
+    verify_cas_uri_exists, write_round_resume_state, CheckpointContentDigestV1,
+    CheckpointRecipeKeyV1, RoundResumeStateV1, CHECKPOINT_RECIPE_DOMAIN_TAG_V1,
+    ROUND_RESUME_STATE_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
 };
 pub use io::{
     MAX_MANIFEST_BYTES, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,

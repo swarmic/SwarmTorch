@@ -5,12 +5,31 @@
 //! and synchronized-cohort [`Ef21SenderState`] / [`Ef21ReceiverState`] (Richtárik et al., 2021).
 
 #[cfg(feature = "alloc")]
+use alloc::collections::BTreeSet;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "alloc")]
+use sha2::{Digest, Sha256};
 
 /// Default pre-allocation limit on `CompressedGradient::num_elements` (`16,777,216` elements = 64 MiB).
 pub const DEFAULT_MAX_COMPRESSION_ELEMENTS: usize = 16_777_216;
+
+/// Domain separation tag for `SharedSeedSparse` deterministic subset sampling (`ADR-0021` §3, `W11-02`).
+pub const SHARED_SPARSE_SEED_DOMAIN_V1: &[u8] = b"swarmtorch.shared_sparse.seed.v1";
+
+/// Domain separation tag for pre-seed Merkle coordinate leaf hashing (`ADR-0021` §3, `W11-02`).
+pub const MERKLE_LEAF_DOMAIN_V1: &[u8] = b"swarmtorch.merkle.leaf.v1";
+
+/// Domain separation tag for power-of-two virtual padding leaves (`ADR-0021` §3, `W11-02`).
+pub const MERKLE_PAD_DOMAIN_V1: &[u8] = b"swarmtorch.merkle.pad.v1";
+
+/// Domain separation tag for internal Merkle tree nodes (`ADR-0021` §3, `W11-02`).
+pub const MERKLE_NODE_DOMAIN_V1: &[u8] = b"swarmtorch.merkle.node.v1";
+
+/// Domain separation tag for binding a round seed to cohort pre-seed commitments (`ADR-0021` §3, `W11-02`).
+pub const VERIFIABLE_ROUND_SEED_DOMAIN_V1: &[u8] = b"swarmtorch.round.seed.v1";
 
 #[cfg(feature = "alloc")]
 fn topk_priority_cmp(a: &(usize, f32), b: &(usize, f32)) -> core::cmp::Ordering {
@@ -48,6 +67,8 @@ pub enum CompressionError {
     ResourceLimitExceeded,
     /// Sparse indices are not strictly ascending (`indices[i] <= indices[i - 1]`).
     UnsortedOrDuplicateIndices,
+    /// Pre-seed Merkle vector commitment or coordinate opening proof verification failed (`ADR-0021` §3).
+    CommitmentVerificationFailed,
 }
 
 impl core::fmt::Display for CompressionError {
@@ -71,6 +92,12 @@ impl core::fmt::Display for CompressionError {
                 write!(
                     f,
                     "sparse indices must be strictly ascending without duplicates"
+                )
+            }
+            Self::CommitmentVerificationFailed => {
+                write!(
+                    f,
+                    "pre-seed Merkle commitment or coordinate opening verification failed"
                 )
             }
         }
@@ -622,6 +649,604 @@ impl Ef21ReceiverState {
             .ok_or(CompressionError::IndexOverflow)?;
         self.estimate = next_estimate;
         Ok(&self.estimate)
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn canonical_f32_bits(v: f32) -> core::result::Result<u32, CompressionError> {
+    if !v.is_finite() {
+        return Err(CompressionError::NonFiniteValue);
+    }
+    if v == 0.0 {
+        Ok(0x0000_0000)
+    } else {
+        Ok(v.to_bits())
+    }
+}
+
+#[cfg(feature = "alloc")]
+struct SharedSparseWordStream {
+    seed: [u8; 32],
+    d: u64,
+    k: u64,
+    counter: u64,
+    block: [u8; 32],
+    offset: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSparseWordStream {
+    fn new(seed: [u8; 32], d: usize, k: usize) -> Self {
+        Self {
+            seed,
+            d: d as u64,
+            k: k as u64,
+            counter: 0,
+            block: [0u8; 32],
+            offset: 32,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if self.offset + 4 > 32 {
+            let mut hasher = Sha256::new();
+            hasher.update(SHARED_SPARSE_SEED_DOMAIN_V1);
+            hasher.update(self.seed);
+            hasher.update(self.d.to_le_bytes());
+            hasher.update(self.k.to_le_bytes());
+            hasher.update(self.counter.to_le_bytes());
+            self.counter = self.counter.wrapping_add(1);
+            let digest = hasher.finalize();
+            self.block.copy_from_slice(&digest);
+            self.offset = 0;
+        }
+        let word = u32::from_le_bytes([
+            self.block[self.offset],
+            self.block[self.offset + 1],
+            self.block[self.offset + 2],
+            self.block[self.offset + 3],
+        ]);
+        self.offset += 4;
+        word
+    }
+
+    /// Unbiased integer in `0..=inclusive_max` via Lemire's divisionless rejection method.
+    fn uniform_u32_inclusive(&mut self, inclusive_max: u32) -> u32 {
+        let bound = (inclusive_max as u64) + 1;
+        if bound == 1 {
+            return 0;
+        }
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let x = self.next_u32() as u64;
+            let m = x * bound;
+            let l = m as u32 as u64;
+            if l >= threshold {
+                return (m >> 32) as u32;
+            }
+        }
+    }
+}
+
+/// Sample an unbiased $k$-of-$d$ coordinate subset in $\mathcal{O}(k \log k)$ time and
+/// $\mathcal{O}(k)$ auxiliary memory using Robert Floyd's selection algorithm (`ADR-0021` §3, `W11-02`).
+///
+/// Unlike a partial Fisher-Yates shuffle over `[0..d]`, this function never allocates an
+/// $\mathcal{O}(d)$ index buffer (`F-04`) and returns the $k$ indices in strictly ascending
+/// canonical order.
+#[cfg(feature = "alloc")]
+pub fn sample_shared_indices_v1(
+    d: usize,
+    k: usize,
+    seed: &[u8; 32],
+) -> core::result::Result<Vec<u32>, CompressionError> {
+    if d == 0 || d > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+        return Err(CompressionError::ResourceLimitExceeded);
+    }
+    if d > u32::MAX as usize {
+        return Err(CompressionError::IndexOverflow);
+    }
+    if k == 0 || k > d {
+        return Err(CompressionError::InvalidRatio);
+    }
+
+    let mut selected = BTreeSet::new();
+    let mut rng = SharedSparseWordStream::new(*seed, d, k);
+
+    for j in (d - k)..d {
+        let t = rng.uniform_u32_inclusive(j as u32);
+        if !selected.insert(t) {
+            selected.insert(j as u32);
+        }
+    }
+
+    Ok(selected.into_iter().collect())
+}
+
+/// Projection scaling profile for [`SharedSeedSparsePayloadV1`] (`ADR-0021` §3, `W11-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SharedSeedScalingProfile {
+    /// Unscaled projection $C_S(x) = P_S x$. Required when paired with local error-feedback
+    /// residual accumulation (`ADR-0020` / [`SharedSeedResidualCompressor`]) so the contraction
+    /// bound $\|x - C_S(x)\|_2^2 \le (1 - k/d)\|x\|_2^2$ holds in expectation.
+    #[default]
+    UnscaledProjectionV1,
+    /// Unbiased scaled projection $C_S(x) = \frac{d}{k} P_S x$ ($\mathbb{E}[C_S(x)] = x$).
+    /// Use only when local residual accumulation is disabled.
+    ScaledUnbiasedV1,
+}
+
+/// Compact wire payload for `SharedSeedSparse` (`ADR-0021` §3, `W11-02`).
+///
+/// Because all peers and the coordinator derive the identical ascending index subset
+/// `S = sample_shared_indices_v1(original_len, k, &seed)`, the wire payload carries only
+/// the $k$ retained `f32` values (`4 * k` bytes) without per-element `u32` index overhead.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedSeedSparsePayloadV1 {
+    /// Full uncompressed vector dimension $d$.
+    pub original_len: u32,
+    /// Number of retained coordinates $k$ ($1 \le k \le d$).
+    pub k: u32,
+    /// Shared 32-byte round seed determining the $k$-of-$d$ support $S$.
+    pub seed: [u8; 32],
+    /// Projection scaling profile applied to `values`.
+    pub scaling: SharedSeedScalingProfile,
+    /// Retained coordinate values ordered by `sample_shared_indices_v1(original_len, k, &seed)`.
+    pub values: Vec<f32>,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedSparsePayloadV1 {
+    /// Project a dense $d$-dimensional vector onto the shared-seed $k$-coordinate subspace.
+    pub fn compress(
+        gradient: &[f32],
+        k: usize,
+        seed: [u8; 32],
+        scaling: SharedSeedScalingProfile,
+    ) -> core::result::Result<Self, CompressionError> {
+        let d = gradient.len();
+        for &v in gradient {
+            if !v.is_finite() {
+                return Err(CompressionError::NonFiniteValue);
+            }
+        }
+        let indices = sample_shared_indices_v1(d, k, &seed)?;
+        let scale_f64 = match scaling {
+            SharedSeedScalingProfile::UnscaledProjectionV1 => 1.0f64,
+            SharedSeedScalingProfile::ScaledUnbiasedV1 => (d as f64) / (k as f64),
+        };
+
+        let mut values = Vec::with_capacity(k);
+        for idx in indices {
+            let raw = gradient[idx as usize];
+            let projected = if scaling == SharedSeedScalingProfile::UnscaledProjectionV1 {
+                raw
+            } else {
+                let s = ((raw as f64) * scale_f64) as f32;
+                if !s.is_finite() {
+                    return Err(CompressionError::NonFiniteValue);
+                }
+                s
+            };
+            values.push(projected);
+        }
+
+        Ok(Self {
+            original_len: d as u32,
+            k: k as u32,
+            seed,
+            scaling,
+            values,
+        })
+    }
+
+    /// Reconstruct the $d$-dimensional sparse vector by scattering `values` into `sample_shared_indices_v1`.
+    pub fn decompress(&self) -> core::result::Result<Vec<f32>, CompressionError> {
+        let d = self.original_len as usize;
+        let k = self.k as usize;
+        let indices = sample_shared_indices_v1(d, k, &self.seed)?;
+        if self.values.len() != k {
+            return Err(CompressionError::InvalidData);
+        }
+        for &v in &self.values {
+            if !v.is_finite() {
+                return Err(CompressionError::NonFiniteValue);
+            }
+        }
+
+        let mut out = alloc::vec![0.0f32; d];
+        for (idx, &val) in indices.into_iter().zip(self.values.iter()) {
+            out[idx as usize] = val;
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn merkle_leaf_hash_v1(
+    index: u32,
+    raw_value: f32,
+) -> core::result::Result<[u8; 32], CompressionError> {
+    let bits = canonical_f32_bits(raw_value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(MERKLE_LEAF_DOMAIN_V1);
+    hasher.update(index.to_le_bytes());
+    hasher.update(bits.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+#[cfg(feature = "alloc")]
+fn merkle_pad_hash_v1(index: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MERKLE_PAD_DOMAIN_V1);
+    hasher.update(index.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+#[cfg(feature = "alloc")]
+fn merkle_node_hash_v1(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MERKLE_NODE_DOMAIN_V1);
+    hasher.update(left);
+    hasher.update(right);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Pre-seed binary SHA-256 Merkle vector commitment (`ADR-0021` §3, `W11-02`).
+///
+/// Published and signed by each cohort peer *before* the round's shared seed is revealed so a
+/// Byzantine peer cannot adaptively fabricate coordinates on the $k$ sampled indices (`F-04`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreSeedVectorCommitmentV1 {
+    /// Full uncompressed vector dimension $d$.
+    pub original_len: u32,
+    /// Binary SHA-256 Merkle root over the $d$ coordinates (padded to $\max(2, \text{next\_power\_of\_two}(d))$).
+    pub merkle_root: [u8; 32],
+}
+
+/// Single coordinate opening proof against a [`PreSeedVectorCommitmentV1`] (`ADR-0021` §3, `W11-02`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MerkleCoordinateProofV1 {
+    /// Coordinate index $j \in [0, d)$.
+    pub index: u32,
+    /// Unscaled pre-seed coordinate value $u_t^{(i, j)}$ committed at leaf $j$.
+    pub raw_value: f32,
+    /// Sibling hashes from leaf level (`level = 0`) to the child of `merkle_root`.
+    pub siblings: Vec<[u8; 32]>,
+}
+
+/// Batch of $k$ Merkle coordinate opening proofs accompanying a [`SharedSeedSparsePayloadV1`].
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MerkleOpeningBatchV1 {
+    /// Opening proofs in canonical ascending index order of `sample_shared_indices_v1`.
+    pub proofs: Vec<MerkleCoordinateProofV1>,
+}
+
+#[cfg(feature = "alloc")]
+impl PreSeedVectorCommitmentV1 {
+    /// Build the full Merkle tree layers (leaf layer at index `0`, root at the last layer)
+    /// for a finite $d$-dimensional vector.
+    fn build_tree_layers(
+        vector: &[f32],
+    ) -> core::result::Result<Vec<Vec<[u8; 32]>>, CompressionError> {
+        let d = vector.len();
+        if d == 0 || d > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        if d > u32::MAX as usize {
+            return Err(CompressionError::IndexOverflow);
+        }
+        let leaf_count = d
+            .checked_next_power_of_two()
+            .ok_or(CompressionError::ResourceLimitExceeded)?
+            .max(2);
+
+        let mut current = Vec::with_capacity(leaf_count);
+        for (idx, &val) in vector.iter().enumerate() {
+            current.push(merkle_leaf_hash_v1(idx as u32, val)?);
+        }
+        for idx in d..leaf_count {
+            current.push(merkle_pad_hash_v1(idx as u32));
+        }
+
+        let mut layers = Vec::new();
+        while current.len() > 1 {
+            let mut next = Vec::with_capacity(current.len() / 2);
+            for pair in current.chunks_exact(2) {
+                next.push(merkle_node_hash_v1(&pair[0], &pair[1]));
+            }
+            layers.push(current);
+            current = next;
+        }
+        layers.push(current);
+        Ok(layers)
+    }
+
+    /// Compute the pre-seed Merkle commitment for `vector` before the shared seed is revealed.
+    pub fn commit(vector: &[f32]) -> core::result::Result<Self, CompressionError> {
+        let layers = Self::build_tree_layers(vector)?;
+        let root = layers
+            .last()
+            .and_then(|top| top.first())
+            .copied()
+            .ok_or(CompressionError::InvalidData)?;
+        Ok(Self {
+            original_len: vector.len() as u32,
+            merkle_root: root,
+        })
+    }
+
+    /// Produce the [`SharedSeedSparsePayloadV1`] and [`MerkleOpeningBatchV1`] for a previously
+    /// committed pre-seed `vector` once the round `seed` is revealed.
+    pub fn open_for_seed(
+        &self,
+        vector: &[f32],
+        k: usize,
+        seed: [u8; 32],
+        scaling: SharedSeedScalingProfile,
+    ) -> core::result::Result<(SharedSeedSparsePayloadV1, MerkleOpeningBatchV1), CompressionError>
+    {
+        if vector.len() != self.original_len as usize {
+            return Err(CompressionError::ShapeMismatch);
+        }
+        let layers = Self::build_tree_layers(vector)?;
+        let root = layers
+            .last()
+            .and_then(|top| top.first())
+            .copied()
+            .ok_or(CompressionError::InvalidData)?;
+        if root != self.merkle_root {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+
+        let payload = SharedSeedSparsePayloadV1::compress(vector, k, seed, scaling)?;
+        let indices = sample_shared_indices_v1(vector.len(), k, &seed)?;
+        let tree_depth = layers.len() - 1;
+        let mut proofs = Vec::with_capacity(k);
+
+        for idx in indices {
+            let mut siblings = Vec::with_capacity(tree_depth);
+            let mut pos = idx as usize;
+            for layer in layers.iter().take(tree_depth) {
+                let sibling_pos = pos ^ 1;
+                siblings.push(layer[sibling_pos]);
+                pos >>= 1;
+            }
+            proofs.push(MerkleCoordinateProofV1 {
+                index: idx,
+                raw_value: vector[idx as usize],
+                siblings,
+            });
+        }
+
+        Ok((payload, MerkleOpeningBatchV1 { proofs }))
+    }
+
+    /// Commit to `vector` and open the $k$ coordinates for `seed` in one call.
+    pub fn commit_and_open(
+        vector: &[f32],
+        k: usize,
+        seed: [u8; 32],
+        scaling: SharedSeedScalingProfile,
+    ) -> core::result::Result<
+        (Self, SharedSeedSparsePayloadV1, MerkleOpeningBatchV1),
+        CompressionError,
+    > {
+        let commitment = Self::commit(vector)?;
+        let (payload, openings) = commitment.open_for_seed(vector, k, seed, scaling)?;
+        Ok((commitment, payload, openings))
+    }
+}
+
+/// Verify that a [`SharedSeedSparsePayloadV1`] and its [`MerkleOpeningBatchV1`] match a peer's
+/// pre-seed [`PreSeedVectorCommitmentV1`] (`ADR-0021` §3, `W11-02`).
+#[cfg(feature = "alloc")]
+pub fn verify_shared_seed_openings_v1(
+    commitment: &PreSeedVectorCommitmentV1,
+    payload: &SharedSeedSparsePayloadV1,
+    openings: &MerkleOpeningBatchV1,
+) -> core::result::Result<(), CompressionError> {
+    if commitment.original_len != payload.original_len {
+        return Err(CompressionError::CommitmentVerificationFailed);
+    }
+    let d = payload.original_len as usize;
+    let k = payload.k as usize;
+    let expected_indices = sample_shared_indices_v1(d, k, &payload.seed)?;
+
+    if payload.values.len() != k || openings.proofs.len() != k {
+        return Err(CompressionError::CommitmentVerificationFailed);
+    }
+
+    let leaf_count = d
+        .checked_next_power_of_two()
+        .ok_or(CompressionError::ResourceLimitExceeded)?
+        .max(2);
+    let expected_depth = leaf_count.trailing_zeros() as usize;
+    let scale_f64 = match payload.scaling {
+        SharedSeedScalingProfile::UnscaledProjectionV1 => 1.0f64,
+        SharedSeedScalingProfile::ScaledUnbiasedV1 => (d as f64) / (k as f64),
+    };
+
+    for ((&expected_idx, &wire_val), proof) in expected_indices
+        .iter()
+        .zip(payload.values.iter())
+        .zip(openings.proofs.iter())
+    {
+        if proof.index != expected_idx || proof.siblings.len() != expected_depth {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+
+        let expected_wire_val = if payload.scaling == SharedSeedScalingProfile::UnscaledProjectionV1
+        {
+            proof.raw_value
+        } else {
+            let s = ((proof.raw_value as f64) * scale_f64) as f32;
+            if !s.is_finite() {
+                return Err(CompressionError::NonFiniteValue);
+            }
+            s
+        };
+
+        if canonical_f32_bits(wire_val)? != canonical_f32_bits(expected_wire_val)? {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+
+        let mut current = merkle_leaf_hash_v1(proof.index, proof.raw_value)?;
+        let mut pos = proof.index as usize;
+        for sibling in &proof.siblings {
+            if (pos & 1) == 0 {
+                current = merkle_node_hash_v1(&current, sibling);
+            } else {
+                current = merkle_node_hash_v1(sibling, &current);
+            }
+            pos >>= 1;
+        }
+
+        if current != commitment.merkle_root {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+    }
+
+    Ok(())
+}
+
+/// Derive a verifiable 32-byte round seed cryptographically bound to the cohort's pre-seed
+/// [`PreSeedVectorCommitmentV1`] roots and an optional external randomness beacon (`ADR-0021` §3).
+#[cfg(feature = "alloc")]
+pub fn derive_verifiable_round_seed_v1(
+    run_id: &[u8; 16],
+    round_id: u64,
+    commitments: &[(crate::traits::PeerId, PreSeedVectorCommitmentV1)],
+    external_beacon: &[u8; 32],
+) -> core::result::Result<[u8; 32], CompressionError> {
+    if commitments.is_empty() {
+        return Err(CompressionError::InvalidData);
+    }
+
+    let mut sorted = commitments.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for window in sorted.windows(2) {
+        if window[0].0 == window[1].0 {
+            return Err(CompressionError::InvalidData);
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(VERIFIABLE_ROUND_SEED_DOMAIN_V1);
+    hasher.update(run_id);
+    hasher.update(round_id.to_le_bytes());
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for (peer_id, commitment) in &sorted {
+        hasher.update(peer_id.as_bytes());
+        hasher.update(commitment.original_len.to_le_bytes());
+        hasher.update(commitment.merkle_root);
+    }
+    hasher.update(external_beacon);
+
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Local error-feedback residual state co-designed for `SharedSeedSparse` (`ADR-0021` §3, `W11-02`).
+///
+/// Implements the two-phase verifiable commitment workflow:
+/// 1. [`Self::prepare_pre_seed_vector`] forms $u_t = g_t + e_t$ and computes its
+///    [`PreSeedVectorCommitmentV1`] *before* the round seed is revealed.
+/// 2. [`Self::finalize_with_seed`] projects $u_t$ onto the shared-seed $k$-coordinate support $S$
+///    using [`SharedSeedScalingProfile::UnscaledProjectionV1`], updates the local residual
+///    $e_{t+1} = u_t - P_S(u_t)$ transactionally, and emits `(payload, openings)`.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct SharedSeedResidualCompressor {
+    residual: Vec<f32>,
+    k: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedResidualCompressor {
+    /// Create a new residual compressor for dimension `dim` retaining `k` coordinates per round.
+    pub fn new(dim: usize, k: usize) -> core::result::Result<Self, CompressionError> {
+        if dim == 0 || dim > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        if k == 0 || k > dim {
+            return Err(CompressionError::InvalidRatio);
+        }
+        Ok(Self {
+            residual: alloc::vec![0.0f32; dim],
+            k,
+        })
+    }
+
+    /// Borrow the current residual vector $e_t$.
+    pub fn residual(&self) -> &[f32] {
+        &self.residual
+    }
+
+    /// Phase 1 (Pre-Seed): Compute $u_t = g_t + e_t$ in widened `f64` and commit to $u_t$ via
+    /// [`PreSeedVectorCommitmentV1`].
+    pub fn prepare_pre_seed_vector(
+        &self,
+        gradient: &[f32],
+    ) -> core::result::Result<(Vec<f32>, PreSeedVectorCommitmentV1), CompressionError> {
+        if gradient.len() != self.residual.len() {
+            return Err(CompressionError::ShapeMismatch);
+        }
+        let mut u = Vec::with_capacity(gradient.len());
+        for (&g, &r) in gradient.iter().zip(self.residual.iter()) {
+            if !g.is_finite() || !r.is_finite() {
+                return Err(CompressionError::NonFiniteValue);
+            }
+            let sum = ((g as f64) + (r as f64)) as f32;
+            if !sum.is_finite() {
+                return Err(CompressionError::NonFiniteValue);
+            }
+            u.push(sum);
+        }
+        let commitment = PreSeedVectorCommitmentV1::commit(&u)?;
+        Ok((u, commitment))
+    }
+
+    /// Phase 2 (Post-Seed): Open the $k$ coordinates selected by `seed` from `pre_seed_u` and
+    /// update the local residual $e_{t+1} = u_t - P_S(u_t)$.
+    pub fn finalize_with_seed(
+        &mut self,
+        pre_seed_u: &[f32],
+        commitment: &PreSeedVectorCommitmentV1,
+        seed: [u8; 32],
+    ) -> core::result::Result<(SharedSeedSparsePayloadV1, MerkleOpeningBatchV1), CompressionError>
+    {
+        if pre_seed_u.len() != self.residual.len() {
+            return Err(CompressionError::ShapeMismatch);
+        }
+        let (payload, openings) = commitment.open_for_seed(
+            pre_seed_u,
+            self.k,
+            seed,
+            SharedSeedScalingProfile::UnscaledProjectionV1,
+        )?;
+        let indices = sample_shared_indices_v1(pre_seed_u.len(), self.k, &seed)?;
+
+        let mut next_residual = pre_seed_u.to_vec();
+        for idx in indices {
+            next_residual[idx as usize] = 0.0;
+        }
+        self.residual = next_residual;
+        Ok((payload, openings))
     }
 }
 

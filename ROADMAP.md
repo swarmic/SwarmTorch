@@ -7,8 +7,8 @@ For a high-level project overview and usage guide, see [`README.md`](README.md).
 | Version | Focus | Status |
 |---------|-------|--------|
 | `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Completed |
-| `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Current (Implemented & Verified) |
-| `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Planned |
+| `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Completed |
+| `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Current (Implemented & Verified) |
 | `v0.2.0` | Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & `wasmi` Sandbox (Wave 12) | Planned |
 | `v0.3.0+` | Production Hardening, Local Artifact Reader (`P2-16`), & Optional Desktop Wrapper (`P2-17`) | Future |
 
@@ -18,7 +18,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-## Completed Milestones (Waves 4–10)
+## Completed Milestones (Waves 4–11)
 
 ### Waves 4–6: Remediation & Artifact/Report Canon Lock
 - Completed `E-01..E-05` semver batch, `F1` execution hints (`ExecutionHint`), `F2a/F2/F3/F4` (`TransformAuditV0`, `UpdateTransform`, composable aggregation pipeline, lightweight tracing), and behavior-preserving `A6X-06` decomposition of artifact/report modules.
@@ -47,16 +47,21 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 3. **Deterministic `MockRuntime` Scheduler, Originator-Authenticated Gossip Wrappers, & Multi-Node Simulation (`W10-03`, `ADR-0003`, `ADR-0014`, `ADR-0022` §3):**
    - Adds bounded FIFO task scheduling and deadline-ordered timer wakers (`std::task::Wake`) to `MockRuntime`, `InnerUpdateV1` + `RecipientWrapperV1` + `BundledGossipDeliveryV1` and topology-aware `MockNetworkHub` in `swarm-torch-net`, and the 6-scenario multi-node honest & Byzantine training simulation suite (`swarm-torch/tests/federated_round_simulation.rs`).
 
+### Wave 11 (`v0.1.0` RC — Landed & Conformance Verified)
+1. **Stateful `CenteredClipping` (`CClip`), Conservative `$s$-Bucketing`, & Exact `no_std` `sqrt_f64` (`W11-01`, `ADR-0019` §4):**
+   - Replaces the legacy fixed-3-iteration Newton-Raphson `sqrt_f32` in `GradientValidator` with a shared IEEE-754 exponent-halving + 4-iteration Newton-Raphson `sqrt_f64_soft` (`swarm-torch-core::num`), implements `CenteredClipping` (`CClip`, Karimireddy et al., ICML 2021) with stateful across-round center tracking in `SwarmRoundCoordinator`, implements conservative `$s$-Bucketing` (`BucketingConfig`, Karimireddy et al., ICLR 2022) with canonical `PeerId`-ordered shuffling, uniform $1/s$ intra-bucket weights, and $f_B = \min(f, B)$ post-bucketing quorum re-validation, and establishes Wave 12 extension hooks (`StalenessWeightingPolicy`, `PrivacyAccountantHook`).
+2. **Verifiable `SharedSeedSparse` Co-Design & Compressed-Subspace Aggregation (`W11-02`, `ADR-0021` §3):**
+   - Implements Robert Floyd's $\mathcal{O}(k)$-space unbiased subset sampler (`sample_shared_indices_v1`), `SharedSeedSparsePayloadV1` (`UnscaledProjectionV1` & `ScaledUnbiasedV1`), pre-seed binary SHA-256 Merkle vector commitments (`PreSeedVectorCommitmentV1`) + coordinate opening proofs (`MerkleOpeningBatchV1`), `derive_verifiable_round_seed_v1`, `SharedSeedResidualCompressor`, and $\mathcal{O}(n^2 k)$ / $\mathcal{O}(Lnk)$ compressed-subspace robust aggregation (`aggregate_shared_seed_sparse_v1`, `aggregate_verifiable_shared_seed_sparse_v1`).
+3. **Frozen 16-Byte `ChunkedFrameCodec`, Pre-Auth `ObservedSourceReassembler`, & Concrete `TcpTransport`/`UdpGossipTransport` (`W11-03`, `ADR-0022` §2):**
+   - Implements the frozen 16-byte `ChunkedFrameCodec` (`[0x53, 0x54]` magic, `CRC-16/IBM-3740`, pinned 19-byte golden vector `53 54 01 03 04 03 02 01 00 00 01 00 03 00 7D A5 AA BB CC`, fixed stride $P = M - 16$), pre-authentication `ObservedSourceReassembler<E>` keyed by `(adapter_generation, observed_source, transfer_id)` with per-source/global budgets and conflict quarantine tombstones, cancellation-safe `TcpTransport` (`TcpFrameReaderState`), and `UdpGossipTransport`.
+4. **`SwarmTorchCheckpointV1` SafeTensors Profile, CAS Integration, & Criterion Benchmarks (`W11-04`, `W10-03`, `ADR-0024` §3):**
+   - Implements the `SwarmTorchCheckpointV1` SafeTensors v1 binary codec (`swarm-torch-models::safetensors_v1`) with strict duplicate-key-rejecting JSON header validation, contiguous offset verification, canonical `model_schema_hash`, transactional `SwarmModel` import/export, CAS helpers (`put_safetensors_checkpoint_v1`, `get_verified_safetensors_checkpoint_v1`), Wave 12 (`W12-03` `LoRaAdapterDescriptorV1`, `W12-04` `RunnerIsolationProfile`) stubs, Criterion benchmarks (`aggregation`, `swarm_bench`), and runnable examples (`hello_swarm`, `byzantine_federated_round`).
+
 ---
 
-## Upcoming Ratified Waves (Waves 11–12)
+## Upcoming Ratified Waves (Wave 12)
 
-1. **Wave 11 (`v0.1.0` RC — Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile):**
-   - `W11-01` (`ADR-0019`): `CenteredClipping` (`CClip`) and conservative `$s$-Bucketing` ($n \bmod s = 0, f_B = \min(f, B)$) with post-bucketing quorum re-checks.
-   - `W11-02` (`ADR-0021`): `SharedSeedSparse` with $\mathcal{O}(k)$ sparse sampling and verifiable pre-seed Merkle/vector commitments.
-   - `W11-03` (`ADR-0022`): Frozen 16-byte `ChunkedFrameCodec` (`[0x53, 0x54]`, `CRC-16/IBM-3740`, fixed stride $P$, observed-source pre-auth budgets) and concrete `TcpTransport`/`UdpGossipTransport`.
-   - `W11-04` (`ADR-0024`): `SwarmTorchCheckpointV1` profile over additive `safetensors` (`0.7+`/`0.8+`) in an optional codec boundary.
-2. **Wave 12 (`v0.2.0` — Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & Installed `wasmi` Sandbox):**
+1. **Wave 12 (`v0.2.0` — Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & Installed `wasmi` Sandbox):**
    - `W12-01` (`ADR-0024`): Optional `swarm-torch-backends` (Burn/Candle adapters) and explicit LoRA / FLoRA delta aggregation.
    - `W12-02` (`ADR-0022`): Separate optional `swarm-torch-transport-zenoh` and `swarm-torch-transport-iroh` crates (1-RTT QUIC streams, distinct link `EndpointId` vs. originator `PeerId`).
    - `W12-03` (`ADR-0023`): Stale-delta `FedAsync` mixing and durable pre-release Rényi DP accounting.

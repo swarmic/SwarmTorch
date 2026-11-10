@@ -30,6 +30,18 @@ pub const INNER_UPDATE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.update.v1";
 /// Domain separation tag for originator-signed gossip recipient wrappers (`ADR-0022` §3.2, `W10-03`).
 pub const RECIPIENT_WRAPPER_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.gossip.wrapper.v1";
 
+/// Domain separation tag for canonical `SwarmTorchCheckpointV1` model schema hashes (`ADR-0024` §3, `W11-04`).
+pub const MODEL_SCHEMA_HASH_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.schema.v1";
+
+/// Compute a 32-byte SHA-256 digest over `data` in both `std` and `no_std` builds.
+#[inline]
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// Scoped envelope v1 signing metadata (`ADR-0021`, `W9-02`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvelopeContextV1 {
@@ -501,11 +513,11 @@ impl GradientValidator {
         let norm_sq = gradients
             .iter()
             .map(|&g| (g as f64) * (g as f64))
-            .sum::<f64>() as f32;
-        let norm = sqrt_f32(norm_sq);
-        if norm > self.max_gradient_norm {
+            .sum::<f64>();
+        let norm_f64 = crate::num::sqrt_f64(norm_sq);
+        if !norm_f64.is_finite() || norm_f64 > (self.max_gradient_norm as f64) {
             return Err(GradientValidationError::NormTooLarge {
-                norm,
+                norm: norm_f64 as f32,
                 max: self.max_gradient_norm,
             });
         }
@@ -514,24 +526,46 @@ impl GradientValidator {
     }
 }
 
-/// Software square root for gradient L2-norm validation only.
+/// Software square root for gradient L2-norm validation.
 #[inline]
+#[allow(dead_code)]
 fn sqrt_f32(x: f32) -> f32 {
-    #[cfg(feature = "std")]
-    {
-        x.sqrt()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        let mut y = x;
-        for _ in 0..8 {
-            y = 0.5 * (y + (x / y));
-        }
-        y
-    }
+    crate::num::sqrt_f32(x)
+}
+
+/// Wave 12 (`W12-02`) extension descriptor for Rényi Differential Privacy (`RdpAccountant`)
+/// composition coupled to explicit $\ell_2$ gradient clipping bounds (`CenteredClipping` /
+/// [`GradientValidator`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RdpBudgetDescriptorV1 {
+    /// Rényi order $\alpha > 1.0$.
+    pub alpha: f64,
+    /// Cumulative privacy loss $\epsilon(\alpha)$ at order `alpha`.
+    pub epsilon_alpha: f64,
+    /// Target $(\epsilon, \delta)$-DP failure probability $\delta \in (0, 1)$.
+    pub target_delta: f64,
+    /// Per-round $\ell_2$ sensitivity / clipping radius $\tau > 0$.
+    pub clipping_radius_tau: f32,
+    /// Gaussian noise multiplier $\sigma / \tau$.
+    pub noise_multiplier: f32,
+}
+
+/// Wave 12 (`W12-02`) extension hook for privacy budget accounting across rounds.
+///
+/// In Wave 11 (`v0.1.0`), `CenteredClipping` and [`GradientValidator`] enforce the geometric
+/// $\ell_2$ sensitivity bound $\tau$, and implementations of this trait can observe or gate
+/// per-round sensitivity expenditure ahead of full `RdpAccountant` integration in Wave 12.
+pub trait PrivacyAccountantHook {
+    /// Returns the current Rényi DP budget descriptor before committing a round.
+    fn current_budget(&self) -> RdpBudgetDescriptorV1;
+
+    /// Records a single round with clipping radius `tau` and cohort subsampling rate `q`,
+    /// returning `Ok(())` if the cumulative budget remains within policy.
+    fn record_clipped_round(
+        &mut self,
+        tau: f32,
+        subsampling_rate_q: f64,
+    ) -> Result<(), CryptoError>;
 }
 
 /// Gradient validation error.

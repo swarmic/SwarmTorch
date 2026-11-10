@@ -3990,8 +3990,8 @@ Wave 5 trust path contract (implemented):
 
 ## ADR-0019: Byzantine-Resilient Aggregation Hardening, Multi-Krum, Bulyan, Centered Clipping (CClip), and Non-IID $s$-Bucketing
 
-**Status:** Accepted (`W9-01` Implemented in Wave 9; `W11-01` Planned for Wave 11)  
-**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Status:** Accepted (`W9-01` & `W11-01` Implemented in Waves 9 & 11)  
+**Date:** 2026-11-01 (Amended 2026-11-10)  
 **Deciders:** Core Team  
 **Extends:** ADR-0007, ADR-0007A, ADR-0013  
 **Roadmap Items:** `W9-01` (Wave 9), `W11-01` (Wave 11)
@@ -4051,7 +4051,7 @@ Every aggregator (`FedAvg`, `TrimmedMean`, `CoordinateMedian`, `Krum`, `Bulyan`,
 - **Stage 1 (Normative — Fixed-$f$, Single-Winner Iterative Krum Preserving Quorum):**
   - Precompute the pairwise `f64` squared-distance table once and maintain original candidate indices throughout selection. For each of $\theta = n - 2f - 2$ iterations: let $R$ be the remaining candidate set and $r = |R|$; retain the configured $f$ unchanged; set neighbor count $k = r - f - 2$; for each $i \in R$, sum its $k$ smallest squared distances to other remaining candidates $j \in R, j \ne i$ ($S_R(i) = \sum_{j \in N_R(i, k)} D_{i,j}^2$); select the minimum-distance-score winner $i^\star = \arg\min_{i \in R}(S_R(i), \operatorname{canonical\_index}(i))$; append $i^\star$ to the selection set and remove $i^\star$ from $R$ (recomputing scores against the reduced $R$ after each removal). Because $\theta = n - 2f - 2$, the final selection occurs at $r_{\mathrm{last}} = n - (\theta - 1) = 2f + 3$ with neighbor count $k_{\mathrm{last}} = f + 1$, preserving Krum's $r \ge 2f + 3$ quorum on every step. Golden selection-semantics conformance fixture: for scalar updates `[0, 1, 2, 3, 4, 5, 6]` with $n = 7, f = 1$ ($\theta = 3, \beta = 1$, scored pools $r \in \{7, 6, 5\}$ with $k \in \{4, 3, 2\}$), `BulyanProfile::IterativeKrumV1` selects original indices `[2, 4, 1]` in selection order and produces final result `2.0`.
 
-#### 4. `CenteredClipping` (`CClip`) & Conservative $s$-Bucketing (`W11-01` — Planned Contract)
+#### 4. `CenteredClipping` (`CClip`) & Conservative $s$-Bucketing (`W11-01` — Implemented)
 
 - **Conservative $s$-Bucketing (`BucketingConfig`):**
   1. Require $s \ge 1$ and **require $n \bmod s == 0$ for the initial production profile** (if a floor-bucketing profile $\lfloor n/s \rfloor$ is enabled, it must shuffle the frozen authenticated roster, use exactly $B \cdot s$ contributors, and record the omitted remainder as an explicit participation policy).
@@ -4144,8 +4144,8 @@ Hardening [`swarm-torch-core/src/replay.rs`](file:///c:/Users/Swarmic/Desktop/Sw
 
 ## ADR-0021: Source-Accurate Compression Validation, Stateful Error Feedback (`ClassicResidual` & `EF21`), and Verifiable Shared-Seed Sparse Co-Design
 
-**Status:** Accepted (`W9-03` Implemented in Wave 9; `W11-02` Planned for Wave 11)  
-**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Status:** Accepted (`W9-03` & `W11-02` Implemented in Waves 9 & 11)  
+**Date:** 2026-11-01 (Amended 2026-11-10)  
 **Deciders:** Core Team  
 **Extends:** ADR-0005, ADR-0007, ADR-0013, ADR-0019  
 **Roadmap Items:** `W9-03` (Wave 9), `W11-02` (Wave 11), `P2-15` (Wave 8.3 closure)
@@ -4185,7 +4185,7 @@ Hardening [`swarm-torch-core/src/compression.rs`](file:///c:/Users/Swarmic/Deskt
    - Receiver maintains per-peer reconstruction state $s_t^i$ ($\mathcal{O}(nd)$ RAM) bound to authenticated `(originator, run_id, schema_hash, compressor_config, state_generation, base_version, new_version)` (`Ef21PeerState`, `Ef21InnovationEnvelope`, `Ef21StateAck`).
    - **Operational State Protocol:** Requires agreed initialization or authenticated full-state snapshot; atomic application on exact `base_version` match; idempotent handling of duplicate deliveries; explicit conflict rejection (`CompressionError::StateConflict`) on mismatched content for the same version; no silent zero-initialization on missing base; and a dedicated `Ef21StateAck` confirming state reconstruction independently of whether Krum selected the peer's vector for the model step.
 
-#### 3. Verifiable `SharedSeedSparse` Projection (`W11-02` — Planned Contract)
+#### 3. Verifiable `SharedSeedSparse` Projection (`W11-02` — Implemented)
 
 1. **Projection Operator & Sparse Sampling:**
    - Baseline unscaled projection $C_S(x) = P_S x$ for uniformly sampled subset $S \subset \{0, \dots, d-1\}$ of size $|S| = k$.
@@ -4199,8 +4199,8 @@ Hardening [`swarm-torch-core/src/compression.rs`](file:///c:/Users/Swarmic/Deskt
 
 ## ADR-0022: Additive Transport Traits, Observed-Source Pre-Auth Reassembly, Originator-Authenticated Gossip Wrappers, and Zenoh/Iroh Adapter Crates
 
-**Status:** Accepted (`W9-04`, `W9-05`, & `W10-03` Implemented in Waves 9–10; `W11-03`, `W12-02` Planned)  
-**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Status:** Accepted (`W9-04`, `W9-05`, `W10-03`, & `W11-03` Implemented in Waves 9–11; `W12-02` Planned)  
+**Date:** 2026-11-01 (Amended 2026-11-10)  
 **Deciders:** Core Team  
 **Supersedes:** Conditional `#[cfg(feature = "std")]` trait split in `swarm-torch-net/src/traits.rs` (ADR-0004)  
 **Extends:** ADR-0002, ADR-0004, ADR-0005, ADR-0020  
@@ -4250,7 +4250,7 @@ Hardening [`swarm-torch-net`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%2
    - Exposes asynchronous complete-message operations under `alloc` using **named associated future types** (`SendFuture<'a>`, `RecvFuture<'a>`, `BroadcastFuture<'a>`) so embedded callers can use local futures while multithreaded callers can require `+ Send` bounds on Rust 1.75.
    - Enabling `std` in `swarm-torch-net` enables `alloc` and `swarm-torch-core/std` **without activating `tokio`**.
 
-#### 2. Frozen 16-Byte Chunk Header, Fixed Stride $P$, & Pre-Auth Reassembly (`W11-03` — Planned Contract)
+#### 2. Frozen 16-Byte Chunk Header, Fixed Stride $P$, & Pre-Auth Reassembly (`W11-03` — Implemented)
 
 1. **16-Byte Header Layout:**
    | Offset | Bytes | Field | Normative Contract |
@@ -4363,8 +4363,8 @@ Advancing [`swarm-torch`](file:///c:/Users/Swarmic/Desktop/Swarmic/Swarmic%20Ind
 
 ## ADR-0024: Reference Models, Analytical Losses, SafeTensors Checkpoint Profile, and Isolated Framework Backend Adapters
 
-**Status:** Accepted (`W9-04`, `W9-05`, `W9-06` Implemented in Wave 9; `W11-04`, `W12-01` Planned)  
-**Date:** 2026-11-01 (Amended 2026-11-02)  
+**Status:** Accepted (`W9-04`, `W9-05`, `W9-06`, & `W11-04` Implemented in Waves 9 & 11; `W12-01` Planned)  
+**Date:** 2026-11-01 (Amended 2026-11-10)  
 **Deciders:** Core Team  
 **Extends:** ADR-0001, ADR-0002, ADR-0009, ADR-0010  
 **Roadmap Items:** `W9-04`, `W9-05`, `W9-06` (Wave 9), `W11-04` (Wave 11), `W12-01` (Wave 12), `P2-11` (`bincode` / `burn` removal)
@@ -4398,7 +4398,7 @@ Review of the model, loss, and framework adapter boundaries across `swarm-torch-
    - **Huber Loss:** Requires finite positive $\delta > 0$, pinning exact piecewise quadratic/linear scaling ($0.5 r^2$ for $|r| \le \delta$, $\delta(|r| - 0.5\delta)$ for $|r| > \delta$), verified on both sides of $|r| = \delta$.
    - **SGD Optimizer:** Explicit learning-rate domain ($\eta > 0$, finite), momentum initialization/reset semantics, weight-decay convention and update order, and multi-step state restore.
 
-#### 3. `SwarmTorchCheckpointV1` SafeTensors Profile (`W11-04` — Planned Contract)
+#### 3. `SwarmTorchCheckpointV1` SafeTensors Profile (`W11-04` — Implemented)
 
 - Package SafeTensors interoperability in an optional format adapter crate or feature boundary using an additive release (`safetensors >= 0.7.0`, MSRV `1.80`).
 - Define **`SwarmTorchCheckpointV1`** profile over SafeTensors:

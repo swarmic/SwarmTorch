@@ -11,8 +11,9 @@ use std::io;
 
 use sha2::{Digest, Sha256};
 use swarm_torch_core::aggregation::{
-    apply_update_transforms, CoordinateMedian, FedAvg, RobustAggregation, RobustAggregator,
-    TrimmedMean,
+    aggregate_with_bucketing_v1, apply_update_transforms, bucket_updates_v1, AggregationBudget,
+    BucketExecutionReport, BucketingConfig, CenteredClipping, CoordinateMedian, FedAvg,
+    PostBucketingRule, RobustAggregation, RobustAggregator, TrimmedMean,
 };
 #[cfg(feature = "robust-aggregation")]
 use swarm_torch_core::aggregation::{Bulyan, Krum};
@@ -427,6 +428,12 @@ pub struct SwarmRoundCoordinator<M: SwarmModel> {
     replay: ReplayProtection,
     admitted: BTreeMap<PeerId, AdmittedPeerEntry>,
     equivocated: BTreeSet<PeerId>,
+    /// Persistent previous-round aggregate center $v^{(r-1)}$ for [`CenteredClipping`] (`ADR-0019` §4).
+    cclip_center: Option<Vec<f32>>,
+    /// Optional `$s$-Bucketing` pre-aggregation configuration (`ADR-0019` §4).
+    bucketing: Option<BucketingConfig>,
+    /// Execution report from the most recent `$s$-Bucketing` step.
+    last_bucketing_report: Option<BucketExecutionReport>,
 }
 
 impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
@@ -523,6 +530,9 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             replay,
             admitted: BTreeMap::new(),
             equivocated: BTreeSet::new(),
+            cclip_center: None,
+            bucketing: None,
+            last_bucketing_report: None,
         })
     }
 
@@ -568,7 +578,46 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             replay,
             admitted: BTreeMap::new(),
             equivocated: BTreeSet::new(),
+            cclip_center: None,
+            bucketing: None,
+            last_bucketing_report: None,
         })
+    }
+
+    /// Configure conservative `$s$-Bucketing` pre-aggregation for subsequent rounds (`ADR-0019` §4, `W11-01`).
+    pub fn set_bucketing(&mut self, bucketing: Option<BucketingConfig>) {
+        self.bucketing = bucketing;
+    }
+
+    /// Borrow the `$s$-Bucketing` execution report from the most recently finalized round.
+    pub const fn last_bucketing_report(&self) -> Option<&BucketExecutionReport> {
+        self.last_bucketing_report.as_ref()
+    }
+
+    /// Borrow the current [`CenteredClipping`] reference center $v^{(r-1)}$, if initialized.
+    pub fn cclip_center(&self) -> Option<&[f32]> {
+        self.cclip_center.as_deref()
+    }
+
+    /// Explicitly seed or restore the [`CenteredClipping`] reference center $v^{(r-1)}$ (`ADR-0019` §4).
+    pub fn set_cclip_center(&mut self, center: Vec<f32>) -> Result<(), RoundError> {
+        let expected = self.model.num_parameters();
+        if center.len() != expected {
+            return Err(RoundError::DimensionMismatch {
+                expected,
+                got: center.len(),
+            });
+        }
+        for &val in &center {
+            if val.is_nan() {
+                return Err(RoundError::Aggregation(CoreError::NanDetected));
+            }
+            if val.is_infinite() {
+                return Err(RoundError::Aggregation(CoreError::InfDetected));
+            }
+        }
+        self.cclip_center = Some(center);
+        Ok(())
     }
 
     /// Current active round number (starts at `1` after genesis initialization).
@@ -819,8 +868,9 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             working_updates = next_updates;
         }
 
-        // Aggregate updates according to `WeightingPolicyV1` and `RobustAggregation`.
-        let aggregated_vec = self.aggregate_working_updates(&admitted_peers, &working_updates)?;
+        // Aggregate updates according to `WeightingPolicyV1`, optional `$s$-Bucketing`, and `RobustAggregation`.
+        let (aggregated_vec, bucketing_report) =
+            self.aggregate_working_updates(&admitted_peers, &working_updates)?;
 
         // Produce candidate model according to `UpdateKindV1`.
         let mut candidate_model = self.model.clone();
@@ -1018,6 +1068,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.parent_asset_key = checkpoint_asset_key.clone();
         self.historical_digests
             .insert(committed_round, content_digest);
+        self.cclip_center = Some(aggregated_vec);
+        self.last_bucketing_report = bucketing_report;
         self.current_round = self.current_round.saturating_add(1);
         self.admitted.clear();
         self.equivocated.clear();
@@ -1040,23 +1092,76 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         &self,
         admitted_peers: &[PeerId],
         updates: &[GradientUpdate],
-    ) -> Result<Vec<f32>, RoundError> {
+    ) -> Result<(Vec<f32>, Option<BucketExecutionReport>), RoundError> {
         if let WeightingPolicyV1::RegistryCertified {
             ref peer_weights,
             max_weight_share,
         } = self.config.weighting_policy
         {
-            if !matches!(self.config.aggregation, RobustAggregation::FedAvg) {
+            if !matches!(self.config.aggregation, RobustAggregation::FedAvg)
+                || self.bucketing.is_some()
+            {
                 return Err(RoundError::Config(
                     RoundConfigError::IncompatibleWeightingPolicy,
                 ));
             }
-            return aggregate_registry_certified_fedavg(
+            let out = aggregate_registry_certified_fedavg(
                 admitted_peers,
                 updates,
                 peer_weights,
                 max_weight_share,
-            );
+            )?;
+            return Ok((out, None));
+        }
+
+        if let Some(mut b_cfg) = self.bucketing {
+            // Mix round_id into the bucketing round_seed so distinct rounds do not repeat the same permutation.
+            let mut seed_hasher = Sha256::new();
+            seed_hasher.update(b"swarmtorch.coordinator.bucketing.seed.v1");
+            seed_hasher.update(b_cfg.round_seed);
+            seed_hasher.update(self.run_id.as_bytes());
+            seed_hasher.update(self.current_round.to_le_bytes());
+            let seed_digest = seed_hasher.finalize();
+            b_cfg.round_seed.copy_from_slice(&seed_digest);
+
+            let budget = AggregationBudget::default_pairwise();
+            if matches!(self.config.aggregation, RobustAggregation::FedAvg) {
+                let (bucket_updates, report) = bucket_updates_v1(updates, &b_cfg)?;
+                let out = FedAvg.aggregate(&bucket_updates)?;
+                return Ok((out, Some(report)));
+            }
+
+            let post_rule = match &self.config.aggregation {
+                RobustAggregation::FedAvg => unreachable!(),
+                RobustAggregation::Median => PostBucketingRule::CoordinateMedian,
+                RobustAggregation::TrimmedMean { trim_ratio } => PostBucketingRule::TrimmedMean {
+                    trim_ratio: *trim_ratio,
+                },
+                #[cfg(feature = "robust-aggregation")]
+                RobustAggregation::Krum { .. } => PostBucketingRule::Krum,
+                #[cfg(feature = "robust-aggregation")]
+                RobustAggregation::MultiKrum { num_selected, .. } => {
+                    PostBucketingRule::MultiKrum { m: *num_selected }
+                }
+                #[cfg(feature = "robust-aggregation")]
+                RobustAggregation::Bulyan { .. } => PostBucketingRule::Bulyan,
+                RobustAggregation::CenteredClipping {
+                    tau,
+                    max_iterations,
+                } => PostBucketingRule::CenteredClipping {
+                    tau: *tau,
+                    max_iterations: *max_iterations,
+                },
+            };
+
+            let (out, report) = aggregate_with_bucketing_v1(
+                updates,
+                &b_cfg,
+                post_rule,
+                self.cclip_center.as_deref(),
+                &budget,
+            )?;
+            return Ok((out, Some(report)));
         }
 
         let out = match &self.config.aggregation {
@@ -1079,10 +1184,21 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 max_byzantine,
                 profile,
             } => Bulyan::try_new(*max_byzantine, *profile)?.aggregate(updates),
+            RobustAggregation::CenteredClipping {
+                tau,
+                max_iterations,
+            } => {
+                let cclip = CenteredClipping::try_new(*tau, *max_iterations, Vec::new())?;
+                if let Some(ref center) = self.cclip_center {
+                    cclip.aggregate_with_center(updates, center)
+                } else {
+                    cclip.aggregate(updates)
+                }
+            }
         }
         .map_err(RoundError::Aggregation)?;
 
-        Ok(out)
+        Ok((out, None))
     }
 }
 
@@ -1561,6 +1677,133 @@ mod tests {
             resumed_coord.model().parameters(),
             coord.model().parameters()
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn coordinator_stateful_centered_clipping_and_s_bucketing_across_rounds() {
+        use swarm_torch_core::aggregation::BucketRemainderPolicy;
+
+        let base = temp_dir("cclip_bucketing");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x66; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let peers: Vec<PeerId> = (1..=6u8).map(peer).collect();
+        let cohort: BTreeSet<PeerId> = peers.iter().copied().collect();
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 0.5,
+                max_iterations: 3,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: cohort,
+            min_quorum: 6,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let model = linear_model_2_1(&[1.0, 2.0, 0.5]);
+        let mut coord =
+            SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
+        coord.set_bucketing(Some(BucketingConfig {
+            bucket_size: 2,
+            byzantine_count: 1,
+            round_seed: [0x99; 32],
+            remainder_policy: BucketRemainderPolicy::StrictExactMultiple,
+        }));
+        assert!(coord.cclip_center().is_none());
+
+        // Round 1: 5 honest peers submit [0.2, 0.2, 0.2], 1 Byzantine peer submits [100.0, 100.0, 100.0].
+        for (i, &p) in peers.iter().enumerate() {
+            let vals = if i < 5 {
+                vec![0.2, 0.2, 0.2]
+            } else {
+                vec![100.0, 100.0, 100.0]
+            };
+            coord
+                .submit_peer_update(
+                    PeerRoundSubmissionV1 {
+                        run_id,
+                        round_id: 1,
+                        base_checkpoint_digest: coord.parent_digest(),
+                        sender: p,
+                        sequence: 1,
+                        timestamp_secs: 100,
+                        update_kind: UpdateKindV1::default(),
+                        values: vals,
+                        reported_examples: None,
+                    },
+                    100,
+                )
+                .unwrap();
+        }
+        let _r1 = coord
+            .finalize_round::<SgdOptimizer<LinearModel>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+        let center_r1 = coord
+            .cclip_center()
+            .expect("cclip_center must be recorded after round 1")
+            .to_vec();
+        assert_eq!(center_r1.len(), 3);
+        let b_rep = coord
+            .last_bucketing_report()
+            .expect("bucketing report must be recorded");
+        assert_eq!(b_rep.num_buckets, 3);
+        assert_eq!(b_rep.effective_byzantine_bound, 1);
+
+        // Round 2 clips around center_r1!
+        for (i, &p) in peers.iter().enumerate() {
+            let vals = if i < 5 {
+                vec![0.22, 0.22, 0.22]
+            } else {
+                vec![-500.0, -500.0, -500.0]
+            };
+            coord
+                .submit_peer_update(
+                    PeerRoundSubmissionV1 {
+                        run_id,
+                        round_id: 2,
+                        base_checkpoint_digest: coord.parent_digest(),
+                        sender: p,
+                        sequence: 2,
+                        timestamp_secs: 110,
+                        update_kind: UpdateKindV1::default(),
+                        values: vals,
+                        reported_examples: None,
+                    },
+                    110,
+                )
+                .unwrap();
+        }
+        let _r2 = coord
+            .finalize_round::<SgdOptimizer<LinearModel>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                3_000,
+            )
+            .unwrap();
+        let center_r2 = coord.cclip_center().unwrap();
+        assert!((center_r2[0] - 0.22).abs() < 0.35);
 
         let _ = fs::remove_dir_all(&base);
     }

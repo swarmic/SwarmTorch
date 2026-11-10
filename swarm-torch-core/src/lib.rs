@@ -35,6 +35,7 @@ pub mod dataops;
 #[cfg(feature = "alloc")]
 pub mod execution;
 pub mod identity;
+pub mod num;
 pub mod observe;
 #[cfg(feature = "alloc")]
 pub mod replay;

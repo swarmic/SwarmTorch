@@ -74,6 +74,26 @@ impl From<GraphValidationError> for SchedulerError {
     }
 }
 
+/// Execution isolation profile for graph node runners (`ADR-0023` §3, Wave 12 `W12-04` stub).
+///
+/// In Wave 11 (`v0.1.0`), `execute_graph_sequential` executes `ExecutionTrust::Core` nodes via
+/// [`RunnerIsolationProfile::InProcessTrusted`]. Wave 12 (`W12-04`) will wire
+/// [`RunnerIsolationProfile::ExternalSandboxedStub`] to OS-level subprocess/Wasm isolation for
+/// `ExecutionTrust::SandboxedExtension` and `ExecutionTrust::UntrustedExternal` nodes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum RunnerIsolationProfile {
+    /// Execute trusted core operators in-process (`ExecutionTrust::Core`).
+    #[default]
+    InProcessTrusted,
+    /// Wave 12 (`W12-04`) stub for out-of-process / Wasm sandboxed execution with resource caps.
+    ExternalSandboxedStub {
+        /// Maximum wall-clock execution time in milliseconds.
+        timeout_ms: u64,
+        /// Maximum resident memory in bytes.
+        max_memory_bytes: u64,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerReport {
     pub executed_nodes: Vec<String>,

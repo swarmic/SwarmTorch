@@ -452,3 +452,81 @@ fn ef21_sender_and_receiver_stay_synchronized_and_reject_dropped_step() {
     let rec1 = receiver.apply_step(seq1, &delta1).unwrap();
     assert_eq!(rec1, sender.estimate());
 }
+
+#[test]
+fn sample_shared_indices_v1_is_o_k_space_strictly_ascending_and_unbiased() {
+    let seed = [0x7Au8; 32];
+    // Test at max allowed dimension d = 16,777,216 with k = 64:
+    // Floyd's algorithm allocates only a 64-entry BTreeSet rather than a 64 MiB Vec<u32>.
+    let d_large = DEFAULT_MAX_COMPRESSION_ELEMENTS;
+    let k_small = 64usize;
+    let idx_a = sample_shared_indices_v1(d_large, k_small, &seed).unwrap();
+    let idx_b = sample_shared_indices_v1(d_large, k_small, &seed).unwrap();
+    assert_eq!(idx_a.len(), k_small);
+    assert_eq!(idx_a, idx_b);
+    for w in idx_a.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "indices must be strictly ascending without duplicates"
+        );
+    }
+    assert!(idx_a.iter().all(|&i| (i as usize) < d_large));
+
+    // Uniform coverage check across d = 16, k = 4 over 800 distinct seeds.
+    let mut counts = [0usize; 16];
+    for s in 0..800u32 {
+        let mut seed_s = [0u8; 32];
+        seed_s[..4].copy_from_slice(&s.to_le_bytes());
+        let subset = sample_shared_indices_v1(16, 4, &seed_s).unwrap();
+        assert_eq!(subset.len(), 4);
+        for idx in subset {
+            counts[idx as usize] += 1;
+        }
+    }
+    // Expected count per coordinate is 800 * (4 / 16) = 200.
+    for &c in &counts {
+        assert!(
+            (150..=250).contains(&c),
+            "coordinate selection count {c} outside uniform window [150, 250]"
+        );
+    }
+}
+
+#[test]
+fn pre_seed_merkle_commitment_and_residual_compressor_prevent_adaptive_tampering() {
+    let mut comp = SharedSeedResidualCompressor::new(10, 3).unwrap();
+    let g1 = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, -0.0];
+
+    let (u1, comm1) = comp.prepare_pre_seed_vector(&g1).unwrap();
+    // Canonicalization check: -0.0 and +0.0 produce identical Merkle root.
+    let mut g1_pos_zero = g1;
+    g1_pos_zero[9] = 0.0;
+    let comm1_pos = PreSeedVectorCommitmentV1::commit(&g1_pos_zero).unwrap();
+    assert_eq!(comm1.merkle_root, comm1_pos.merkle_root);
+
+    let seed1 = [0x11u8; 32];
+    let (payload1, openings1) = comp.finalize_with_seed(&u1, &comm1, seed1).unwrap();
+    assert!(verify_shared_seed_openings_v1(&comm1, &payload1, &openings1).is_ok());
+
+    // Residual + decompressed payload must reconstruct u1 exactly.
+    let decompressed1 = payload1.decompress().unwrap();
+    for i in 0..10 {
+        let reconstructed = decompressed1[i] + comp.residual()[i];
+        assert!((reconstructed - u1[i]).abs() < 1e-6);
+    }
+
+    // Tampering with a proof index, raw_value, or sibling hash must fail closed.
+    let mut bad_openings = openings1.clone();
+    bad_openings.proofs[0].raw_value += 0.01;
+    assert_eq!(
+        verify_shared_seed_openings_v1(&comm1, &payload1, &bad_openings).unwrap_err(),
+        CompressionError::CommitmentVerificationFailed
+    );
+
+    let mut bad_sibling = openings1.clone();
+    bad_sibling.proofs[0].siblings[0][0] ^= 0x01;
+    assert_eq!(
+        verify_shared_seed_openings_v1(&comm1, &payload1, &bad_sibling).unwrap_err(),
+        CompressionError::CommitmentVerificationFailed
+    );
+}

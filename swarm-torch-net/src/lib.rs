@@ -16,17 +16,14 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod chunked;
 pub mod gossip;
 pub mod protocol;
+#[cfg(feature = "std")]
+pub mod tcp;
 pub mod traits;
-
-// TCP transport - placeholder
-// #[cfg(feature = "tcp-transport")]
-// pub mod tcp;
-
-// UDP transport - placeholder
-// #[cfg(feature = "udp-transport")]
-// pub mod udp;
+#[cfg(feature = "std")]
+pub mod udp;
 
 mod mock;
 pub use mock::MockTransport;
@@ -37,9 +34,14 @@ pub use mock::{MockNetworkHub, MockPeerTransport, Topology};
 
 /// Prelude for convenient imports
 pub mod prelude {
+    pub use crate::chunked::*;
     pub use crate::gossip::*;
     pub use crate::protocol::*;
+    #[cfg(feature = "std")]
+    pub use crate::tcp::*;
     pub use crate::traits::*;
+    #[cfg(feature = "std")]
+    pub use crate::udp::*;
 }
 
 /// Result type for network operations

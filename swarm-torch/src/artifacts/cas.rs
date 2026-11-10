@@ -373,3 +373,135 @@ pub fn read_verified_round_resume_state(run_dir: &Path) -> io::Result<Option<Rou
     verify_cas_uri_exists(run_dir, &state.blob_uri, Some(state.blob_bytes))?;
     Ok(Some(state))
 }
+
+/// Export `model` as a `SwarmTorchCheckpointV1` SafeTensors v1 binary payload (`ADR-0024` §3, `W11-04`)
+/// and publish it to `runs/<run_id>/blobs/sha256/<hex_digest>` using write-once atomic semantics.
+pub fn put_safetensors_checkpoint_v1<M: SwarmModel>(
+    run_dir: &Path,
+    model: &M,
+    schema: &swarm_torch_models::safetensors_v1::ModelTensorSchemaV1,
+    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
+) -> io::Result<(CheckpointContentDigestV1, String, u64)> {
+    let bytes =
+        swarm_torch_models::safetensors_v1::export_safetensors_checkpoint_v1(model, schema, limits)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let digest = CheckpointContentDigestV1::from_bytes_slice(&bytes);
+    write_once_cas_blob(run_dir, digest.as_bytes(), &bytes)?;
+    let uri = digest.to_cas_uri();
+    Ok((digest, uri, bytes.len() as u64))
+}
+
+/// Load and cryptographically verify a `SwarmTorchCheckpointV1` SafeTensors v1 checkpoint from
+/// `runs/<run_id>/blobs/sha256/<hex_digest>` into `template` (`ADR-0024` §3, `W11-04`).
+///
+/// Fails closed if the CAS blob is missing, its SHA-256 digest does not match `expected_digest`,
+/// its `model_schema_hash` or tensor layout differs from `expected_schema`, or any parameter is non-finite.
+pub fn get_verified_safetensors_checkpoint_v1<M: SwarmModel>(
+    run_dir: &Path,
+    mut template: M,
+    expected_digest: &CheckpointContentDigestV1,
+    expected_schema: &swarm_torch_models::safetensors_v1::ModelTensorSchemaV1,
+    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
+) -> io::Result<M> {
+    let blob_path = run_dir
+        .join("blobs")
+        .join("sha256")
+        .join(expected_digest.to_hex());
+    if !blob_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "SafeTensors checkpoint CAS blob not found: {}",
+                blob_path.display()
+            ),
+        ));
+    }
+    let meta_len = std::fs::metadata(&blob_path)?.len();
+    let (bytes, actual_sha) =
+        read_and_hash_bounded(&blob_path, meta_len, MAX_SINGLE_ARTIFACT_BYTES)?;
+    if &actual_sha != expected_digest.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "SafeTensors checkpoint CAS blob SHA-256 mismatch for {}",
+                expected_digest
+            ),
+        ));
+    }
+    swarm_torch_models::safetensors_v1::import_safetensors_checkpoint_v1(
+        &mut template,
+        expected_schema,
+        &bytes,
+        limits,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(template)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarm_torch_models::safetensors_v1::{ModelTensorSchemaV1, SafeTensorsLimitsV1};
+    use swarm_torch_models::simple::LinearModel;
+
+    #[test]
+    fn safetensors_cas_roundtrip_and_serde_json_header_compatibility() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "swarmtorch_safetensors_cas_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp run dir");
+
+        let mut model = LinearModel::new(3, 2).expect("valid linear model");
+        model
+            .load_parameters(&[0.1, 0.2, 0.3, -0.4, 0.5, -0.6, 0.05, -0.05])
+            .expect("load params");
+        let schema = ModelTensorSchemaV1::for_linear(3, 2).expect("valid schema");
+        let limits = SafeTensorsLimitsV1::default();
+
+        let (digest, uri, size_bytes) =
+            put_safetensors_checkpoint_v1(&temp_dir, &model, &schema, &limits)
+                .expect("put_safetensors_checkpoint_v1 must succeed");
+        assert!(uri.starts_with("cas://sha256/"));
+        assert!(size_bytes > 8);
+
+        // Verify the physical CAS file header is valid standard JSON via serde_json
+        let blob_path = verify_cas_uri_exists(&temp_dir, &uri, Some(size_bytes))
+            .expect("CAS blob must exist and match SHA-256");
+        let raw_bytes = std::fs::read(&blob_path).expect("read CAS blob");
+        let header_len = u64::from_le_bytes(raw_bytes[0..8].try_into().unwrap()) as usize;
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&raw_bytes[8..8 + header_len]).expect("valid serde_json header");
+        assert_eq!(
+            header_json["__metadata__"]["format"].as_str(),
+            Some("swarmtorch.checkpoint.v1")
+        );
+        assert!(header_json["__metadata__"]["model_schema_hash"]
+            .as_str()
+            .is_some());
+        assert_eq!(header_json["linear.weight"]["dtype"].as_str(), Some("F32"));
+
+        // Verify roundtrip into a fresh template model
+        let template = LinearModel::new(3, 2).expect("template");
+        let restored =
+            get_verified_safetensors_checkpoint_v1(&temp_dir, template, &digest, &schema, &limits)
+                .expect("get_verified_safetensors_checkpoint_v1 must succeed");
+        assert_eq!(restored.parameters(), model.parameters());
+
+        // Verify schema mismatch fails closed
+        let wrong_schema =
+            ModelTensorSchemaV1::single_f32_tensor("wrong.weights", 8).expect("wrong schema");
+        let template2 = LinearModel::new(3, 2).expect("template2");
+        assert!(get_verified_safetensors_checkpoint_v1(
+            &temp_dir,
+            template2,
+            &digest,
+            &wrong_schema,
+            &limits,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

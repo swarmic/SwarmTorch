@@ -357,7 +357,6 @@ fn from_seed_accepts_nonzero_seed() {
 }
 
 #[test]
-#[cfg(feature = "std")]
 fn sqrt_f32_precision_within_1e6_relative_error() {
     let test_values: &[f32] = &[
         0.001, 0.01, 0.1, 1.0, 2.0, 4.0, 9.0, 16.0, 100.0, 1000.0, 1e6, 1e-6, 1e10, 1e-10, 1e20,
@@ -365,15 +364,40 @@ fn sqrt_f32_precision_within_1e6_relative_error() {
     ];
     for &x in test_values {
         let ours = sqrt_f32(x);
-        let reference = x.sqrt();
-        let rel_err = ((ours - reference) / reference).abs();
+        let soft = crate::num::sqrt_f64_soft(x as f64) as f32;
+        let rel_err = ((ours - soft) / soft).abs();
         assert!(
             rel_err < 1e-6,
-            "sqrt_f32({}) = {} vs std {} (relative error {})",
+            "sqrt_f32({}) = {} vs soft {} (relative error {})",
             x,
             ours,
-            reference,
+            soft,
             rel_err
         );
     }
+}
+
+#[test]
+fn gradient_validator_rejects_f32_norm_sq_overflow_without_nan_bypass() {
+    // Regression test for F-01: two finite coordinates of 2e19 have norm_sq = 8e38 > f32::MAX
+    // (~3.4028e38) and true L2 norm ~2.8284e19.
+    // Casting norm_sq to f32 before sqrt previously produced +Inf -> NaN under no_std,
+    // bypassing `norm > max_gradient_norm`.
+    let validator = GradientValidator {
+        max_coordinate_value: f32::MAX,
+        max_gradient_norm: 2.5e19,
+    };
+    let gradients = [2e19_f32, 2e19_f32];
+    let err = validator
+        .validate(&gradients)
+        .expect_err("norm ~2.828e19 > 2.5e19 must be rejected without NaN bypass");
+    assert!(matches!(err, GradientValidationError::NormTooLarge { .. }));
+
+    // Conversely, when max_gradient_norm = 3.0e19 (> 2.8284e19), evaluating sqrt in f64
+    // avoids premature f32 overflow of norm_sq = 8e38.
+    let permissive = GradientValidator {
+        max_coordinate_value: f32::MAX,
+        max_gradient_norm: 3.0e19,
+    };
+    assert!(permissive.validate(&gradients).is_ok());
 }

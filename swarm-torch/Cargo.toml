@@ -13,6 +13,10 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 name = "swarm_torch"
 path = "src/lib.rs"
@@ -52,9 +56,6 @@ robust-aggregation = ["swarm-torch-core/robust-aggregation"]
 # Telemetry
 telemetry = ["swarm-torch-core/telemetry"]
 
-# Python bindings (separate build)
-python = []
-
 [dependencies]
 swarm-torch-core = { workspace = true, default-features = false, features = ["alloc"] }
 swarm-torch-net = { workspace = true, default-features = false }
@@ -78,6 +79,14 @@ required-features = ["std"]
 [[example]]
 name = "hello_swarm"
 required-features = ["std", "tokio-runtime"]
+
+[[example]]
+name = "artifact_pipeline"
+required-features = ["std"]
+
+[[example]]
+name = "byzantine_federated_round"
+required-features = ["std"]
 
 [[bench]]
 name = "swarm_bench"

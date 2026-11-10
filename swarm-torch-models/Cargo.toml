@@ -7,8 +7,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
 keywords = ["machine-learning", "models", "federated-learning", "no_std"]
-categories = ["science", "machine-learning", "no-std"]
+categories = ["science", "algorithms", "no-std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "swarm_torch_models"

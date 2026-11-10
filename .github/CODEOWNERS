@@ -3,10 +3,10 @@
 
 # Governance, architecture contracts, and contribution policy
 /ADRs.md @swarmic
+/CHANGELOG.md @swarmic
 /ROADMAP.md @swarmic
 /SECURITY.md @swarmic
 /CONTRIBUTING.md @swarmic
-/CONTEXT_SOURCES.md @swarmic
 /SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md @swarmic
 /SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md @swarmic
 

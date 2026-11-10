@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/event.schema.json",
+  "title": "EventRecord",
+  "description": "SwarmTorch v1 NDJSON event record line contract (events.ndjson, ADR-0016).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ts_unix_nanos", "trace_id", "span_id", "name", "attrs"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "ts_unix_nanos": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "span_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "attrs": {
+      "type": "object"
+    }
+  }
+}

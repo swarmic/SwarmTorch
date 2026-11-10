@@ -19,7 +19,7 @@ This document is intended to be a **canonical SwarmTorch reference**, co-equal w
 1. `ADRs.md` (architecture decisions)
 2. The `swarm-torch-*` crate source code (implementation truth)
 
-See [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) for the public document hierarchy and external mission-plane boundary (`ADR-0008A` / `P2-18`).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`ADRs.md`](ADRs.md) (`ADR-0008A`) for the public document hierarchy and external mission-plane boundary (`P2-18`).
 
 ### Claim -> Evidence Convention (Mandatory)
 
@@ -46,27 +46,27 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 
 | Area | Claim / Component | Evidence | Status (Implemented / Partial / Planned / Non-goal) | Notes |
 |------|-------------------|----------|-----------------------------------------------------|-------|
-| Artifact spine | Run Artifact Bundle (v1) writer + manifest hashing exists | Evidence: ADR-0016, swarm-torch/src/artifacts/mod.rs, swarm-torch/src/artifacts/bundle.rs | Partial | Atomic writes + thread-safe sink + profile policies implemented; higher-level UI/export tooling pending |
-| DataOps | Executable `graph.json` schema + deterministic hashing + fingerprint metadata schemas | Evidence: ADR-0017, swarm-torch-core/src/run_graph.rs, swarm-torch-core/src/dataops.rs, swarm-torch/src/artifacts/session.rs | Partial | Execution engine is pending; registry/lineage/materialization emitters are implemented metadata-first |
-| Extensibility | Sandboxed-by-default extensions | Evidence: ADR-0018 | Planned | WASM-first host (future) |
-| Telemetry | Canonical IDs + span/event/metric record types + emitter trait | Evidence: ADR-0012, ADR-0016, swarm-torch-core/src/observe.rs | Partial | Tracing integration + OTLP export is not implemented yet |
-| Threat model | Threat model + trust boundaries defined | Evidence: ADR-0008, ADR-0008A | Implemented | Documented; enforcement varies by feature |
-| Robustness | Robust aggregation algorithms | Evidence: swarm-torch-core/src/aggregation.rs, swarm-torch-core/tests/robustness_harness.rs | Partial | FedAvg/TrimmedMean/Median implemented; initial robustness harness implemented (not a release gate) |
-| Compression | Update compression primitives | Evidence: swarm-torch-core/src/compression.rs | Partial | TopK/Quantized implemented; convergence guarantees TBD |
-| Networking | Message envelope + transport trait | Evidence: swarm-torch-net/src/protocol.rs, swarm-torch-net/src/traits.rs | Partial | Real transports are placeholders |
+| Artifact spine | Run Artifact Bundle (v1) writer + signed manifest + Draft 2020-12 schema conformance | Evidence: ADR-0016, ADR-0023, swarm-torch/src/artifacts/, schemas/v1/ | Implemented | Cross-process `.bundle.lock`, `ManifestSignatureV1`, `VerifiedBundleV1` (`TrustPolicy::Strict`), and CAS checkpoints implemented |
+| DataOps | Executable `graph.json` schema + sequential scheduler + `DataOpsSession` lifecycle | Evidence: ADR-0017, ADR-0023, swarm-torch-core/src/run_graph.rs, swarm-torch/src/scheduler.rs | Implemented | Sequential graph runner, physical CAS cache-hit verification, and lineage/materialization emitters implemented |
+| Extensibility | Sandboxed-by-default extensions | Evidence: ADR-0018, ADR-0025 | Planned | WASM-first `wasmi` host (`W12-04`) |
+| Telemetry | Canonical IDs + span/event/metric record types + emitter trait | Evidence: ADR-0012, ADR-0016, swarm-torch-core/src/observe.rs | Partial | `swarmtorch.*` canonical namespace enforced; external OTLP export planned |
+| Threat model | Threat model + trust boundaries defined | Evidence: ADR-0008, ADR-0008A | Implemented | Documented; enforced across protocol, coordinator, and artifact boundaries |
+| Robustness | Robust aggregation + Non-IID bucketing | Evidence: ADR-0007, ADR-0019, swarm-torch-core/src/aggregation.rs | Implemented | `FedAvg`, `CoordinateMedian`, `TrimmedMean`, `Krum`/`Multi-Krum`, `Bulyan IterativeKrumV1`, `CenteredClippingAggregator`, and `SBucketingTransformer` implemented |
+| Compression | Update compression + error feedback + verifiable sparse projection | Evidence: ADR-0021, swarm-torch-core/src/compression.rs | Implemented | `TopK`, `RandomK`, `Quantized`, `ClassicResidual`, `EF21`, and `SharedSeedSparse` (`SharedSeedCoordinateVerifier`) implemented |
+| Networking | Message envelope + transport traits + low-MTU chunked framing + TCP/UDP | Evidence: ADR-0004, ADR-0022, swarm-torch-net/src/ | Implemented | `PacketTransport`, `SwarmTransport`, `ChunkedFrameCodec` (16B `CRC-16/IBM-3740`), `TcpPacketTransport`, `UdpPacketTransport`, and gossip wrappers implemented |
 | Replay protection | Sequence/timestamp validation enforced (memory-only cache) | Evidence: swarm-torch-core/src/replay.rs, swarm-torch-net/src/protocol.rs, ADR-0008B | Implemented | LRU cache, ┬▒60s skew window, 16-message out-of-order tolerance |
-| Message auth | Ed25519 signing/verification with domain-separated preimage | Evidence: ADR-0008, ADR-0008B, swarm-torch-core/src/crypto.rs | Implemented | Production Ed25519 path; sender field uses raw public key bytes |
-| Gradient validation | Bounds checking (NaN/Inf/L2/coordinate) | Evidence: swarm-torch-core/src/crypto.rs | Implemented | Used as a building block for verified zone |
-| Identity boundary | External identity provider boundary (Sybil resistance out-of-scope) | Evidence: ADR-0008A | Planned | IdentityProvider trait is not implemented in code yet |
-| Coordination | Gossip coordination + quorum rounds | Evidence: ADR-0006A, swarm-torch-core/src/consensus.rs | Planned | Current crate has structs only; protocol implementation pending |
-| Topology | Topology as a first-class config | Evidence: swarm-torch-core/src/algorithms.rs, ADR-0004A | Partial | Enum exists; adaptive policies/rewiring not implemented |
-| Staleness | Bounded async + staleness-aware policy | Evidence: ADR-0004B | Planned | `staleness.rs` not implemented yet |
-| Runtime | Tokio/Embassy runtime abstraction | Evidence: swarm-torch-runtime/src/lib.rs | Partial | Tokio wrapper works and is Rust 1.75-gated; Embassy remains placeholder and outside the Rust 1.75 conformance gate |
-| Models | Reference models + backend integration | Evidence: swarm-torch-models/src/simple.rs | Partial | Burn integration is placeholder |
-| Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs, swarm-torch-core/Cargo.toml | Partial | Core `no_std + alloc` and minimal `no_std` build gates compile; embedded runtime/transport and end-to-end examples remain planned |
-| GPU | WGPU-first; CUDA optional backend | Evidence: ADR-0015 | Planned | Backend wiring pending |
+| Message auth | Ed25519 signing/verification with domain-separated preimage | Evidence: ADR-0008, ADR-0008B, ADR-0021, swarm-torch-core/src/crypto.rs | Implemented | 6-stage `MessageEnvelope::decode_and_verify_payload` under `"swarmtorch.envelope.v1"` |
+| Gradient validation | Bounds checking (NaN/Inf/L2/coordinate) | Evidence: swarm-torch-core/src/crypto.rs, swarm-torch-core/src/aggregation.rs | Implemented | Pre-aggregation finiteness/shape validation (`MAX_COHORT_SIZE = 1024`) |
+| Identity boundary | External identity provider boundary (Sybil resistance out-of-scope) | Evidence: ADR-0008A, swarm-torch-core/src/replay.rs | Partial | Static `CohortAllowlist` implemented; external RA provider profile planned |
+| Coordination | Gossip coordination + unified `SwarmRoundCoordinator` | Evidence: ADR-0006A, ADR-0023, swarm-torch/src/coordinator.rs | Implemented | `SwarmRoundCoordinator` (`ModelDeltaV1`/`GradientV1`, equivocation revocation, CAS/SafeTensors commit) and authenticated gossip wrappers implemented |
+| Topology | Topology as a first-class config | Evidence: swarm-torch-core/src/algorithms.rs, ADR-0004A | Partial | Enum and `MockNetworkHub` topology simulation implemented; adaptive rewiring planned |
+| Staleness | Bounded async + staleness-aware policy | Evidence: ADR-0004B, ADR-0025 | Planned | `FedAsync` stale-delta mixing scheduled for Wave 12 (`W12-03`) |
+| Runtime | Tokio/Embassy/`MockRuntime` runtime abstraction | Evidence: ADR-0003, swarm-torch-runtime/src/lib.rs | Implemented | `SwarmClock` / `SwarmRuntime` split with Tokio, deterministic `MockRuntime` scheduler, and `no_std` spin/Embassy surfaces |
+| Models | Reference models + losses + SafeTensors v1 persistence | Evidence: ADR-0023, ADR-0024, swarm-torch-models/src/ | Implemented | `LinearModel`, `MlpModel`, `MseLoss`, `CrossEntropyLoss`, `HuberLoss`, `FedProxRegularizer`, `SgdOptimizer`, and `SwarmTorchCheckpointV1` implemented |
+| Embedded | `no_std` portability posture | Evidence: ADR-0002, swarm-torch-core/src/lib.rs | Implemented | Core and models `no_std + alloc` and minimal `no_std` gates verified; hardware radio drivers planned |
+| GPU | WGPU-first; CUDA optional backend | Evidence: ADR-0015, ADR-0024 | Planned | Isolated to optional `swarm-torch-backends` crate (`W12-01`) |
 | Python | Optional, bounded Python interop | Evidence: ADR-0009 | Planned | Keep separate crate boundary |
-| Supply chain | Dependency/license/source policy configs | Evidence: SECURITY.md, deny.toml, supply-chain/, .github/workflows/rust.yml | Partial | `cargo deny` + `cargo audit` are CI-enforced; `cargo vet` is advisory in Wave 8.1 |
+| Supply chain | Dependency/license/source policy configs | Evidence: SECURITY.md, deny.toml, supply-chain/, .github/workflows/rust.yml | Implemented | `cargo deny`, `cargo audit`, and `cargo vet` are all CI-blocking |
 
 MSRV policy is currently tiered by crate:
 - `swarm-torch-core` security-critical path is validated on Rust 1.75.
@@ -124,22 +124,22 @@ Tracked follow-up: `P2-12` (`Status: Planned`, Wave 8.2) defines normative vs pr
 
 Evidence: ADR-0006A
 
-**Current implementation:** data structures exist (membership view, votes), but no end-to-end coordinator exists yet.
+**Current implementation:** `SwarmRoundCoordinator` (`swarm-torch/src/coordinator.rs`) implements round-gated quorum aggregation, equivocation revocation, and authoritative CAS/SafeTensors commits, paired with originator-authenticated gossip wrappers (`swarm-torch-net/src/gossip.rs`).
 
-Evidence: swarm-torch-core/src/consensus.rs
+Evidence: ADR-0022, ADR-0023, swarm-torch/src/coordinator.rs, swarm-torch-net/src/gossip.rs
 
 ### Transport Model (Current)
 
-SwarmTorch defines a transport abstraction with explicit capabilities (reliability class, bandwidth class, message size, multicast support).
+SwarmTorch defines `PacketTransport` and GAT-based `SwarmTransport` abstractions with explicit capabilities (reliability class, bandwidth class, message size, multicast support).
 
-Evidence: swarm-torch-net/src/traits.rs
+Evidence: ADR-0022, swarm-torch-net/src/traits.rs
 
 Current status:
 
-- `MockTransport`/`MockNetwork` exist for testing/scaffolding.
-- Real TCP/UDP/BLE/LoRa transports are placeholders (feature flags exist, implementations do not).
+- `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), `LoopbackPacketTransport`, and `MockTransport`/`MockNetworkHub` are implemented.
+- Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) and optional `Zenoh`/`Iroh` adapter crates (`W12-02`) are planned for `v0.2.0`.
 
-Evidence: swarm-torch-net/src/mock.rs, swarm-torch-net/Cargo.toml
+Evidence: swarm-torch-net/src/chunked.rs, swarm-torch-net/src/tcp.rs, swarm-torch-net/src/udp.rs, swarm-torch-net/src/mock.rs
 
 ### Topology and Staleness (Design Target vs Current)
 
@@ -491,7 +491,7 @@ Evidence: ADR-0011, ADR-0013, ADR-0014, `SECURITY.md`.
 
 Tracked follow-up: `P2-18` (`Status: Planned`, Wave 8.3) defines integration-only mapping without importing mission-plane semantics into SwarmTorch core.
 
-Evidence: `CONTEXT_SOURCES.md`.
+Evidence: `ADR-0008A`, `CONTRIBUTING.md`.
 
 ## Roadmap and Open Problems
 
@@ -550,7 +550,7 @@ This appendix lists conformance hooks that keep the white paperΓÇÖs normative
 |------|------|--------|----------|
 | RustSec advisories | `cargo audit` | Implemented | Evidence: .github/workflows/rust.yml, SECURITY.md |
 | License/source policy | `cargo deny check` | Implemented | Evidence: .github/workflows/rust.yml, deny.toml, SECURITY.md |
-| Human audit tracking | `cargo vet` | Partial | Evidence: .github/workflows/rust.yml, supply-chain/, SECURITY.md (advisory in Wave 8.1) |
+| Human audit tracking | `cargo vet` | Implemented | Evidence: .github/workflows/rust.yml, supply-chain/, SECURITY.md (blocking in CI) |
 | Public API SemVer regression | `cargo semver-checks check-release` | Planned | Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#cargo-semver-checks |
 | OSV lockfile scan | CI: `google/osv-scanner-action` (Cargo.lock) | Planned | Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#OSV-Scanner-Action |
 
@@ -596,7 +596,7 @@ These are blocking gates for releases once implemented in CI:
 
 | Gate | Hook | Status | Evidence |
 |------|------|--------|----------|
-| No legacy docs/ links | `rg -n \"\\bdocs/\" -g\"*.md\" .` (expect only external URLs or clearly marked historical text) | Implemented | Evidence: CONTEXT_SOURCES.md |
+| No legacy docs/ links | `rg -n \"\\bdocs/\" -g\"*.md\" .` (expect only external URLs or clearly marked historical text) | Implemented | Evidence: CONTRIBUTING.md |
 | Evidence discipline | Manual review: any **MUST/SHOULD/MAY** has an `Evidence:` pointer nearby | Implemented | Evidence: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md |
 
 ### Appendix C: Artifact Schema References

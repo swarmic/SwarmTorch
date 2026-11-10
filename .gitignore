@@ -14,6 +14,9 @@ docs/adr/
 docs/internal/
 docs/plans/
 docs/audits/
+/docs/release_notes/
+/examples/
+/CONTEXT_SOURCES.md
 .agents/
 .agent/
 AGENTS.md

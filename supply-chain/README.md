@@ -8,19 +8,19 @@ This directory is the `cargo vet` store for this workspace.
 - `audits.toml`: first-party audit records.
 - `imports.lock`: pinned upstream import metadata.
 
-## Wave 8.1 Policy
+## CI Enforcement Policy
 
-- `cargo vet` runs in CI as **advisory** for one wave (8.1).
-- `cargo deny` and `cargo audit` are blocking in CI.
-- After Wave 8.1, `cargo vet` is intended to be promoted to blocking once the audit baseline is stabilized.
+- `cargo deny`, `cargo audit`, and `cargo vet` all run as **blocking** gates in CI (`.github/workflows/rust.yml`).
 - CI pins supply-chain tool versions:
   - `cargo-deny` `0.19.0`
   - `cargo-audit` `0.22.1`
   - `cargo-vet` `0.10.2`
-- First-party audits now exist for critical crates:
+- First-party `safe-to-deploy` audits exist for critical crates:
   - `ed25519-dalek 2.1.1`
   - `sha2 0.10.9`
   - `postcard 1.1.3`
+  - `rand_chacha 0.3.1`
+  - `ppv-lite86 0.2.21`
 
 ## Exemption Policy
 

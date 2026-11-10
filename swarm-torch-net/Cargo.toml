@@ -7,8 +7,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
 keywords = ["networking", "transport", "embedded", "iot"]
 categories = ["network-programming", "embedded", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "swarm_torch_net"

@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/registry.schema.json",
+  "title": "DatasetRegistryV1",
+  "description": "SwarmTorch v1 dataset registry snapshot (datasets/registry.json, ADR-0016, ADR-0017).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "datasets"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "datasets": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/DatasetEntryV1"
+      }
+    }
+  },
+  "$defs": {
+    "SourceDescriptorV0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "content_type", "auth_mode"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "auth_mode": {
+          "type": ["string", "object"]
+        },
+        "etag_or_version": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "SchemaDescriptorV0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "canonical"],
+      "properties": {
+        "format": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "canonical": {
+          "type": "string",
+          "maxLength": 65536
+        }
+      }
+    },
+    "DatasetEntryV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_key",
+        "fingerprint_v0",
+        "source_fingerprint_v0",
+        "schema_hash_v0",
+        "recipe_hash_v0",
+        "trust"
+      ],
+      "properties": {
+        "asset_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fingerprint_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_fingerprint_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "schema_hash_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "recipe_hash_v0": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "trust": {
+          "type": "string",
+          "enum": ["trusted", "untrusted"]
+        },
+        "source": {
+          "$ref": "#/$defs/SourceDescriptorV0"
+        },
+        "schema": {
+          "$ref": "#/$defs/SchemaDescriptorV0"
+        },
+        "license_flags": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "pii_tags": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        }
+      }
+    }
+  }
+}

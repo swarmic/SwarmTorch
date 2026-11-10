@@ -7,8 +7,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
 keywords = ["swarm", "machine-learning", "no_std", "algorithms"]
 categories = ["no-std", "science", "algorithms"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "swarm_torch_core"
@@ -28,9 +34,6 @@ robust-aggregation = ["krum", "bulyan", "trimmed-mean"]
 # Telemetry
 telemetry = ["tracing"]
 defmt = ["dep:defmt"]
-
-# Experimental algorithms
-experimental-pso = []
 
 [dependencies]
 serde = { workspace = true }

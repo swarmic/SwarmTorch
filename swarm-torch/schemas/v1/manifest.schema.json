@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/manifest.schema.json",
+  "title": "ManifestV1",
+  "description": "SwarmTorch v1 run artifact bundle manifest with optional Ed25519 ManifestSignatureV1 (ADR-0016, ADR-0023).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "hash_algo", "entries"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "16-byte RunId encoded as 32 lowercase hex characters (non-zero)."
+    },
+    "hash_algo": {
+      "type": "string",
+      "const": "sha256"
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/ManifestEntryV1"
+      }
+    },
+    "signature": {
+      "$ref": "#/$defs/ManifestSignatureV1"
+    }
+  },
+  "$defs": {
+    "ManifestEntryV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "required"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "$comment": "Exact u64 byte length; consumers in IEEE-754 binary64 environments MUST use a 64-bit/BigInt-capable JSON parser."
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ManifestSignatureV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signer_public_key", "signed_unix_nanos", "entries_hash", "signature"],
+      "properties": {
+        "signer_public_key": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signed_unix_nanos": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "$comment": "Exact u64 Unix nanosecond timestamp."
+        },
+        "entries_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{128}$"
+        }
+      }
+    }
+  }
+}

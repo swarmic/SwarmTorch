@@ -22,11 +22,11 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ### Waves 4–6: Remediation & Artifact/Report Canon Lock
 - Completed `E-01..E-05` semver batch, `F1` execution hints (`ExecutionHint`), `F2a/F2/F3/F4` (`TransformAuditV0`, `UpdateTransform`, composable aggregation pipeline, lightweight tracing), and behavior-preserving `A6X-06` decomposition of artifact/report modules.
-- Evidence: `docs/release_notes/v0.1.0-alpha.6x-wave4.md`, `docs/release_notes/v0.1.0-alpha.6x-wave5.md`, `docs/release_notes/v0.1.0-alpha.6x-wave6.md`.
+- Evidence: [`CHANGELOG.md`](CHANGELOG.md), `swarm-torch/src/artifacts/`, `swarm-torch/src/report/`.
 
 ### Waves 7–8.1: Sequential Scheduler, Path Confinement, & Supply-Chain Baseline
 - Shipped sequential graph execution engine MVP, typed `NodeV1` policy/resource fields, initial Byzantine robustness harness, Rust 1.75 `no_std + alloc` conformance in `run_graph`, artifact manifest path confinement (`validate_manifest_*`), `swarmtorch.*` telemetry namespace sync, and blocking `cargo deny` / `cargo audit` CI lanes.
-- Evidence: `docs/release_notes/v0.1.0-alpha.7x.md`, `docs/release_notes/v0.1.0-alpha.8x-wave0.md`, `docs/release_notes/v0.1.0-alpha.8x-wave1.md`.
+- Evidence: [`CHANGELOG.md`](CHANGELOG.md), `swarm-torch/src/scheduler.rs`, `.github/workflows/rust.yml`.
 
 ### Wave 9 (`v0.1.0-alpha.9` — Landed & Conformance Verified)
 1. **Byzantine Aggregator Hardening, One-Pass `Multi-Krum`, & `BulyanProfile::IterativeKrumV1` (`W9-01`, `ADR-0019`):**

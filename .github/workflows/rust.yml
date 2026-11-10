@@ -72,6 +72,12 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo run -p swarm-torch --example artifact_pipeline --locked
 
+      - name: Package verification (stable only)
+        if: matrix.rust == 'stable'
+        run: |
+          cargo package --workspace --no-verify --locked
+          cargo package -p swarm-torch-core --locked
+
   supply_chain:
     runs-on: ubuntu-latest
 

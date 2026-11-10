@@ -302,3 +302,36 @@ fn schema_validator_rejects_negative_fixtures_across_contracts() {
     let bad_mat = br#"{"schema_version":99,"ts_unix_nanos":1,"asset_key":"k","fingerprint_v0":"a","node_id":"11111111111111111111111111111111","node_def_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unsafe_surface":false}"#;
     assert!(validate_ndjson_bytes_against_schema(bad_mat, MATERIALIZATION_SCHEMA_JSON).is_err());
 }
+
+#[test]
+fn packaged_schemas_match_workspace_root_schemas() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_schemas = manifest_dir.join("..").join("schemas").join("v1");
+    if !workspace_schemas.is_dir() {
+        // Running inside an isolated `cargo package` verification directory where `../schemas/v1` is absent.
+        return;
+    }
+
+    let schemas = [
+        ("manifest.schema.json", MANIFEST_SCHEMA_JSON),
+        ("run.schema.json", RUN_SCHEMA_JSON),
+        ("graph.schema.json", GRAPH_SCHEMA_JSON),
+        ("registry.schema.json", REGISTRY_SCHEMA_JSON),
+        ("lineage.schema.json", LINEAGE_SCHEMA_JSON),
+        ("span.schema.json", SPAN_SCHEMA_JSON),
+        ("event.schema.json", EVENT_SCHEMA_JSON),
+        ("metric.schema.json", METRIC_SCHEMA_JSON),
+        ("materialization.schema.json", MATERIALIZATION_SCHEMA_JSON),
+    ];
+
+    for (name, embedded) in schemas {
+        let root_path = workspace_schemas.join(name);
+        let root_raw = fs::read_to_string(&root_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", root_path.display()));
+        assert_eq!(
+            embedded.replace("\r\n", "\n"),
+            root_raw.replace("\r\n", "\n"),
+            "packaged schema {name} drifted from workspace root schemas/v1/{name}"
+        );
+    }
+}

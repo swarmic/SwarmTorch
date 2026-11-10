@@ -66,15 +66,17 @@ In alignment with OpenSSF supply-chain and anti-social-engineering best practice
 
 ---
 
-## Canonical Docs (No Drift)
+## Canonical Docs & Mission-Plane Boundary (No Drift)
 
-SwarmTorch uses a strict public document hierarchy ([`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md)) to prevent context drift:
+SwarmTorch maintains a strict public document hierarchy to prevent context drift:
 
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
 - [`ADRs.md`](ADRs.md) (ratified architecture decision contracts)
-- [`ROADMAP.md`](ROADMAP.md) (public milestone and wave status)
+- [`ROADMAP.md`](ROADMAP.md) & [`CHANGELOG.md`](CHANGELOG.md) (public milestone, wave status, and release history)
 - [`SECURITY.md`](SECURITY.md) (threat model, vulnerability reporting, and supply-chain gates)
 - Crate source (`swarm-torch-*`) (implementation truth)
+
+Per `ADR-0008A` (`P2-18`), SwarmTorch implements portable swarm learning and DataOps primitives (`no_std`-compatible core). External mission-plane control, remote attestation (RA) capability issuance, radio link key management, physical robot actuation interlocks, and external receipt ledgers remain outside SwarmTorch core.
 
 If you add or change a **normative** requirement (`MUST`/`SHOULD`/`MAY`), you must update the corresponding ADR or white paper section and include an `Evidence:` pointer to the enforcing code and tests.
 

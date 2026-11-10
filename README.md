@@ -17,15 +17,17 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
 - [`ADRs.md`](ADRs.md) (architecture decisions)
-- [`CONTEXT_SOURCES.md`](CONTEXT_SOURCES.md) (document hierarchy; drift controls)
+- [`CHANGELOG.md`](CHANGELOG.md) (release history & wave milestones)
 - [`SECURITY.md`](SECURITY.md) (security policy + supply chain gates)
 
-## Implementation Reality (Wave 9 — `v0.1.0-alpha.9`)
+## Implementation Reality (Wave 11 — `v0.1.0` Release Candidate)
 
-- `swarm-torch` (top-level orchestration crate) is currently **std-only**.
-- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport`).
-- Receiver-bound `SessionId` replay/auth enforcement (`ADR-0020`, `swarmtorch.envelope.v1`, expiry-indexed safe `BTreeMap` cache), hardened `Multi-Krum` and `Bulyan` (`BulyanProfile::IterativeKrumV1`, `ADR-0019`), bounded decompression + `ClassicResidual` / `EF21` error feedback (`ADR-0021`), additive `PacketTransport` / `SwarmTransport` traits + originator-authenticated gossip wrappers (`ADR-0022`), and contiguous `LinearModel` / `MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer` (`ADR-0024`) are implemented in Wave 9.
-- Concrete TCP/UDP/BLE/LoRa/WiFi transport backends and optional `Zenoh`/`Iroh` adapter crates remain planned (current net path provides `PacketTransport`, `SwarmTransport`, `LoopbackPacketTransport`, and `MockTransport`).
+- `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
+- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`).
+- Receiver-bound `SessionId` replay/auth enforcement (`ADR-0020`, `swarmtorch.envelope.v1`, expiry-indexed safe `BTreeMap` cache), hardened `Multi-Krum`, `Bulyan` (`BulyanProfile::IterativeKrumV1`), stateful `CenteredClippingAggregator` (`CClip`), and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`SBucketingTransformer`, `ADR-0019`) are implemented.
+- Bounded decompression, `ClassicResidual` / `EF21` error feedback, and verifiable `SharedSeedSparse` (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`, `ADR-0021`) are implemented alongside contiguous `LinearModel` / `MlpModel`, analytical losses (`MSE`, `CrossEntropy`, `Huber`, `FedProx`), `SgdOptimizer`, and zero-dependency `SwarmTorchCheckpointV1` SafeTensors v1 persistence (`ADR-0023`, `ADR-0024`).
+- `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), Ed25519-signed `RunArtifactBundle` v1 (`TrustPolicy::Strict`, cross-process `BundleLockGuard`), and Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`) are implemented in `swarm-torch`.
+- Concrete `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), 16-byte `ChunkedFrameCodec` (`CRC-16/IBM-3740`), originator-authenticated gossip wrappers, `LoopbackPacketTransport`, and `MockTransport` are implemented in `swarm-torch-net` (`ADR-0004`, `ADR-0022`). Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) and optional `Zenoh`/`Iroh` adapter crates remain planned for `v0.2.0`.
 
 -----
 
@@ -46,7 +48,7 @@ The Rust ML ecosystem has excellent tools for specific problems:
 |**Embedded targets** (`no_std`)|⚠️ Partial (`no_std + alloc`); `embedded_min` planned|❌ Not supported     |❌ Not supported         |
 |**Asynchronous participation** |✅ Core design            |⚠️ Limited           |⚠️ Experimental          |
 |**Byzantine robustness**       |✅ Pluggable aggregators  |❌ No defense        |⚠️ Research only         |
-|**Heterogeneous networks**     |⚠️ Trait + mock transport (concrete transports planned)|❌ Assumes datacenter|❌ Assumes reliable links|
+|**Heterogeneous networks**     |✅ Low-MTU chunking + TCP/UDP/Gossip|❌ Assumes datacenter|❌ Assumes reliable links|
 |**Memory footprint**           |✅ <256KB for participants|❌ GBs required      |❌ GBs required          |
 |**Zero Python runtime**        |✅ Pure Rust              |❌ Python required   |❌ Python required       |
 
@@ -205,9 +207,8 @@ SwarmTorch uses **[probe-rs](https://probe.rs/)** as the golden path for embedde
 # Install probe-rs toolchain
 cargo install probe-rs-tools cargo-embed
 
-# Flash and debug embedded target
-cd examples/embedded
-cargo embed --chip STM32H743ZITx --release
+# Verify no_std + alloc core build for embedded targets
+cargo build -p swarm-torch-core --no-default-features --features alloc
 ```
 
 See the [Supported Targets](#supported-targets--embedded-profiles) section above for detailed target-specific setup.
@@ -230,12 +231,11 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`tokio-runtime`     |Use Tokio runtime adapter                |✅ Yes       |
 |`embassy-runtime`   |Enable Embassy runtime adapter (`no_std`)|❌ No        |
 |`robust-aggregation`|Enable robust aggregation strategies (`krum`, `bulyan`)|✅ Yes|
-|`tcp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
-|`udp-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
-|`ble-transport`     |Transport feature flag surface (backend implementation planned)|❌ No|
-|`lora-transport`    |Transport feature flag surface (backend implementation planned)|❌ No|
+|`tcp-transport`     |Enable Tokio TCP length-prefixed packet transport (`TcpPacketTransport`)|❌ No|
+|`udp-transport`     |Enable Tokio UDP chunk-multiplexed packet transport (`UdpPacketTransport`)|❌ No|
+|`ble-transport`     |Transport feature flag surface (hardware radio backend planned)|❌ No|
+|`lora-transport`    |Transport feature flag surface (hardware radio backend planned)|❌ No|
 |`telemetry`         |Core telemetry module re-exports         |❌ No        |
-|`python`            |Reserved marker for future Python boundary work|❌ No   |
 
 External framework bridges (such as Burn and Candle in `swarm-torch-backends`, WGPU/CUDA acceleration, and PyO3 bindings) are isolated to optional adapter crates and roadmap waves (`ADR-0015`, `ADR-0024`).
 
@@ -264,24 +264,24 @@ The diagram mixes implemented components and roadmap targets.
 │            Application Layer (Your Code)                 │
 ├─────────────────────────────────────────────────────────┤
 │   Swarm Learning & Coordination Layer                   │
+│   • SwarmRoundCoordinator & CAS/SafeTensors Checkpoints │
 │   • Robust aggregators (Median, Trimmed Mean,           │
-│     Krum / Multi-Krum, Bulyan IterativeKrumV1)          │
-│   • Compression & Error Feedback (ClassicResidual, EF21)│
-│   • Topology builders (Ring, FullMesh, Gossip, etc.)    │
+│     Krum / Multi-Krum, Bulyan, CClip, s-Bucketing)      │
+│   • Compression (ClassicResidual, EF21, SharedSeed)     │
 ├─────────────────────────────────────────────────────────┤
 │   Model & Optimization Layer (swarm-torch-models)       │
 │   • Reference LinearModel & contiguous MlpModel         │
-│   • Analytical MSE, Cross-Entropy, & Huber losses       │
-│   • SgdOptimizer & generic SwarmModel trait             │
+│   • Analytical MSE, Cross-Entropy, Huber, FedProx       │
+│   • SgdOptimizer & SwarmTorchCheckpointV1 SafeTensors   │
 ├─────────────────────────────────────────────────────────┤
 │   Identity & Security Layer                             │
 │   • Gossip-based eventual consistency (NOT consensus)   │
 │   • Ed25519 EnvelopeV1 + receiver-bound SessionId       │
-│   • Originator-signed gossip recipient wrappers         │
+│   • Signed RunArtifactBundle v1 + TrustPolicy::Strict   │
 ├─────────────────────────────────────────────────────────┤
 │   Transport Abstraction (swarm-torch-net)               │
-│   • Additive PacketTransport & SwarmTransport traits    │
-│   • Loopback & Mock transports (concrete I/O planned)   │
+│   • PacketTransport & GAT SwarmTransport traits         │
+│   • ChunkedFrameCodec (16B CRC-16) + TCP/UDP/Mock       │
 ├─────────────────────────────────────────────────────────┤
 │   Runtime Abstraction (swarm-torch-runtime)             │
 │   • Tokio & PollLoop (std)  │  Embassy & Spin (no_std)  │
@@ -329,8 +329,10 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 |**Trimmed Mean**          |✅ Medium-High    |Low               |Balanced performance         |
 |**Krum / Multi-Krum**     |✅ High           |Medium ($\mathcal{O}(n^2 d)$)|Small-medium fleets ($n \ge 2f + 3$)|
 |**Bulyan (`IterativeKrumV1`)**|✅ Very High  |Medium-High ($\mathcal{O}(n^2 d)$)|High-resilience cohorts ($n \ge 4f + 3$)|
+|**Centered Clipping (`CClip`)**|✅ High (Non-IID)|Low ($\mathcal{O}(L n d)$)|Stateful momentum/history clipping (`W11-01`)|
+|**`SBucketingTransformer`**|✅ Variance Reduction|Low ($\mathcal{O}(n d)$)|Pre-aggregation Non-IID $s$-bucketing (`W11-01`)|
 
-`CenteredClipping` (`CClip`) and Non-IID $s$-bucketing are specified in [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) and scheduled for Wave 11 (`W11-01`).
+Stateful `CenteredClippingAggregator` (`CClip`) and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`SBucketingTransformer`) are implemented in `swarm-torch-core::aggregation` per [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) (`W11-01`).
 
 **Important caveat:** Research shows that all robust aggregators can degrade under specific attack strategies, especially in high-dimensional settings. SwarmTorch provides:
 
@@ -351,8 +353,7 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust
 
 ## Network Transports
 
-SwarmTorch provides a unified `SwarmTransport` trait.  
-Current implementation includes mock transport/network for integration tests; concrete TCP/UDP/BLE/LoRa/WiFi backends are roadmap work.
+SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), `LoopbackPacketTransport`, and `MockTransport`. Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) are roadmap work.
 
 ```rust,ignore
 pub trait SwarmTransport {
@@ -382,9 +383,8 @@ let transport = MultiTransport::new()
     .fallback_policy(FallbackPolicy::PreferLowLatency);
 ```
 
-Envelope serialization is provided by the protocol module (`postcard`).  
-Concrete transport-specific framing/compression policies remain planned.  
-See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)**.
+Envelope serialization (`postcard` + Ed25519 `MessageEnvelope` v1) and 16-byte `ChunkedFrameCodec` low-MTU fragmentation/reassembly (`W11-03`) are implemented in `swarm-torch-net`.  
+See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)** and **[ADR-0022: Transport Trait Split & Low-MTU Framing](ADRs.md#adr-0022-transport-trait-split-gossip-recipient-authentication-and-low-mtu-chunked-framing)**.
 
 -----
 
@@ -423,19 +423,20 @@ Currently available examples in-repo:
 ```bash
 cargo run -p swarm-torch --example hello_swarm
 cargo run -p swarm-torch --example artifact_pipeline
+cargo run -p swarm-torch --example byzantine_federated_round
 ```
 
 -----
 
 ## Roadmap
 
-### v0.1.0 - Swarm Learning Core & Coordinator (Active — Wave 9 Complete)
+### v0.1.0 - Swarm Learning Core & Coordinator (Active — Wave 11 RC Complete)
 
 - ✅ Sequential execution engine MVP & artifact/report bundle pipeline (Waves 6–8)
 - ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`EnvelopeV1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
-- ⏳ Wave 10 (`v0.1.0-alpha.10`): Unified Swarm Round Coordinator, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock, and deterministic multi-node simulation
-- ⏳ Wave 11 (`v0.1.0-rc.1`): `CenteredClipping` (`CClip`), Non-IID $s$-bucketing, verifiable `SharedSeedSparse` projection, 16-byte chunked packet reassembly (`CRC-16/IBM-3740`), and `SwarmTorchCheckpointV1` SafeTensors profile
-- ⏳ Wave 12 (`v0.1.0` Final): Optional `swarm-torch-backends` (Burn/Candle/LoRA), optional `swarm-torch-transport-zenoh` & `swarm-torch-transport-iroh`, `FedAsync` stale-delta mixing + durable Rényi DP accounting, and `wasmi` extension sandbox + columnar data runner
+- ✅ Wave 10 (`v0.1.0-beta.1`): Unified `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock (`BundleLockGuard`), Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`), and deterministic multi-node simulation
+- ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClippingAggregator` (`CClip`), Non-IID $s$-bucketing (`SBucketingTransformer`), verifiable `SharedSeedSparse` projection (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpPacketTransport` / `UdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
+- ⏳ Wave 12 (`v0.2.0` Expansion): Optional `swarm-torch-backends` (Burn/Candle/LoRA), optional `swarm-torch-transport-zenoh` & `swarm-torch-transport-iroh`, `FedAsync` stale-delta mixing + durable Rényi DP accounting, and `wasmi` extension sandbox + columnar data runner
 
 ### v0.2.0 - Edge ML & Hardware Fleet Expansion
 

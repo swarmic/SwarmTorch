@@ -16,24 +16,24 @@ use super::io::{MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES};
 pub const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Embedded canonical schema for `manifest.json`.
-pub const MANIFEST_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/manifest.schema.json");
+pub const MANIFEST_SCHEMA_JSON: &str = include_str!("../../schemas/v1/manifest.schema.json");
 /// Embedded canonical schema for `run.json`.
-pub const RUN_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/run.schema.json");
+pub const RUN_SCHEMA_JSON: &str = include_str!("../../schemas/v1/run.schema.json");
 /// Embedded canonical schema for `graph.json`.
-pub const GRAPH_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/graph.schema.json");
+pub const GRAPH_SCHEMA_JSON: &str = include_str!("../../schemas/v1/graph.schema.json");
 /// Embedded canonical schema for `datasets/registry.json`.
-pub const REGISTRY_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/registry.schema.json");
+pub const REGISTRY_SCHEMA_JSON: &str = include_str!("../../schemas/v1/registry.schema.json");
 /// Embedded canonical schema for `datasets/lineage.json`.
-pub const LINEAGE_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/lineage.schema.json");
+pub const LINEAGE_SCHEMA_JSON: &str = include_str!("../../schemas/v1/lineage.schema.json");
 /// Embedded canonical schema for `spans.ndjson` lines.
-pub const SPAN_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/span.schema.json");
+pub const SPAN_SCHEMA_JSON: &str = include_str!("../../schemas/v1/span.schema.json");
 /// Embedded canonical schema for `events.ndjson` lines.
-pub const EVENT_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/event.schema.json");
+pub const EVENT_SCHEMA_JSON: &str = include_str!("../../schemas/v1/event.schema.json");
 /// Embedded canonical schema for `metrics.ndjson` lines.
-pub const METRIC_SCHEMA_JSON: &str = include_str!("../../../schemas/v1/metric.schema.json");
+pub const METRIC_SCHEMA_JSON: &str = include_str!("../../schemas/v1/metric.schema.json");
 /// Embedded canonical schema for `datasets/materializations.ndjson` lines.
 pub const MATERIALIZATION_SCHEMA_JSON: &str =
-    include_str!("../../../schemas/v1/materialization.schema.json");
+    include_str!("../../schemas/v1/materialization.schema.json");
 
 /// Error returned when a JSON/NDJSON artifact violates its Draft 2020-12 schema contract.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,13 +25,11 @@ fn swarm_benchmark(c: &mut Criterion) {
             )
             .unwrap();
             let mut reassembler = ObservedSourceReassembler::<u32>::new(limits).unwrap();
-            let mut now_ms = 1_000u64;
             let mut completed_len = 0usize;
-            for frame in &frames {
+            for (now_ms, frame) in (1_000u64..).zip(frames.iter()) {
                 if let Some(msg) = reassembler.ingest_frame(1, 42u32, frame, now_ms).unwrap() {
                     completed_len = msg.payload.len();
                 }
-                now_ms += 1;
             }
             assert_eq!(completed_len, payload.len());
         })

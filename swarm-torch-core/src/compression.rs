@@ -1136,7 +1136,7 @@ pub fn derive_verifiable_round_seed_v1(
     }
 
     let mut sorted = commitments.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.sort_by_key(|a| a.0);
     for window in sorted.windows(2) {
         if window[0].0 == window[1].0 {
             return Err(CompressionError::InvalidData);

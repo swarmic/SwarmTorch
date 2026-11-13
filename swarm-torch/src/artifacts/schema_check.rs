@@ -34,6 +34,9 @@ pub const METRIC_SCHEMA_JSON: &str = include_str!("../../schemas/v1/metric.schem
 /// Embedded canonical schema for `datasets/materializations.ndjson` lines.
 pub const MATERIALIZATION_SCHEMA_JSON: &str =
     include_str!("../../schemas/v1/materialization.schema.json");
+/// Embedded canonical schema for `stcl-json-v1` columnar table payloads (`P2-20b`).
+pub const COLUMNAR_TABLE_SCHEMA_JSON: &str =
+    include_str!("../../schemas/v1/columnar_table.schema.json");
 
 /// Error returned when a JSON/NDJSON artifact violates its Draft 2020-12 schema contract.
 #[derive(Debug, Clone, PartialEq, Eq)]

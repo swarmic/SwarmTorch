@@ -12,6 +12,8 @@ pub mod schema_check;
 mod session;
 mod sink;
 
+pub mod dp_ledger;
+
 pub use bundle::{
     compute_manifest_entries_hash_v1, sign_manifest_v1, verify_manifest_signature_v1,
     ManifestEntryV1, ManifestSignatureV1, ManifestV1, RunArtifactBundle, RunFileV1, TrustPolicy,
@@ -24,6 +26,11 @@ pub use cas::{
     CheckpointRecipeKeyV1, RoundResumeStateV1, CHECKPOINT_RECIPE_DOMAIN_TAG_V1,
     ROUND_RESUME_STATE_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
 };
+pub use dp_ledger::{
+    append_dp_release_record_durable, derive_dp_receipt_id, pre_release_debit_dp_accountant,
+    read_dp_ledger_entries, reconstruct_dp_accountant_from_ledger, CryptoErrorOrIo,
+    DpLedgerEntryV1, DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1,
+};
 pub use io::{
     MAX_MANIFEST_BYTES, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
     MAX_TOTAL_BUNDLE_BYTES,
@@ -34,7 +41,10 @@ pub use sink::{ArtifactWriteProfile, ManifestRefreshPolicy, RunArtifactSink, Sna
 
 #[cfg(test)]
 pub(crate) use io::read_json;
-pub(crate) use io::{hex_lower, parse_json_slice, parse_ndjson_slice_bounded};
+pub(crate) use io::{
+    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, read_bytes_bounded,
+    write_once_cas_blob,
+};
 
 pub(crate) fn record_validation_error_to_io<E: core::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())

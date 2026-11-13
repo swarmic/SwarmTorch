@@ -1600,8 +1600,8 @@ pub fn aggregate_verifiable_shared_seed_sparse_v1(
     aggregate_shared_seed_sparse_v1(&verified_payloads, aggregator, budget)
 }
 
-/// Wave 12 (`W12-01`) extension descriptor for bounded-staleness asynchronous aggregation
-/// (`FedAsync` mixing profile).
+/// Wave 12 (`W12-03` / `ADR-0023` §4.1) descriptor for bounded-staleness asynchronous aggregation
+/// (`FedAsync` polynomial decay mixing profile).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
 pub struct FedAsyncStalenessDescriptorV1 {
@@ -1613,12 +1613,185 @@ pub struct FedAsyncStalenessDescriptorV1 {
     pub polynomial_decay_exponent: f32,
 }
 
-/// Wave 12 (`W12-01`) extension trait for staleness-weighted asynchronous model mixing.
+impl FedAsyncStalenessDescriptorV1 {
+    /// Validate policy hyperparameters before admitting asynchronous updates.
+    pub fn validate(&self) -> Result<()> {
+        if !self.base_alpha.is_finite()
+            || self.base_alpha <= 0.0
+            || self.base_alpha > 1.0
+            || !self.polynomial_decay_exponent.is_finite()
+            || self.polynomial_decay_exponent < 0.0
+        {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(())
+    }
+
+    /// Compute the effective mixing weight $\alpha(\tau)$ with an optional hinge threshold
+    /// $\tau_{\text{hinge}}$ (`Xie et al. 2019`):
+    /// - For $\tau \le \tau_{\text{hinge}}$, $\alpha(\tau) = \alpha_0$.
+    /// - For $\tau > \tau_{\text{hinge}}$, $\alpha(\tau) = \alpha_0 (1 + (\tau - \tau_{\text{hinge}}))^{-a}$.
+    pub fn compute_hinge_mixing_alpha(
+        &self,
+        base_round_id: u64,
+        current_round_id: u64,
+        hinge_threshold_rounds: u64,
+    ) -> Result<f32> {
+        self.validate()?;
+        if base_round_id > current_round_id {
+            return Err(Error::InvalidThreshold);
+        }
+        let tau = current_round_id - base_round_id;
+        if tau > self.max_staleness_rounds {
+            return Err(Error::InvalidThreshold);
+        }
+        if tau <= hinge_threshold_rounds || self.polynomial_decay_exponent == 0.0 {
+            return Ok(self.base_alpha);
+        }
+        let excess_tau = (tau - hinge_threshold_rounds) as f64;
+        let decay = crate::num::exp_f64_soft(
+            -(self.polynomial_decay_exponent as f64) * crate::num::ln_f64_soft(1.0 + excess_tau),
+        );
+        let alpha = ((self.base_alpha as f64) * decay) as f32;
+        if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+            return Err(Error::InvalidThreshold);
+        }
+        Ok(alpha)
+    }
+}
+
+/// Wave 12 (`W12-03`) trait for staleness-weighted asynchronous model mixing.
 pub trait StalenessWeightingPolicy {
     /// Compute the effective mixing weight $\alpha(\tau) \in [0, 1]$ for an update trained against
     /// `base_round_id` arriving at `current_round_id`, or `Err(Error::InvalidThreshold)` if
     /// staleness exceeds policy bounds.
     fn compute_mixing_alpha(&self, base_round_id: u64, current_round_id: u64) -> Result<f32>;
+}
+
+impl StalenessWeightingPolicy for FedAsyncStalenessDescriptorV1 {
+    fn compute_mixing_alpha(&self, base_round_id: u64, current_round_id: u64) -> Result<f32> {
+        self.compute_hinge_mixing_alpha(base_round_id, current_round_id, 0)
+    }
+}
+
+/// Audit and telemetry receipt emitted by [`apply_fedasync_stale_delta_v1`] (`ADR-0023` §4.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FedAsyncStaleMixOutcomeV1 {
+    /// Updated server model parameters $w_{\text{new}}$.
+    pub updated_weights: Vec<f32>,
+    /// Effective staleness-decayed mixing weight $\alpha(\tau) \in (0, 1]$.
+    pub effective_alpha: f32,
+    /// Staleness lag $\tau = r_{\text{current}} - r_{\text{base}}$.
+    pub staleness_rounds: u64,
+    /// Pre-clipping $\ell_2$ norm $\|\Delta_{\text{stale}}\|_2$ in `f64`.
+    pub raw_delta_l2_norm: f64,
+    /// Post-clipping $\ell_2$ norm $\|\Delta_{\text{clipped}}\|_2$ in `f64`.
+    pub clipped_delta_l2_norm: f64,
+    /// Server base-drift $\ell_2$ norm $\|w_{\text{base}} - w_{\text{current}}\|_2$ in `f64`.
+    pub base_drift_l2_norm: f64,
+    /// Whether the incoming stale delta exceeded `max_delta_norm_tau` and was $\ell_2$-clipped.
+    pub was_clipped: bool,
+}
+
+/// Apply a bounded-staleness asynchronous client delta $\Delta_i = w_i^{\text{local}} - w_{t_{\text{base}}}$
+/// to the current server model $w_{t_{\text{cur}}}$ with exact base-drift compensation (`ADR-0023` §4.1):
+///
+/// $$w_{\text{new}} = (1 - \alpha(\tau)) w_{t_{\text{cur}}} + \alpha(\tau) \left(w_{t_{\text{base}}} + \Delta_{\text{clipped}}\right) = w_{t_{\text{cur}}} + \alpha(\tau) \left(w_{t_{\text{base}}} - w_{t_{\text{cur}}} + \Delta_{\text{clipped}}\right)$$
+///
+/// ### Security & Numerical Invariants
+/// 1. All three input vectors (`w_current`, `w_base`, `stale_delta`) must have identical non-zero length
+///    and contain strictly finite `f32` elements (`NaN` $\to$ [`Error::NanDetected`], `Inf` $\to$ [`Error::InfDetected`]).
+/// 2. Optional $\ell_2$ norm clipping (`max_delta_norm_tau`) is applied to `stale_delta` **before** adding
+///    the server drift term $(w_{t_{\text{base}}} - w_{t_{\text{cur}}})$ so a Byzantine contributor cannot
+///    exploit model drift to smuggle an unbounded update.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_fedasync_stale_delta_v1<P: StalenessWeightingPolicy + ?Sized>(
+    policy: &P,
+    base_round_id: u64,
+    current_round_id: u64,
+    w_current: &[f32],
+    w_base: &[f32],
+    stale_delta: &[f32],
+    max_delta_norm_tau: Option<f32>,
+) -> Result<FedAsyncStaleMixOutcomeV1> {
+    if w_current.is_empty()
+        || w_current.len() != w_base.len()
+        || w_current.len() != stale_delta.len()
+    {
+        return Err(Error::InvalidGradient);
+    }
+
+    let effective_alpha = policy.compute_mixing_alpha(base_round_id, current_round_id)?;
+    if !effective_alpha.is_finite() || effective_alpha <= 0.0 || effective_alpha > 1.0 {
+        return Err(Error::InvalidThreshold);
+    }
+    let staleness_rounds = current_round_id
+        .checked_sub(base_round_id)
+        .ok_or(Error::InvalidThreshold)?;
+
+    let mut delta_sq_sum = 0.0f64;
+    let mut drift_sq_sum = 0.0f64;
+
+    for j in 0..w_current.len() {
+        let wc = w_current[j];
+        let wb = w_base[j];
+        let d = stale_delta[j];
+        if wc.is_nan() || wb.is_nan() || d.is_nan() {
+            return Err(Error::NanDetected);
+        }
+        if wc.is_infinite() || wb.is_infinite() || d.is_infinite() {
+            return Err(Error::InfDetected);
+        }
+        let d_f64 = d as f64;
+        delta_sq_sum += d_f64 * d_f64;
+        let drift_f64 = (wb as f64) - (wc as f64);
+        drift_sq_sum += drift_f64 * drift_f64;
+    }
+
+    let raw_delta_l2_norm = crate::num::sqrt_f64_soft(delta_sq_sum);
+    let base_drift_l2_norm = crate::num::sqrt_f64_soft(drift_sq_sum);
+    if !raw_delta_l2_norm.is_finite() || !base_drift_l2_norm.is_finite() {
+        return Err(Error::InfDetected);
+    }
+
+    let (clip_scale, clipped_delta_l2_norm, was_clipped) = match max_delta_norm_tau {
+        Some(tau) => {
+            if !tau.is_finite() || tau <= 0.0 {
+                return Err(Error::InvalidThreshold);
+            }
+            let tau_f64 = tau as f64;
+            if raw_delta_l2_norm > tau_f64 {
+                (tau_f64 / raw_delta_l2_norm, tau_f64, true)
+            } else {
+                (1.0, raw_delta_l2_norm, false)
+            }
+        }
+        None => (1.0, raw_delta_l2_norm, false),
+    };
+
+    let alpha_f64 = effective_alpha as f64;
+    let mut updated_weights = Vec::with_capacity(w_current.len());
+    for j in 0..w_current.len() {
+        let wc = w_current[j] as f64;
+        let wb = w_base[j] as f64;
+        let d_clipped = (stale_delta[j] as f64) * clip_scale;
+        let next_w = wc + alpha_f64 * ((wb - wc) + d_clipped);
+        let next_f32 = next_w as f32;
+        if !next_f32.is_finite() {
+            return Err(Error::InfDetected);
+        }
+        updated_weights.push(next_f32);
+    }
+
+    Ok(FedAsyncStaleMixOutcomeV1 {
+        updated_weights,
+        effective_alpha,
+        staleness_rounds,
+        raw_delta_l2_norm,
+        clipped_delta_l2_norm,
+        base_drift_l2_norm,
+        was_clipped,
+    })
 }
 
 /// Configuration for robust aggregation

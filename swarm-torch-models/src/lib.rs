@@ -14,6 +14,10 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+pub mod backend_bridge;
+#[cfg(feature = "alloc")]
+pub mod lora;
 pub mod loss;
 pub mod mlp;
 pub mod optim;
@@ -23,6 +27,10 @@ pub mod simple;
 
 /// Prelude for convenient imports
 pub mod prelude {
+    #[cfg(feature = "alloc")]
+    pub use crate::backend_bridge::*;
+    #[cfg(feature = "alloc")]
+    pub use crate::lora::*;
     pub use crate::loss::*;
     pub use crate::optim::*;
     #[cfg(feature = "alloc")]

@@ -32,6 +32,7 @@ pub mod consensus;
 pub mod crypto;
 #[cfg(feature = "alloc")]
 pub mod dataops;
+pub mod dp;
 #[cfg(feature = "alloc")]
 pub mod execution;
 pub mod identity;

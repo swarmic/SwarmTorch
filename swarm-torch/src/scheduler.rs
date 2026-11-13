@@ -85,7 +85,9 @@ pub enum RunnerIsolationProfile {
     /// Execute trusted core operators in-process (`ExecutionTrust::Core`).
     #[default]
     InProcessTrusted,
-    /// Wave 12 (`W12-04`) stub for out-of-process / Wasm sandboxed execution with resource caps.
+    /// Wave 12 (`W12-04`) real deterministic WebAssembly sandboxed executor (`ExecutionTrust::SandboxedExtension`).
+    WasmSandboxedV1(crate::wasm_sandbox::SandboxedExtensionPolicyV1),
+    /// Legacy placeholder stub for external process isolation.
     ExternalSandboxedStub {
         /// Maximum wall-clock execution time in milliseconds.
         timeout_ms: u64,
@@ -245,6 +247,32 @@ pub fn execute_graph_sequential(
     run_id: RunId,
     clock_nanos: fn() -> u64,
 ) -> Result<SchedulerReport, SchedulerError> {
+    execute_graph_with_isolation(
+        graph,
+        session,
+        runner,
+        policy,
+        &RunnerIsolationProfile::InProcessTrusted,
+        None,
+        run_id,
+        clock_nanos,
+    )
+}
+
+/// Execute a graph sequentially under an explicit [`RunnerIsolationProfile`] and optional pinned
+/// WebAssembly extension registry (`ADR-0018`, `W12-04`).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_graph_with_isolation(
+    graph: &GraphV1,
+    session: &mut DataOpsSession,
+    runner: &NativeOpRunner,
+    policy: &dyn ExecutionPolicy,
+    isolation: &RunnerIsolationProfile,
+    wasm_registry: Option<&std::collections::BTreeMap<[u8; 32], Vec<u8>>>,
+    run_id: RunId,
+    clock_nanos: fn() -> u64,
+) -> Result<SchedulerReport, SchedulerError> {
+    let empty_registry = std::collections::BTreeMap::new();
     let ordered = topological_sort_nodes(graph)?;
     let mut report = SchedulerReport::default();
     let trace_id = TraceId::from_bytes(*run_id.as_bytes());
@@ -307,7 +335,7 @@ pub fn execute_graph_sequential(
                 schema: None,
             })
             .collect();
-        let output_specs: Vec<OutputSpec> = node
+        let mut output_specs: Vec<OutputSpec> = node
             .outputs
             .iter()
             .map(|output| OutputSpec {
@@ -371,12 +399,77 @@ pub fn execute_graph_sequential(
             continue;
         }
 
-        let runner_result =
-            runner.run_with_context(&context, &node, &inputs, session.sink().as_ref());
+        // Fail-closed isolation enforcement before invoking runner
+        let wasm_arg = match (&node.execution_trust, isolation) {
+            (swarm_torch_core::run_graph::ExecutionTrust::Core, _) => {
+                if node.op_type == "wasm_transform" {
+                    let error_code =
+                        "isolation_denied:wasm_transform requires SandboxedExtension trust"
+                            .to_string();
+                    session.record_node_error(&node, started, 0, error_code.clone())?;
+                    emit_scheduler_event(
+                        session.sink().as_ref(),
+                        trace_id,
+                        started,
+                        "scheduler/node_denied",
+                        &node.node_key,
+                        Some(&error_code),
+                    )?;
+                    report.failed_nodes.push(node.node_key.clone());
+                    continue;
+                }
+                None
+            }
+            (
+                swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension,
+                RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
+            ) => Some((wasm_policy, wasm_registry.unwrap_or(&empty_registry))),
+            (swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension, _) => {
+                let error_code =
+                    "isolation_denied:SandboxedExtension requires RunnerIsolationProfile::WasmSandboxedV1"
+                        .to_string();
+                session.record_node_error(&node, started, 0, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    started,
+                    "scheduler/node_denied",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
+            (swarm_torch_core::run_graph::ExecutionTrust::UnsafeExtension, _) => {
+                let error_code =
+                    "isolation_denied:UnsafeExtension has no permitted host executor".to_string();
+                session.record_node_error(&node, started, 0, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    started,
+                    "scheduler/node_denied",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
+        };
+
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let runner_result = runner.run_in_session(
+            &context,
+            &run_dir,
+            &node,
+            &inputs,
+            session.sink().as_ref(),
+            wasm_arg,
+        );
         let finished = (clock_nanos)();
         let duration_ms = finished.saturating_sub(started) / 1_000_000;
-        let runner_instances = match runner_result {
-            Ok(instances) => instances,
+        let exec_outcome = match runner_result {
+            Ok(outcome) => outcome,
             Err(error) => {
                 let error_code = format!("runner_error:{error}");
                 session.record_node_error(&node, finished, duration_ms, error_code.clone())?;
@@ -392,6 +485,20 @@ pub fn execute_graph_sequential(
                 continue;
             }
         };
+        for phys_spec in &exec_outcome.output_specs {
+            if let Some(target_spec) = output_specs
+                .iter_mut()
+                .find(|s| s.asset_key == phys_spec.asset_key)
+            {
+                if phys_spec.rows.is_some() {
+                    target_spec.rows = phys_spec.rows;
+                }
+                if phys_spec.bytes.is_some() {
+                    target_spec.bytes = phys_spec.bytes;
+                }
+            }
+        }
+        let runner_instances = exec_outcome.instances;
 
         let materialize = session.materialize_node_outputs(
             &node,
@@ -1102,6 +1209,101 @@ mod tests {
             assert!(!span.attrs.contains_key("input_count"));
             assert!(!span.attrs.contains_key("output_count"));
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scheduler_enforces_wasm_sandbox_isolation_for_sandboxed_extension_nodes() {
+        use crate::wasm_sandbox::{SandboxedExtensionPolicyV1, WASM_MAGIC_AND_VERSION_V1};
+        use std::collections::BTreeMap;
+
+        // Build minimal real .wasm module exporting transform(ptr=0, len) -> len that XORs mem[0..len] with 0x20
+        let ops: Vec<u8> = vec![
+            0x41, 0x00, 0x21, 0x02, 0x03, 0x40, 0x20, 0x02, 0x20, 0x01, 0x48, 0x04, 0x40, 0x20,
+            0x00, 0x20, 0x02, 0x6a, 0x20, 0x00, 0x20, 0x02, 0x6a, 0x2d, 0x00, 0x00, 0x41, 0x20,
+            0x73, 0x3a, 0x00, 0x00, 0x20, 0x02, 0x41, 0x01, 0x6a, 0x21, 0x02, 0x0c, 0x01, 0x0b,
+            0x0b, 0x20, 0x01,
+        ];
+        let mut wasm = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        // sec 1: type (i32, i32) -> i32
+        wasm.extend_from_slice(&[1, 7, 1, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
+        // sec 3: func 0 -> type 0
+        wasm.extend_from_slice(&[3, 2, 1, 0]);
+        // sec 5: memory init 1 max 1
+        wasm.extend_from_slice(&[5, 4, 1, 0x01, 1, 1]);
+        // sec 7: export "transform" -> func 0
+        wasm.extend_from_slice(&[7, 13, 1, 9]);
+        wasm.extend_from_slice(b"transform");
+        wasm.extend_from_slice(&[0x00, 0x00]);
+        // sec 10: 1 local i32 + ops + end
+        let mut body = vec![1, 1, 0x7f];
+        body.extend_from_slice(&ops);
+        body.push(0x0b);
+        wasm.push(10);
+        wasm.push((body.len() + 2) as u8);
+        wasm.push(1);
+        wasm.push(body.len() as u8);
+        wasm.extend_from_slice(&body);
+
+        let hash = SandboxedExtensionPolicyV1::sha256_module(&wasm);
+        let hex_hash: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+
+        let (base, mut session) = create_session("wasm_isolation");
+        register_source(&mut session, "dataset://ns/raw");
+
+        let mut wasm_node = make_node(
+            "node/wasm_op",
+            "wasm_transform",
+            &["dataset://ns/raw"],
+            &["dataset://ns/wasm_out"],
+            ExecutionTrust::SandboxedExtension,
+        );
+        wasm_node.params.insert(
+            "module_sha256".to_string(),
+            swarm_torch_core::run_graph::CanonValue::Str(hex_hash),
+        );
+        wasm_node.params.insert(
+            "export".to_string(),
+            swarm_torch_core::run_graph::CanonValue::Str("transform".to_string()),
+        );
+
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("wasm-isolation-test".to_string()),
+            nodes: vec![wasm_node],
+            edges: vec![],
+        };
+
+        // 1. Under InProcessTrusted, SandboxedExtension MUST fail closed!
+        let r_denied = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            RunId::from_bytes([0x67; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_denied.failed_nodes, vec!["node/wasm_op"]);
+
+        // 2. Under WasmSandboxedV1 with allowlisted module, SandboxedExtension executes cleanly!
+        let wasm_policy = SandboxedExtensionPolicyV1::with_allowed_hash(hash);
+        let mut registry = BTreeMap::new();
+        registry.insert(hash, wasm);
+        let r_ok = execute_graph_with_isolation(
+            &graph,
+            &mut session,
+            &NativeOpRunner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
+            Some(&registry),
+            RunId::from_bytes([0x68; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r_ok.failed_nodes.is_empty());
+        assert_eq!(r_ok.executed_nodes, vec!["node/wasm_op"]);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -5,11 +5,10 @@
 # -----------------------------------------------------------------------------
 # Private Planning Guard (Safety Net)
 # -----------------------------------------------------------------------------
-# NOTE: Canonical public contracts (`ADRs.md`, `SECURITY.md`, `ROADMAP.md`,
-# `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`, and `.sources.md`) are versioned
-# in this repository. Private strategic planning and internal audit artifacts
-# are versioned in the separate `swarm-torch-planning` repository outside this
-# working tree.
+# NOTE: Canonical public contracts (`ADRs.md`, `SECURITY.md`, `ROADMAP.md`, and
+# `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`) are versioned in this repository.
+# Unabridged ADR deliberations, whitepaper source bibliographies, wave plans,
+# and internal audit artifacts are versioned in `swarm-torch-planning`.
 docs/adr/
 docs/internal/
 docs/plans/
@@ -17,6 +16,12 @@ docs/audits/
 /docs/release_notes/
 /examples/
 /CONTEXT_SOURCES.md
+/ADRs-full-deliberations.md
+/SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md
+*_implementation_plan.md
+*implementation_plan*.md
+*_plan.md
+adapters/*/Cargo.lock
 .agents/
 .agent/
 AGENTS.md

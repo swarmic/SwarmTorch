@@ -7,6 +7,12 @@ members = [
     "swarm-torch-models",
     "swarm-torch",
 ]
+exclude = [
+    "adapters/swarm-torch-backends",
+    "adapters/swarm-torch-transport-iroh",
+    "adapters/swarm-torch-transport-zenoh",
+    "adapters/swarm-torch-mcp",
+]
 
 [workspace.package]
 version = "0.1.0"

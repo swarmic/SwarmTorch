@@ -8,8 +8,8 @@ For a high-level project overview and usage guide, see [`README.md`](README.md).
 |---------|-------|--------|
 | `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Completed |
 | `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Completed |
-| `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Current (Implemented & Verified) |
-| `v0.2.0` | Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & `wasmi` Sandbox (Wave 12) | Planned |
+| `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Completed |
+| `v0.2.0` | Isolated Framework/Transport/MCP Adapters, LoRA/FLoRA, `FedAsync` + Durable RDP, & Wasm/Columnar Sandbox (Wave 12) | Current (Implemented & Verified) |
 | `v0.3.0+` | Production Hardening, Local Artifact Reader (`P2-16`), & Optional Desktop Wrapper (`P2-17`) | Future |
 
 ## Release Gates
@@ -18,7 +18,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-## Completed Milestones (Waves 4–11)
+## Completed Milestones (Waves 4–12)
 
 ### Waves 4–6: Remediation & Artifact/Report Canon Lock
 - Completed `E-01..E-05` semver batch, `F1` execution hints (`ExecutionHint`), `F2a/F2/F3/F4` (`TransformAuditV0`, `UpdateTransform`, composable aggregation pipeline, lightweight tracing), and behavior-preserving `A6X-06` decomposition of artifact/report modules.
@@ -59,14 +59,23 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-## Upcoming Ratified Waves (Wave 12)
+### Wave 12 (`v0.2.0` — Landed & Conformance Verified)
+1. **Isolated Framework Bridges & LoRA / FLoRA Update Algebra (`W12-01`, `ADR-0024` §4):**
+   - Adds `BackendTensorBridge` / `BackendModelHandleV1` and explicit `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models`, coordinated by `SwarmRoundCoordinator::aggregate_lora_cohort_round`, plus isolated Burn/Candle adapter bridges in `adapters/swarm-torch-backends`.
+2. **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4):**
+   - Adds `QuicStreamHandshakePolicyV1`, `QuicLengthPrefixedCodecV1`, and `ZenohTopicContractV1` binding verified link identities to originator `PeerId`s under bounded frame quotas (`swarm-torch-net::carrier`), plus standalone `adapters/swarm-torch-transport-iroh` (`IrohCarrierAdapterV1`) and `adapters/swarm-torch-transport-zenoh` (`ZenohCarrierAdapterV1`) crates outside root `Cargo.lock`.
+3. **Stale-Delta `FedAsync` Mixing & Durable Pre-Release RDP Accounting (`W12-03`, `ADR-0023` §4):**
+   - Adds `no_std` IEEE-754 `exp_f64_soft`/`ln_f64_soft`/`log_sum_exp_pair_f64` (`swarm-torch-core::num`), `apply_fedasync_stale_delta_v1` with anchor-window drift compensation and Byzantine clipping (`swarm-torch-core::aggregation`), `RdpAccountantV1` (`swarm-torch-core::dp`), and crash-idempotent `dp/ledger.ndjson` pre-release debits (`swarm-torch::artifacts::dp_ledger`) wired into `SwarmRoundCoordinator::finalize_round` / `step_fedasync_stale_submission`.
+4. **Deterministic Wasm Extension Sandbox, Physical Columnar Runner, & Schema Contract (`W12-04`, `P2-20b`, `ADR-0025`):**
+   - Adds `schemas/v1/columnar_table.schema.json` (mirrored byte-identically into `swarm-torch/schemas/v1/`), pure-Rust `#![forbid(unsafe_code)]` fuel/memory-metered `WasmSandboxRunnerV1` (`swarm-torch::wasm_sandbox`), `RunnerIsolationProfile::WasmSandboxedV1` scheduler enforcement (`swarm-torch::scheduler`), and schema-validated physical columnar/NDJSON execution (`NativeOpRunner::run_in_session`).
+5. **Zero-Port Read-Only Strict MCP Inspector (`W12-05`, `ADR-0016`):**
+   - Adds `McpInspectorServerV1` and the `swarm_torch_mcp` `stdio` JSON-RPC 2.0 binary (`swarm-torch::mcp_inspector`) plus `adapters/swarm-torch-mcp`, requiring `TrustPolicy::Strict` signatures on every request and exposing 4 read-only `swarmtorch://runs/{run_id}/*` resources and 4 audit/prediction/DP-trace tools.
 
-1. **Wave 12 (`v0.2.0` — Isolated Framework/Transport Adapters, `FedAsync` + Durable RDP, & Installed `wasmi` Sandbox):**
-   - `W12-01` (`ADR-0024`): Optional `swarm-torch-backends` (Burn/Candle adapters) and explicit LoRA / FLoRA delta aggregation.
-   - `W12-02` (`ADR-0022`): Separate optional `swarm-torch-transport-zenoh` and `swarm-torch-transport-iroh` crates (1-RTT QUIC streams, distinct link `EndpointId` vs. originator `PeerId`).
-   - `W12-03` (`ADR-0023`): Stale-delta `FedAsync` mixing and durable pre-release Rényi DP accounting.
-   - `W12-04` (`ADR-0025`, `P2-20b`): `wasmi` sandbox host with installed `store.limiter(...)` + `trap_on_grow_failure(true)` + fuel, physical NDJSON/Arrow/Parquet execution in `NativeOpRunner`, and Parquet schema contracts (`P2-20b`).
-   - `W12-05` (`ADR-0016`): Optional isolated `swarm-torch-mcp` read-only artifact inspection adapter over `stdio` backed by `TrustPolicy::Strict`.
+---
+
+## Upcoming Milestones (v0.3.0+)
+
+- Production hardening, local read-only artifact viewer (`P2-16`), and optional desktop wrapper (`P2-17`) over `VerifiedBundleV1`.
 
 ---
 

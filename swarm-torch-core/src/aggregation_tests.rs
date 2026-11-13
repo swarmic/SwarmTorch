@@ -633,3 +633,66 @@ fn shared_seed_sparse_subspace_aggregation_matches_full_space_and_verifies_merkl
         Error::VerificationFailed
     );
 }
+
+#[test]
+fn test_fedasync_staleness_policy_and_drift_compensated_mixing() {
+    let policy = FedAsyncStalenessDescriptorV1 {
+        base_alpha: 0.6,
+        max_staleness_rounds: 5,
+        polynomial_decay_exponent: 0.5,
+    };
+
+    // Zero staleness -> base_alpha
+    let alpha0 = policy.compute_mixing_alpha(10, 10).unwrap();
+    assert!((alpha0 - 0.6).abs() < 1e-6);
+
+    // Staleness tau = 3 -> 0.6 * (1 + 3)^(-0.5) = 0.6 * 0.5 = 0.3
+    let alpha3 = policy.compute_mixing_alpha(7, 10).unwrap();
+    assert!((alpha3 - 0.3).abs() < 1e-6);
+
+    // Hinge threshold tau_hinge = 2 at tau = 3 -> excess = 1 -> 0.6 * (1 + 1)^(-0.5) = 0.6 / sqrt(2)
+    let alpha_hinge = policy.compute_hinge_mixing_alpha(7, 10, 2).unwrap();
+    let expected_hinge = 0.6f32 / core::f32::consts::SQRT_2;
+    assert!((alpha_hinge - expected_hinge).abs() < 1e-6);
+
+    // Future round or exceeding max_staleness_rounds fails closed
+    assert_eq!(
+        policy.compute_mixing_alpha(11, 10).unwrap_err(),
+        Error::InvalidThreshold
+    );
+    assert_eq!(
+        policy.compute_mixing_alpha(4, 10).unwrap_err(),
+        Error::InvalidThreshold
+    );
+
+    // Drift-compensated mixing:
+    // Suppose w_base (at round 7) = [10.0, 20.0], w_current (at round 10) = [14.0, 28.0].
+    // Client trained from w_base and produced local weights w_local = [12.0, 24.0] => stale_delta = [2.0, 4.0].
+    // Exact FedAsync convex combination at alpha(3) = 0.3:
+    // w_new = (1 - 0.3) * w_current + 0.3 * (w_base + stale_delta)
+    //       = 0.7 * [14.0, 28.0] + 0.3 * [12.0, 24.0] = [13.4, 26.8].
+    // Notice naive uncompensated w_current + 0.3 * stale_delta would give [14.6, 29.2] (diverging!).
+    let w_base = [10.0f32, 20.0f32];
+    let w_current = [14.0f32, 28.0f32];
+    let stale_delta = [2.0f32, 4.0f32];
+
+    let outcome =
+        apply_fedasync_stale_delta_v1(&policy, 7, 10, &w_current, &w_base, &stale_delta, None)
+            .unwrap();
+    assert_eq!(outcome.staleness_rounds, 3);
+    assert!(!outcome.was_clipped);
+    assert!((outcome.updated_weights[0] - 13.4).abs() < 1e-5);
+    assert!((outcome.updated_weights[1] - 26.8).abs() < 1e-5);
+
+    // With pre-drift L2 norm clipping: ||[3.0, 4.0]||_2 = 5.0, clipped to tau = 2.5 => [1.5, 2.0].
+    let byz_delta = [3.0f32, 4.0f32];
+    let clipped =
+        apply_fedasync_stale_delta_v1(&policy, 7, 10, &w_current, &w_base, &byz_delta, Some(2.5))
+            .unwrap();
+    assert!(clipped.was_clipped);
+    assert!((clipped.raw_delta_l2_norm - 5.0).abs() < 1e-9);
+    assert!((clipped.clipped_delta_l2_norm - 2.5).abs() < 1e-9);
+    // w_base + d_clipped = [11.5, 22.0], 0.7 * [14, 28] + 0.3 * [11.5, 22.0] = [13.25, 26.2]
+    assert!((clipped.updated_weights[0] - 13.25).abs() < 1e-5);
+    assert!((clipped.updated_weights[1] - 26.2).abs() < 1e-5);
+}

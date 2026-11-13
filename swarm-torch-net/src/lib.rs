@@ -16,6 +16,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod carrier;
 pub mod chunked;
 pub mod gossip;
 pub mod protocol;
@@ -34,6 +35,7 @@ pub use mock::{MockNetworkHub, MockPeerTransport, Topology};
 
 /// Prelude for convenient imports
 pub mod prelude {
+    pub use crate::carrier::*;
     pub use crate::chunked::*;
     pub use crate::gossip::*;
     pub use crate::protocol::*;

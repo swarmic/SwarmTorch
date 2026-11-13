@@ -76,6 +76,11 @@ name = "swarm_torch_report"
 path = "src/bin/swarm_torch_report.rs"
 required-features = ["std"]
 
+[[bin]]
+name = "swarm_torch_mcp"
+path = "src/bin/swarm_torch_mcp.rs"
+required-features = ["std"]
+
 [[example]]
 name = "hello_swarm"
 required-features = ["std", "tokio-runtime"]

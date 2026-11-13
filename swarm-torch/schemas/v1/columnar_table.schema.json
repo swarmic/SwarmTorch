@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmtorch.dev/schemas/v1/columnar_table.schema.json",
+  "title": "SwarmTorch Columnar Table v1",
+  "description": "Canonical deterministic columnar table payload schema (P2-20b / stcl-json-v1).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "table_format",
+    "row_count",
+    "columns",
+    "rows"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "table_format": {
+      "type": "string",
+      "enum": ["stcl-json-v1"]
+    },
+    "row_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "columns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "dtype", "nullable"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "dtype": {
+            "type": "string",
+            "enum": ["i64", "f64", "bool", "utf8", "bytes_hex"]
+          },
+          "nullable": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            { "type": "integer" },
+            { "type": "number" },
+            { "type": "boolean" },
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "content_digest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

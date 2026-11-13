@@ -5,6 +5,31 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-13 (Wave 12)
+
+### Added
+- **Isolated Framework Bridges & LoRA / FLoRA Aggregation (`W12-01`, `ADR-0024` §4):**
+  - Added `BackendTensorBridge` and `BackendModelHandleV1` in `swarm-torch-models::backend_bridge`.
+  - Added `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models::lora`, integrated with `SwarmRoundCoordinator::aggregate_lora_cohort_round`.
+  - Added isolated `adapters/swarm-torch-backends` crate (`BurnModuleBridgeV1`, `CandleModuleBridgeV1`, excluded from root `Cargo.lock`).
+- **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4):**
+  - Added `QuicStreamHandshakePolicyV1`, `QuicLengthPrefixedCodecV1`, and `ZenohTopicContractV1` in `swarm-torch-net::carrier`.
+  - Added isolated `adapters/swarm-torch-transport-iroh` (`IrohCarrierAdapterV1`) and `adapters/swarm-torch-transport-zenoh` (`ZenohCarrierAdapterV1`) crates outside root `Cargo.lock`.
+- **Stale-Delta `FedAsync` & Durable Pre-Release RDP Accounting (`W12-03`, `ADR-0023` §4):**
+  - Added pure `no_std` IEEE-754 `exp_f64_soft`/`exp_f64`, `ln_f64_soft`/`ln_f64`, and `log_sum_exp_pair_f64` in `swarm-torch-core::num`.
+  - Added `FedAsyncStalenessDescriptorV1`, `StalenessWeightingPolicy`, `FedAsyncStaleMixOutcomeV1`, and `apply_fedasync_stale_delta_v1` in `swarm-torch-core::aggregation`.
+  - Added `RdpAccountantV1` (`DpMechanismProfileV1`, `DpUnitV1`, `DpAdjacencyV1`, `DpConversionFormulaV1`, `restore_from_orders`) in `swarm-torch-core::dp` and crash-idempotent `dp/ledger.ndjson` debits in `swarm-torch::artifacts::dp_ledger`, integrated into `SwarmRoundCoordinator` (`configure_dp_accountant`, `enable_fedasync`, `step_fedasync_stale_submission`, pre-release debit before checkpoint publication in `finalize_round`).
+- **Deterministic Wasm Sandbox, Columnar Data Runner, & Schema `P2-20b` (`W12-04`, `ADR-0025`):**
+  - Published `schemas/v1/columnar_table.schema.json` (mirrored byte-identically in `swarm-torch/schemas/v1/columnar_table.schema.json`) and registered `COLUMNAR_TABLE_SCHEMA_JSON` in `swarm-torch::artifacts::schema_check`.
+  - Added pure-Rust `#![forbid(unsafe_code)]` fuel/memory-limited `WasmSandboxRunnerV1` in `swarm-torch::wasm_sandbox` with pre-parse SHA-256 allowlists, WASI/host import rejection, `Start` section execution under limits, and checked `(ptr, len)` guest slice reads.
+  - Added `RunnerIsolationProfile::WasmSandboxedV1` enforcement in `swarm-torch::scheduler` (`execute_graph_with_isolation`) and schema-validated physical columnar/NDJSON execution (`ColumnarTableV1`, `PhysicalExecOutcomeV1`) in `NativeOpRunner::run_in_session`.
+- **Zero-Port Read-Only Strict MCP Inspector (`W12-05`, `ADR-0016`):**
+  - Added `McpInspectorServerV1` and the `swarm_torch_mcp` `stdio` JSON-RPC 2.0 binary (`swarm-torch::mcp_inspector`), requiring `TrustPolicy::Strict` verification on every request and serving 4 read-only `swarmtorch://runs/{run_id}/*` resources and 4 inspection/audit/prediction/DP-trace tools.
+  - Added isolated `adapters/swarm-torch-mcp` crate (`SwarmTorchMcpAdapterV1`).
+
+### Changed
+- Compacted public `ADRs.md` to concise normative contracts and moved whitepaper source bibliography (`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md`) and unabridged deliberations to `swarm-torch-planning`.
+
 ## [0.1.0] - 2026-11-10 (Release Candidate — Wave 11)
 
 ### Added

@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use swarm_torch::artifacts::schema_check::{
     parse_and_check_schema_meta, validate_json_bytes_against_schema,
-    validate_ndjson_bytes_against_schema, validate_verified_bundle_schemas, EVENT_SCHEMA_JSON,
-    GRAPH_SCHEMA_JSON, LINEAGE_SCHEMA_JSON, MANIFEST_SCHEMA_JSON, MATERIALIZATION_SCHEMA_JSON,
-    METRIC_SCHEMA_JSON, REGISTRY_SCHEMA_JSON, RUN_SCHEMA_JSON, SPAN_SCHEMA_JSON,
+    validate_ndjson_bytes_against_schema, validate_verified_bundle_schemas,
+    COLUMNAR_TABLE_SCHEMA_JSON, EVENT_SCHEMA_JSON, GRAPH_SCHEMA_JSON, LINEAGE_SCHEMA_JSON,
+    MANIFEST_SCHEMA_JSON, MATERIALIZATION_SCHEMA_JSON, METRIC_SCHEMA_JSON, REGISTRY_SCHEMA_JSON,
+    RUN_SCHEMA_JSON, SPAN_SCHEMA_JSON,
 };
 use swarm_torch::artifacts::{RunArtifactBundle, TrustPolicy};
 use swarm_torch_core::crypto::KeyPair;
@@ -50,6 +51,7 @@ fn all_nine_v1_schemas_have_valid_draft_2020_12_metadata() {
         ("event.schema.json", EVENT_SCHEMA_JSON),
         ("metric.schema.json", METRIC_SCHEMA_JSON),
         ("materialization.schema.json", MATERIALIZATION_SCHEMA_JSON),
+        ("columnar_table.schema.json", COLUMNAR_TABLE_SCHEMA_JSON),
     ];
 
     for (name, raw) in schemas {
@@ -301,6 +303,13 @@ fn schema_validator_rejects_negative_fixtures_across_contracts() {
     // 4. materialization.schema.json: unknown schema_version 99
     let bad_mat = br#"{"schema_version":99,"ts_unix_nanos":1,"asset_key":"k","fingerprint_v0":"a","node_id":"11111111111111111111111111111111","node_def_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unsafe_surface":false}"#;
     assert!(validate_ndjson_bytes_against_schema(bad_mat, MATERIALIZATION_SCHEMA_JSON).is_err());
+
+    // 5. columnar_table.schema.json: valid stcl-json-v1 instance vs invalid dtype / negative row_count
+    let good_col = br#"{"schema_version":1,"table_format":"stcl-json-v1","row_count":2,"columns":[{"name":"id","dtype":"i64","nullable":false},{"name":"score","dtype":"f64","nullable":true}],"rows":[[1,0.5],[2,null]]}"#;
+    validate_json_bytes_against_schema(good_col, COLUMNAR_TABLE_SCHEMA_JSON)
+        .expect("valid columnar_table.v1 instance must conform");
+    let bad_col = br#"{"schema_version":1,"table_format":"stcl-json-v1","row_count":-1,"columns":[{"name":"id","dtype":"complex128","nullable":false}],"rows":[]}"#;
+    assert!(validate_json_bytes_against_schema(bad_col, COLUMNAR_TABLE_SCHEMA_JSON).is_err());
 }
 
 #[test]
@@ -322,6 +331,7 @@ fn packaged_schemas_match_workspace_root_schemas() {
         ("event.schema.json", EVENT_SCHEMA_JSON),
         ("metric.schema.json", METRIC_SCHEMA_JSON),
         ("materialization.schema.json", MATERIALIZATION_SCHEMA_JSON),
+        ("columnar_table.schema.json", COLUMNAR_TABLE_SCHEMA_JSON),
     ];
 
     for (name, embedded) in schemas {

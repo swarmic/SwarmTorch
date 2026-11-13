@@ -51,102 +51,13 @@ impl std::error::Error for LossError {}
 /// Portable `f64` exponential (`std` intrinsics when available; IEEE-754 range-reduced polynomial in `no_std`).
 #[inline]
 pub(crate) fn exp_f64(x: f64) -> f64 {
-    #[cfg(feature = "std")]
-    {
-        x.exp()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        if x.is_nan() {
-            return f64::NAN;
-        }
-        if x >= 709.782_712_893_384 {
-            return f64::INFINITY;
-        }
-        if x <= -745.133_219_101_941_1 {
-            return 0.0;
-        }
-        const LN2_HI: f64 = 6.931_471_803_691_238e-1;
-        const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
-        const INV_LN2: f64 = 1.442_695_040_888_963_4;
-
-        let k_float = if x >= 0.0 {
-            (x * INV_LN2 + 0.5) as i64 as f64
-        } else {
-            (x * INV_LN2 - 0.5) as i64 as f64
-        };
-        let k = k_float as i64;
-        let r = (x - k_float * LN2_HI) - k_float * LN2_LO;
-
-        // Degree-11 Taylor expansion on |r| <= ln(2)/2 (~0.34657), accurate to < 1e-16.
-        let mut poly = 1.0 / 39_916_800.0;
-        poly = poly * r + 1.0 / 3_628_800.0;
-        poly = poly * r + 1.0 / 362_880.0;
-        poly = poly * r + 1.0 / 40_320.0;
-        poly = poly * r + 1.0 / 5_040.0;
-        poly = poly * r + 1.0 / 720.0;
-        poly = poly * r + 1.0 / 120.0;
-        poly = poly * r + 1.0 / 24.0;
-        poly = poly * r + 1.0 / 6.0;
-        poly = poly * r + 0.5;
-        poly = poly * r + 1.0;
-        let exp_r = poly * r + 1.0;
-
-        if k >= -1022 && k <= 1023 {
-            let scale = f64::from_bits(((1023 + k) as u64) << 52);
-            exp_r * scale
-        } else {
-            // Subnormal tail (-1074 <= k < -1022)
-            let scale1 = f64::from_bits(((1023 - 512) as u64) << 52);
-            let rem_k = (k + 512).clamp(-1022, 1023);
-            let scale2 = f64::from_bits(((1023 + rem_k) as u64) << 52);
-            (exp_r * scale1) * scale2
-        }
-    }
+    swarm_torch_core::num::exp_f64(x)
 }
 
 /// Portable `f64` natural logarithm (`std` intrinsics when available; IEEE-754 mantissa reduction in `no_std`).
 #[inline]
 pub(crate) fn ln_f64(x: f64) -> f64 {
-    #[cfg(feature = "std")]
-    {
-        x.ln()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        if x.is_nan() || x < 0.0 {
-            return f64::NAN;
-        }
-        if x == 0.0 {
-            return f64::NEG_INFINITY;
-        }
-        if x.is_infinite() {
-            return f64::INFINITY;
-        }
-        const LN2: f64 = core::f64::consts::LN_2;
-        const SQRT_HALF: f64 = core::f64::consts::FRAC_1_SQRT_2;
-
-        let bits = x.to_bits();
-        let mut exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
-        let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (1023u64 << 52));
-        if m < SQRT_HALF {
-            m *= 2.0;
-            exp -= 1;
-        }
-        let u = (m - 1.0) / (m + 1.0);
-        let u2 = u * u;
-        let mut series = 1.0 / 17.0;
-        series = series * u2 + 1.0 / 15.0;
-        series = series * u2 + 1.0 / 13.0;
-        series = series * u2 + 1.0 / 11.0;
-        series = series * u2 + 1.0 / 9.0;
-        series = series * u2 + 1.0 / 7.0;
-        series = series * u2 + 1.0 / 5.0;
-        series = series * u2 + 1.0 / 3.0;
-        series = series * u2 + 1.0;
-        let ln_m = 2.0 * u * series;
-        (exp as f64) * LN2 + ln_m
-    }
+    swarm_torch_core::num::ln_f64(x)
 }
 
 /// Mean Squared Error (MSE) loss (`ADR-0024` §2.2):

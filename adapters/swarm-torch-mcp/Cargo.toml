@@ -1,0 +1,13 @@
+[package]
+name = "swarm-torch-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MPL-2.0"
+publish = false
+description = "Isolated zero-port read-only strict MCP inspector adapter for SwarmTorch"
+
+[workspace]
+
+[dependencies]
+swarm-torch = { path = "../../swarm-torch", default-features = false, features = ["std"] }

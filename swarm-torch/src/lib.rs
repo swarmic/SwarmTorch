@@ -97,6 +97,14 @@ pub mod scheduler;
 #[cfg(feature = "std")]
 pub mod coordinator;
 
+/// Deterministic WebAssembly extension sandbox & fuel-metered runner (std-only).
+#[cfg(feature = "std")]
+pub mod wasm_sandbox;
+
+/// Zero-port read-only strict MCP inspector over stdio JSON-RPC 2.0 (std-only).
+#[cfg(feature = "std")]
+pub mod mcp_inspector;
+
 /// Prelude module for convenient imports
 ///
 /// ```rust,ignore

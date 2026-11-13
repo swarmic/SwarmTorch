@@ -1,0 +1,19 @@
+[package]
+name = "swarm-torch-backends"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MPL-2.0"
+publish = false
+description = "Isolated external DL framework adapter bridges (Burn / Candle) for SwarmTorch"
+
+[features]
+default = []
+burn = []
+candle = []
+
+[workspace]
+
+[dependencies]
+swarm-torch-core = { path = "../../swarm-torch-core" }
+swarm-torch-models = { path = "../../swarm-torch-models" }

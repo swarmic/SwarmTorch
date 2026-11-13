@@ -1,0 +1,14 @@
+[package]
+name = "swarm-torch-transport-zenoh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MPL-2.0"
+publish = false
+description = "Isolated Zenoh pub/sub topic contract carrier adapter for SwarmTorch"
+
+[workspace]
+
+[dependencies]
+swarm-torch-core = { path = "../../swarm-torch-core" }
+swarm-torch-net = { path = "../../swarm-torch-net" }

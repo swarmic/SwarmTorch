@@ -150,6 +150,10 @@ pub enum CryptoError {
     InvalidPublicKey,
     /// Signature verification failed.
     VerificationFailed,
+    /// Cumulative differential privacy $(\varepsilon, \delta)$ budget exhausted (`ADR-0023` §4.2).
+    PrivacyBudgetExhausted,
+    /// Invalid differential privacy hyperparameter ($\tau \le 0$, $\sigma \le 0$, $q \notin (0, 1]$, or $\delta \notin (0, 1)$).
+    InvalidPrivacyParameter,
 }
 
 impl core::fmt::Display for CryptoError {
@@ -159,6 +163,12 @@ impl core::fmt::Display for CryptoError {
             Self::InvalidSignatureEncoding => write!(f, "invalid signature encoding"),
             Self::InvalidPublicKey => write!(f, "invalid public key"),
             Self::VerificationFailed => write!(f, "signature verification failed"),
+            Self::PrivacyBudgetExhausted => {
+                write!(f, "differential privacy budget exhausted")
+            }
+            Self::InvalidPrivacyParameter => {
+                write!(f, "invalid differential privacy parameter")
+            }
         }
     }
 }
@@ -533,10 +543,11 @@ fn sqrt_f32(x: f32) -> f32 {
     crate::num::sqrt_f32(x)
 }
 
-/// Wave 12 (`W12-02`) extension descriptor for Rényi Differential Privacy (`RdpAccountant`)
+/// Wave 12 (`W12-03`) descriptor for Rényi Differential Privacy (`RdpAccountantV1`)
 /// composition coupled to explicit $\ell_2$ gradient clipping bounds (`CenteredClipping` /
 /// [`GradientValidator`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
 pub struct RdpBudgetDescriptorV1 {
     /// Rényi order $\alpha > 1.0$.
     pub alpha: f64,

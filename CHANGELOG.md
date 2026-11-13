@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `QuicStreamHandshakePolicyV1`, `QuicLengthPrefixedCodecV1`, and `ZenohTopicContractV1` in `swarm-torch-net::carrier`.
   - Added isolated `adapters/swarm-torch-transport-iroh` (`IrohCarrierAdapterV1`) and `adapters/swarm-torch-transport-zenoh` (`ZenohCarrierAdapterV1`) crates outside root `Cargo.lock`.
 - **Stale-Delta `FedAsync` & Durable Pre-Release RDP Accounting (`W12-03`, `ADR-0023` §4):**
-  - Added pure `no_std` IEEE-754 `exp_f64_soft`/`exp_f64`, `ln_f64_soft`/`ln_f64`, and `log_sum_exp_pair_f64` in `swarm-torch-core::num`.
+  - Added pure `no_std` IEEE-754 `abs_f64`/`abs_f32`, `exp_f64_soft`/`exp_f64`, `ln_f64_soft`/`ln_f64`, and `log_sum_exp_pair_f64` in `swarm-torch-core::num` (MSRV 1.75 compatible).
   - Added `FedAsyncStalenessDescriptorV1`, `StalenessWeightingPolicy`, `FedAsyncStaleMixOutcomeV1`, and `apply_fedasync_stale_delta_v1` in `swarm-torch-core::aggregation`.
   - Added `RdpAccountantV1` (`DpMechanismProfileV1`, `DpUnitV1`, `DpAdjacencyV1`, `DpConversionFormulaV1`, `restore_from_orders`) in `swarm-torch-core::dp` and crash-idempotent `dp/ledger.ndjson` debits in `swarm-torch::artifacts::dp_ledger`, integrated into `SwarmRoundCoordinator` (`configure_dp_accountant`, `enable_fedasync`, `step_fedasync_stale_submission`, pre-release debit before checkpoint publication in `finalize_round`).
 - **Deterministic Wasm Sandbox, Columnar Data Runner, & Schema `P2-20b` (`W12-04`, `ADR-0025`):**

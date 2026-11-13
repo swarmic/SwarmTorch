@@ -374,7 +374,9 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
                 if pair.descriptor.rank != r0 {
                     return Err(LoraError::HeterogeneousRankUnsupportedInMode);
                 }
-                if (pair.descriptor.alpha - alpha0).abs() > f32::EPSILON * alpha0.abs().max(1.0) {
+                if swarm_torch_core::num::abs_f32(pair.descriptor.alpha - alpha0)
+                    > f32::EPSILON * swarm_torch_core::num::abs_f32(alpha0).max(1.0)
+                {
                     // Reject conflicting alpha scaling inside FreezeASingleFactorV1 so no
                     // participant can amplify its contribution via arbitrary alpha_i inflation.
                     return Err(LoraError::CohortMismatch);
@@ -462,7 +464,9 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
             let r0 = first.descriptor.rank;
             let alpha0 = first.descriptor.alpha;
             for (_, pair) in submissions {
-                if pair.descriptor.rank != r0 || (pair.descriptor.alpha - alpha0).abs() > 1e-6 {
+                if pair.descriptor.rank != r0
+                    || swarm_torch_core::num::abs_f32(pair.descriptor.alpha - alpha0) > 1e-6
+                {
                     return Err(LoraError::HeterogeneousRankUnsupportedInMode);
                 }
             }

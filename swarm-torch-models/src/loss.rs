@@ -245,7 +245,7 @@ impl HuberLoss {
 
         for i in 0..n {
             let r = (predictions[i] as f64) - (targets[i] as f64);
-            let abs_r = r.abs();
+            let abs_r = swarm_torch_core::num::abs_f64(r);
             let (item_loss, item_grad) = if abs_r <= delta64 {
                 (0.5 * r * r, r * inv_n)
             } else {

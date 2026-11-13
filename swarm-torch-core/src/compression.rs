@@ -36,7 +36,7 @@ fn topk_priority_cmp(a: &(usize, f32), b: &(usize, f32)) -> core::cmp::Ordering 
     // Deterministic total order:
     // 1) descending |value| (largest first)
     // 2) ascending index (tie-breaker)
-    let abs_cmp = b.1.abs().total_cmp(&a.1.abs());
+    let abs_cmp = crate::num::abs_f32(b.1).total_cmp(&crate::num::abs_f32(a.1));
     if abs_cmp == core::cmp::Ordering::Equal {
         a.0.cmp(&b.0)
     } else {

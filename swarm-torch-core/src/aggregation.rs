@@ -738,7 +738,7 @@ pub fn bulyan_stage2_nearest_to_median(
         ranked.clear();
         for (idx, slice) in selected_updates.iter().enumerate() {
             let val = slice[coord];
-            let dist = ((val as f64) - median).abs();
+            let dist = crate::num::abs_f64((val as f64) - median);
             ranked.push((idx, val, dist));
         }
 

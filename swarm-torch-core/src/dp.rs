@@ -11,7 +11,7 @@
 //! - Fail-closed budget gating via [`PrivacyAccountantHook`].
 
 use crate::crypto::{CryptoError, PrivacyAccountantHook, RdpBudgetDescriptorV1};
-use crate::num::{ln_f64_soft, log_sum_exp_pair_f64};
+use crate::num::{abs_f64, ln_f64_soft, log_sum_exp_pair_f64};
 
 /// Number of Rényi divergence orders in [`RDP_ALPHA_GRID_V1`].
 pub const RDP_GRID_LEN: usize = 16;
@@ -403,7 +403,7 @@ impl RdpAccountantV1 {
 
         let opt_idx = RDP_ALPHA_GRID_V1
             .iter()
-            .position(|&a| (a - opt_alpha).abs() < 1e-12)
+            .position(|&a| abs_f64(a - opt_alpha) < 1e-12)
             .unwrap_or(0);
 
         let desc = RdpBudgetDescriptorV1 {
@@ -421,7 +421,7 @@ impl PrivacyAccountantHook for RdpAccountantV1 {
     fn current_budget(&self) -> RdpBudgetDescriptorV1 {
         let opt_idx = RDP_ALPHA_GRID_V1
             .iter()
-            .position(|&a| (a - self.last_optimal_alpha).abs() < 1e-12)
+            .position(|&a| abs_f64(a - self.last_optimal_alpha) < 1e-12)
             .unwrap_or(0);
         RdpBudgetDescriptorV1 {
             alpha: self.last_optimal_alpha,
@@ -471,14 +471,14 @@ mod tests {
         assert_eq!(acc.committed_rounds(), 4);
         let orders = acc.cumulative_rdp_orders();
         for (i, &alpha) in RDP_ALPHA_GRID_V1.iter().enumerate() {
-            assert!((orders[i] - 0.5 * alpha).abs() < 1e-12);
+            assert!(abs_f64(orders[i] - 0.5 * alpha) < 1e-12);
         }
 
         // At alpha = 6.0: rho(6) = 3.0, ln(1e5)/5 = 11.512925465 / 5 = 2.302585093 => eps = 5.302585093
         let (eps, delta, opt_alpha) = acc.current_approx_dp();
         assert_eq!(delta, 1e-5);
         assert_eq!(opt_alpha, 6.0);
-        assert!((eps - (3.0 + 11.512_925_464_970_229 / 5.0)).abs() < 1e-9);
+        assert!(abs_f64(eps - (3.0 + 11.512_925_464_970_229 / 5.0)) < 1e-9);
     }
 
     #[test]

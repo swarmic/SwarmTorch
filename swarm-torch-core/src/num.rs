@@ -1,10 +1,25 @@
 //! Deterministic, `no_std`-compatible floating-point math helpers.
 //!
-//! Under `no_std`, Rust `core` does not provide `f64::sqrt` or `f32::sqrt`.
-//! [`sqrt_f64`] and [`sqrt_f32`] provide IEEE-754 exponent-halving + Newton-Raphson
-//! implementations that preserve `+0.0`, `-0.0`, `+Inf`, and `NaN` semantics and achieve
-//! full 53-bit (`f64`) / 24-bit (`f32`) precision across the entire finite domain,
-//! including subnormals and `f64::MAX`.
+//! Under `no_std`, Rust `core` on MSRV 1.75 does not provide `f64::abs`, `f32::abs`,
+//! `f64::sqrt`, or `f32::sqrt`.
+//! [`abs_f64`], [`abs_f32`], [`sqrt_f64`], and [`sqrt_f32`] provide IEEE-754 bit-level
+//! and Newton-Raphson implementations that preserve `+0.0`, `-0.0`, `+Inf`, and `NaN`
+//! semantics and achieve full precision across the finite domain, including subnormals
+//! and `f64::MAX`.
+
+/// Computes $|x|$ for `f64` in both `std` and `no_std` builds without relying on
+/// `std`-only float methods on MSRV 1.75.
+#[inline]
+pub fn abs_f64(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff)
+}
+
+/// Computes $|x|$ for `f32` in both `std` and `no_std` builds without relying on
+/// `std`-only float methods on MSRV 1.75.
+#[inline]
+pub fn abs_f32(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0x7fff_ffff)
+}
 
 /// Software IEEE-754 square root over `f64` used under `no_std` and exposed for
 /// deterministic cross-target verification.
@@ -225,6 +240,23 @@ pub fn log_sum_exp_pair_f64(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abs_f64_and_abs_f32_preserve_ieee754_semantics() {
+        assert_eq!(abs_f64(-0.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(abs_f64(0.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(abs_f64(-3.5), 3.5);
+        assert_eq!(abs_f64(3.5), 3.5);
+        assert_eq!(abs_f64(f64::NEG_INFINITY), f64::INFINITY);
+        assert!(abs_f64(-f64::NAN).is_nan());
+
+        assert_eq!(abs_f32(-0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(abs_f32(0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(abs_f32(-2.25), 2.25);
+        assert_eq!(abs_f32(2.25), 2.25);
+        assert_eq!(abs_f32(f32::NEG_INFINITY), f32::INFINITY);
+        assert!(abs_f32(-f32::NAN).is_nan());
+    }
 
     #[test]
     fn sqrt_f64_soft_special_values_preserve_ieee754_semantics() {

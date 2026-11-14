@@ -3,7 +3,7 @@
 //! These traits define the fundamental abstractions used throughout SwarmTorch.
 
 #[cfg(feature = "alloc")]
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::crypto::CryptoError;
 use crate::Result;
@@ -72,6 +72,31 @@ pub trait UpdateTransform: Send + Sync {
     }
 }
 
+/// Schema version for [`OptimizerStateSnapshotV1`].
+#[cfg(feature = "alloc")]
+pub const OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1: u32 = 1;
+
+/// Canonical serialized optimizer state snapshot for transactional checkpointing and resume
+/// (`ADR-0023` §2.2, `ST-04`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OptimizerStateSnapshotV1 {
+    /// Schema version (`1`).
+    pub schema_version: u32,
+    /// Stable optimizer implementation identifier (e.g., `"swarmtorch.sgd.v1"`).
+    pub optimizer_kind: String,
+    /// Learning rate hyperparameter $\eta > 0$.
+    pub learning_rate: f32,
+    /// Momentum factor $\beta \in [0, 1)$.
+    pub momentum: f32,
+    /// Weight decay coefficient $\lambda \ge 0$.
+    pub weight_decay: f32,
+    /// Active velocity / first-moment buffer.
+    pub velocity: Vec<f32>,
+    /// Optional opaque extension state for custom optimizers.
+    pub custom_state: Vec<u8>,
+}
+
 /// An optimizer that can be used in swarm learning
 pub trait SwarmOptimizer: Send + Sync {
     /// Model type this optimizer updates (unconstrained `Input`/`Output` per ADR-0024).
@@ -91,6 +116,45 @@ pub trait SwarmOptimizer: Send + Sync {
 
     /// Set the learning rate
     fn set_learning_rate(&mut self, lr: f32);
+
+    /// Export canonical optimizer state for durable checkpointing (`ST-04`).
+    #[cfg(feature = "alloc")]
+    fn snapshot_state(&self) -> Result<Option<OptimizerStateSnapshotV1>> {
+        let lr = self.learning_rate();
+        if !lr.is_finite() || lr <= 0.0 {
+            return Err(crate::Error::InvalidThreshold);
+        }
+        Ok(Some(OptimizerStateSnapshotV1 {
+            schema_version: OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1,
+            optimizer_kind: String::from("swarmtorch.generic_lr_only.v1"),
+            learning_rate: lr,
+            momentum: 0.0,
+            weight_decay: 0.0,
+            velocity: Vec::new(),
+            custom_state: Vec::new(),
+        }))
+    }
+
+    /// Restore optimizer state from a verified snapshot (`ST-04`), failing closed if the snapshot
+    /// schema, optimizer kind, bounds, or finiteness checks fail.
+    #[cfg(feature = "alloc")]
+    fn restore_state(&mut self, snapshot: &OptimizerStateSnapshotV1) -> Result<()> {
+        if snapshot.schema_version != OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1 {
+            return Err(crate::Error::Serialization);
+        }
+        if snapshot.optimizer_kind != "swarmtorch.generic_lr_only.v1"
+            || !snapshot.learning_rate.is_finite()
+            || snapshot.learning_rate <= 0.0
+            || !snapshot.momentum.is_finite()
+            || !snapshot.weight_decay.is_finite()
+            || !snapshot.velocity.is_empty()
+            || !snapshot.custom_state.is_empty()
+        {
+            return Err(crate::Error::VerificationFailed);
+        }
+        self.set_learning_rate(snapshot.learning_rate);
+        Ok(())
+    }
 }
 
 /// A fitness function for swarm optimization
@@ -243,6 +307,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct DummyOptimizer;
 
     impl SwarmOptimizer for DummyOptimizer {

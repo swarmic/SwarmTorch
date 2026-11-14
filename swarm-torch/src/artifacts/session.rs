@@ -92,6 +92,8 @@ pub struct DataOpsSession {
     dataops_write_count: u64,
     /// Transform audits to attach to the next materialization record(s).
     pending_transform_audits: Vec<TransformAuditV0>,
+    /// Latest recorded physical `(rows, bytes)` keyed by `(asset_key, fingerprint_v0)`.
+    cached_output_metrics: BTreeMap<(String, String), (Option<u64>, Option<u64>)>,
 }
 
 impl DataOpsSession {
@@ -112,6 +114,7 @@ impl DataOpsSession {
             next_snapshot_pair_seq: 1,
             dataops_write_count: 0,
             pending_transform_audits: Vec::new(),
+            cached_output_metrics: BTreeMap::new(),
         }
     }
 
@@ -193,12 +196,21 @@ impl DataOpsSession {
 
         let mat_path = datasets_dir.join("materializations.ndjson");
         let mut max_seq = 0u64;
+        let mut cached_output_metrics = BTreeMap::new();
         if mat_path.exists() {
             let bytes = read_bytes_bounded(&mat_path, MAX_SINGLE_ARTIFACT_BYTES)?;
             let rows: Vec<MaterializationRecordCompat> =
                 parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let v2 = row.into_v2();
+                if v2.status == MaterializationStatusV0::Ok
+                    && (v2.rows.is_some() || v2.bytes.is_some())
+                {
+                    cached_output_metrics.insert(
+                        (v2.asset_key.clone(), v2.fingerprint_v0.clone()),
+                        (v2.rows, v2.bytes),
+                    );
+                }
                 let seq = if v2.record_seq == 0 {
                     (idx as u64) + 1
                 } else {
@@ -229,6 +241,7 @@ impl DataOpsSession {
             next_snapshot_pair_seq,
             dataops_write_count: 0,
             pending_transform_audits: Vec::new(),
+            cached_output_metrics,
         })
     }
 
@@ -266,6 +279,14 @@ impl DataOpsSession {
     /// These audits are attached to the next `materialize_node_outputs` call and then cleared.
     pub fn record_transform_applied(&mut self, audit: &TransformAuditV0) {
         self.pending_transform_audits.push(audit.clone());
+    }
+
+    pub(crate) fn pending_transform_audit_len(&self) -> usize {
+        self.pending_transform_audits.len()
+    }
+
+    pub(crate) fn truncate_pending_transform_audits(&mut self, len: usize) {
+        self.pending_transform_audits.truncate(len);
     }
 
     /// Look up fingerprint (64-char hex) for an asset_key.
@@ -519,14 +540,26 @@ impl DataOpsSession {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let fp_hex = hex_lower(&dataset_fp);
 
-            // Preserve existing source descriptor if this is a verified cache hit on the same fingerprint.
-            let preserved_source = self.registry.get(&output.asset_key).and_then(|existing| {
-                if existing.fingerprint_v0 == fp_hex {
-                    existing.source.clone()
-                } else {
-                    None
-                }
-            });
+            // Preserve existing source descriptor, schema, and physical metrics on verified cache hits.
+            let existing_same_fp = self
+                .registry
+                .get(&output.asset_key)
+                .filter(|existing| existing.fingerprint_v0 == fp_hex);
+            let preserved_source = existing_same_fp.and_then(|existing| existing.source.clone());
+            let preserved_schema = output
+                .schema
+                .clone()
+                .or_else(|| existing_same_fp.and_then(|existing| existing.schema.clone()));
+            let (cached_rows, cached_bytes) = if cache_decision == CacheDecisionV0::Hit {
+                self.cached_output_metrics
+                    .get(&(output.asset_key.clone(), fp_hex.clone()))
+                    .copied()
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            let effective_rows = output.rows.or(cached_rows);
+            let effective_bytes = output.bytes.or(cached_bytes);
 
             let entry = DatasetEntryV1 {
                 asset_key: output.asset_key.clone(),
@@ -536,7 +569,7 @@ impl DataOpsSession {
                 recipe_hash_v0: hex_lower(&recipe),
                 trust: output_trust,
                 source: preserved_source,
-                schema: output.schema.clone(),
+                schema: preserved_schema,
                 license_flags: Vec::new(),
                 pii_tags: Vec::new(),
             };
@@ -568,8 +601,8 @@ impl DataOpsSession {
                 op_type: node.op_type.clone(),
                 input_asset_keys: input_asset_keys.clone(),
                 input_fingerprints_v0: input_fingerprints_v0.clone(),
-                rows: output.rows,
-                bytes: output.bytes,
+                rows: effective_rows,
+                bytes: effective_bytes,
                 cache_decision,
                 cache_reason: None,
                 cache_key_v0: Some(cache_key.clone()),
@@ -596,6 +629,14 @@ impl DataOpsSession {
             self.sink.append_materialization_v2(mat)?;
         }
 
+        for mat in &staged_materializations {
+            if mat.rows.is_some() || mat.bytes.is_some() {
+                self.cached_output_metrics.insert(
+                    (mat.asset_key.clone(), mat.fingerprint_v0.clone()),
+                    (mat.rows, mat.bytes),
+                );
+            }
+        }
         for entry in staged_entries {
             self.registry.insert(entry.asset_key.clone(), entry);
         }
@@ -904,42 +945,70 @@ impl DataOpsSession {
             .unwrap_or(false)
     }
 
+    /// Return the declared `content_type` for `asset_key` if registered with a [`SourceDescriptorV0`].
+    pub fn asset_content_type(&self, asset_key: &str) -> Option<&str> {
+        self.registry
+            .get(asset_key)
+            .and_then(|entry| entry.source.as_ref())
+            .map(|source| source.content_type.as_str())
+    }
+
+    /// Return cached schema, row count, and byte count for a registered `asset_key`.
+    pub fn cached_output_spec(&self, asset_key: &str) -> Option<OutputSpec> {
+        let entry = self.registry.get(asset_key)?;
+        let (rows, bytes) = self
+            .cached_output_metrics
+            .get(&(asset_key.to_string(), entry.fingerprint_v0.clone()))
+            .copied()
+            .unwrap_or((None, None));
+        Some(OutputSpec {
+            asset_key: asset_key.to_string(),
+            schema: entry.schema.clone(),
+            rows,
+            bytes,
+        })
+    }
+
     /// Evaluate whether `node` can reuse all of its declared `outputs` from cache
     /// (`ADR-0023` §2.3, `W10-01`).
     ///
     /// - Respects [`CachePolicyV0::Bypass`] by returning [`CacheDecisionV0::Bypass`].
     /// - Requires `node.outputs` to be non-empty and every predicted output to match the current
     ///   registry entry's `fingerprint_v0`.
-    /// - If a registered asset has a `cas://sha256/...` or `blobs/sha256/...` URI in its
-    ///   [`SourceDescriptorV0`], verifies that the physical CAS blob exists on disk and its
-    ///   SHA-256 matches before returning [`CacheDecisionV0::Hit`].
-    pub fn verify_cache_hit(&self, node: &NodeV1, outputs: &[OutputSpecCore]) -> CacheDecisionV0 {
+    /// - Returns `Ok(CacheDecisionV0::Miss)` when no matching cached output is registered.
+    /// - When a recorded cache entry matches the predicted fingerprint and binds a
+    ///   `cas://sha256/...` or `blobs/sha256/...` URI, verifies that the physical CAS blob exists
+    ///   and its SHA-256 matches, returning `Err(io::Error)` on missing/corrupt CAS integrity failure
+    ///   instead of silently downgrading to `Miss`.
+    pub fn verify_cache_hit(
+        &self,
+        node: &NodeV1,
+        outputs: &[OutputSpecCore],
+    ) -> io::Result<CacheDecisionV0> {
         if matches!(node.cache_policy, Some(CachePolicyV0::Bypass)) {
-            return CacheDecisionV0::Bypass;
+            return Ok(CacheDecisionV0::Bypass);
         }
         if outputs.is_empty() {
-            return CacheDecisionV0::Miss;
+            return Ok(CacheDecisionV0::Miss);
         }
         let Ok(predicted) = self.predict(node, outputs) else {
-            return CacheDecisionV0::Miss;
+            return Ok(CacheDecisionV0::Miss);
         };
         let run_dir = self.sink.bundle().run_dir();
         for pred in &predicted {
             let Some(entry) = self.registry.get(&pred.asset_key) else {
-                return CacheDecisionV0::Miss;
+                return Ok(CacheDecisionV0::Miss);
             };
             if entry.fingerprint_v0 != pred.fingerprint_v0 {
-                return CacheDecisionV0::Miss;
+                return Ok(CacheDecisionV0::Miss);
             }
             if let Some(ref src) = entry.source {
-                if parse_cas_uri_digest(&src.uri).is_some()
-                    && verify_cas_uri_exists(run_dir, &src.uri, None).is_err()
-                {
-                    return CacheDecisionV0::Miss;
+                if parse_cas_uri_digest(&src.uri).is_some() {
+                    verify_cas_uri_exists(run_dir, &src.uri, None)?;
                 }
             }
         }
-        CacheDecisionV0::Hit
+        Ok(CacheDecisionV0::Hit)
     }
 
     #[cfg(test)]

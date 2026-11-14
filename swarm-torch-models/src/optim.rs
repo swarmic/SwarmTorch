@@ -4,6 +4,8 @@
 //! regularization, and transactional parameter updates over any [`SwarmModel`].
 
 use core::marker::PhantomData;
+#[cfg(feature = "alloc")]
+use swarm_torch_core::traits::{OptimizerStateSnapshotV1, OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1};
 use swarm_torch_core::traits::{SwarmModel, SwarmOptimizer};
 
 /// Error returned by [`SgdOptimizer`].
@@ -189,6 +191,78 @@ impl<M: SwarmModel, const MAX_PARAMS: usize> SwarmOptimizer for SgdOptimizer<M, 
             self.learning_rate = lr;
         }
     }
+
+    #[cfg(feature = "alloc")]
+    fn snapshot_state(&self) -> swarm_torch_core::Result<Option<OptimizerStateSnapshotV1>> {
+        if !self.learning_rate.is_finite() || self.learning_rate <= 0.0 {
+            return Err(swarm_torch_core::Error::InvalidThreshold);
+        }
+        if !self.momentum.is_finite() || !(0.0..1.0).contains(&self.momentum) {
+            return Err(swarm_torch_core::Error::InvalidThreshold);
+        }
+        if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
+            return Err(swarm_torch_core::Error::InvalidThreshold);
+        }
+        if self.velocity_len > MAX_PARAMS {
+            return Err(swarm_torch_core::Error::InvalidGradient);
+        }
+        let mut velocity = alloc::vec::Vec::with_capacity(self.velocity_len);
+        for &v in &self.velocity[..self.velocity_len] {
+            if !v.is_finite() {
+                return Err(swarm_torch_core::Error::NanDetected);
+            }
+            velocity.push(v);
+        }
+        Ok(Some(OptimizerStateSnapshotV1 {
+            schema_version: OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1,
+            optimizer_kind: alloc::string::String::from("swarmtorch.sgd.v1"),
+            learning_rate: self.learning_rate,
+            momentum: self.momentum,
+            weight_decay: self.weight_decay,
+            velocity,
+            custom_state: alloc::vec::Vec::new(),
+        }))
+    }
+
+    #[cfg(feature = "alloc")]
+    fn restore_state(
+        &mut self,
+        snapshot: &OptimizerStateSnapshotV1,
+    ) -> swarm_torch_core::Result<()> {
+        if snapshot.schema_version != OPTIMIZER_STATE_SNAPSHOT_SCHEMA_V1 {
+            return Err(swarm_torch_core::Error::Serialization);
+        }
+        if snapshot.optimizer_kind != "swarmtorch.sgd.v1" || !snapshot.custom_state.is_empty() {
+            return Err(swarm_torch_core::Error::VerificationFailed);
+        }
+        if !snapshot.learning_rate.is_finite()
+            || snapshot.learning_rate <= 0.0
+            || !snapshot.momentum.is_finite()
+            || !(0.0..1.0).contains(&snapshot.momentum)
+            || !snapshot.weight_decay.is_finite()
+            || snapshot.weight_decay < 0.0
+        {
+            return Err(swarm_torch_core::Error::InvalidThreshold);
+        }
+        if snapshot.velocity.len() > MAX_PARAMS {
+            return Err(swarm_torch_core::Error::ResourceExhausted);
+        }
+        for &v in &snapshot.velocity {
+            if !v.is_finite() {
+                return Err(swarm_torch_core::Error::NanDetected);
+            }
+        }
+        // All validation passed; atomically apply restored optimizer state.
+        self.learning_rate = snapshot.learning_rate;
+        self.momentum = snapshot.momentum;
+        self.weight_decay = snapshot.weight_decay;
+        for slot in self.velocity.iter_mut() {
+            *slot = 0.0;
+        }
+        self.velocity[..snapshot.velocity.len()].copy_from_slice(&snapshot.velocity);
+        self.velocity_len = snapshot.velocity.len();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +321,42 @@ mod tests {
             Err(OptimError::NonFiniteGradient)
         );
         assert_eq!(model.parameters(), &snapshot[..]);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn sgd_optimizer_snapshot_restore_preserves_momentum_and_rejects_corrupt_state() {
+        let mut model_live = LinearModel::new(2, 1).unwrap().with_random_init(17);
+        let mut opt_live =
+            SgdOptimizer::<LinearModel, 8>::with_hyperparams(0.05, 0.9, 1e-4).unwrap();
+        opt_live.step(&mut model_live, &[0.4, -0.3, 0.2]).unwrap();
+        let snap = opt_live.snapshot_state().unwrap().expect("sgd snapshot");
+        assert_eq!(snap.optimizer_kind, "swarmtorch.sgd.v1");
+        assert_eq!(snap.velocity.len(), 3);
+
+        // Restoring into a fresh optimizer produces bit-for-bit identical next step.
+        let mut model_restored = model_live.clone();
+        let mut opt_restored = SgdOptimizer::<LinearModel, 8>::new(0.9).unwrap();
+        opt_restored.restore_state(&snap).unwrap();
+        opt_live
+            .step(&mut model_live, &[-0.1, 0.25, -0.05])
+            .unwrap();
+        opt_restored
+            .step(&mut model_restored, &[-0.1, 0.25, -0.05])
+            .unwrap();
+        assert_eq!(model_restored.parameters(), model_live.parameters());
+        assert_eq!(opt_restored.velocity(), opt_live.velocity());
+
+        // Fail closed without mutating existing optimizer state when kind/NaN/bounds are invalid.
+        let vel_before = opt_restored.velocity().to_vec();
+        let mut bad_kind = snap.clone();
+        bad_kind.optimizer_kind = alloc::string::String::from("wrong.kind");
+        assert!(opt_restored.restore_state(&bad_kind).is_err());
+        assert_eq!(opt_restored.velocity(), &vel_before[..]);
+
+        let mut nan_vel = snap.clone();
+        nan_vel.velocity[0] = f32::NAN;
+        assert!(opt_restored.restore_state(&nan_vel).is_err());
+        assert_eq!(opt_restored.velocity(), &vel_before[..]);
     }
 }

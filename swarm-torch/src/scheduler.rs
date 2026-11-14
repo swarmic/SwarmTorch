@@ -19,7 +19,7 @@ use swarm_torch_core::run_graph::{
 };
 
 use crate::artifacts::{parse_cas_uri_digest, DataOpsSession, OutputSpec};
-use crate::native_runner::{ExecutionContext, NativeOpRunner};
+use crate::native_runner::{ExecutionContext, NativeOpRunner, CONTENT_TYPE_OCTET_STREAM};
 
 #[derive(Debug)]
 pub enum SchedulerError {
@@ -349,8 +349,38 @@ pub fn execute_graph_with_isolation(
             })
             .collect();
 
-        let cache_decision = session.verify_cache_hit(&node, &core_specs);
+        let cache_decision = match session.verify_cache_hit(&node, &core_specs) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let finished = (clock_nanos)();
+                let error_code = format!("cache_integrity_error:{error}");
+                session.record_node_error(&node, finished, 0, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    finished,
+                    "scheduler/node_failed",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
+        };
         if cache_decision == CacheDecisionV0::Hit {
+            for spec in &mut output_specs {
+                if let Some(cached) = session.cached_output_spec(&spec.asset_key) {
+                    if spec.schema.is_none() {
+                        spec.schema = cached.schema;
+                    }
+                    if spec.rows.is_none() {
+                        spec.rows = cached.rows;
+                    }
+                    if spec.bytes.is_none() {
+                        spec.bytes = cached.bytes;
+                    }
+                }
+            }
             let finished = (clock_nanos)();
             if let Err(error) = session.materialize_node_outputs(
                 &node,
@@ -475,14 +505,21 @@ pub fn execute_graph_with_isolation(
             }
         };
 
+        let mut input_content_types = BTreeMap::new();
+        for input in &node.inputs {
+            if let Some(ct) = session.asset_content_type(&input.asset_key) {
+                input_content_types.insert(input.asset_key.clone(), ct.to_string());
+            }
+        }
         let run_dir = session.sink().bundle().run_dir().to_path_buf();
-        let runner_result = runner.run_in_session(
+        let runner_result = runner.run_in_session_with_content_types(
             &context,
             &run_dir,
             &node,
             &inputs,
             session.sink().as_ref(),
             wasm_arg,
+            &input_content_types,
         );
         let finished = (clock_nanos)();
         let duration_ms = finished.saturating_sub(started) / 1_000_000;
@@ -540,7 +577,8 @@ pub fn execute_graph_with_isolation(
             continue;
         }
 
-        // Preserve any verified CAS URI returned by the runner on declared outputs.
+        // Preserve verified CAS URI + canonical content_type returned by the runner on declared outputs.
+        let output_content_types = exec_outcome.output_content_types;
         for instance in &runner_instances {
             if let Some(ref uri) = instance.uri {
                 if parse_cas_uri_digest(uri).is_some()
@@ -549,11 +587,11 @@ pub fn execute_graph_with_isolation(
                         .iter()
                         .any(|declared| declared.asset_key == instance.asset_key)
                 {
-                    session.bind_output_cas_uri(
-                        &instance.asset_key,
-                        uri,
-                        "application/octet-stream",
-                    )?;
+                    let out_ct = output_content_types
+                        .get(&instance.asset_key)
+                        .map(String::as_str)
+                        .unwrap_or(CONTENT_TYPE_OCTET_STREAM);
+                    session.bind_output_cas_uri(&instance.asset_key, uri, out_ct)?;
                 }
             }
         }
@@ -621,6 +659,10 @@ mod tests {
     };
 
     use crate::artifacts::{RunArtifactBundle, RunArtifactSink};
+    use crate::native_runner::{
+        ColumnDtypeV1, ColumnSchemaV1, ColumnarTableV1, RunnerExecutionModeV1,
+        CONTENT_TYPE_COLUMNAR_JSON_V1, CONTENT_TYPE_NDJSON,
+    };
     use crate::report::load_report;
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -869,7 +911,7 @@ mod tests {
         let report = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests),
             &PermissivePolicy,
             RunId::from_bytes([0x11; 16]),
             test_clock,
@@ -905,11 +947,13 @@ mod tests {
             edges: vec![],
         };
 
+        let test_runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
+
         // First run: CacheDecisionV0::Miss
         let r1 = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &test_runner,
             &PermissivePolicy,
             RunId::from_bytes([0x12; 16]),
             test_clock,
@@ -935,7 +979,7 @@ mod tests {
         let r2 = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &test_runner,
             &PermissivePolicy,
             RunId::from_bytes([0x12; 16]),
             test_clock,
@@ -943,7 +987,7 @@ mod tests {
         .unwrap();
         assert_eq!(r2.cached_nodes, vec!["node/cacheable"]);
 
-        // Delete the physical CAS blob on disk -> must invalidate cache hit and force Miss!
+        // Delete the physical CAS blob on disk -> explicit integrity failure, NEVER silent Miss!
         let blob_path = session
             .sink()
             .bundle()
@@ -953,19 +997,32 @@ mod tests {
             .join(digest.to_hex());
         fs::remove_file(&blob_path).unwrap();
 
+        let direct_err = session
+            .verify_cache_hit(
+                &node,
+                &[OutputSpecCore {
+                    asset_key: "dataset://ns/cached_out".to_string(),
+                    schema: None,
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(direct_err.kind(), io::ErrorKind::NotFound);
+
         let r3 = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &test_runner,
             &PermissivePolicy,
             RunId::from_bytes([0x12; 16]),
             test_clock,
         )
         .unwrap();
+        assert!(r3.cached_nodes.is_empty());
         assert!(
-            r3.cached_nodes.is_empty(),
-            "deleting physical CAS blob must force CacheDecisionV0::Miss"
+            r3.executed_nodes.is_empty(),
+            "deleting physical CAS blob must fail closed rather than silently re-executing"
         );
+        assert_eq!(r3.failed_nodes, vec!["node/cacheable"]);
 
         // CachePolicyV0::Bypass -> must force CacheDecisionV0::Bypass even when fingerprint matches!
         let mut bypass_node = node;
@@ -979,7 +1036,7 @@ mod tests {
         let r4 = execute_graph_sequential(
             &bypass_graph,
             &mut session,
-            &NativeOpRunner,
+            &test_runner,
             &PermissivePolicy,
             RunId::from_bytes([0x12; 16]),
             test_clock,
@@ -999,9 +1056,13 @@ mod tests {
             CacheDecisionV0::Hit
         );
         assert_eq!(
-            loaded.materializations[2].cache_decision,
-            CacheDecisionV0::Miss
+            loaded.materializations[2].status,
+            MaterializationStatusV0::Error
         );
+        assert!(loaded.materializations[2]
+            .error_code
+            .as_deref()
+            .is_some_and(|code| code.starts_with("cache_integrity_error:")));
         assert_eq!(
             loaded.materializations[3].cache_decision,
             CacheDecisionV0::Bypass
@@ -1032,7 +1093,7 @@ mod tests {
         let report = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::new(),
             &CoreOnlyPolicy,
             RunId::from_bytes([0x22; 16]),
             test_clock,
@@ -1088,7 +1149,7 @@ mod tests {
         let report = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::new(),
             &PermissivePolicy,
             RunId::from_bytes([0x33; 16]),
             test_clock,
@@ -1137,7 +1198,7 @@ mod tests {
         let report = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests),
             &PermissivePolicy,
             RunId::from_bytes([0x55; 16]),
             test_clock,
@@ -1192,7 +1253,7 @@ mod tests {
         let report = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests),
             &PermissivePolicy,
             RunId::from_bytes([0x66; 16]),
             test_clock,
@@ -1297,7 +1358,7 @@ mod tests {
         let r_denied = execute_graph_sequential(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::new(),
             &PermissivePolicy,
             RunId::from_bytes([0x67; 16]),
             test_clock,
@@ -1312,7 +1373,7 @@ mod tests {
         let r_blocked = execute_graph_with_isolation(
             &graph,
             &mut session,
-            &NativeOpRunner,
+            &NativeOpRunner::new(),
             &PermissivePolicy,
             &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
             Some(&registry),
@@ -1323,6 +1384,265 @@ mod tests {
         assert_eq!(r_blocked.failed_nodes, vec!["node/wasm_op"]);
         assert!(r_blocked.executed_nodes.is_empty());
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st10_scheduler_physical_strict_dag_propagates_formats_metrics_and_reopen_cache_hits() {
+        use sha2::{Digest, Sha256};
+        use swarm_torch_core::run_graph::CanonValue;
+
+        use crate::artifacts::{
+            hex_lower, write_once_cas_blob, ArtifactWriteProfile, LockAcquisitionPolicy,
+        };
+
+        let base = temp_dir("st10_physical_dag");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([0x7A; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let cols = vec![
+            ColumnSchemaV1 {
+                name: "id".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            },
+            ColumnSchemaV1 {
+                name: "score".to_string(),
+                dtype: ColumnDtypeV1::F64,
+                nullable: false,
+            },
+        ];
+        let tbl1 = ColumnarTableV1::try_new(
+            cols.clone(),
+            vec![
+                vec![serde_json::Value::from(1), serde_json::Value::from(0.9)],
+                vec![serde_json::Value::from(2), serde_json::Value::from(0.2)],
+                vec![serde_json::Value::from(3), serde_json::Value::from(0.85)],
+            ],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+        let tbl2 = ColumnarTableV1::try_new(
+            cols,
+            vec![vec![
+                serde_json::Value::from(4),
+                serde_json::Value::from(0.95),
+            ]],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let sha1: [u8; 32] = Sha256::digest(&tbl1).into();
+        let sha2: [u8; 32] = Sha256::digest(&tbl2).into();
+        write_once_cas_blob(&run_dir, &sha1, &tbl1).unwrap();
+        write_once_cas_blob(&run_dir, &sha2, &tbl2).unwrap();
+
+        let ingest = make_node("ingest/shards", "ingest", &[], &[], ExecutionTrust::Core);
+        session
+            .register_source(
+                "dataset://ns/shard1",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&sha1)),
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: Some("v1".to_string()),
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+        session
+            .register_source(
+                "dataset://ns/shard2",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&sha2)),
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: Some("v1".to_string()),
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let mut filter_node = make_node(
+            "node/filter",
+            "filter_rows",
+            &["dataset://ns/shard1"],
+            &["dataset://ns/filtered"],
+            ExecutionTrust::Core,
+        );
+        filter_node
+            .params
+            .insert("column".to_string(), CanonValue::Str("score".to_string()));
+        filter_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        filter_node
+            .params
+            .insert("value".to_string(), CanonValue::Str("0.8".to_string()));
+        let union_node = make_node(
+            "node/union",
+            "union",
+            &["dataset://ns/filtered", "dataset://ns/shard2"],
+            &["dataset://ns/merged"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("st10-physical".to_string()),
+            nodes: vec![filter_node.clone(), union_node.clone()],
+            edges: vec![EdgeV1 {
+                from_node_id: node_id_from_key(&filter_node.node_key),
+                to_node_id: node_id_from_key(&union_node.node_key),
+                asset_key: Some("dataset://ns/filtered".to_string()),
+            }],
+        };
+
+        // Run 1 with default PhysicalStrict NativeOpRunner::new(): filter -> union end-to-end!
+        let r1 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert!(r1.failed_nodes.is_empty(), "{:?}", r1.failed_nodes);
+        assert_eq!(r1.executed_nodes, vec!["node/filter", "node/union"]);
+        assert!(r1.cached_nodes.is_empty());
+        assert_eq!(
+            session.asset_content_type("dataset://ns/filtered"),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
+        assert_eq!(
+            session.asset_content_type("dataset://ns/merged"),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
+
+        session.finalize().unwrap();
+        let r1_merged = load_report(&run_dir)
+            .unwrap()
+            .materializations
+            .into_iter()
+            .find(|m| m.asset_key == "dataset://ns/merged")
+            .unwrap();
+        assert_eq!(r1_merged.rows, Some(3));
+        assert!(r1_merged.bytes.unwrap() > 0);
+
+        // Close and reopen session -> Run 2 must hit cache and preserve CAS URI, content_type, rows, bytes!
+        drop(session);
+        let mut reopened = DataOpsSession::open(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let r2 = execute_graph_sequential(
+            &graph,
+            &mut reopened,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert!(r2.failed_nodes.is_empty());
+        assert_eq!(r2.cached_nodes, vec!["node/filter", "node/union"]);
+        assert_eq!(
+            reopened.asset_content_type("dataset://ns/merged"),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
+
+        reopened.finalize().unwrap();
+        let hit_merged = load_report(&run_dir)
+            .unwrap()
+            .materializations
+            .into_iter()
+            .rfind(|m| m.asset_key == "dataset://ns/merged")
+            .unwrap();
+        assert_eq!(hit_merged.cache_decision, CacheDecisionV0::Hit);
+        assert_eq!(hit_merged.rows, r1_merged.rows);
+        assert_eq!(hit_merged.bytes, r1_merged.bytes);
+
+        // Also test NDJSON DAG (`{...}\n` rows) end-to-end through PhysicalStrict scheduler
+        let nd_bytes = b"{\"id\":10,\"score\":0.9}\n{\"id\":11,\"score\":0.1}\n";
+        let sha_nd: [u8; 32] = Sha256::digest(nd_bytes).into();
+        write_once_cas_blob(&run_dir, &sha_nd, nd_bytes).unwrap();
+        reopened
+            .register_source(
+                "dataset://ns/nd_raw",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&sha_nd)),
+                    content_type: CONTENT_TYPE_NDJSON.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: Some("v1".to_string()),
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+        let mut nd_filter = make_node(
+            "node/nd_filter",
+            "filter_rows",
+            &["dataset://ns/nd_raw"],
+            &["dataset://ns/nd_filtered"],
+            ExecutionTrust::Core,
+        );
+        nd_filter
+            .params
+            .insert("column".to_string(), CanonValue::Str("score".to_string()));
+        nd_filter
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        nd_filter
+            .params
+            .insert("value".to_string(), CanonValue::Str("0.5".to_string()));
+        let nd_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("st10-ndjson".to_string()),
+            nodes: vec![nd_filter],
+            edges: vec![],
+        };
+        let r_nd = execute_graph_sequential(
+            &nd_graph,
+            &mut reopened,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert!(r_nd.failed_nodes.is_empty());
+        assert_eq!(
+            reopened.asset_content_type("dataset://ns/nd_filtered"),
+            Some(CONTENT_TYPE_NDJSON)
+        );
+        reopened.finalize().unwrap();
+        let nd_mat = load_report(&run_dir)
+            .unwrap()
+            .materializations
+            .into_iter()
+            .rfind(|m| m.asset_key == "dataset://ns/nd_filtered")
+            .unwrap();
+        assert_eq!(nd_mat.rows, Some(1));
+
+        drop(reopened);
         let _ = fs::remove_dir_all(&base);
     }
 }

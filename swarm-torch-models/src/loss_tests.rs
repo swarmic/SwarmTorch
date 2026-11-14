@@ -93,3 +93,53 @@ fn fedprox_regularizer_adds_single_owner_proximal_term() {
     assert!((grads[0] - 0.6).abs() < 1e-6);
     assert!((grads[1] - (-0.45)).abs() < 1e-6);
 }
+
+#[test]
+fn st14_mse_huber_and_fedprox_leave_grad_slices_untouched_on_overflow() {
+    // 1. MseLoss: index 0 has small finite diff, index 1 overflows squared loss (and grad).
+    let mse_preds = [1.0f32, 3.0e38];
+    let mse_targets = [0.0f32, -3.0e38];
+    let initial = [123.5f32, -987.25f32];
+    let mut grad = initial;
+    assert_eq!(
+        MseLoss::compute_and_grad(&mse_preds, &mse_targets, &mut grad),
+        Err(LossError::NonFiniteResult)
+    );
+    assert_eq!(grad[0].to_bits(), initial[0].to_bits());
+    assert_eq!(grad[1].to_bits(), initial[1].to_bits());
+
+    // Also test case where per-element grad fits f32 (scale * diff < f32::MAX) while mean squared loss overflows f32.
+    let mse_preds_loss_overflow = [1.0f32, 1.0e20];
+    let mse_targets_loss_overflow = [0.0f32, -1.0e20];
+    let mut grad2 = initial;
+    assert_eq!(
+        MseLoss::compute_and_grad(
+            &mse_preds_loss_overflow,
+            &mse_targets_loss_overflow,
+            &mut grad2
+        ),
+        Err(LossError::NonFiniteResult)
+    );
+    assert_eq!(grad2[0].to_bits(), initial[0].to_bits());
+    assert_eq!(grad2[1].to_bits(), initial[1].to_bits());
+
+    // 2. HuberLoss: large delta + index 1 overflows mean loss after finite index 0.
+    let huber = HuberLoss::new(f32::MAX).unwrap();
+    let mut grad_huber = initial;
+    assert_eq!(
+        huber.compute_and_grad(&[1.0f32, 1.0e20], &[0.0f32, -1.0e20], &mut grad_huber),
+        Err(LossError::NonFiniteResult)
+    );
+    assert_eq!(grad_huber[0].to_bits(), initial[0].to_bits());
+    assert_eq!(grad_huber[1].to_bits(), initial[1].to_bits());
+
+    // 3. FedProxRegularizer: penalty overflows f32 on index 1 after finite index 0.
+    let fedprox = FedProxRegularizer::new(1.0).unwrap();
+    let mut grads_fp = initial;
+    assert_eq!(
+        fedprox.apply_to_gradients(&[1.0f32, 1.0e20], &[0.0f32, -1.0e20], &mut grads_fp),
+        Err(LossError::NonFiniteResult)
+    );
+    assert_eq!(grads_fp[0].to_bits(), initial[0].to_bits());
+    assert_eq!(grads_fp[1].to_bits(), initial[1].to_bits());
+}

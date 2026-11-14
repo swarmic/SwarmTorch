@@ -16,7 +16,7 @@ use swarm_torch::coordinator::{
     SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
     COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1, COMPRESSION_SCHEMA_DENSE_F32_LE_V1,
 };
-use swarm_torch::native_runner::NativeOpRunner;
+use swarm_torch::native_runner::{NativeOpRunner, RunnerExecutionModeV1};
 use swarm_torch::report::load_report_strict;
 use swarm_torch::scheduler::execute_graph_sequential;
 use swarm_torch_core::aggregation::{BulyanProfile, RobustAggregation};
@@ -764,11 +764,13 @@ fn scenario_6_cas_cache_hit_bypass_tamper_rejection_and_post_seal_fence() {
         edges: vec![],
     };
 
+    let test_runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
+
     // First execution: Miss, then bind physical CAS blob
     let r1 = execute_graph_sequential(
         &graph,
         &mut session,
-        &NativeOpRunner,
+        &test_runner,
         &PermissivePolicy,
         run_id,
         || 1_000,
@@ -787,7 +789,7 @@ fn scenario_6_cas_cache_hit_bypass_tamper_rejection_and_post_seal_fence() {
     let r2 = execute_graph_sequential(
         &graph,
         &mut session,
-        &NativeOpRunner,
+        &test_runner,
         &PermissivePolicy,
         run_id,
         || 2_000,
@@ -795,7 +797,7 @@ fn scenario_6_cas_cache_hit_bypass_tamper_rejection_and_post_seal_fence() {
     .unwrap();
     assert_eq!(r2.cached_nodes.len(), 1);
 
-    // Corrupt 1 byte inside the CAS blob -> verify_cache_hit must detect SHA-256 mismatch and force Miss!
+    // Corrupt 1 byte inside the CAS blob -> verify_cache_hit & scheduler MUST return an explicit integrity failure!
     let blob_path = session
         .sink()
         .bundle()
@@ -807,19 +809,32 @@ fn scenario_6_cas_cache_hit_bypass_tamper_rejection_and_post_seal_fence() {
     corrupted[0] ^= 0xFF;
     fs::write(&blob_path, &corrupted).unwrap();
 
+    let cache_err = session
+        .verify_cache_hit(
+            &graph.nodes[0],
+            &[swarm_torch_core::dataops::OutputSpecCore {
+                asset_key: "dataset://ns/stage_out".to_string(),
+                schema: None,
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(cache_err.kind(), std::io::ErrorKind::InvalidData);
+
     let r3 = execute_graph_sequential(
         &graph,
         &mut session,
-        &NativeOpRunner,
+        &test_runner,
         &PermissivePolicy,
         run_id,
         || 3_000,
     )
     .unwrap();
+    assert!(r3.cached_nodes.is_empty());
     assert!(
-        r3.cached_nodes.is_empty(),
-        "corrupted CAS blob must invalidate cache hit and force re-execution"
+        r3.executed_nodes.is_empty(),
+        "corrupted CAS blob must not silently re-execute cached node"
     );
+    assert_eq!(r3.failed_nodes, vec!["stage_cached"]);
 
     // Restore valid CAS blob before sealing and signing the bundle
     fs::remove_file(&blob_path).unwrap();

@@ -59,7 +59,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-### Wave 12 & Wave 13 Phases `13-0` & `13A` (`v0.2.0` — Containment + Auth/Replay Hardened)
+### Wave 12 & Wave 13 Phases `13-0`, `13A`, & `13B` (`v0.2.0` — Containment, Auth/Replay, & Transactional Storage Hardened)
 1. **Isolated Framework Bridges & LoRA / FLoRA Update Algebra (`W12-01`, `ADR-0024` §4):**
    - Adds `BackendTensorBridge` / `BackendModelHandleV1` and explicit `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models`, coordinated atomically on staged base weights in `SwarmRoundCoordinator::aggregate_lora_cohort_round`, plus **`Simulation verified`** contract bridges in `adapters/swarm-torch-backends` (live `burn`/`candle` SDKs scheduled for Phase `13D-4`).
 2. **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4, `ST-08`):**
@@ -76,6 +76,10 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
    - Enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) in `SwarmRoundCoordinator`, failing closed on legacy unverified `PeerRoundSubmissionV1` ingress without state mutation.
    - Replaces sentinel `PeerId([0xFF; 32])` transport attribution with `ObservedSourceRef` + `ObservedTransportMessage`, seals cross-crate `VerifiedLinkPrincipalV1` carrier proofs, and adds receiver-nonce `session_id` v2 replay handshakes (`SessionHandshakeChallengeV2`, default `RequireSessionHandshake`, monotonic `TimestampFloor`).
    - Re-architects `ObservedSourceReassembler<E>` with dimensioned `Vec<u64>` bitmaps, contiguous `Vec<u8>` assembly storage, non-evicting quarantine tombstones + $O(\log S)$ source quarantine escalation, and full peak heap accounting.
+7. **Phase `13B` Transactional Coordinator Commits, Kernel Bundle Locking, `PhysicalStrict` Cache Integrity, & Numerical Atomicity (`ST-04`, `ST-05`, `ST-10`, `ST-14`):**
+   - Promotes `SwarmRoundCoordinator` state atomically via CAS-persisted `CoordinatorResumeStateV2`, `OptimizerStateSnapshotV1`, `CenteredClippingCenterBlobV1`, `HistoricalAnchorsBlobV1`, and manifest-signed `CommittedHeadV1` (`checkpoints/committed_head.json`), supporting `RestoreModeV1::{ExactTrainingState, WeightsOnlyMigratePolicy}` (`resume_exact_training_state` / `restore_weights_only`).
+   - Upgrades `.bundle.lock` to persistent `fs4` kernel locks (`flock`/`LockFileEx`), enforces `DurabilityPolicyV1::SyncEachAppend` on DP ledgers and DataOps streams, SHA-256 verifies CAS blobs during `VerifiedBundleV1` / `verify_committed_head`, and fixes `RunArtifactSink::write_graph_unlocked` self-locking.
+   - Defaults `NativeOpRunner` to `RunnerExecutionModeV1::PhysicalStrict` with declared MIME dispatch (zero `{` byte sniffing), propagates `verify_cache_hit` CAS errors as explicit `cache_integrity_error:` node failures with reopen metric preservation, fixes `exp_f64_soft` (`k >= 1024`), and enforces two-pass atomic gradient validation in `swarm-torch-models::loss`.
 
 ---
 
@@ -95,7 +99,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 | Runtime abstraction | `SwarmClock` and `SwarmRuntime` split; `TokioRuntime` and 32-bit portable `MockRuntime` with deterministic task/timer scheduler implemented; `EmbassyRuntime` gated on `embassy` + `embassy-time-driver` | `swarm-torch-runtime/src/lib.rs` |
 | Transport layer | Allocation-free `PacketTransport`, GAT `SwarmTransport` (`ObservedSourceRef`), originator-signed `BundledGossipDeliveryV1`/`V2`, `TcpTransport`/`UdpGossipTransport`, and bounded `ObservedSourceReassembler` landed; evented socket I/O in `13C-1`, radio flags placeholder-only | `swarm-torch-net/src/{traits,gossip,chunked,tcp,udp}.rs` |
 | Replay/auth security | `MessageEnvelope` v1.0 & v0.3 (`V0_3`) domain-separated Ed25519 signatures, safe dual-tree `BTreeMap` replay store, `CohortAllowlist`, default `RequireSessionHandshake` (`SessionHandshakeChallengeV2` + `session_id`), `TimestampFloor`, and 3-stage `SwarmRoundCoordinator` admission | `swarm-torch-core/src/replay.rs`, `swarm-torch-net/src/protocol.rs`, `swarm-torch/src/coordinator.rs` |
-| Coordinator, CAS, & strict artifacts | `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `.bundle.lock`, `ManifestSignatureV1`, `TrustPolicy::Strict`, and 9 Draft 2020-12 JSON Schemas implemented | `swarm-torch/src/coordinator.rs`, `swarm-torch/src/artifacts/`, `schemas/v1/`, `swarm-torch/tests/federated_round_simulation.rs` |
+| Coordinator, CAS, & strict artifacts | `SwarmRoundCoordinator` (transactional `CommittedHeadV1` + `CoordinatorResumeStateV2` + `OptimizerStateSnapshotV1`), physical CAS checkpoints (`blobs/sha256/<digest>`), persistent `fs4` `.bundle.lock`, `DurabilityPolicyV1::SyncEachAppend`, `PhysicalStrict` `NativeOpRunner`, `ManifestSignatureV1`, `TrustPolicy::Strict`, and 9 Draft 2020-12 JSON Schemas implemented | `swarm-torch/src/coordinator.rs`, `swarm-torch/src/artifacts/`, `swarm-torch/src/{native_runner,scheduler}.rs`, `schemas/v1/`, `swarm-torch/tests/federated_round_simulation.rs` |
 
 ### Baseline Command Set (must remain green)
 

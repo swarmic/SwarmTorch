@@ -99,6 +99,7 @@ impl MseLoss {
         let scale_grad = 2.0 * inv_n;
         let mut sum_sq = 0.0f64;
 
+        // Pass 1: validate all scalar gradients and accumulated loss before mutating `grad_out`.
         for i in 0..n {
             let diff = (predictions[i] as f64) - (targets[i] as f64);
             sum_sq += diff * diff;
@@ -106,12 +107,17 @@ impl MseLoss {
             if !g.is_finite() {
                 return Err(LossError::NonFiniteResult);
             }
-            grad_out[i] = g;
         }
 
         let loss = (sum_sq * inv_n) as f32;
         if !loss.is_finite() {
             return Err(LossError::NonFiniteResult);
+        }
+
+        // Pass 2: commit validated gradients atomically.
+        for i in 0..n {
+            let diff = (predictions[i] as f64) - (targets[i] as f64);
+            grad_out[i] = (scale_grad * diff) as f32;
         }
         Ok(loss)
     }
@@ -171,14 +177,21 @@ impl CrossEntropyLoss {
             return Err(LossError::NonFiniteResult);
         }
 
-        for (c, (&z, g_slot)) in logits.iter().zip(grad_out.iter_mut()).enumerate() {
+        // Pass 1: validate every gradient element before mutating `grad_out`.
+        for (c, &z) in logits.iter().enumerate() {
             let prob = exp_f64((z as f64) - max_logit) / sum_exp;
             let indicator = if c == target_class { 1.0 } else { 0.0 };
             let g = (prob - indicator) as f32;
             if !g.is_finite() {
                 return Err(LossError::NonFiniteResult);
             }
-            *g_slot = g;
+        }
+
+        // Pass 2: commit validated gradients.
+        for (c, (&z, g_slot)) in logits.iter().zip(grad_out.iter_mut()).enumerate() {
+            let prob = exp_f64((z as f64) - max_logit) / sum_exp;
+            let indicator = if c == target_class { 1.0 } else { 0.0 };
+            *g_slot = (prob - indicator) as f32;
         }
 
         Ok(loss)
@@ -243,6 +256,7 @@ impl HuberLoss {
         let inv_n = 1.0 / (n as f64);
         let mut total_loss = 0.0f64;
 
+        // Pass 1: validate every item gradient and final mean loss before mutating `grad_out`.
         for i in 0..n {
             let r = (predictions[i] as f64) - (targets[i] as f64);
             let abs_r = swarm_torch_core::num::abs_f64(r);
@@ -257,12 +271,24 @@ impl HuberLoss {
             if !g.is_finite() {
                 return Err(LossError::NonFiniteResult);
             }
-            grad_out[i] = g;
         }
 
         let loss = (total_loss * inv_n) as f32;
         if !loss.is_finite() {
             return Err(LossError::NonFiniteResult);
+        }
+
+        // Pass 2: commit validated gradients atomically.
+        for i in 0..n {
+            let r = (predictions[i] as f64) - (targets[i] as f64);
+            let abs_r = swarm_torch_core::num::abs_f64(r);
+            let item_grad = if abs_r <= delta64 {
+                r * inv_n
+            } else {
+                let sign = if r >= 0.0 { 1.0 } else { -1.0 };
+                delta64 * sign * inv_n
+            };
+            grad_out[i] = item_grad as f32;
         }
         Ok(loss)
     }
@@ -330,6 +356,8 @@ impl FedProxRegularizer {
 
         let mu64 = self.mu as f64;
         let mut sq_norm = 0.0f64;
+
+        // Pass 1: validate every updated gradient and proximal penalty before mutating `param_grads`.
         for i in 0..d {
             let diff = (params[i] as f64) - (parent_params[i] as f64);
             sq_norm += diff * diff;
@@ -337,12 +365,17 @@ impl FedProxRegularizer {
             if !updated_g.is_finite() {
                 return Err(LossError::NonFiniteResult);
             }
-            param_grads[i] = updated_g;
         }
 
         let penalty = (0.5 * mu64 * sq_norm) as f32;
         if !penalty.is_finite() {
             return Err(LossError::NonFiniteResult);
+        }
+
+        // Pass 2: commit validated gradient updates atomically.
+        for i in 0..d {
+            let diff = (params[i] as f64) - (parent_params[i] as f64);
+            param_grads[i] = ((param_grads[i] as f64) + mu64 * diff) as f32;
         }
         Ok(penalty)
     }

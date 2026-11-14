@@ -12,8 +12,7 @@
 //!   debited and **non-refundable**.
 //! - Idempotent retries keyed on `receipt_id` observe the persisted debit without double-charging.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -25,8 +24,8 @@ use swarm_torch_core::dp::{
 use swarm_torch_core::observe::RunId;
 
 use super::io::{
-    hex_lower, parse_ndjson_slice_bounded, read_bytes_bounded, sync_parent_dir, MAX_NDJSON_LINES,
-    MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
+    append_ndjson_with_policy, hex_lower, parse_ndjson_slice_bounded, read_bytes_bounded,
+    DurabilityPolicyV1, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
 };
 
 /// Canonical relative path of the durable DP release ledger inside a run bundle.
@@ -165,10 +164,6 @@ pub fn append_dp_release_record_durable(
     }
 
     let ledger_path = run_dir.join(DP_LEDGER_REL_PATH);
-    if let Some(parent) = ledger_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let existing = read_dp_ledger_entries(run_dir)?;
     if let Some(prev) = existing.iter().find(|e| e.receipt_id == entry.receipt_id) {
         let orders_match = prev.cumulative_rdp_orders.len() == entry.cumulative_rdp_orders.len()
@@ -189,18 +184,7 @@ pub fn append_dp_release_record_durable(
         return Ok(false);
     }
 
-    let line = serde_json::to_string(entry)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize error: {e}")))?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&ledger_path)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    file.sync_all()?;
-    sync_parent_dir(&ledger_path)?;
+    append_ndjson_with_policy(&ledger_path, entry, DurabilityPolicyV1::SyncEachAppend)?;
     Ok(true)
 }
 

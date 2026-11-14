@@ -13,7 +13,11 @@ use swarm_torch_core::observe::{
 use swarm_torch_core::run_graph::GraphV1;
 
 use super::bundle::ManifestV1;
-use super::lock::BundleLockGuard;
+use super::cas::{
+    read_committed_head_v1, write_archived_generation_manifest_bytes, write_committed_head_v1,
+    COMMITTED_HEAD_REL_PATH,
+};
+use super::lock::{BundleLockGuard, LockAcquisitionPolicy};
 use super::record_validation_error_to_io;
 use super::RunArtifactBundle;
 
@@ -167,22 +171,57 @@ impl RunArtifactSink {
         Ok(state.generation)
     }
 
+    /// Finalize (and optionally sign) `manifest.json` during an active round commit and archive the
+    /// exact serialized manifest bytes for generation `generation` (`ST-04`).
+    ///
+    /// Returns `(manifest, manifest_sha256_hex)`.
+    pub(crate) fn finalize_checkpoint_manifest(
+        &self,
+        generation: u64,
+        signer: Option<&KeyPair>,
+    ) -> io::Result<(ManifestV1, String)> {
+        let state = self.guard_unsealed()?;
+        let _ephemeral_lock = if state.lock_guard.is_none() {
+            Some(self.bundle.acquire_lock(LockAcquisitionPolicy::default())?)
+        } else {
+            None
+        };
+        let (manifest, manifest_bytes, manifest_sha256) =
+            self.bundle.finalize_manifest_with_sha256_unlocked(signer)?;
+        write_archived_generation_manifest_bytes(
+            self.bundle.run_dir(),
+            generation,
+            &manifest_bytes,
+        )?;
+        Ok((manifest, manifest_sha256))
+    }
+
     /// Finalize (and optionally sign) `manifest.json`, seal the sink against any late writes
     /// from cloned `Arc<RunArtifactSink>` handles, and release any held `.bundle.lock`
     /// (`ADR-0023` §2.1, `W10-01`).
     pub fn seal_and_finalize(&self, signer: Option<&KeyPair>) -> io::Result<(u64, ManifestV1)> {
         let mut state = self.guard_unsealed()?;
-        let manifest = if state.lock_guard.is_some() {
-            self.bundle.finalize_manifest_unlocked(signer)?
+        let _ephemeral_lock = if state.lock_guard.is_none() {
+            Some(self.bundle.acquire_lock(LockAcquisitionPolicy::default())?)
         } else {
-            match signer {
-                Some(kp) => self.bundle.finalize_signed_manifest(kp)?,
-                None => {
-                    self.bundle.finalize_manifest()?;
-                    super::io::read_json(&self.bundle.run_dir().join("manifest.json"))?
-                }
-            }
+            None
         };
+        let (manifest, manifest_bytes, manifest_sha256) =
+            self.bundle.finalize_manifest_with_sha256_unlocked(signer)?;
+        // If `checkpoints/committed_head.json` exists, re-pin its `manifest_sha256` and archived
+        // generation manifest to the newly finalized (possibly signed) bundle manifest so subsequent
+        // strict checkpoint resume stays consistent with `manifest.json` (`ST-04`).
+        let head_path = self.bundle.run_dir().join(COMMITTED_HEAD_REL_PATH);
+        if head_path.exists() {
+            let mut head = read_committed_head_v1(self.bundle.run_dir())?;
+            write_archived_generation_manifest_bytes(
+                self.bundle.run_dir(),
+                head.generation,
+                &manifest_bytes,
+            )?;
+            head.manifest_sha256 = manifest_sha256;
+            write_committed_head_v1(self.bundle.run_dir(), &head)?;
+        }
         state.sealed = true;
         state.generation = state.generation.saturating_add(1);
         let gen = state.generation;
@@ -243,7 +282,11 @@ impl RunArtifactSink {
 
     pub fn write_graph(&self, graph: &GraphV1) -> io::Result<()> {
         let mut state = self.guard_unsealed()?;
-        self.bundle.write_graph(graph)?;
+        if state.lock_guard.is_some() {
+            self.bundle.write_graph_unlocked(graph)?;
+        } else {
+            self.bundle.write_graph(graph)?;
+        }
         self.post_write_maybe_refresh_manifest(&mut state)
     }
 

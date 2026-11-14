@@ -128,10 +128,19 @@ pub fn exp_f64_soft(x: f64) -> f64 {
     poly = poly * r + 1.0;
     poly = poly * r + 1.0;
 
-    // Scale by 2^k via IEEE-754 exponent bit manipulation (handling subnormal k < -1022).
+    // Scale by 2^k via IEEE-754 exponent bit manipulation:
+    // - k <= -1022 enters subnormal output range and must be split in two steps.
+    // - k >= 1024 (e.g. x in [709.436, 709.7827) where nearest k == 1024 and poly < 1) would set
+    //   a biased single-step exponent of 2047 (INF), so split it into two normal scales too.
     if k <= -1022 {
         let k1 = -1022i64;
         let k2 = (k as i64) - k1; // in [-53, 0]
+        let scale1 = f64::from_bits(((k1 + 1023) as u64) << 52);
+        let scale2 = f64::from_bits(((k2 + 1023) as u64) << 52);
+        (poly * scale1) * scale2
+    } else if k >= 1024 {
+        let k1 = 512i64;
+        let k2 = (k as i64) - k1; // <= 512 when x < 709.7827
         let scale1 = f64::from_bits(((k1 + 1023) as u64) << 52);
         let scale2 = f64::from_bits(((k2 + 1023) as u64) << 52);
         (poly * scale1) * scale2
@@ -353,5 +362,34 @@ mod tests {
 
         let lse = log_sum_exp_pair_f64(1000.0, 1000.0);
         assert!((lse - (1000.0 + core::f64::consts::LN_2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exp_f64_soft_large_positive_k_1024_stays_finite_and_accurate() {
+        // Values where round(x / ln(2)) == 1024 (< overflow threshold 709.782712893384).
+        let cases = [709.0f64, 709.436f64, 709.5f64, 709.78f64];
+        for &x in &cases {
+            let got = exp_f64_soft(x);
+            assert!(
+                got.is_finite(),
+                "exp_f64_soft({x}) must be finite, got {got:e}"
+            );
+            #[cfg(feature = "std")]
+            {
+                let expected = x.exp();
+                let rel_err = (got - expected).abs() / expected;
+                assert!(
+                    rel_err < 1e-13,
+                    "exp_f64_soft({x}) = {got:e}, expected {expected:e}, rel_err = {rel_err:e}"
+                );
+            }
+        }
+        assert!(exp_f64_soft(709.783).is_infinite());
+
+        let lse = log_sum_exp_pair_f64(709.5, 709.5);
+        assert!(
+            (lse - (709.5 + core::f64::consts::LN_2)).abs() < 1e-12,
+            "log_sum_exp_pair_f64(709.5, 709.5) = {lse}"
+        );
     }
 }

@@ -5,7 +5,19 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0` & `13A`)
+## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0`, `13A`, & `13B`)
+
+### Security & Reliability (`Phase 13B` — Transactional Learning, Durable Storage, & `PhysicalStrict` Execution)
+- **Transactional Coordinator Commits & Resumable Training State (`ST-04`, `13B-1`):**
+  - Added signed head promotion via `checkpoints/committed_head.json` (`CommittedHeadV1`, verified by `RunArtifactBundle::verify_committed_head`), staging `CoordinatorResumeStateV2`, `OptimizerStateSnapshotV1`, `CenteredClippingCenterBlobV1`, and `HistoricalAnchorsBlobV1` in write-once CAS prior to head swap so mid-commit failures roll back without advancing model weights, round IDs, or replay/epoch state.
+  - Added `SwarmRoundCoordinator::{resume_exact_training_state, restore_weights_only, restore_with_mode}` (`RestoreModeV1`), persisting optimizer momentum/velocity, Centered Clipping centers, FedAsync historical anchors, and monotonic replay `TimestampFloor` across restarts.
+- **Persistent `fs4` Kernel Bundle Locks, Write-Once CAS Verification, & Durability Policies (`ST-05`, `13B-2`):**
+  - Replaced `create_new`/unlink `.bundle.lock` handling in `swarm-torch::artifacts::lock` with persistent inode-safe `fs4` kernel locks (`flock` on Unix, `LockFileEx` on Windows, zero unlink races and automatic OS release on crash) and added supply-chain exemption `EX-2026-11-14-01` for `fs4`'s transitive graph.
+  - Added `DurabilityPolicyV1::{SyncEachAppend, SyncAtCommit}` defaulting `dp/ledger.ndjson` and DataOps state streams to `SyncEachAppend` (`write + flush + sync_all` + POSIX `sync_parent_dir`), verified write-once CAS SHA-256 digests in `VerifiedBundleV1` / `verify_committed_head`, and added `RunArtifactSink::write_graph_unlocked` to eliminate self-lock re-entrancy.
+- **`PhysicalStrict` Execution, Fail-Closed Cache Integrity, & Numerical Atomicity (`ST-10`, `ST-14`, `13B-3`):**
+  - Defaulted `NativeOpRunner::new()` to `RunnerExecutionModeV1::PhysicalStrict` (`with_mode` opt-in for `MetadataOnlyForTests`), removing `{` byte sniffing in favor of explicit `CONTENT_TYPE_COLUMNAR_JSON_V1` / `CONTENT_TYPE_NDJSON` dispatch (`ColumnarInputFormatV1`) and failing closed on legacy `run_with_context` or non-CAS/missing inputs.
+  - Propagated `io::Error` from `DataOpsSession::verify_cache_hit` on missing/corrupt CAS blobs (turning cache corruption into explicit node failures `cache_integrity_error:` in `scheduler.rs` with zero silent re-execution), propagated `output_content_types` across DAG edges, and preserved cached `rows`, `bytes`, `schema`, and `source` metrics across session reopen cache hits.
+  - Fixed `exp_f64_soft` overflow at large positive binary exponents (`k >= 1024`) in `swarm-torch-core::num`, and refactored `MseLoss`, `CrossEntropyLoss`, `HuberLoss`, and `FedProxRegularizer` (`swarm-torch-models::loss`) to two-pass atomic gradient validation before mutating caller buffers.
 
 ### Security (`Phase 13A` — Auth Admission, Replay V2, & Bounded Reassembly)
 - **3-Stage Authenticated Coordinator Admission (`ST-01`):**

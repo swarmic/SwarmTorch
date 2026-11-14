@@ -19,11 +19,17 @@ use swarm_torch_core::observe::{
 };
 use swarm_torch_core::run_graph::{validate_graph_v1, validate_node_v1, GraphV1};
 
+use super::cas::{
+    get_verified_coordinator_resume_state_v2, is_unhashed_checkpoint_head_rel_path,
+    read_committed_head_v1, CheckpointContentDigestV1, CommittedHeadV1, CoordinatorResumeStateV2,
+    COMMITTED_HEAD_REL_PATH,
+};
+use super::dp_ledger::DP_LEDGER_REL_PATH;
 use super::io::{
-    append_ndjson, collect_files_recursive, decode_hex_exact, ensure_file, hex_lower,
-    parse_json_slice, read_and_hash_bounded, read_bytes_bounded, read_json, rel_path_string,
-    sha256_file, write_json_pretty_atomic, MAX_MANIFEST_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
-    MAX_TOTAL_BUNDLE_BYTES,
+    append_ndjson_with_policy, atomic_write, collect_files_recursive, decode_hex_exact,
+    ensure_file, hex_lower, parse_json_slice, read_and_hash_bounded, read_bytes_bounded, read_json,
+    rel_path_string, sha256_file, sync_parent_dir, write_json_pretty_atomic, DurabilityPolicyV1,
+    MAX_MANIFEST_BYTES, MAX_SINGLE_ARTIFACT_BYTES, MAX_TOTAL_BUNDLE_BYTES,
 };
 use super::lock::{BundleLockGuard, LockAcquisitionPolicy};
 use super::record_validation_error_to_io;
@@ -383,6 +389,10 @@ impl RunArtifactBundle {
     /// Validates node field bounds (M-09) and computes derived fields (`node_id`, `node_def_hash`).
     pub fn write_graph(&self, graph: &GraphV1) -> io::Result<()> {
         let _lock = self.acquire_lock(LockAcquisitionPolicy::default())?;
+        self.write_graph_unlocked(graph)
+    }
+
+    pub(crate) fn write_graph_unlocked(&self, graph: &GraphV1) -> io::Result<()> {
         let mut g = graph.clone();
         for node in &g.nodes {
             validate_node_v1(node)
@@ -404,30 +414,55 @@ impl RunArtifactBundle {
     }
 
     pub fn append_span(&self, span: &SpanRecord) -> io::Result<()> {
+        self.append_span_with_durability(span, DurabilityPolicyV1::SyncAtCommit)
+    }
+
+    pub fn append_span_with_durability(
+        &self,
+        span: &SpanRecord,
+        durability: DurabilityPolicyV1,
+    ) -> io::Result<()> {
         validate_span_record(span).map_err(record_validation_error_to_io)?;
-        append_ndjson(&self.run_dir.join("spans.ndjson"), span)
+        append_ndjson_with_policy(&self.run_dir.join("spans.ndjson"), span, durability)
     }
 
     pub fn append_event(&self, event: &EventRecord) -> io::Result<()> {
+        self.append_event_with_durability(event, DurabilityPolicyV1::SyncAtCommit)
+    }
+
+    pub fn append_event_with_durability(
+        &self,
+        event: &EventRecord,
+        durability: DurabilityPolicyV1,
+    ) -> io::Result<()> {
         validate_event_record(event).map_err(record_validation_error_to_io)?;
-        append_ndjson(&self.run_dir.join("events.ndjson"), event)
+        append_ndjson_with_policy(&self.run_dir.join("events.ndjson"), event, durability)
     }
 
     pub fn append_metric(&self, metric: &MetricRecord) -> io::Result<()> {
+        self.append_metric_with_durability(metric, DurabilityPolicyV1::SyncAtCommit)
+    }
+
+    pub fn append_metric_with_durability(
+        &self,
+        metric: &MetricRecord,
+        durability: DurabilityPolicyV1,
+    ) -> io::Result<()> {
         validate_metric_record(metric).map_err(record_validation_error_to_io)?;
-        append_ndjson(&self.run_dir.join("metrics.ndjson"), metric)
+        append_ndjson_with_policy(&self.run_dir.join("metrics.ndjson"), metric, durability)
     }
 
     pub fn append_materialization(
         &self,
         materialization: &MaterializationRecordV1,
     ) -> io::Result<()> {
-        append_ndjson(
+        append_ndjson_with_policy(
             &self
                 .run_dir
                 .join("datasets")
                 .join("materializations.ndjson"),
             materialization,
+            DurabilityPolicyV1::SyncEachAppend,
         )
     }
 
@@ -435,29 +470,32 @@ impl RunArtifactBundle {
         &self,
         materialization: &MaterializationRecordV2,
     ) -> io::Result<()> {
-        append_ndjson(
+        append_ndjson_with_policy(
             &self
                 .run_dir
                 .join("datasets")
                 .join("materializations.ndjson"),
             materialization,
+            DurabilityPolicyV1::SyncEachAppend,
         )
     }
 
     pub fn append_registry_update(&self, dataset: &DatasetEntryV1) -> io::Result<()> {
-        append_ndjson(
+        append_ndjson_with_policy(
             &self
                 .run_dir
                 .join("datasets")
                 .join("registry_updates.ndjson"),
             dataset,
+            DurabilityPolicyV1::SyncEachAppend,
         )
     }
 
     pub fn append_lineage_edge_update(&self, edge: &LineageEdgeV1) -> io::Result<()> {
-        append_ndjson(
+        append_ndjson_with_policy(
             &self.run_dir.join("datasets").join("lineage_edges.ndjson"),
             edge,
+            DurabilityPolicyV1::SyncEachAppend,
         )
     }
 
@@ -472,13 +510,22 @@ impl RunArtifactBundle {
         write_json_pretty_atomic(&self.run_dir.join("datasets").join("lineage.json"), lineage)
     }
 
-    /// Durability hook: fsync all required v1 files, propagating any I/O failure (`ADR-0023` §2.2).
+    /// Durability hook: flush and sync all required v1 files and `dp/ledger.ndjson` (if present),
+    /// propagating any I/O failure (`ADR-0023` §2.2, `ST-05`).
     pub fn sync_required_v1(&self) -> io::Result<()> {
         for rel in required_paths_v1() {
             let path = self.run_dir.join(rel);
             let f = fs::OpenOptions::new().write(true).open(&path)?;
             f.sync_all()?;
         }
+        let dp_ledger_path = self.run_dir.join(DP_LEDGER_REL_PATH);
+        if dp_ledger_path.exists() {
+            let f = fs::OpenOptions::new().write(true).open(&dp_ledger_path)?;
+            f.sync_all()?;
+            sync_parent_dir(&dp_ledger_path)?;
+        }
+        sync_parent_dir(&self.run_dir.join("run.json"))?;
+        sync_parent_dir(&self.run_dir.join("datasets").join("registry.json"))?;
         Ok(())
     }
 
@@ -499,6 +546,15 @@ impl RunArtifactBundle {
         &self,
         signer: Option<&KeyPair>,
     ) -> io::Result<ManifestV1> {
+        let (manifest, _, _) = self.finalize_manifest_with_sha256_unlocked(signer)?;
+        Ok(manifest)
+    }
+
+    /// Internal manifest writer returning `(ManifestV1, raw_json_bytes, manifest_sha256_hex)`.
+    pub(crate) fn finalize_manifest_with_sha256_unlocked(
+        &self,
+        signer: Option<&KeyPair>,
+    ) -> io::Result<(ManifestV1, Vec<u8>, String)> {
         let canonical_root = self.run_dir.canonicalize()?;
 
         // Ensure baseline v1 required files exist and are synced before hashing.
@@ -522,6 +578,9 @@ impl RunArtifactBundle {
                 continue;
             }
             let rel = rel_path_string(&file_path, &self.run_dir)?;
+            if is_unhashed_checkpoint_head_rel_path(&rel) {
+                continue;
+            }
             validate_manifest_path(&rel)?;
             ensure_path_within_bundle(&file_path, &canonical_root, &rel)?;
             let bytes = fs::metadata(&file_path)?.len();
@@ -551,20 +610,17 @@ impl RunArtifactBundle {
             sign_manifest_v1(&mut manifest, key_pair, signed_unix_nanos)?;
         }
 
-        write_json_pretty_atomic(&self.run_dir.join("manifest.json"), &manifest)?;
-        Ok(manifest)
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+        let manifest_sha256 = hex_lower(&Sha256::digest(&manifest_bytes));
+        atomic_write(&self.run_dir.join("manifest.json"), &manifest_bytes)?;
+        Ok((manifest, manifest_bytes, manifest_sha256))
     }
 
-    /// Validate `manifest.json` and load all manifest-listed files in a single bounded pass
-    /// (`ADR-0023` §3.1, `W10-02`).
-    ///
-    /// Eliminates TOCTOU path reopens and unlisted file consultation.
-    pub fn verify_and_load(&self, policy: &TrustPolicy) -> io::Result<VerifiedBundleV1> {
-        let manifest_path = self.run_dir.join("manifest.json");
-        let manifest_bytes = read_bytes_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
-        let manifest: ManifestV1 = parse_json_slice(&manifest_bytes)?;
-        let canonical_root = self.run_dir.canonicalize()?;
-
+    fn verify_manifest_header_and_policy(
+        &self,
+        manifest: &ManifestV1,
+        policy: &TrustPolicy,
+    ) -> io::Result<VerificationStatus> {
         if manifest.schema_version != SCHEMA_VERSION_V1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -586,7 +642,7 @@ impl RunArtifactBundle {
 
         let entries_hash = compute_manifest_entries_hash_v1(&manifest.entries)?;
 
-        let status = match policy {
+        match policy {
             TrustPolicy::Strict {
                 trusted_public_keys,
                 expected_run_id,
@@ -610,7 +666,7 @@ impl RunArtifactBundle {
                     }
                 }
                 let (signer_pk, signed_unix_nanos) =
-                    verify_manifest_signature_v1(&manifest, &entries_hash)?;
+                    verify_manifest_signature_v1(manifest, &entries_hash)?;
                 if !trusted_public_keys.iter().any(|k| k == &signer_pk) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -627,18 +683,30 @@ impl RunArtifactBundle {
                         ));
                     }
                 }
-                VerificationStatus::VerifiedStrict {
+                Ok(VerificationStatus::VerifiedStrict {
                     signer_public_key: signer_pk,
                     signed_unix_nanos,
-                }
+                })
             }
             TrustPolicy::LegacyPermissive => {
                 if manifest.signature.is_some() {
-                    let _ = verify_manifest_signature_v1(&manifest, &entries_hash)?;
+                    let _ = verify_manifest_signature_v1(manifest, &entries_hash)?;
                 }
-                VerificationStatus::UnverifiedLegacyPermissive
+                Ok(VerificationStatus::UnverifiedLegacyPermissive)
             }
-        };
+        }
+    }
+
+    /// Validate `manifest.json` and load all manifest-listed files in a single bounded pass
+    /// (`ADR-0023` §3.1, `W10-02`).
+    ///
+    /// Eliminates TOCTOU path reopens and unlisted file consultation.
+    pub fn verify_and_load(&self, policy: &TrustPolicy) -> io::Result<VerifiedBundleV1> {
+        let manifest_path = self.run_dir.join("manifest.json");
+        let manifest_bytes = read_bytes_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+        let manifest: ManifestV1 = parse_json_slice(&manifest_bytes)?;
+        let canonical_root = self.run_dir.canonicalize()?;
+        let status = self.verify_manifest_header_and_policy(&manifest, policy)?;
 
         let mut seen_paths: BTreeSet<String> = BTreeSet::new();
         let mut seen_required_paths: BTreeSet<String> = BTreeSet::new();
@@ -739,6 +807,198 @@ impl RunArtifactBundle {
         self.verify_and_load(&TrustPolicy::LegacyPermissive)
             .map(|_| ())
     }
+
+    /// Authenticate `checkpoints/committed_head.json`, verify its pinned manifest (active
+    /// `manifest.json` or crash-consistent archived generation manifest matching `head.manifest_sha256`),
+    /// verify all listed CAS dependencies for [`CoordinatorResumeStateV2`], and return the
+    /// verified resume envelope (`ST-04`).
+    pub fn verify_committed_head(
+        &self,
+        policy: &TrustPolicy,
+    ) -> io::Result<(
+        CommittedHeadV1,
+        ManifestV1,
+        VerificationStatus,
+        CoordinatorResumeStateV2,
+    )> {
+        let head = read_committed_head_v1(&self.run_dir)?;
+        if head.run_id != self.run_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "committed_head.json run_id {} does not match bundle run_id {}",
+                    head.run_id, self.run_id
+                ),
+            ));
+        }
+
+        let manifest_path = self.run_dir.join("manifest.json");
+        let active_manifest_sha = sha256_file(&manifest_path).ok().map(|d| hex_lower(&d));
+        let (manifest, status) = if active_manifest_sha.as_deref()
+            == Some(head.manifest_sha256.as_str())
+        {
+            let verified = self.verify_and_load(policy)?;
+            (verified.manifest, verified.status)
+        } else {
+            // Crash-recovery path: a subsequent round may have updated manifest.json before
+            // committed_head.json advanced; verify the generation's archived manifest matching
+            // the pinned `head.manifest_sha256` hash and policy signature instead.
+            let archive_rel = super::cas::committed_manifest_archive_rel_path(head.generation);
+            let archive_path = self.run_dir.join(&archive_rel);
+            if !archive_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active manifest.json sha256 ({:?}) != committed_head.manifest_sha256 ({}) and archived manifest {} is missing",
+                        active_manifest_sha, head.manifest_sha256, archive_rel
+                    ),
+                ));
+            }
+            let archive_bytes = read_bytes_bounded(&archive_path, MAX_MANIFEST_BYTES)?;
+            let archive_sha = hex_lower(&Sha256::digest(&archive_bytes));
+            if archive_sha != head.manifest_sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "archived manifest {} sha256 {} != committed_head.manifest_sha256 {}",
+                        archive_rel, archive_sha, head.manifest_sha256
+                    ),
+                ));
+            }
+            let archived: ManifestV1 = parse_json_slice(&archive_bytes)?;
+            let status = self.verify_manifest_header_and_policy(&archived, policy)?;
+            validate_manifest_entries_well_formed(&archived)?;
+            (archived, status)
+        };
+
+        let (resume_v2, resume_digest) =
+            get_verified_coordinator_resume_state_v2(&self.run_dir, &head.resume_state_cas_uri)?;
+        if resume_v2.run_id != head.run_id
+            || resume_v2.generation != head.generation
+            || resume_v2.round_id != head.round_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CoordinatorResumeStateV2 metadata disagrees with committed_head.json",
+            ));
+        }
+        let expected_next_round = head.round_id.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "committed_head.json round_id overflows next_round_id",
+            )
+        })?;
+        if resume_v2.next_round_id != expected_next_round {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CoordinatorResumeStateV2 next_round_id {} != expected {}",
+                    resume_v2.next_round_id, expected_next_round
+                ),
+            ));
+        }
+
+        // Every immutable CAS artifact referenced by the resume envelope MUST be authenticated in
+        // the verified manifest (and physical blob SHA-256 verified before use).
+        verify_cas_entry_in_manifest(&manifest, &resume_digest, None)?;
+        verify_cas_entry_in_manifest(
+            &manifest,
+            &resume_v2.model_digest,
+            Some(resume_v2.model_blob_bytes),
+        )?;
+        verify_cas_entry_in_manifest(
+            &manifest,
+            &resume_v2.historical_anchors_digest,
+            Some(resume_v2.historical_anchors_bytes),
+        )?;
+        if let Some(opt_digest) = resume_v2.optimizer_state_digest.as_ref() {
+            verify_cas_entry_in_manifest(&manifest, opt_digest, resume_v2.optimizer_state_bytes)?;
+        }
+        if let Some(cclip_digest) = resume_v2.cclip_center_digest.as_ref() {
+            verify_cas_entry_in_manifest(&manifest, cclip_digest, resume_v2.cclip_center_bytes)?;
+        }
+
+        // Keep `COMMITTED_HEAD_REL_PATH` referenced cleanly for manifest consistency checks.
+        let _ = COMMITTED_HEAD_REL_PATH;
+
+        Ok((head, manifest, status, resume_v2))
+    }
+}
+
+fn validate_manifest_entries_well_formed(manifest: &ManifestV1) -> io::Result<()> {
+    let mut seen_paths = BTreeSet::new();
+    let mut seen_required = BTreeSet::new();
+    for entry in &manifest.entries {
+        validate_manifest_path(&entry.path)?;
+        if !seen_paths.insert(entry.path.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate manifest path entry: {}", entry.path),
+            ));
+        }
+        let req = is_required_path_v1(&entry.path);
+        if req && !entry.required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "required path marked non-required in manifest: {}",
+                    entry.path
+                ),
+            ));
+        }
+        if req {
+            seen_required.insert(entry.path.clone());
+        }
+    }
+    for required in required_paths_v1() {
+        if !seen_required.contains(*required) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("required manifest entry missing: {required}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_cas_entry_in_manifest(
+    manifest: &ManifestV1,
+    digest: &CheckpointContentDigestV1,
+    expected_bytes: Option<u64>,
+) -> io::Result<()> {
+    let rel_path = digest.rel_blob_path();
+    let expected_hex = digest.to_hex();
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.path == rel_path)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("CAS object {rel_path} is not authenticated by manifest"),
+            )
+        })?;
+    if entry.sha256 != expected_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest entry digest {} does not match expected CAS digest {}",
+                entry.sha256, expected_hex
+            ),
+        ));
+    }
+    if let Some(exp_len) = expected_bytes {
+        if entry.bytes != exp_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest entry byte length {} for {} does not match expected {}",
+                    entry.bytes, rel_path, exp_len
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn required_paths_v1() -> &'static [&'static str] {

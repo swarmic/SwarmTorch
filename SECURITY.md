@@ -25,7 +25,7 @@
 
 ---
 
-## Current Security Posture (Wave 13 Phases `13-0` & `13A` Hardening)
+## Current Security Posture (Wave 13 Phases `13-0`, `13A`, & `13B` Hardening)
 
 SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its implemented layers:
 
@@ -41,11 +41,13 @@ SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its imp
   - All aggregators (`FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, `Bulyan` `BulyanProfile::IterativeKrumV1`, and stateful `CenteredClippingAggregator`) validate every coordinate of every update for `.is_finite()`, enforce `MAX_COHORT_SIZE = 1024`, sort via `total_cmp`, and widen sums/midpoints/distances to `f64` before narrowing to finite `f32`.
   - `SBucketingTransformer` deterministically shuffles client updates via `ChaCha8Rng` (`"swarmtorch.sbucket.v1"`) before robust aggregation, and `SharedSeedCoordinateVerifier` rejects out-of-policy sparse coordinate indices (`"swarmtorch.shared_seed_sparse.v1"`) before Byzantine distance calculation.
   - Compression codecs (`compression.rs`) validate hyperparameters and finiteness prior to buffer mutation, and `dataops.rs` enforces `MAX_RAW_SOURCE_URI_LEN = 4096` before URI redaction allocation.
-- **Signed Artifact Manifests, Cross-Process Bundle Locking, & SafeTensors Bounds (`ADR-0016`, `ADR-0023`, `W10-02`, `W11-04`):**
-  - `RunArtifactBundle` enforces cross-process exclusive `.bundle.lock` (`BundleLockGuard`), unique `.staging.*` atomic writes, Ed25519 `ManifestSignatureV1` over raw 16-byte `RunId` preimages, single-pass zero-TOCTOU `VerifiedBundleV1` (`TrustPolicy::Strict`), and Draft 2020-12 JSON Schema validation (`schemas/v1/*.schema.json`), rejecting path traversal (`..`), absolute paths, and symlink escapes on Unix and Windows CI lanes.
-  - `SwarmTorchCheckpointV1` enforces `HEADER_SIZE_LIMIT = 65_536` and strict contiguous `F32` byte-interval validation before parameter loading.
+- **Signed Artifact Manifests, Persistent Kernel Locking, `PhysicalStrict` DataOps, & SafeTensors Bounds (`ADR-0016`, `ADR-0023`, `ADR-0025`, `W10-02`, `W11-04`, `13B-1..3`):**
+  - `RunArtifactBundle` enforces persistent inode-safe `fs4` kernel locking on `.bundle.lock` (`BundleLockGuard`), unique `.staging.*` atomic writes with `sync_all()` (+ POSIX parent-dir `sync_parent_dir`), `DurabilityPolicyV1::SyncEachAppend` on DP ledgers and DataOps state streams, Ed25519 `ManifestSignatureV1` over raw 16-byte `RunId` preimages, single-pass zero-TOCTOU `VerifiedBundleV1` (`TrustPolicy::Strict`) with write-once CAS SHA-256 verification, and signed `CommittedHeadV1` (`CoordinatorResumeStateV2` + `OptimizerStateSnapshotV1` + `CenteredClippingCenterBlobV1` + `HistoricalAnchorsBlobV1`) rollback safety across `SwarmRoundCoordinator` round commits.
+  - `NativeOpRunner` defaults to `RunnerExecutionModeV1::PhysicalStrict` with explicit MIME dispatch (`ColumnarInputFormatV1`, zero `{` sniffing) and fails closed on missing/corrupt CAS cache blobs (`verify_cache_hit` -> `cache_integrity_error:`). `SwarmTorchCheckpointV1` enforces `HEADER_SIZE_LIMIT = 65_536` and strict contiguous `F32` byte-interval validation before parameter loading.
 
 ### Known Current Boundaries & Active Wave 13 Remediation (`v0.2.0` -> Wave 13)
+
+- **Windows / Non-Unix Directory Metadata Sync Boundary (`ST-05`):** On Unix (`#[cfg(unix)]`), `sync_parent_dir` opens parent directories and invokes `sync_all()` after `SyncEachAppend` appends, CAS hardlinks, and staging renames; on non-Unix platforms (including Windows), `sync_parent_dir` is a documented no-op because regular-file `File::sync_all()` invokes `FlushFileBuffers`, whereas Windows directory handles do not guarantee uniform directory-entry flush semantics across all drivers and filesystems.
 
 - **Experimental Differential Privacy Accounting (`ST-02`, Phase `13-0`):** `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`dp_ledger.rs`), and `trace_aggregation_budget` (`mcp_inspector.rs`) currently perform **experimental accounting-only tracking** (`guarantees_differential_privacy = false`). `SwarmRoundCoordinator::supports_certified_differential_privacy()` returns `false`, and any `VerifiedMechanismProtected` profile fails closed until a certified `DpFedAvgV1` mechanism profile ships post-Wave-13.
 - **Untrusted Wasm Extension Containment (`ST-09`, Phase `13-0` -> `13D-1`):** `RunnerIsolationProfile::WasmSandboxedV1`, `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) pending isolated `wasmi` integration (`adapters/swarm-torch-wasm`, Phase `13D-1`).

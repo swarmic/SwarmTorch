@@ -1,15 +1,21 @@
-//! Cross-process exclusive bundle lockfile guard (`ADR-0023` §3.2, `P2-02`, `W10-02`).
+//! Cross-process exclusive bundle lockfile guard (`ADR-0023` §3.2, `P2-02`, `ST-05`).
 //!
-//! Enforces mutual exclusion across `RunArtifactBundle` mutations using kernel-atomic
-//! `OpenOptions::create_new(true)` (`O_CREAT | O_EXCL` on POSIX, `CREATE_NEW` on Windows)
-//! and a retained open [`std::fs::File`] handle under `#![forbid(unsafe_code)]`.
+//! Enforces mutual exclusion across `RunArtifactBundle` writers using kernel advisory/mandatory
+//! locking via [`fs4::FileExt::try_lock`] (`flock` on Unix, `LockFileEx` on Windows) over a
+//! **persistent** inode-safe `.bundle.lock` handle under `#![forbid(unsafe_code)]`.
+//!
+//! Unlike `create_new` + `Drop::remove_file`, `.bundle.lock` is never unlinked on release,
+//! eliminating two-inode unlink/recreate races and guaranteeing automatic kernel cleanup if a
+//! writer crashes (`SIGKILL` / abnormal process termination).
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fs4::{FileExt, TryLockError};
 
 /// Canonical lockfile name inside `runs/<run_id>/`.
 pub const BUNDLE_LOCK_FILE_NAME: &str = ".bundle.lock";
@@ -19,7 +25,7 @@ static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Policy controlling how [`BundleLockGuard::acquire`] handles lock contention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockAcquisitionPolicy {
-    /// Immediately return [`BundleLockError::BundleBusy`] if `.bundle.lock` exists.
+    /// Immediately return [`BundleLockError::BundleBusy`] if `.bundle.lock` is held.
     FailFast,
     /// Poll until `timeout` elapses before returning [`BundleLockError::BundleBusy`].
     BoundedWait {
@@ -98,9 +104,10 @@ struct LockMetadataV1 {
     lease_nonce: u64,
 }
 
-/// RAII guard for the cross-process exclusive `.bundle.lock` file (`ADR-0023` §3.2).
+/// RAII guard for the cross-process exclusive `.bundle.lock` file (`ADR-0023` §3.2, `ST-05`).
 ///
-/// Retains the open [`File`] handle while alive and removes `.bundle.lock` on [`Drop`].
+/// Retains an exclusively locked persistent [`File`] handle while alive, calling
+/// [`fs4::FileExt::unlock`] on [`Drop`] without unlinking `.bundle.lock`.
 #[derive(Debug)]
 pub struct BundleLockGuard {
     lock_path: PathBuf,
@@ -109,15 +116,15 @@ pub struct BundleLockGuard {
 }
 
 impl BundleLockGuard {
-    /// Acquire an exclusive lock on `run_dir/.bundle.lock` according to `policy`.
+    /// Acquire an exclusive kernel lock on `run_dir/.bundle.lock` according to `policy`.
     pub fn acquire(run_dir: &Path, policy: LockAcquisitionPolicy) -> Result<Self, BundleLockError> {
         let lock_path = run_dir.join(BUNDLE_LOCK_FILE_NAME);
         let start = Instant::now();
 
         loop {
-            match Self::try_create_lock(&lock_path) {
+            match Self::try_acquire_lock(&lock_path) {
                 Ok(guard) => return Ok(guard),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match policy {
+                Err(BundleLockError::BundleBusy { .. }) => match policy {
                     LockAcquisitionPolicy::FailFast => {
                         return Err(BundleLockError::BundleBusy { lock_path });
                     }
@@ -125,23 +132,40 @@ impl BundleLockGuard {
                         timeout,
                         poll_interval,
                     } => {
-                        if start.elapsed() >= timeout {
+                        let elapsed = start.elapsed();
+                        if elapsed >= timeout {
                             return Err(BundleLockError::BundleBusy { lock_path });
                         }
-                        thread::sleep(poll_interval.max(Duration::from_millis(1)));
+                        let remaining = timeout.saturating_sub(elapsed);
+                        let sleep_for = poll_interval.max(Duration::from_millis(1)).min(remaining);
+                        thread::sleep(sleep_for);
                     }
                 },
-                Err(e) => return Err(BundleLockError::Io(e)),
+                Err(e) => return Err(e),
             }
         }
     }
 
-    fn try_create_lock(lock_path: &Path) -> io::Result<Self> {
+    fn try_acquire_lock(lock_path: &Path) -> Result<Self, BundleLockError> {
+        // Never pass `.truncate(true)` here: truncation before holding the kernel lock would
+        // clobber an active holder's diagnostic metadata without mutual exclusion.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
-            .open(lock_path)?;
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(BundleLockError::Io)?;
+
+        match FileExt::try_lock(&file) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(BundleLockError::BundleBusy {
+                    lock_path: lock_path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(e)) => return Err(BundleLockError::Io(e)),
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -154,11 +178,22 @@ impl BundleLockGuard {
             acquired_unix_nanos,
             lease_nonce,
         };
-        let payload = serde_json::to_vec(&meta).map_err(io::Error::other)?;
-        if let Err(e) = file.write_all(&payload).and_then(|()| file.sync_all()) {
-            drop(file);
-            let _ = fs::remove_file(lock_path);
-            return Err(e);
+        let payload =
+            serde_json::to_vec(&meta).map_err(|e| BundleLockError::Io(io::Error::other(e)))?;
+
+        // Write diagnostic metadata strictly AFTER holding the exclusive kernel lock.
+        let write_res: io::Result<()> = (|| {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&payload)?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = FileExt::unlock(&file);
+            return Err(BundleLockError::Io(e));
         }
 
         Ok(Self {
@@ -181,8 +216,9 @@ impl BundleLockGuard {
 
 impl Drop for BundleLockGuard {
     fn drop(&mut self) {
-        // Close the open file handle before unlinking so Windows allows removal.
-        drop(self.file.take());
-        let _ = fs::remove_file(&self.lock_path);
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+            drop(file);
+        }
     }
 }

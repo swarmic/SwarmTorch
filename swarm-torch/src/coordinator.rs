@@ -18,7 +18,7 @@ use swarm_torch_core::aggregation::{
 #[cfg(feature = "robust-aggregation")]
 use swarm_torch_core::aggregation::{Bulyan, BulyanProfile, Krum};
 use swarm_torch_core::compression::CompressedGradient;
-use swarm_torch_core::crypto::{sha256_slices, SessionHandshakeChallengeV2, Signature};
+use swarm_torch_core::crypto::{sha256_slices, KeyPair, SessionHandshakeChallengeV2, Signature};
 use swarm_torch_core::dataops::{
     AuthModeMarker, CacheDecisionV0, SourceDescriptorV0, TransformAuditV0, TrustClass,
 };
@@ -33,7 +33,8 @@ use swarm_torch_core::run_graph::{
     node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind,
 };
 use swarm_torch_core::traits::{
-    FitnessFunction, GradientUpdate, PeerId, SwarmModel, SwarmOptimizer, UpdateTransform,
+    FitnessFunction, GradientUpdate, OptimizerStateSnapshotV1, PeerId, SwarmModel, SwarmOptimizer,
+    UpdateTransform,
 };
 use swarm_torch_core::Error as CoreError;
 use swarm_torch_models::lora::LoraAdapterPairV1;
@@ -42,10 +43,14 @@ use swarm_torch_net::gossip::{
 };
 
 use crate::artifacts::{
-    get_verified_checkpoint_model, pre_release_debit_dp_accountant, put_checkpoint_model,
-    reconstruct_dp_accountant_from_ledger, write_round_resume_state, CheckpointContentDigestV1,
-    CheckpointRecipeKeyV1, CryptoErrorOrIo, DataOpsSession, OutputSpec, RoundResumeStateV1,
-    ROUND_RESUME_STATE_SCHEMA_V1,
+    get_verified_cclip_center_v1, get_verified_checkpoint_model,
+    get_verified_historical_anchors_v1, get_verified_optimizer_state_snapshot_v1,
+    pre_release_debit_dp_accountant, put_cclip_center_v1, put_checkpoint_model,
+    put_coordinator_resume_state_v2, put_historical_anchors_v1, put_optimizer_state_snapshot_v1,
+    reconstruct_dp_accountant_from_ledger, write_committed_head_v1, write_round_resume_state,
+    CheckpointContentDigestV1, CheckpointRecipeKeyV1, CommittedHeadV1, CoordinatorResumeStateV2,
+    CryptoErrorOrIo, DataOpsSession, OutputSpec, RestoreModeV1, RoundResumeStateV1, TrustPolicy,
+    COMMITTED_HEAD_SCHEMA_V1, COORDINATOR_RESUME_STATE_SCHEMA_V2, ROUND_RESUME_STATE_SCHEMA_V1,
 };
 
 /// Domain tag for canonical peer round submission digests (`ADR-0023` §1.3).
@@ -1019,6 +1024,19 @@ pub enum RoundError {
     },
     /// Wire payload compression/schema/LoRA decoding failed (`ST-01`).
     InvalidWirePayload(String),
+    /// Round identifier reached `u64::MAX` and cannot advance safely (`ST-04`).
+    RoundIdOverflow {
+        round_id: u64,
+    },
+    /// Coordinator generation counter reached `u64::MAX` (`ST-04`).
+    CoordinatorGenerationOverflow {
+        generation: u64,
+    },
+    /// Required resume state dependency (optimizer state, CClip center, anchors, or manifest)
+    /// is missing, mismatched, or incompatible (`ST-04`).
+    ResumeStateMismatch(String),
+    /// Optimizer state snapshot serialization or restoration failed (`ST-04`).
+    OptimizerStateError(String),
     Io(io::Error),
 }
 
@@ -1106,6 +1124,14 @@ impl core::fmt::Display for RoundError {
                 "stale coordinator_generation on verified submission: expected {expected}, got {got}"
             ),
             Self::InvalidWirePayload(msg) => write!(f, "invalid wire payload: {msg}"),
+            Self::RoundIdOverflow { round_id } => {
+                write!(f, "round_id overflow advancing past {round_id}")
+            }
+            Self::CoordinatorGenerationOverflow { generation } => {
+                write!(f, "coordinator_generation overflow advancing past {generation}")
+            }
+            Self::ResumeStateMismatch(msg) => write!(f, "resume state validation failed: {msg}"),
+            Self::OptimizerStateError(msg) => write!(f, "optimizer state error: {msg}"),
             Self::Io(e) => write!(f, "artifact/CAS I/O error: {e}"),
         }
     }
@@ -1164,6 +1190,15 @@ pub struct RoundCommitSummaryV1 {
     pub weight_mismatch_warnings: Vec<String>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum CommitFailPoint {
+    AfterCasBeforeManifest,
+    AfterManifestBeforeCommittedHead,
+    AfterCommittedHeadBeforeMemory,
+}
+
 /// Unified round coordinator state machine (`ADR-0023` §1, `W10-01`).
 pub struct SwarmRoundCoordinator<M: SwarmModel> {
     run_id: RunId,
@@ -1196,6 +1231,140 @@ pub struct SwarmRoundCoordinator<M: SwarmModel> {
     fedasync_clip_norm: Option<f32>,
     /// Bounded historical parameter anchor window (`round_id -> w_round`) for `FedAsync` drift compensation.
     historical_anchors: BTreeMap<u64, Vec<f32>>,
+    /// Optional Ed25519 keypair used to sign every round's Step 3 manifest before committing `committed_head.json`.
+    manifest_signer: Option<KeyPair>,
+    /// Deterministic test fault-injection seam across the 5-step transactional commit boundary (`ST-04`).
+    #[cfg(test)]
+    fail_point: Option<CommitFailPoint>,
+}
+
+struct StagedRoundCommit<M> {
+    committed_round: u64,
+    next_round: u64,
+    next_generation: u64,
+    candidate_model: M,
+    optimizer_snapshot: Option<OptimizerStateSnapshotV1>,
+    next_cclip_center: Option<Vec<f32>>,
+    next_historical_anchors: BTreeMap<u64, Vec<f32>>,
+    next_historical_digests_without_new: BTreeMap<u64, CheckpointContentDigestV1>,
+    next_bucketing_report: Option<BucketExecutionReport>,
+    checkpoint_asset_key: String,
+    node_key: String,
+    op_type: String,
+    output_rows: Option<u64>,
+    admitted_peers: Vec<PeerId>,
+    equivocated_peers: Vec<PeerId>,
+    frozen_raw_inputs: BTreeMap<PeerId, Vec<f32>>,
+    weight_mismatch_warnings: Vec<String>,
+    fitness_score: Option<f32>,
+    staged_transform_audits: Vec<TransformAuditV0>,
+    dp_subsampling_q_override: Option<f64>,
+    dp_explicit_tau: Option<f32>,
+    emit_standard_telemetry: bool,
+    clear_round_admitted: bool,
+    ts_unix_nanos: u64,
+    telemetry_admitted_count: usize,
+    telemetry_equivocated_count: usize,
+}
+
+fn hex_lower_32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use core::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn hash_round_coordinator_config(hasher: &mut Sha256, config: &RoundCoordinatorConfig) {
+    match config.update_kind {
+        UpdateKindV1::ModelDeltaV1 {
+            server_learning_rate,
+        } => {
+            hasher.update([1u8]);
+            hasher.update(server_learning_rate.to_bits().to_le_bytes());
+        }
+        UpdateKindV1::GradientV1 => hasher.update([2u8]),
+    }
+
+    match &config.aggregation {
+        RobustAggregation::FedAvg => hasher.update([1u8]),
+        RobustAggregation::Median => hasher.update([2u8]),
+        RobustAggregation::TrimmedMean { trim_ratio } => {
+            hasher.update([3u8]);
+            hasher.update(trim_ratio.to_bits().to_le_bytes());
+        }
+        #[cfg(feature = "robust-aggregation")]
+        RobustAggregation::Krum { num_byzantine } => {
+            hasher.update([4u8]);
+            hasher.update((*num_byzantine as u64).to_le_bytes());
+        }
+        #[cfg(feature = "robust-aggregation")]
+        RobustAggregation::MultiKrum {
+            num_byzantine,
+            num_selected,
+        } => {
+            hasher.update([5u8]);
+            hasher.update((*num_byzantine as u64).to_le_bytes());
+            hasher.update((*num_selected as u64).to_le_bytes());
+        }
+        #[cfg(feature = "robust-aggregation")]
+        RobustAggregation::Bulyan {
+            max_byzantine,
+            profile,
+        } => {
+            hasher.update([6u8]);
+            hasher.update((*max_byzantine as u64).to_le_bytes());
+            let p_tag: u8 = match profile {
+                BulyanProfile::IterativeKrumV1 => 1,
+            };
+            hasher.update([p_tag]);
+        }
+        RobustAggregation::CenteredClipping {
+            tau,
+            max_iterations,
+        } => {
+            hasher.update([7u8]);
+            hasher.update(tau.to_bits().to_le_bytes());
+            hasher.update((*max_iterations as u64).to_le_bytes());
+        }
+    }
+
+    match &config.weighting_policy {
+        WeightingPolicyV1::EqualPeerVote => hasher.update([1u8]),
+        WeightingPolicyV1::RegistryCertified {
+            peer_weights,
+            max_weight_share,
+        } => {
+            hasher.update([2u8]);
+            hasher.update(max_weight_share.to_bits().to_le_bytes());
+            hasher.update((peer_weights.len() as u64).to_le_bytes());
+            for (peer, &weight) in peer_weights {
+                hasher.update(peer.as_bytes());
+                hasher.update(weight.to_le_bytes());
+            }
+        }
+    }
+
+    hasher.update((config.authorized_cohort.len() as u64).to_le_bytes());
+    for peer in &config.authorized_cohort {
+        hasher.update(peer.as_bytes());
+    }
+    hasher.update((config.min_quorum as u64).to_le_bytes());
+    hasher.update(config.max_staleness.to_le_bytes());
+    hasher.update(config.max_clock_skew_secs.to_le_bytes());
+}
+
+fn compute_base_config_policy_digest_hex(
+    config: &RoundCoordinatorConfig,
+    param_count: usize,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"swarmtorch.coordinator.base_config.v1");
+    hasher.update((param_count as u64).to_le_bytes());
+    hash_round_coordinator_config(&mut hasher, config);
+    let digest: [u8; 32] = hasher.finalize().into();
+    hex_lower_32(&digest)
 }
 
 fn default_swarm_instance_id(run_id: RunId) -> [u8; 16] {
@@ -1213,9 +1382,41 @@ fn default_coordinator_peer_id(run_id: RunId) -> PeerId {
 }
 
 impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
+    fn build_replay_protection(
+        config: &RoundCoordinatorConfig,
+        floor_secs: u32,
+    ) -> ReplayProtection {
+        let allowlist = CohortAllowlist::from_peers(config.authorized_cohort.iter().copied());
+        let replay = ReplayProtection::try_with_config(1024, config.max_clock_skew_secs)
+            .expect("non-zero capacity")
+            .with_cohort_allowlist(allowlist);
+        if floor_secs > 0 {
+            replay.with_timestamp_floor(floor_secs)
+        } else {
+            replay
+        }
+    }
+
+    fn compute_next_historical_anchors(
+        &self,
+        committed_round: u64,
+        committed_weights: Vec<f32>,
+    ) -> BTreeMap<u64, Vec<f32>> {
+        let mut next = self.historical_anchors.clone();
+        next.insert(committed_round, committed_weights);
+        let max_keep = self.config.max_staleness.max(
+            self.fedasync_policy
+                .map(|p| p.max_staleness_rounds)
+                .unwrap_or(0),
+        );
+        let cutoff = committed_round.saturating_sub(max_keep);
+        next.retain(|&r, _| r >= cutoff);
+        next
+    }
+
     /// Initialize a new [`SwarmRoundCoordinator`] at round 1, persisting the genesis (round 0)
-    /// model checkpoint into the run bundle's physical CAS store and registering it as a
-    /// source asset in `session` (`ADR-0023` §1, §2.2).
+    /// model checkpoint, anchors, `CoordinatorResumeStateV2` CAS spine, finalized manifest, and
+    /// authoritative `checkpoints/committed_head.json` (`ADR-0023` §1, §2.2, `ST-04`).
     pub fn initialize(
         run_id: RunId,
         config: RoundCoordinatorConfig,
@@ -1272,6 +1473,65 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             &ingest_node,
         )?;
 
+        let mut historical_digests = BTreeMap::new();
+        historical_digests.insert(0, genesis_digest);
+        let mut historical_anchors = BTreeMap::new();
+        historical_anchors.insert(0, initial_model.parameters().to_vec());
+        let (anchors_digest, anchors_uri, anchors_bytes) =
+            put_historical_anchors_v1(&run_dir, &historical_anchors)?;
+
+        let swarm_instance_id = default_swarm_instance_id(run_id);
+        let coordinator_peer_id = default_coordinator_peer_id(run_id);
+        let config_policy_digest_hex =
+            compute_base_config_policy_digest_hex(&config, initial_model.num_parameters());
+
+        let resume_v2 = CoordinatorResumeStateV2 {
+            schema_version: COORDINATOR_RESUME_STATE_SCHEMA_V2,
+            run_id,
+            swarm_instance_id,
+            coordinator_peer_id,
+            generation: 0,
+            round_id: 0,
+            next_round_id: 1,
+            checkpoint_asset_key: genesis_asset_key.clone(),
+            recipe_key: genesis_recipe_key,
+            model_digest: genesis_digest,
+            model_blob_uri: genesis_uri.clone(),
+            model_blob_bytes: genesis_bytes,
+            parameter_count: initial_model.num_parameters(),
+            optimizer_state_digest: None,
+            optimizer_state_cas_uri: None,
+            optimizer_state_bytes: None,
+            cclip_center_digest: None,
+            cclip_center_cas_uri: None,
+            cclip_center_bytes: None,
+            historical_anchors_digest: anchors_digest,
+            historical_anchors_cas_uri: anchors_uri,
+            historical_anchors_bytes: anchors_bytes,
+            historical_digests: historical_digests.clone(),
+            replay_timestamp_floor_secs: 0,
+            config_policy_digest_hex,
+            fedasync_policy: None,
+            fedasync_hinge_threshold: 0,
+            fedasync_clip_norm: None,
+            bucketing: None,
+            committed_unix_nanos: ts_unix_nanos,
+        };
+        let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
+            put_coordinator_resume_state_v2(&run_dir, &resume_v2)?;
+
+        let (_manifest, manifest_sha256) = session.sink().finalize_checkpoint_manifest(0, None)?;
+        let head = CommittedHeadV1 {
+            schema_version: COMMITTED_HEAD_SCHEMA_V1,
+            run_id,
+            generation: 0,
+            round_id: 0,
+            manifest_sha256,
+            resume_state_cas_uri: resume_v2_uri,
+            committed_unix_nanos: ts_unix_nanos,
+        };
+        write_committed_head_v1(&run_dir, &head)?;
+
         let resume_state = RoundResumeStateV1 {
             schema_version: ROUND_RESUME_STATE_SCHEMA_V1,
             run_id,
@@ -1286,18 +1546,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         };
         write_round_resume_state(&run_dir, &resume_state)?;
 
-        let allowlist = CohortAllowlist::from_peers(config.authorized_cohort.iter().copied());
-        let replay = ReplayProtection::try_with_config(1024, config.max_clock_skew_secs)
-            .expect("non-zero capacity")
-            .with_cohort_allowlist(allowlist);
-
-        let mut historical_digests = BTreeMap::new();
-        historical_digests.insert(0, genesis_digest);
-        let mut historical_anchors = BTreeMap::new();
-        historical_anchors.insert(0, initial_model.parameters().to_vec());
-
-        let swarm_instance_id = default_swarm_instance_id(run_id);
-        let coordinator_peer_id = default_coordinator_peer_id(run_id);
+        let replay = Self::build_replay_protection(&config, 0);
 
         Ok(Self {
             run_id,
@@ -1322,11 +1571,268 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_hinge_threshold: 0,
             fedasync_clip_norm: None,
             historical_anchors,
+            manifest_signer: None,
+            #[cfg(test)]
+            fail_point: None,
         })
     }
 
-    /// Resume a [`SwarmRoundCoordinator`] from a verified [`RoundResumeStateV1`] and its
-    /// physical CAS checkpoint blob (`ADR-0023` §2.2).
+    /// Restore only verified checkpoint weights onto a clean training lineage (`RestoreModeV1::WeightsOnlyRestore`, `ST-04`).
+    ///
+    /// Resets `cclip_center = None`, clears `fedasync_policy` and `bucketing`, keeps only the
+    /// restored checkpoint as the historical anchor for `round_id`, and forces fresh session
+    /// handshake onboarding with a monotonic timestamp floor.
+    pub fn restore_weights_only(
+        config: RoundCoordinatorConfig,
+        model_template: M,
+        session: &DataOpsSession,
+        trust_policy: &TrustPolicy,
+    ) -> Result<Self, RoundError> {
+        config.validate()?;
+        let run_dir = session.sink().bundle().run_dir();
+        let (_head, _manifest, _status, resume_v2) = session
+            .sink()
+            .bundle()
+            .verify_committed_head(trust_policy)?;
+        if resume_v2.run_id != session.sink().bundle().run_id() {
+            return Err(RoundError::RunIdMismatch {
+                expected: session.sink().bundle().run_id(),
+                got: resume_v2.run_id,
+            });
+        }
+        let model: M = get_verified_checkpoint_model(
+            run_dir,
+            model_template,
+            &resume_v2.model_digest,
+            resume_v2.parameter_count,
+        )?;
+        let replay = Self::build_replay_protection(&config, resume_v2.replay_timestamp_floor_secs);
+
+        let mut historical_digests = BTreeMap::new();
+        historical_digests.insert(resume_v2.round_id, resume_v2.model_digest);
+        let mut historical_anchors = BTreeMap::new();
+        historical_anchors.insert(resume_v2.round_id, model.parameters().to_vec());
+
+        Ok(Self {
+            run_id: resume_v2.run_id,
+            swarm_instance_id: resume_v2.swarm_instance_id,
+            coordinator_peer_id: resume_v2.coordinator_peer_id,
+            coordinator_generation: resume_v2.generation,
+            config,
+            current_round: resume_v2.next_round_id,
+            model,
+            parent_digest: resume_v2.model_digest,
+            parent_recipe_key: resume_v2.recipe_key,
+            parent_asset_key: resume_v2.checkpoint_asset_key,
+            historical_digests,
+            replay,
+            admitted: BTreeMap::new(),
+            equivocated: BTreeSet::new(),
+            cclip_center: None,
+            bucketing: None,
+            last_bucketing_report: None,
+            dp_accountant: None,
+            fedasync_policy: None,
+            fedasync_hinge_threshold: 0,
+            fedasync_clip_norm: None,
+            historical_anchors,
+            manifest_signer: None,
+            #[cfg(test)]
+            fail_point: None,
+        })
+    }
+
+    /// Perform full authenticated resume of model weights, optimizer state, `cclip_center`,
+    /// bounded `historical_anchors`, generation counter, and replay floor from
+    /// `checkpoints/committed_head.json` (`RestoreModeV1::ExactTrainingResume`, `ST-04`).
+    ///
+    /// Fails closed if `committed_head.json`, manifest signature/integrity, `CoordinatorResumeStateV2`,
+    /// `model`, `optimizer_state` (mandatory for `UpdateKindV1::GradientV1`), `cclip_center`
+    /// (mandatory for `CenteredClipping` with `round_id >= 1`), `historical_anchors`, or
+    /// `config` policy digest is missing, mismatched, or corrupted. Does not mutate `optimizer`
+    /// unless every verification check succeeds.
+    pub fn resume_exact_training_state<O: SwarmOptimizer<Model = M>>(
+        config: RoundCoordinatorConfig,
+        model_template: M,
+        optimizer: Option<&mut O>,
+        session: &DataOpsSession,
+        trust_policy: &TrustPolicy,
+    ) -> Result<Self, RoundError> {
+        config.validate()?;
+        let run_dir = session.sink().bundle().run_dir();
+        let (_head, _manifest, _status, resume_v2) = session
+            .sink()
+            .bundle()
+            .verify_committed_head(trust_policy)?;
+        if resume_v2.run_id != session.sink().bundle().run_id() {
+            return Err(RoundError::RunIdMismatch {
+                expected: session.sink().bundle().run_id(),
+                got: resume_v2.run_id,
+            });
+        }
+
+        let model: M = get_verified_checkpoint_model(
+            run_dir,
+            model_template,
+            &resume_v2.model_digest,
+            resume_v2.parameter_count,
+        )?;
+        let expected_cfg_hex =
+            compute_base_config_policy_digest_hex(&config, model.num_parameters());
+        if expected_cfg_hex != resume_v2.config_policy_digest_hex {
+            return Err(RoundError::ResumeStateMismatch(format!(
+                "coordinator config policy digest {} does not match committed checkpoint policy {}",
+                expected_cfg_hex, resume_v2.config_policy_digest_hex
+            )));
+        }
+
+        // Load and verify optimizer snapshot BEFORE mutating caller's `optimizer`!
+        let loaded_opt_snapshot = if matches!(config.update_kind, UpdateKindV1::GradientV1) {
+            if optimizer.is_none() {
+                return Err(RoundError::ResumeStateMismatch(
+                    "ExactTrainingResume with UpdateKindV1::GradientV1 requires Some(optimizer)"
+                        .to_string(),
+                ));
+            }
+            if resume_v2.round_id >= 1 {
+                let opt_digest = resume_v2.optimizer_state_digest.as_ref().ok_or_else(|| {
+                    RoundError::ResumeStateMismatch(
+                        "missing optimizer_state_digest in committed GradientV1 checkpoint"
+                            .to_string(),
+                    )
+                })?;
+                Some(get_verified_optimizer_state_snapshot_v1(
+                    run_dir,
+                    opt_digest,
+                    resume_v2.optimizer_state_bytes,
+                )?)
+            } else {
+                None
+            }
+        } else if optimizer.is_some() {
+            match resume_v2.optimizer_state_digest.as_ref() {
+                Some(opt_digest) => Some(get_verified_optimizer_state_snapshot_v1(
+                    run_dir,
+                    opt_digest,
+                    resume_v2.optimizer_state_bytes,
+                )?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Load and verify `cclip_center` (mandatory for `CenteredClipping` once >= 1 round committed).
+        let restored_cclip_center = if matches!(
+            config.aggregation,
+            RobustAggregation::CenteredClipping { .. }
+        ) && resume_v2.round_id >= 1
+        {
+            let cclip_digest = resume_v2.cclip_center_digest.as_ref().ok_or_else(|| {
+                RoundError::ResumeStateMismatch(
+                    "missing cclip_center_digest for CenteredClipping ExactTrainingResume"
+                        .to_string(),
+                )
+            })?;
+            Some(get_verified_cclip_center_v1(
+                run_dir,
+                cclip_digest,
+                resume_v2.cclip_center_bytes,
+                model.num_parameters(),
+            )?)
+        } else if let Some(cclip_digest) = resume_v2.cclip_center_digest.as_ref() {
+            Some(get_verified_cclip_center_v1(
+                run_dir,
+                cclip_digest,
+                resume_v2.cclip_center_bytes,
+                model.num_parameters(),
+            )?)
+        } else {
+            None
+        };
+
+        // Load and verify bounded `historical_anchors`.
+        let restored_anchors = get_verified_historical_anchors_v1(
+            run_dir,
+            &resume_v2.historical_anchors_digest,
+            Some(resume_v2.historical_anchors_bytes),
+            model.num_parameters(),
+        )?;
+        if !restored_anchors.contains_key(&resume_v2.round_id) {
+            return Err(RoundError::ResumeStateMismatch(format!(
+                "historical_anchors missing anchor for committed round {}",
+                resume_v2.round_id
+            )));
+        }
+
+        // Apply optimizer restore ONLY after all other CAS/manifest/config checks succeed.
+        if let (Some(opt), Some(ref snapshot)) = (optimizer, loaded_opt_snapshot) {
+            opt.restore_state(snapshot)
+                .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?;
+        }
+
+        let replay = Self::build_replay_protection(&config, resume_v2.replay_timestamp_floor_secs);
+
+        Ok(Self {
+            run_id: resume_v2.run_id,
+            swarm_instance_id: resume_v2.swarm_instance_id,
+            coordinator_peer_id: resume_v2.coordinator_peer_id,
+            coordinator_generation: resume_v2.generation,
+            config,
+            current_round: resume_v2.next_round_id,
+            model,
+            parent_digest: resume_v2.model_digest,
+            parent_recipe_key: resume_v2.recipe_key,
+            parent_asset_key: resume_v2.checkpoint_asset_key,
+            historical_digests: resume_v2.historical_digests,
+            replay,
+            admitted: BTreeMap::new(),
+            equivocated: BTreeSet::new(),
+            cclip_center: restored_cclip_center,
+            bucketing: resume_v2.bucketing,
+            last_bucketing_report: None,
+            dp_accountant: None,
+            fedasync_policy: resume_v2.fedasync_policy,
+            fedasync_hinge_threshold: resume_v2.fedasync_hinge_threshold,
+            fedasync_clip_norm: resume_v2.fedasync_clip_norm,
+            historical_anchors: restored_anchors,
+            manifest_signer: None,
+            #[cfg(test)]
+            fail_point: None,
+        })
+    }
+
+    /// Dispatch coordinator restoration via an explicit [`RestoreModeV1`] (`ST-04`).
+    pub fn restore_with_mode<O: SwarmOptimizer<Model = M>>(
+        mode: RestoreModeV1,
+        config: RoundCoordinatorConfig,
+        model_template: M,
+        optimizer: Option<&mut O>,
+        session: &DataOpsSession,
+        trust_policy: &TrustPolicy,
+    ) -> Result<Self, RoundError> {
+        match mode {
+            RestoreModeV1::WeightsOnlyRestore => {
+                Self::restore_weights_only(config, model_template, session, trust_policy)
+            }
+            RestoreModeV1::ExactTrainingResume => Self::resume_exact_training_state(
+                config,
+                model_template,
+                optimizer,
+                session,
+                trust_policy,
+            ),
+        }
+    }
+
+    /// Legacy v1 coordinator resume helper (`ADR-0023` §2.2).
+    ///
+    /// Prefer [`Self::resume_exact_training_state`] or [`Self::restore_weights_only`] which
+    /// verify `checkpoints/committed_head.json`, optimizer state, `cclip_center`, and bounded
+    /// `historical_anchors` fail-closed (`ST-04`).
+    #[deprecated(
+        note = "use resume_exact_training_state or restore_weights_only for authenticated transactional state recovery (ST-04)"
+    )]
     pub fn from_resume_state(
         config: RoundCoordinatorConfig,
         model_template: M,
@@ -1334,6 +1840,29 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         session: &DataOpsSession,
     ) -> Result<Self, RoundError> {
         config.validate()?;
+        if matches!(config.update_kind, UpdateKindV1::GradientV1) {
+            return Err(RoundError::ResumeStateMismatch(
+                "from_resume_state cannot restore GradientV1 optimizer state; use resume_exact_training_state or restore_weights_only"
+                    .to_string(),
+            ));
+        }
+        if matches!(
+            config.aggregation,
+            RobustAggregation::CenteredClipping { .. }
+        ) && resume_state.round_id >= 1
+        {
+            return Err(RoundError::ResumeStateMismatch(
+                "from_resume_state cannot restore CenteredClipping center; use resume_exact_training_state or restore_weights_only"
+                    .to_string(),
+            ));
+        }
+        let next_round =
+            resume_state
+                .round_id
+                .checked_add(1)
+                .ok_or(RoundError::RoundIdOverflow {
+                    round_id: resume_state.round_id,
+                })?;
         let run_dir = session.sink().bundle().run_dir();
         if resume_state.run_id != session.sink().bundle().run_id() {
             return Err(RoundError::RunIdMismatch {
@@ -1347,17 +1876,9 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             &resume_state.content_digest,
             resume_state.parameter_count,
         )?;
-        let allowlist = CohortAllowlist::from_peers(config.authorized_cohort.iter().copied());
-        let replay = ReplayProtection::try_with_config(1024, config.max_clock_skew_secs)
-            .expect("non-zero capacity")
-            .with_cohort_allowlist(allowlist);
         let floor_secs =
             (resume_state.committed_unix_nanos / 1_000_000_000).min(u32::MAX as u64) as u32;
-        let replay = if floor_secs > 0 {
-            replay.with_timestamp_floor(floor_secs)
-        } else {
-            replay
-        };
+        let replay = Self::build_replay_protection(&config, floor_secs);
 
         let mut historical_digests = BTreeMap::new();
         historical_digests.insert(resume_state.round_id, resume_state.content_digest);
@@ -1372,7 +1893,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             coordinator_peer_id,
             coordinator_generation: 0,
             config,
-            current_round: resume_state.round_id.saturating_add(1),
+            current_round: next_round,
             model,
             parent_digest: resume_state.content_digest,
             parent_recipe_key: resume_state.recipe_key,
@@ -1389,7 +1910,27 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_hinge_threshold: 0,
             fedasync_clip_norm: None,
             historical_anchors,
+            manifest_signer: None,
+            #[cfg(test)]
+            fail_point: None,
         })
+    }
+
+    /// Attach an Ed25519 manifest signing key so Step 3 signs every committed round manifest
+    /// prior to publishing `checkpoints/committed_head.json` (`ST-04`).
+    pub fn with_manifest_signer(mut self, signer: KeyPair) -> Self {
+        self.manifest_signer = Some(signer);
+        self
+    }
+
+    /// Configure or clear the Step 3 manifest signing key (`ST-04`).
+    pub fn set_manifest_signer(&mut self, signer: Option<KeyPair>) {
+        self.manifest_signer = signer;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_commit_fail_point(&mut self, fp: CommitFailPoint) {
+        self.fail_point = Some(fp);
     }
 
     /// Configure conservative `$s$-Bucketing` pre-aggregation for subsequent rounds (`ADR-0019` §4, `W11-01`).
@@ -1486,82 +2027,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         hasher.update(self.coordinator_peer_id.as_bytes());
         hasher.update((self.model.num_parameters() as u64).to_le_bytes());
 
-        match self.config.update_kind {
-            UpdateKindV1::ModelDeltaV1 {
-                server_learning_rate,
-            } => {
-                hasher.update([1u8]);
-                hasher.update(server_learning_rate.to_bits().to_le_bytes());
-            }
-            UpdateKindV1::GradientV1 => hasher.update([2u8]),
-        }
-
-        match &self.config.aggregation {
-            RobustAggregation::FedAvg => hasher.update([1u8]),
-            RobustAggregation::Median => hasher.update([2u8]),
-            RobustAggregation::TrimmedMean { trim_ratio } => {
-                hasher.update([3u8]);
-                hasher.update(trim_ratio.to_bits().to_le_bytes());
-            }
-            #[cfg(feature = "robust-aggregation")]
-            RobustAggregation::Krum { num_byzantine } => {
-                hasher.update([4u8]);
-                hasher.update((*num_byzantine as u64).to_le_bytes());
-            }
-            #[cfg(feature = "robust-aggregation")]
-            RobustAggregation::MultiKrum {
-                num_byzantine,
-                num_selected,
-            } => {
-                hasher.update([5u8]);
-                hasher.update((*num_byzantine as u64).to_le_bytes());
-                hasher.update((*num_selected as u64).to_le_bytes());
-            }
-            #[cfg(feature = "robust-aggregation")]
-            RobustAggregation::Bulyan {
-                max_byzantine,
-                profile,
-            } => {
-                hasher.update([6u8]);
-                hasher.update((*max_byzantine as u64).to_le_bytes());
-                let p_tag: u8 = match profile {
-                    BulyanProfile::IterativeKrumV1 => 1,
-                };
-                hasher.update([p_tag]);
-            }
-            RobustAggregation::CenteredClipping {
-                tau,
-                max_iterations,
-            } => {
-                hasher.update([7u8]);
-                hasher.update(tau.to_bits().to_le_bytes());
-                hasher.update((*max_iterations as u64).to_le_bytes());
-            }
-        }
-
-        match &self.config.weighting_policy {
-            WeightingPolicyV1::EqualPeerVote => hasher.update([1u8]),
-            WeightingPolicyV1::RegistryCertified {
-                peer_weights,
-                max_weight_share,
-            } => {
-                hasher.update([2u8]);
-                hasher.update(max_weight_share.to_bits().to_le_bytes());
-                hasher.update((peer_weights.len() as u64).to_le_bytes());
-                for (peer, &weight) in peer_weights {
-                    hasher.update(peer.as_bytes());
-                    hasher.update(weight.to_le_bytes());
-                }
-            }
-        }
-
-        hasher.update((self.config.authorized_cohort.len() as u64).to_le_bytes());
-        for peer in &self.config.authorized_cohort {
-            hasher.update(peer.as_bytes());
-        }
-        hasher.update((self.config.min_quorum as u64).to_le_bytes());
-        hasher.update(self.config.max_staleness.to_le_bytes());
-        hasher.update(self.config.max_clock_skew_secs.to_le_bytes());
+        hash_round_coordinator_config(&mut hasher, &self.config);
 
         match self.fedasync_policy {
             Some(p) => {
@@ -1875,28 +2341,47 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     /// Finalize the current round, applying `transforms`, running the configured
     /// [`RobustAggregation`] / [`WeightingPolicyV1`], updating the global model, evaluating
     /// optional `fitness`, and committing the new checkpoint to the physical CAS store and
-    /// [`DataOpsSession`] (`ADR-0023` §1, §2.2).
+    /// Finalize the active round cleanly using transactional 5-step commit (`ADR-0023` §1, §2.2, `ST-04`):
+    ///
+    /// 1. Validate quorum, bounds, transforms, aggregation, candidate optimizer step, and fitness
+    ///    strictly in memory without mutating `self`, `*server_optimizer`, or `session`.
+    /// 2. Pre-debit DP ledger if configured and write immutable CAS blobs (`model`, optional
+    ///    `optimizer_state`, optional `cclip_center`, `historical_anchors`, `CoordinatorResumeStateV2`),
+    ///    followed by DataOps materialization & telemetry.
+    /// 3. Finalize (and optionally sign) `manifest.json` + archived generation manifest.
+    /// 4. Atomically swap & sync `checkpoints/committed_head.json` (authoritative commit point).
+    /// 5. Commit staged state into memory (`self` + `*server_optimizer`) infallibly.
     pub fn finalize_round<O, F>(
         &mut self,
         transforms: &[&dyn UpdateTransform],
-        mut server_optimizer: Option<&mut O>,
+        server_optimizer: Option<&mut O>,
         fitness: Option<&F>,
         session: &mut DataOpsSession,
         ts_unix_nanos: u64,
     ) -> Result<RoundCommitSummaryV1, RoundError>
     where
-        O: SwarmOptimizer<Model = M>,
+        O: SwarmOptimizer<Model = M> + Clone,
         F: FitnessFunction<Model = M>,
     {
-        // Re-verify quorum after any equivocation removals or timeout expiration (`ADR-0023` §1.3).
+        // Step 1: Pure in-memory preparation & validation (`ST-04`).
         if self.admitted.len() < self.config.min_quorum {
             return Err(RoundError::InsufficientQuorum {
                 admitted: self.admitted.len(),
                 min_quorum: self.config.min_quorum,
             });
         }
+        let next_round = self
+            .current_round
+            .checked_add(1)
+            .ok_or(RoundError::RoundIdOverflow {
+                round_id: self.current_round,
+            })?;
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
 
-        // Deterministic PeerId-sorted order (`BTreeMap` iteration is sorted by `PeerId`).
         let mut admitted_peers = Vec::with_capacity(self.admitted.len());
         let mut frozen_raw_inputs = BTreeMap::new();
         let mut working_updates = Vec::with_capacity(self.admitted.len());
@@ -1924,7 +2409,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             }
         }
 
-        // Apply pre-aggregation transforms on cloned working buffers while preserving frozen_raw_inputs.
+        let mut staged_transform_audits = Vec::with_capacity(transforms.len());
         for &transform in transforms {
             struct DynTransformRef<'a>(&'a dyn UpdateTransform);
             impl UpdateTransform for DynTransformRef<'_> {
@@ -1942,16 +2427,15 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             let (next_updates, mut audit): (Vec<GradientUpdate>, TransformAuditV0) =
                 apply_update_transforms(working_updates, &wrapper);
             audit.round_id = self.current_round;
-            session.record_transform_applied(&audit);
+            staged_transform_audits.push(audit);
             working_updates = next_updates;
         }
 
-        // Aggregate updates according to `WeightingPolicyV1`, optional `$s$-Bucketing`, and `RobustAggregation`.
         let (aggregated_vec, bucketing_report) =
             self.aggregate_working_updates(&admitted_peers, &working_updates)?;
 
-        // Produce candidate model according to `UpdateKindV1`.
         let mut candidate_model = self.model.clone();
+        let mut staged_optimizer: Option<O> = None;
         match self.config.update_kind {
             UpdateKindV1::ModelDeltaV1 {
                 server_learning_rate,
@@ -1972,18 +2456,31 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                     .map_err(RoundError::Aggregation)?;
             }
             UpdateKindV1::GradientV1 => {
-                let opt = server_optimizer.as_mut().ok_or_else(|| {
+                let opt = server_optimizer.as_deref().ok_or_else(|| {
                     RoundError::OptimizerStep(
                         "UpdateKindV1::GradientV1 requires a server SwarmOptimizer".to_string(),
                     )
                 })?;
-                opt.step(&mut candidate_model, &aggregated_vec)
+                let mut candidate_opt = opt.clone();
+                candidate_opt
+                    .step(&mut candidate_model, &aggregated_vec)
                     .map_err(|e| RoundError::OptimizerStep(format!("{e:?}")))?;
                 if candidate_model.parameters().iter().any(|p| !p.is_finite()) {
                     return Err(RoundError::Aggregation(CoreError::NanDetected));
                 }
+                staged_optimizer = Some(candidate_opt);
             }
         }
+
+        let optimizer_snapshot = match (&staged_optimizer, server_optimizer.as_deref()) {
+            (Some(cand), _) => cand
+                .snapshot_state()
+                .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
+            (None, Some(opt)) => opt
+                .snapshot_state()
+                .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
+            (None, None) => None,
+        };
 
         let fitness_score = match fitness {
             Some(evaluator) => {
@@ -2000,31 +2497,114 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             None => None,
         };
 
-        // Authoritative CAS checkpoint persistence + DataOps materialization (`ADR-0023` §2.2).
+        let committed_round = self.current_round;
+        let next_historical_anchors = self.compute_next_historical_anchors(
+            committed_round,
+            candidate_model.parameters().to_vec(),
+        );
+        let equivocated_peers: Vec<PeerId> = self.equivocated.iter().copied().collect();
+        let telemetry_admitted_count = admitted_peers.len();
+        let telemetry_equivocated_count = self.equivocated.len();
+        let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
+        let node_key = format!("train/round_{committed_round}");
+
+        let plan = StagedRoundCommit {
+            committed_round,
+            next_round,
+            next_generation,
+            candidate_model,
+            optimizer_snapshot,
+            next_cclip_center: Some(aggregated_vec),
+            next_historical_anchors,
+            next_historical_digests_without_new: self.historical_digests.clone(),
+            next_bucketing_report: bucketing_report,
+            checkpoint_asset_key,
+            node_key,
+            op_type: "swarm_round_aggregate".to_string(),
+            output_rows: Some(admitted_peers.len() as u64),
+            admitted_peers,
+            equivocated_peers,
+            frozen_raw_inputs,
+            weight_mismatch_warnings,
+            fitness_score,
+            staged_transform_audits,
+            dp_subsampling_q_override: None,
+            dp_explicit_tau: None,
+            emit_standard_telemetry: true,
+            clear_round_admitted: true,
+            ts_unix_nanos,
+            telemetry_admitted_count,
+            telemetry_equivocated_count,
+        };
+
+        let summary = self.commit_round_plan_v1(plan, session)?;
+        if let (Some(opt), Some(committed_opt)) = (server_optimizer, staged_optimizer) {
+            *opt = committed_opt;
+        }
+        Ok(summary)
+    }
+
+    #[cfg(test)]
+    fn check_test_fail_point(&mut self, expected: CommitFailPoint) -> Result<(), RoundError> {
+        if self.fail_point == Some(expected) {
+            self.fail_point = None;
+            return Err(RoundError::Io(io::Error::other(format!(
+                "injected test fault at {expected:?}"
+            ))));
+        }
+        Ok(())
+    }
+
+    fn commit_round_plan_v1(
+        &mut self,
+        plan: StagedRoundCommit<M>,
+        session: &mut DataOpsSession,
+    ) -> Result<RoundCommitSummaryV1, RoundError> {
         let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        // Step 2a: Pre-release DP debit if enabled (permanently recorded once debited).
         self.pre_release_dp_debit_if_enabled(
             session,
-            self.current_round,
-            ts_unix_nanos,
-            None,
-            None,
+            plan.committed_round,
+            plan.ts_unix_nanos,
+            plan.dp_explicit_tau,
+            plan.dp_subsampling_q_override,
         )?;
-        let (content_digest, blob_uri, blob_bytes) =
-            put_checkpoint_model(&run_dir, &candidate_model)?;
 
-        let checkpoint_asset_key = format!("checkpoint://round/{}", self.current_round);
-        let node_key = format!("train/round_{}", self.current_round);
+        // Step 2b: Write all immutable CAS dependencies via write-once CAS blobs.
+        let (content_digest, blob_uri, blob_bytes) =
+            put_checkpoint_model(&run_dir, &plan.candidate_model)?;
+
+        let (optimizer_state_digest, optimizer_state_cas_uri, optimizer_state_bytes) =
+            match plan.optimizer_snapshot.as_ref() {
+                Some(snap) => {
+                    let (d, u, b) = put_optimizer_state_snapshot_v1(&run_dir, snap)?;
+                    (Some(d), Some(u), Some(b))
+                }
+                None => (None, None, None),
+            };
+        let (cclip_center_digest, cclip_center_cas_uri, cclip_center_bytes) =
+            match plan.next_cclip_center.as_deref() {
+                Some(center) => {
+                    let (d, u, b) = put_cclip_center_v1(&run_dir, center)?;
+                    (Some(d), Some(u), Some(b))
+                }
+                None => (None, None, None),
+            };
+        let (historical_anchors_digest, historical_anchors_cas_uri, historical_anchors_bytes) =
+            put_historical_anchors_v1(&run_dir, &plan.next_historical_anchors)?;
+
         let round_node = NodeV1 {
-            node_key: node_key.clone(),
-            node_id: Some(node_id_from_key(&node_key)),
+            node_key: plan.node_key.clone(),
+            node_id: Some(node_id_from_key(&plan.node_key)),
             op_kind: OpKind::Train,
-            op_type: "swarm_round_aggregate".to_string(),
+            op_type: plan.op_type,
             inputs: vec![AssetRefV1 {
                 asset_key: self.parent_asset_key.clone(),
                 fingerprint: Some(self.parent_digest.to_hex()),
             }],
             outputs: vec![AssetRefV1 {
-                asset_key: checkpoint_asset_key.clone(),
+                asset_key: plan.checkpoint_asset_key.clone(),
                 fingerprint: Some(content_digest.to_hex()),
             }],
             params: CanonParams::new(),
@@ -2038,140 +2618,217 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             resources: None,
             op_hash: None,
         };
-
         let node_def_digest = node_def_hash_v1(&round_node)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let recipe_key = CheckpointRecipeKeyV1::derive(
             self.run_id,
-            self.current_round,
+            plan.committed_round,
             &node_def_digest,
             &self.parent_recipe_key,
         );
 
-        session.materialize_node_outputs(
+        let mut next_historical_digests = plan.next_historical_digests_without_new;
+        next_historical_digests.insert(plan.committed_round, content_digest);
+        let replay_timestamp_floor_secs =
+            (plan.ts_unix_nanos / 1_000_000_000).min(u32::MAX as u64) as u32;
+        let param_count = plan.candidate_model.num_parameters();
+        let config_policy_digest_hex =
+            compute_base_config_policy_digest_hex(&self.config, param_count);
+
+        let resume_v2 = CoordinatorResumeStateV2 {
+            schema_version: COORDINATOR_RESUME_STATE_SCHEMA_V2,
+            run_id: self.run_id,
+            swarm_instance_id: self.swarm_instance_id,
+            coordinator_peer_id: self.coordinator_peer_id,
+            generation: plan.next_generation,
+            round_id: plan.committed_round,
+            next_round_id: plan.next_round,
+            checkpoint_asset_key: plan.checkpoint_asset_key.clone(),
+            recipe_key,
+            model_digest: content_digest,
+            model_blob_uri: blob_uri.clone(),
+            model_blob_bytes: blob_bytes,
+            parameter_count: param_count,
+            optimizer_state_digest,
+            optimizer_state_cas_uri,
+            optimizer_state_bytes,
+            cclip_center_digest,
+            cclip_center_cas_uri,
+            cclip_center_bytes,
+            historical_anchors_digest,
+            historical_anchors_cas_uri,
+            historical_anchors_bytes,
+            historical_digests: next_historical_digests.clone(),
+            replay_timestamp_floor_secs,
+            config_policy_digest_hex,
+            fedasync_policy: self.fedasync_policy,
+            fedasync_hinge_threshold: self.fedasync_hinge_threshold,
+            fedasync_clip_norm: self.fedasync_clip_norm,
+            bucketing: self.bucketing,
+            committed_unix_nanos: plan.ts_unix_nanos,
+        };
+        let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
+            put_coordinator_resume_state_v2(&run_dir, &resume_v2)?;
+
+        // Step 2c: Record DataOps materializations & telemetry (preserving pending_transform_audits
+        // on failure so un-committed transforms do not leak into subsequent retries).
+        let prev_audit_len = session.pending_transform_audit_len();
+        for audit in &plan.staged_transform_audits {
+            session.record_transform_applied(audit);
+        }
+        if let Err(err) = session.materialize_node_outputs(
             &round_node,
             &[OutputSpec {
-                asset_key: checkpoint_asset_key.clone(),
+                asset_key: plan.checkpoint_asset_key.clone(),
                 schema: None,
-                rows: Some(admitted_peers.len() as u64),
+                rows: plan.output_rows,
                 bytes: Some(blob_bytes),
             }],
-            ts_unix_nanos,
+            plan.ts_unix_nanos,
             CacheDecisionV0::Miss,
             1,
-        )?;
+        ) {
+            session.truncate_pending_transform_audits(prev_audit_len);
+            return Err(RoundError::Io(err));
+        }
         session.bind_output_cas_uri(
-            &checkpoint_asset_key,
+            &plan.checkpoint_asset_key,
             &blob_uri,
             "application/x-swarmtorch-model-v1",
         )?;
 
-        let resume_state = RoundResumeStateV1 {
+        if plan.emit_standard_telemetry {
+            let trace_id = TraceId::from_bytes(*self.run_id.as_bytes());
+            let mut span_hasher = Sha256::new();
+            span_hasher.update(b"swarmtorch.round.span.v1");
+            span_hasher.update(self.run_id.as_bytes());
+            span_hasher.update(plan.committed_round.to_le_bytes());
+            let span_digest = span_hasher.finalize();
+            let mut span_bytes = [0u8; 8];
+            span_bytes.copy_from_slice(&span_digest[..8]);
+            if span_bytes == [0u8; 8] {
+                span_bytes[0] = 1;
+            }
+            let span_id = SpanId::from_bytes(span_bytes);
+
+            let mut attrs = AttrMap::new();
+            attrs.insert(
+                "swarmtorch.round_id".to_string(),
+                AttrValue::I64(plan.committed_round as i64),
+            );
+            attrs.insert(
+                "swarmtorch.admitted_peers".to_string(),
+                AttrValue::I64(plan.telemetry_admitted_count as i64),
+            );
+            attrs.insert(
+                "swarmtorch.equivocated_peers".to_string(),
+                AttrValue::I64(plan.telemetry_equivocated_count as i64),
+            );
+            attrs.insert(
+                "swarmtorch.checkpoint_digest".to_string(),
+                AttrValue::Str(content_digest.to_hex()),
+            );
+
+            session.sink().emit_span(&SpanRecord {
+                schema_version: 1,
+                trace_id,
+                span_id,
+                parent_span_id: None,
+                name: format!("round/{}", plan.committed_round),
+                start_unix_nanos: plan.ts_unix_nanos.saturating_sub(1_000_000),
+                end_unix_nanos: Some(plan.ts_unix_nanos),
+                attrs: attrs.clone(),
+            })?;
+            session.sink().emit_event(&EventRecord {
+                schema_version: 1,
+                ts_unix_nanos: plan.ts_unix_nanos,
+                trace_id,
+                span_id: Some(span_id),
+                name: "coordinator/round_committed".to_string(),
+                attrs: attrs.clone(),
+            })?;
+            if let Some(score) = plan.fitness_score {
+                session.sink().emit_metric(&MetricRecord {
+                    schema_version: 1,
+                    ts_unix_nanos: plan.ts_unix_nanos,
+                    trace_id,
+                    span_id: Some(span_id),
+                    name: "round_fitness".to_string(),
+                    value: score as f64,
+                    unit: Some("score".to_string()),
+                    attrs,
+                })?;
+            }
+        }
+
+        #[cfg(test)]
+        self.check_test_fail_point(CommitFailPoint::AfterCasBeforeManifest)?;
+
+        // Step 3: Finalize (and optionally sign) `manifest.json` + archived generation manifest.
+        let signer_ref = self.manifest_signer.as_ref();
+        let (_manifest, manifest_sha256) = session
+            .sink()
+            .finalize_checkpoint_manifest(plan.next_generation, signer_ref)?;
+
+        #[cfg(test)]
+        self.check_test_fail_point(CommitFailPoint::AfterManifestBeforeCommittedHead)?;
+
+        // Step 4: Authoritative Logical Commit Point — atomic swap & sync of `committed_head.json`.
+        let head = CommittedHeadV1 {
+            schema_version: COMMITTED_HEAD_SCHEMA_V1,
+            run_id: self.run_id,
+            generation: plan.next_generation,
+            round_id: plan.committed_round,
+            manifest_sha256,
+            resume_state_cas_uri: resume_v2_uri,
+            committed_unix_nanos: plan.ts_unix_nanos,
+        };
+        write_committed_head_v1(&run_dir, &head)?;
+
+        let legacy_resume_state = RoundResumeStateV1 {
             schema_version: ROUND_RESUME_STATE_SCHEMA_V1,
             run_id: self.run_id,
-            round_id: self.current_round,
-            checkpoint_asset_key: checkpoint_asset_key.clone(),
+            round_id: plan.committed_round,
+            checkpoint_asset_key: plan.checkpoint_asset_key.clone(),
             recipe_key,
             content_digest,
             blob_uri: blob_uri.clone(),
             blob_bytes,
-            parameter_count: candidate_model.num_parameters(),
-            committed_unix_nanos: ts_unix_nanos,
+            parameter_count: param_count,
+            committed_unix_nanos: plan.ts_unix_nanos,
         };
-        write_round_resume_state(&run_dir, &resume_state)?;
+        write_round_resume_state(&run_dir, &legacy_resume_state)?;
 
-        // Emit telemetry span, event, and optional fitness metric.
-        let trace_id = TraceId::from_bytes(*self.run_id.as_bytes());
-        let mut span_hasher = Sha256::new();
-        span_hasher.update(b"swarmtorch.round.span.v1");
-        span_hasher.update(self.run_id.as_bytes());
-        span_hasher.update(self.current_round.to_le_bytes());
-        let span_digest = span_hasher.finalize();
-        let mut span_bytes = [0u8; 8];
-        span_bytes.copy_from_slice(&span_digest[..8]);
-        if span_bytes == [0u8; 8] {
-            span_bytes[0] = 1;
-        }
-        let span_id = SpanId::from_bytes(span_bytes);
+        #[cfg(test)]
+        self.check_test_fail_point(CommitFailPoint::AfterCommittedHeadBeforeMemory)?;
 
-        let mut attrs = AttrMap::new();
-        attrs.insert(
-            "swarmtorch.round_id".to_string(),
-            AttrValue::I64(self.current_round as i64),
-        );
-        attrs.insert(
-            "swarmtorch.admitted_peers".to_string(),
-            AttrValue::I64(admitted_peers.len() as i64),
-        );
-        attrs.insert(
-            "swarmtorch.equivocated_peers".to_string(),
-            AttrValue::I64(self.equivocated.len() as i64),
-        );
-        attrs.insert(
-            "swarmtorch.checkpoint_digest".to_string(),
-            AttrValue::Str(content_digest.to_hex()),
-        );
-
-        session.sink().emit_span(&SpanRecord {
-            schema_version: 1,
-            trace_id,
-            span_id,
-            parent_span_id: None,
-            name: format!("round/{}", self.current_round),
-            start_unix_nanos: ts_unix_nanos.saturating_sub(1_000_000),
-            end_unix_nanos: Some(ts_unix_nanos),
-            attrs: attrs.clone(),
-        })?;
-        session.sink().emit_event(&EventRecord {
-            schema_version: 1,
-            ts_unix_nanos,
-            trace_id,
-            span_id: Some(span_id),
-            name: "coordinator/round_committed".to_string(),
-            attrs: attrs.clone(),
-        })?;
-        if let Some(score) = fitness_score {
-            session.sink().emit_metric(&MetricRecord {
-                schema_version: 1,
-                ts_unix_nanos,
-                trace_id,
-                span_id: Some(span_id),
-                name: "round_fitness".to_string(),
-                value: score as f64,
-                unit: Some("score".to_string()),
-                attrs,
-            })?;
-        }
-
-        let equivocated_peers: Vec<PeerId> = self.equivocated.iter().copied().collect();
-        let committed_round = self.current_round;
-
-        // Advance coordinator state to the next round.
-        self.model = candidate_model;
+        // Step 5: Infallible in-memory state transition.
+        self.model = plan.candidate_model;
         self.parent_digest = content_digest;
         self.parent_recipe_key = recipe_key;
-        self.parent_asset_key = checkpoint_asset_key.clone();
-        self.historical_digests
-            .insert(committed_round, content_digest);
-        self.cclip_center = Some(aggregated_vec);
-        self.last_bucketing_report = bucketing_report;
-        self.record_anchor_and_prune(self.current_round, self.model.parameters().to_vec());
-        self.current_round = self.current_round.saturating_add(1);
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
-        self.admitted.clear();
-        self.equivocated.clear();
+        self.parent_asset_key = plan.checkpoint_asset_key.clone();
+        self.historical_digests = next_historical_digests;
+        self.cclip_center = plan.next_cclip_center;
+        self.historical_anchors = plan.next_historical_anchors;
+        self.last_bucketing_report = plan.next_bucketing_report;
+        self.current_round = plan.next_round;
+        self.coordinator_generation = plan.next_generation;
+        if plan.clear_round_admitted {
+            self.admitted.clear();
+            self.equivocated.clear();
+        }
 
         Ok(RoundCommitSummaryV1 {
-            round_id: committed_round,
-            admitted_peers,
-            equivocated_peers,
-            checkpoint_asset_key,
+            round_id: plan.committed_round,
+            admitted_peers: plan.admitted_peers,
+            equivocated_peers: plan.equivocated_peers,
+            checkpoint_asset_key: plan.checkpoint_asset_key,
             recipe_key,
             content_digest,
             blob_uri,
-            fitness_score,
-            frozen_raw_inputs,
-            weight_mismatch_warnings,
+            fitness_score: plan.fitness_score,
+            frozen_raw_inputs: plan.frozen_raw_inputs,
+            weight_mismatch_warnings: plan.weight_mismatch_warnings,
         })
     }
 
@@ -2288,17 +2945,6 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         Ok((out, None))
     }
 
-    fn record_anchor_and_prune(&mut self, round_id: u64, weights: Vec<f32>) {
-        self.historical_anchors.insert(round_id, weights);
-        let max_keep = self.config.max_staleness.max(
-            self.fedasync_policy
-                .map(|p| p.max_staleness_rounds)
-                .unwrap_or(0),
-        );
-        let cutoff = round_id.saturating_sub(max_keep);
-        self.historical_anchors.retain(|&r, _| r >= cutoff);
-    }
-
     fn pre_release_dp_debit_if_enabled(
         &mut self,
         session: &mut DataOpsSession,
@@ -2370,13 +3016,18 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
             ));
         }
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
         let acc =
             reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(|err| match err {
                 CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
                 CryptoErrorOrIo::Io(e) => RoundError::Io(e),
             })?;
         self.dp_accountant = Some(acc);
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        self.coordinator_generation = next_generation;
         Ok(())
     }
 
@@ -2399,7 +3050,17 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 return Err(RoundError::Aggregation(CoreError::InvalidThreshold));
             }
         }
-        let latest = self.current_round.saturating_sub(1);
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
+        let latest = self
+            .current_round
+            .checked_sub(1)
+            .ok_or(RoundError::RoundIdOverflow {
+                round_id: self.current_round,
+            })?;
         if !self.historical_anchors.contains_key(&latest) {
             self.historical_anchors
                 .insert(latest, self.model.parameters().to_vec());
@@ -2407,7 +3068,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.fedasync_policy = Some(policy);
         self.fedasync_hinge_threshold = hinge_threshold_rounds;
         self.fedasync_clip_norm = clip_norm;
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        self.coordinator_generation = next_generation;
         Ok(())
     }
 
@@ -2573,111 +3234,56 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             .map_err(RoundError::Aggregation)?;
 
         let committed_round = self.current_round;
-        // Mandatory fail-closed DP pre-release debit BEFORE writing checkpoint to CAS!
-        self.pre_release_dp_debit_if_enabled(
-            session,
-            committed_round,
-            ts_unix_nanos,
-            self.fedasync_clip_norm,
-            Some(subsampling_rate_q),
+        let next_round = committed_round
+            .checked_add(1)
+            .ok_or(RoundError::RoundIdOverflow {
+                round_id: committed_round,
+            })?;
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
         )?;
-
-        let run_dir = session.sink().bundle().run_dir().to_path_buf();
-        let (content_digest, blob_uri, blob_bytes) =
-            put_checkpoint_model(&run_dir, &candidate_model)?;
-
-        let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
-        let node_key = format!("train/round_{committed_round}_fedasync");
-        let round_node = NodeV1 {
-            node_key: node_key.clone(),
-            node_id: Some(node_id_from_key(&node_key)),
-            op_kind: OpKind::Train,
-            op_type: "fedasync_stale_step".to_string(),
-            inputs: vec![AssetRefV1 {
-                asset_key: self.parent_asset_key.clone(),
-                fingerprint: Some(self.parent_digest.to_hex()),
-            }],
-            outputs: vec![AssetRefV1 {
-                asset_key: checkpoint_asset_key.clone(),
-                fingerprint: Some(content_digest.to_hex()),
-            }],
-            params: CanonParams::new(),
-            code_ref: Some(format!("swarm-torch@{}", env!("CARGO_PKG_VERSION"))),
-            unsafe_surface: false,
-            execution_trust: ExecutionTrust::Core,
-            node_def_hash: None,
-            execution_hint: None,
-            cache_policy: None,
-            materialization_policy: None,
-            resources: None,
-            op_hash: None,
-        };
-        let node_def_digest = node_def_hash_v1(&round_node)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let recipe_key = CheckpointRecipeKeyV1::derive(
-            self.run_id,
+        let next_historical_anchors = self.compute_next_historical_anchors(
             committed_round,
-            &node_def_digest,
-            &self.parent_recipe_key,
+            candidate_model.parameters().to_vec(),
         );
-
-        session.materialize_node_outputs(
-            &round_node,
-            &[OutputSpec {
-                asset_key: checkpoint_asset_key.clone(),
-                schema: None,
-                rows: Some(1),
-                bytes: Some(blob_bytes),
-            }],
-            ts_unix_nanos,
-            CacheDecisionV0::Miss,
-            1,
-        )?;
-        session.bind_output_cas_uri(
-            &checkpoint_asset_key,
-            &blob_uri,
-            "application/x-swarmtorch-model-v1",
-        )?;
-
-        let resume_state = RoundResumeStateV1 {
-            schema_version: ROUND_RESUME_STATE_SCHEMA_V1,
-            run_id: self.run_id,
-            round_id: committed_round,
-            checkpoint_asset_key: checkpoint_asset_key.clone(),
-            recipe_key,
-            content_digest,
-            blob_uri: blob_uri.clone(),
-            blob_bytes,
-            parameter_count: candidate_model.num_parameters(),
-            committed_unix_nanos: ts_unix_nanos,
-        };
-        write_round_resume_state(&run_dir, &resume_state)?;
-
         let mut frozen_raw_inputs = BTreeMap::new();
         frozen_raw_inputs.insert(verified.sender, verified.values);
 
-        self.model = candidate_model;
-        self.parent_digest = content_digest;
-        self.parent_recipe_key = recipe_key;
-        self.parent_asset_key = checkpoint_asset_key.clone();
-        self.historical_digests
-            .insert(committed_round, content_digest);
-        self.record_anchor_and_prune(committed_round, self.model.parameters().to_vec());
-        self.current_round = committed_round.saturating_add(1);
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
+        let node_key = format!("train/round_{committed_round}_fedasync");
 
-        let summary = RoundCommitSummaryV1 {
-            round_id: committed_round,
+        let plan = StagedRoundCommit {
+            committed_round,
+            next_round,
+            next_generation,
+            candidate_model,
+            optimizer_snapshot: None,
+            next_cclip_center: self.cclip_center.clone(),
+            next_historical_anchors,
+            next_historical_digests_without_new: self.historical_digests.clone(),
+            next_bucketing_report: self.last_bucketing_report.clone(),
+            checkpoint_asset_key,
+            node_key,
+            op_type: "fedasync_stale_step".to_string(),
+            output_rows: Some(1),
             admitted_peers: vec![verified.sender],
             equivocated_peers: Vec::new(),
-            checkpoint_asset_key,
-            recipe_key,
-            content_digest,
-            blob_uri,
-            fitness_score: None,
             frozen_raw_inputs,
             weight_mismatch_warnings: Vec::new(),
+            fitness_score: None,
+            staged_transform_audits: Vec::new(),
+            dp_subsampling_q_override: Some(subsampling_rate_q),
+            dp_explicit_tau: self.fedasync_clip_norm,
+            emit_standard_telemetry: false,
+            clear_round_admitted: false,
+            ts_unix_nanos,
+            telemetry_admitted_count: 1,
+            telemetry_equivocated_count: 0,
         };
+
+        let summary = self.commit_round_plan_v1(plan, session)?;
         Ok((outcome, summary))
     }
 
@@ -2811,6 +3417,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             None => None,
         };
 
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
+
         // Fail-closed DP debit before committing base-weight merge or releasing aggregated factors.
         self.pre_release_dp_debit_if_enabled(
             session,
@@ -2823,7 +3435,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         if let (Some(base_w), Some(staged)) = (base_weights_to_merge, staged_base_weights.take()) {
             base_w.copy_from_slice(&staged);
         }
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        self.coordinator_generation = next_generation;
 
         Ok(outcome)
     }
@@ -3650,6 +4262,7 @@ mod tests {
         let resume_state = resume_state.expect("resume state must exist");
         assert_eq!(resume_state.round_id, 1);
 
+        #[allow(deprecated)]
         let mut resumed_coord: SwarmRoundCoordinator<LinearModel> =
             SwarmRoundCoordinator::from_resume_state(
                 config,
@@ -4079,6 +4692,7 @@ mod tests {
         let resume_state = crate::artifacts::read_verified_round_resume_state(&run_dir)
             .unwrap()
             .unwrap();
+        #[allow(deprecated)]
         let mut recovered = SwarmRoundCoordinator::<LinearModel>::from_resume_state(
             config,
             linear_model_2_1(&[0.0, 0.0, 0.0]),
@@ -4894,6 +5508,7 @@ mod tests {
         .unwrap();
         let resume_state = resume_state.unwrap();
 
+        #[allow(deprecated)]
         let mut resumed: SwarmRoundCoordinator<LinearModel> =
             SwarmRoundCoordinator::from_resume_state(
                 config,
@@ -4949,6 +5564,687 @@ mod tests {
                 t_r1_secs + 1
             )
             .is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st04_finalize_round_failure_in_optimizer_or_fitness_leaves_state_untouched() {
+        use swarm_torch_models::optim::SgdOptimizer;
+
+        struct FailingEvaluator;
+        impl FitnessFunction for FailingEvaluator {
+            type Model = LinearModel;
+            type Error = &'static str;
+            fn evaluate(&self, _model: &Self::Model) -> Result<f32, Self::Error> {
+                Err("injected fitness failure")
+            }
+        }
+
+        let base = temp_dir("st04_failure_atomicity");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x61; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(41);
+        let p2 = TestPeer::new(42);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::GradientV1,
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 10.0,
+                max_iterations: 2,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap();
+
+        let mut opt = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.1, 0.9, 0.0).unwrap();
+
+        // Commit Round 1 cleanly so optimizer velocity, cclip_center, and committed_head advance.
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x02, 100);
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let b = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                100,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.5, -0.25, 0.1],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt),
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let head_before = crate::artifacts::read_committed_head_v1(&run_dir).unwrap();
+        let model_before = coord.model().parameters().to_vec();
+        let vel_before = opt.velocity().to_vec();
+        let cclip_before = coord.cclip_center().unwrap().to_vec();
+        let gen_before = coord.coordinator_generation();
+
+        // Round 2: admit valid gradients, then fail inside `FailingEvaluator` -> ZERO mutations!
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let b = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                2,
+                110,
+                2,
+                coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.4, 0.4, -0.2],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
+                .unwrap();
+        }
+        let err = coord
+            .finalize_round(
+                &[],
+                Some(&mut opt),
+                Some(&FailingEvaluator),
+                &mut session,
+                3_000,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RoundError::FitnessEvaluation(_)));
+        assert_eq!(coord.current_round(), 2);
+        assert_eq!(coord.coordinator_generation(), gen_before);
+        assert_eq!(coord.model().parameters(), &model_before[..]);
+        assert_eq!(opt.velocity(), &vel_before[..]);
+        assert_eq!(coord.cclip_center().unwrap(), &cclip_before[..]);
+        assert_eq!(
+            crate::artifacts::read_committed_head_v1(&run_dir).unwrap(),
+            head_before
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st04_crash_seams_before_and_after_committed_head_preserve_strict_recovery() {
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_models::optim::SgdOptimizer;
+
+        let base = temp_dir("st04_crash_seams");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x62; 16]);
+        let signer = KeyPair::from_seed([0x88; 32]).unwrap();
+        let strict_policy = TrustPolicy::Strict {
+            trusted_public_keys: vec![*signer.public_key()],
+            expected_run_id: Some(run_id),
+            min_signed_unix_nanos: None,
+        };
+
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(43);
+        let p2 = TestPeer::new(44);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::GradientV1,
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 10.0,
+                max_iterations: 2,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+        let mut opt = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 0.0).unwrap();
+
+        // Commit Round 1 cleanly (signed manifest + committed_head gen=1).
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x02, 100);
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let b = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                100,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.2, -0.1, 0.3],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt),
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+        let r1_model = coord.model().parameters().to_vec();
+        let r1_vel = opt.velocity().to_vec();
+        let r1_cclip = coord.cclip_center().unwrap().to_vec();
+        let r1_gen = coord.coordinator_generation();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let r1_head = crate::artifacts::read_committed_head_v1(&run_dir).unwrap();
+        assert_eq!(r1_head.generation, r1_gen);
+        assert_eq!(r1_head.round_id, 1);
+
+        // Round 2 Case A: Inject crash AFTER manifest written/signed BEFORE committed_head swap!
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let b = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                2,
+                110,
+                2,
+                coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.3, 0.1, -0.2],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
+                .unwrap();
+        }
+        coord.set_test_commit_fail_point(CommitFailPoint::AfterManifestBeforeCommittedHead);
+        let crash_before_head = coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt),
+                None,
+                &mut session,
+                3_000,
+            )
+            .unwrap_err();
+        assert!(matches!(crash_before_head, RoundError::Io(_)));
+
+        // In-memory state AND committed_head still point to Round 1!
+        assert_eq!(coord.current_round(), 2);
+        assert_eq!(coord.model().parameters(), &r1_model[..]);
+        assert_eq!(opt.velocity(), &r1_vel[..]);
+        assert_eq!(
+            crate::artifacts::read_committed_head_v1(&run_dir).unwrap(),
+            r1_head
+        );
+
+        // Simulated restart right now under TrustPolicy::Strict MUST recover Round 1 cleanly!
+        drop(session);
+        let (restarted_session, _) = DataOpsSession::resume(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut recovered_opt = SgdOptimizer::<LinearModel, 16>::new(0.99).unwrap();
+        let mut recovered = SwarmRoundCoordinator::resume_exact_training_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut recovered_opt),
+            &restarted_session,
+            &strict_policy,
+        )
+        .unwrap()
+        .with_manifest_signer(signer);
+        assert_eq!(recovered.current_round(), 2);
+        assert_eq!(recovered.coordinator_generation(), r1_gen);
+        assert_eq!(recovered.model().parameters(), &r1_model[..]);
+        assert_eq!(recovered_opt.velocity(), &r1_vel[..]);
+        assert_eq!(recovered.cclip_center().unwrap(), &r1_cclip[..]);
+
+        // Round 2 Case B: Inject crash AFTER CAS (before manifest) on recovered coordinator, then
+        // inject crash AFTER committed_head BEFORE memory -> committed_head advances to Round 2!
+        let s1_r2 = p1.establish_session(&mut recovered, 2, 0x11, 120);
+        let s2_r2 = p2.establish_session(&mut recovered, 2, 0x12, 120);
+        for (p, s) in [(&p1, s1_r2), (&p2, s2_r2)] {
+            let b = p.build_dense_delivery(
+                &recovered,
+                s,
+                2,
+                1,
+                120,
+                2,
+                recovered.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.3, 0.1, -0.2],
+                0,
+            );
+            recovered
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 120)
+                .unwrap();
+        }
+        let mut sess2 = restarted_session;
+        recovered.set_test_commit_fail_point(CommitFailPoint::AfterCasBeforeManifest);
+        assert!(recovered
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut recovered_opt),
+                None,
+                &mut sess2,
+                4_000,
+            )
+            .is_err());
+        assert_eq!(recovered.current_round(), 2);
+
+        recovered.set_test_commit_fail_point(CommitFailPoint::AfterCommittedHeadBeforeMemory);
+        assert!(recovered
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut recovered_opt),
+                None,
+                &mut sess2,
+                4_000,
+            )
+            .is_err());
+        // Process crashed before Step 5 memory update, but disk committed_head already switched to Round 2!
+        assert_eq!(recovered.current_round(), 2);
+        let head_after = crate::artifacts::read_committed_head_v1(&run_dir).unwrap();
+        assert_eq!(head_after.round_id, 2);
+
+        drop(sess2);
+        let (sess3, _) = DataOpsSession::resume(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut opt_r2 = SgdOptimizer::<LinearModel, 16>::new(0.99).unwrap();
+        let rec_r2 = SwarmRoundCoordinator::resume_exact_training_state(
+            config,
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt_r2),
+            &sess3,
+            &strict_policy,
+        )
+        .unwrap();
+        assert_eq!(rec_r2.current_round(), 3);
+        assert_eq!(rec_r2.coordinator_generation(), r1_gen + 1);
+        assert_ne!(rec_r2.model().parameters(), &r1_model[..]);
+        assert_ne!(opt_r2.velocity(), &r1_vel[..]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st04_exact_resume_matches_continuous_run_and_weights_only_clears_lineage() {
+        use swarm_torch_core::aggregation::FedAsyncStalenessDescriptorV1;
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_models::optim::SgdOptimizer;
+
+        let base_cont = temp_dir("st04_continuous");
+        let base_res = temp_dir("st04_resumed");
+        let _ = fs::remove_dir_all(&base_cont);
+        let _ = fs::remove_dir_all(&base_res);
+        fs::create_dir_all(&base_cont).unwrap();
+        fs::create_dir_all(&base_res).unwrap();
+
+        let run_id = RunId::from_bytes([0x63; 16]);
+        let signer = KeyPair::from_seed([0x7A; 32]).unwrap();
+        let strict_policy = TrustPolicy::Strict {
+            trusted_public_keys: vec![*signer.public_key()],
+            expected_run_id: Some(run_id),
+            min_signed_unix_nanos: None,
+        };
+        let p1 = TestPeer::new(45);
+        let p2 = TestPeer::new(46);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::GradientV1,
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 10.0,
+                max_iterations: 2,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 2,
+            max_clock_skew_secs: 60,
+        };
+        let fedasync = FedAsyncStalenessDescriptorV1 {
+            base_alpha: 0.4,
+            max_staleness_rounds: 2,
+            polynomial_decay_exponent: 0.5,
+        };
+
+        // Run A: Continuous 2 rounds with GradientV1 + CenteredClipping + FedAsync enabled.
+        let mut sess_a = DataOpsSession::create(
+            &base_cont,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut coord_a = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_a,
+            1_000,
+        )
+        .unwrap();
+        coord_a.enable_fedasync(fedasync, 0, None).unwrap();
+        let mut opt_a = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 1e-4).unwrap();
+        let s1_a = p1.establish_session(&mut coord_a, 1, 0x01, 100);
+        let s2_a = p2.establish_session(&mut coord_a, 1, 0x02, 100);
+        for r in [1u64, 2] {
+            for (p, s) in [(&p1, s1_a), (&p2, s2_a)] {
+                let b = p.build_dense_delivery(
+                    &coord_a,
+                    s,
+                    1,
+                    r,
+                    100 + r as u32,
+                    r,
+                    coord_a.parent_digest(),
+                    PayloadKindV1::GradientV1,
+                    &[0.1 * r as f32, -0.2, 0.05],
+                    0,
+                );
+                coord_a
+                    .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
+                    .unwrap();
+            }
+            coord_a
+                .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                    &[],
+                    Some(&mut opt_a),
+                    None,
+                    &mut sess_a,
+                    (100 + r) * 1_000_000_000,
+                )
+                .unwrap();
+        }
+
+        // Run B: Same Round 1, then sign/close, ExactTrainingResume, then Round 2!
+        let mut sess_b1 = DataOpsSession::create(
+            &base_res,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut coord_b1 = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_b1,
+            1_000,
+        )
+        .unwrap();
+        coord_b1.enable_fedasync(fedasync, 0, None).unwrap();
+        let mut opt_b1 =
+            SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 1e-4).unwrap();
+        let s1_b1 = p1.establish_session(&mut coord_b1, 1, 0x01, 100);
+        let s2_b1 = p2.establish_session(&mut coord_b1, 1, 0x02, 100);
+        for (p, s) in [(&p1, s1_b1), (&p2, s2_b1)] {
+            let b = p.build_dense_delivery(
+                &coord_b1,
+                s,
+                1,
+                1,
+                101,
+                1,
+                coord_b1.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.1, -0.2, 0.05],
+                0,
+            );
+            coord_b1
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 101)
+                .unwrap();
+        }
+        coord_b1
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt_b1),
+                None,
+                &mut sess_b1,
+                101 * 1_000_000_000,
+            )
+            .unwrap();
+        let run_dir_b = sess_b1.sink().bundle().run_dir().to_path_buf();
+        sess_b1.commit_and_close(Some(&signer)).unwrap();
+
+        let (mut sess_b2, _) = DataOpsSession::resume(
+            &run_dir_b,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut opt_b2 = SgdOptimizer::<LinearModel, 16>::new(0.5).unwrap();
+        let mut coord_b2 = SwarmRoundCoordinator::resume_exact_training_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt_b2),
+            &sess_b2,
+            &strict_policy,
+        )
+        .unwrap();
+        // Round 0 historical anchor from pre-crash is still retained!
+        assert!(coord_b2.historical_anchor_weights(0).is_some());
+        assert!(coord_b2.cclip_center().is_some());
+
+        let s1_b2 = p1.establish_session(&mut coord_b2, 2, 0x21, 102);
+        let s2_b2 = p2.establish_session(&mut coord_b2, 2, 0x22, 102);
+        for (p, s) in [(&p1, s1_b2), (&p2, s2_b2)] {
+            let b = p.build_dense_delivery(
+                &coord_b2,
+                s,
+                2,
+                1,
+                102,
+                2,
+                coord_b2.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.2, -0.2, 0.05],
+                0,
+            );
+            coord_b2
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 102)
+                .unwrap();
+        }
+        coord_b2
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt_b2),
+                None,
+                &mut sess_b2,
+                102 * 1_000_000_000,
+            )
+            .unwrap();
+
+        // Resumed Run B matches continuous Run A bit-for-bit!
+        assert_eq!(coord_b2.model().parameters(), coord_a.model().parameters());
+        assert_eq!(opt_b2.velocity(), opt_a.velocity());
+        assert_eq!(coord_b2.cclip_center(), coord_a.cclip_center());
+        assert_eq!(
+            coord_b2.coordinator_generation(),
+            coord_a.coordinator_generation()
+        );
+
+        // Negative ExactTrainingResume tests: untrusted key, None optimizer, changed config fail closed!
+        let bad_signer = KeyPair::from_seed([0x99; 32]).unwrap();
+        assert!(SwarmRoundCoordinator::resume_exact_training_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt_b2),
+            &sess_b2,
+            &TrustPolicy::Strict {
+                trusted_public_keys: vec![*bad_signer.public_key()],
+                expected_run_id: Some(run_id),
+                min_signed_unix_nanos: None,
+            },
+        )
+        .is_err());
+        assert!(
+            SwarmRoundCoordinator::resume_exact_training_state::<SgdOptimizer<LinearModel, 16>>(
+                config.clone(),
+                LinearModel::new(2, 1).unwrap(),
+                None,
+                &sess_b2,
+                &TrustPolicy::LegacyPermissive,
+            )
+            .is_err()
+        );
+        let mut wrong_cfg = config.clone();
+        wrong_cfg.max_staleness = 0;
+        assert!(SwarmRoundCoordinator::resume_exact_training_state(
+            wrong_cfg,
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt_b2),
+            &sess_b2,
+            &TrustPolicy::LegacyPermissive,
+        )
+        .is_err());
+
+        // WeightsOnlyRestore: clears cclip_center & round 0 anchor, preserves weights cleanly!
+        sess_b2.commit_and_close(Some(&signer)).unwrap();
+        let (sess_b3, _) = DataOpsSession::resume(
+            &run_dir_b,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let weights_only = SwarmRoundCoordinator::restore_weights_only(
+            config,
+            LinearModel::new(2, 1).unwrap(),
+            &sess_b3,
+            &strict_policy,
+        )
+        .unwrap();
+        assert_eq!(
+            weights_only.model().parameters(),
+            coord_b2.model().parameters()
+        );
+        assert!(weights_only.cclip_center().is_none());
+        assert!(weights_only.historical_anchor_weights(0).is_none());
+        assert!(weights_only.historical_anchor_weights(2).is_some());
+
+        let _ = fs::remove_dir_all(&base_cont);
+        let _ = fs::remove_dir_all(&base_res);
+    }
+
+    #[test]
+    fn st04_round_id_overflow_fails_closed_without_mutating_state() {
+        let base = temp_dir("st04_round_overflow");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x64; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let p1 = TestPeer::new(47);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id].into_iter().collect(),
+            min_quorum: 1,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap();
+        coord.current_round = u64::MAX;
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let b = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            u64::MAX,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        coord
+            .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        let err = coord
+            .finalize_round::<swarm_torch_models::optim::SgdOptimizer<LinearModel>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RoundError::RoundIdOverflow { round_id: u64::MAX }
+        ));
+        assert_eq!(coord.current_round(), u64::MAX);
 
         let _ = fs::remove_dir_all(&base);
     }

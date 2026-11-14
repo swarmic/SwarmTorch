@@ -201,14 +201,74 @@ pub type WasmIsolationCtx<'a> = (
     &'a BTreeMap<[u8; 32], Vec<u8>>,
 );
 
-/// Output produced by [`NativeOpRunner::run_in_session`], preserving physical row/byte counts
-/// and content-addressed CAS URIs alongside [`AssetInstanceV1`] descriptors (`W12-04`).
+/// Canonical `content_type` for `ColumnarTableV1` JSON payloads (`ST-10`).
+pub const CONTENT_TYPE_COLUMNAR_JSON_V1: &str = "application/vnd.swarmtorch.columnar+json";
+/// Canonical `content_type` for line-delimited JSON object streams (`ST-10`).
+pub const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
+/// Canonical `content_type` for opaque binary CAS payloads (such as model checkpoints).
+pub const CONTENT_TYPE_OCTET_STREAM: &str = "application/octet-stream";
+
+/// Declared physical payload format resolved from `SourceDescriptorV0.content_type` (`ST-10`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnarInputFormatV1 {
+    ColumnarTableV1,
+    Ndjson,
+    OpaqueBinary,
+}
+
+impl ColumnarInputFormatV1 {
+    /// Parse a declared `SourceDescriptorV0.content_type` without falling back to byte sniffing.
+    pub fn from_content_type(content_type: &str) -> io::Result<Self> {
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match mime.as_str() {
+            CONTENT_TYPE_COLUMNAR_JSON_V1 => Ok(Self::ColumnarTableV1),
+            CONTENT_TYPE_NDJSON | "application/ndjson" => Ok(Self::Ndjson),
+            CONTENT_TYPE_OCTET_STREAM => Ok(Self::OpaqueBinary),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported or ambiguous content_type '{other}'; expected '{CONTENT_TYPE_COLUMNAR_JSON_V1}', '{CONTENT_TYPE_NDJSON}', or '{CONTENT_TYPE_OCTET_STREAM}'"
+                ),
+            )),
+        }
+    }
+
+    /// Canonical MIME `content_type` string emitted for outputs of this format.
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::ColumnarTableV1 => CONTENT_TYPE_COLUMNAR_JSON_V1,
+            Self::Ndjson => CONTENT_TYPE_NDJSON,
+            Self::OpaqueBinary => CONTENT_TYPE_OCTET_STREAM,
+        }
+    }
+}
+
+/// Execution strictness mode for [`NativeOpRunner`] (`ST-10`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunnerExecutionModeV1 {
+    /// Fail closed unless every declared input resolves to an authenticated `cas://sha256/`
+    /// blob with an explicitly declared `content_type`. Default for production & SDK callers.
+    #[default]
+    PhysicalStrict,
+    /// Explicit metadata-only fallback permitted solely for unit/scheduler tests without CAS blobs.
+    MetadataOnlyForTests,
+}
+
+/// Output produced by [`NativeOpRunner::run_in_session_with_content_types`], preserving physical
+/// row/byte counts, declared output content-types, and CAS URIs alongside [`AssetInstanceV1`] descriptors.
 #[derive(Debug, Clone)]
 pub struct PhysicalExecOutcomeV1 {
     /// Emitted output asset instances (including `cas://sha256/<hex>` URIs).
     pub instances: Vec<AssetInstanceV1>,
     /// Computed output specs carrying real physical row/byte measurements.
     pub output_specs: Vec<OutputSpec>,
+    /// Declared canonical `content_type` keyed by output `asset_key`.
+    pub output_content_types: BTreeMap<String, String>,
 }
 
 /// Execution context for the native runner.
@@ -231,18 +291,42 @@ fn deterministic_span_id(node_id_bytes: &[u8; 16], ts_nanos: u64) -> SpanId {
     SpanId::from_bytes(bytes)
 }
 
-/// Minimal native OpRunner (metadata-only).
+/// Native DataOps [`OpRunner`] supporting physical CAS execution and explicit test metadata mode.
 ///
-/// Supports three op_types:
-/// - `"passthrough"` — returns inputs as-is
-/// - `"filter_rows"` — returns inputs with metadata indicating filter applied
-/// - `"union"` — returns input metadata unchanged (output derivation happens at materialization)
-pub struct NativeOpRunner;
+/// Defaults to [`RunnerExecutionModeV1::PhysicalStrict`] (`ST-10`).
+///
+/// Supports three `op_type`s:
+/// - `"passthrough"` — validates/copies CAS inputs (or forwards metadata in [`RunnerExecutionModeV1::MetadataOnlyForTests`])
+/// - `"filter_rows"` — executes typed row filtering over `ColumnarTableV1` or NDJSON CAS blobs
+/// - `"union"` — merges homogeneous `ColumnarTableV1` or NDJSON CAS inputs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NativeOpRunner {
+    mode: RunnerExecutionModeV1,
+}
 
 impl NativeOpRunner {
+    /// Construct a fail-closed [`RunnerExecutionModeV1::PhysicalStrict`] runner.
+    pub const fn new() -> Self {
+        Self {
+            mode: RunnerExecutionModeV1::PhysicalStrict,
+        }
+    }
+
+    /// Construct a runner with an explicit [`RunnerExecutionModeV1`].
+    pub const fn with_mode(mode: RunnerExecutionModeV1) -> Self {
+        Self { mode }
+    }
+
+    /// Return the configured [`RunnerExecutionModeV1`].
+    pub const fn mode(&self) -> RunnerExecutionModeV1 {
+        self.mode
+    }
+
     /// Run with explicit execution context.
     ///
-    /// Emits a span for the operation. Returns output asset instances.
+    /// Fails closed under [`RunnerExecutionModeV1::PhysicalStrict`] because no `run_dir`/CAS
+    /// session is available; use [`NativeOpRunner::run_in_session_with_content_types`] or
+    /// [`NativeOpRunner::with_mode`] with [`RunnerExecutionModeV1::MetadataOnlyForTests`].
     pub fn run_with_context<E: RunEventEmitter<Error = io::Error>>(
         &self,
         ctx: &ExecutionContext,
@@ -250,6 +334,13 @@ impl NativeOpRunner {
         inputs: &[AssetInstanceV1],
         emitter: &E,
     ) -> io::Result<Vec<AssetInstanceV1>> {
+        if self.mode == RunnerExecutionModeV1::PhysicalStrict {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "PhysicalStrict NativeOpRunner requires a CAS session; use run_in_session_with_content_types or RunnerExecutionModeV1::MetadataOnlyForTests",
+            ));
+        }
+
         let start_nanos = (ctx.clock_nanos)();
 
         // Resolve node_id
@@ -329,11 +420,11 @@ impl NativeOpRunner {
         emitter.emit_span(&span)
     }
 
-    /// Execute a graph operator against physical CAS blobs in `run_dir` (`ColumnarTableV1` JSON /
-    /// NDJSON) and/or fail-closed WebAssembly extensions (`W12-04`).
+    /// Execute a graph operator against physical CAS blobs in `run_dir` without additional
+    /// declared input `content_type`s.
     ///
-    /// Falls back cleanly to metadata-only `run_with_context` when inputs have no `cas://sha256/`
-    /// physical blobs and the operator is a core metadata transform.
+    /// Under [`RunnerExecutionModeV1::PhysicalStrict`], physical operators fail closed unless
+    /// declared input `content_type`s are supplied via [`Self::run_in_session_with_content_types`].
     pub fn run_in_session<E: RunEventEmitter<Error = io::Error>>(
         &self,
         ctx: &ExecutionContext,
@@ -342,6 +433,31 @@ impl NativeOpRunner {
         inputs: &[AssetInstanceV1],
         emitter: &E,
         wasm_isolation: Option<WasmIsolationCtx<'_>>,
+    ) -> io::Result<PhysicalExecOutcomeV1> {
+        let empty = BTreeMap::new();
+        self.run_in_session_with_content_types(
+            ctx,
+            run_dir,
+            node,
+            inputs,
+            emitter,
+            wasm_isolation,
+            &empty,
+        )
+    }
+
+    /// Execute a graph operator against physical CAS blobs in `run_dir` using explicit declared
+    /// `input_content_types` (`asset_key -> SourceDescriptorV0.content_type`, `ST-10`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_in_session_with_content_types<E: RunEventEmitter<Error = io::Error>>(
+        &self,
+        ctx: &ExecutionContext,
+        run_dir: &Path,
+        node: &NodeV1,
+        inputs: &[AssetInstanceV1],
+        emitter: &E,
+        wasm_isolation: Option<WasmIsolationCtx<'_>>,
+        input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
         let start_nanos = (ctx.clock_nanos)();
         let node_id = node
@@ -359,34 +475,62 @@ impl NativeOpRunner {
             ));
         }
 
+        if !matches!(
+            node.op_type.as_str(),
+            "passthrough" | "filter_rows" | "union"
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported op_type: {}", node.op_type),
+            ));
+        }
+
         let has_cas_inputs = !inputs.is_empty()
             && inputs
                 .iter()
                 .all(|i| i.uri.as_deref().and_then(parse_cas_uri_digest).is_some());
 
         if !has_cas_inputs {
-            let instances = self.run_with_context(ctx, node, inputs, emitter)?;
-            let output_specs = node
-                .outputs
-                .iter()
-                .map(|o| OutputSpec {
-                    asset_key: o.asset_key.clone(),
-                    schema: None,
-                    rows: None,
-                    bytes: None,
-                })
-                .collect();
-            return Ok(PhysicalExecOutcomeV1 {
-                instances,
-                output_specs,
-            });
+            match self.mode {
+                RunnerExecutionModeV1::PhysicalStrict => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "PhysicalStrict NativeOpRunner requires non-empty cas://sha256 inputs for '{}'",
+                            node.op_type
+                        ),
+                    ));
+                }
+                RunnerExecutionModeV1::MetadataOnlyForTests => {
+                    let instances = self.run_with_context(ctx, node, inputs, emitter)?;
+                    let output_specs = node
+                        .outputs
+                        .iter()
+                        .map(|o| OutputSpec {
+                            asset_key: o.asset_key.clone(),
+                            schema: None,
+                            rows: None,
+                            bytes: None,
+                        })
+                        .collect();
+                    return Ok(PhysicalExecOutcomeV1 {
+                        instances,
+                        output_specs,
+                        output_content_types: BTreeMap::new(),
+                    });
+                }
+            }
         }
 
-        // Physical CAS execution (`passthrough`, `filter_rows`, `union`)
+        // Physical CAS execution (`passthrough`, `filter_rows`, `union`) with strict content-type dispatch.
         let outcome = match node.op_type.as_str() {
-            "passthrough" => Self::physical_passthrough(run_dir, node, inputs)?,
-            "filter_rows" => Self::physical_filter_rows(run_dir, node, inputs)?,
-            "union" => Self::physical_union(run_dir, node, inputs)?,
+            "passthrough" => {
+                Self::physical_passthrough(run_dir, node, inputs, input_content_types)?
+            }
+            "filter_rows" => {
+                Self::physical_filter_rows(run_dir, node, inputs, input_content_types)?
+            }
+            "union" => Self::physical_union(run_dir, node, inputs, input_content_types)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -408,17 +552,67 @@ impl NativeOpRunner {
         Ok(outcome)
     }
 
+    fn resolve_input_format(
+        instance: &AssetInstanceV1,
+        input_content_types: &BTreeMap<String, String>,
+    ) -> io::Result<ColumnarInputFormatV1> {
+        let ct = input_content_types
+            .get(&instance.asset_key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "missing declared SourceDescriptorV0.content_type for physical input '{}'",
+                        instance.asset_key
+                    ),
+                )
+            })?;
+        ColumnarInputFormatV1::from_content_type(ct)
+    }
+
+    fn parse_ndjson_rows(raw: &[u8]) -> io::Result<Vec<(String, Value)>> {
+        let text = std::str::from_utf8(raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut parsed = Vec::new();
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let obj: Value = serde_json::from_str(trimmed)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            if !obj.is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("NDJSON row {} must be a JSON object", line_idx + 1),
+                ));
+            }
+            parsed.push((trimmed.to_string(), obj));
+        }
+        Ok(parsed)
+    }
+
     fn physical_passthrough(
         run_dir: &Path,
         node: &NodeV1,
         inputs: &[AssetInstanceV1],
+        input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
         let mut instances = Vec::with_capacity(inputs.len());
         let mut output_specs = Vec::with_capacity(inputs.len());
+        let mut output_content_types = BTreeMap::new();
         for (idx, inp) in inputs.iter().enumerate() {
+            let fmt = Self::resolve_input_format(inp, input_content_types)?;
             let raw = read_verified_cas_input(run_dir, inp)?;
+            let row_count = match fmt {
+                ColumnarInputFormatV1::ColumnarTableV1 => {
+                    let tbl = ColumnarTableV1::from_json_bytes_strict(&raw)?;
+                    Some(tbl.row_count)
+                }
+                ColumnarInputFormatV1::Ndjson => Some(Self::parse_ndjson_rows(&raw)?.len() as u64),
+                ColumnarInputFormatV1::OpaqueBinary => None,
+            };
             let (hex, uri, byte_len) = write_cas_bytes(run_dir, &raw)?;
-            let row_count = infer_row_count(&raw);
             let out_key = node
                 .outputs
                 .get(idx)
@@ -430,15 +624,17 @@ impl NativeOpRunner {
                 uri: Some(uri),
             });
             output_specs.push(OutputSpec {
-                asset_key: out_key,
+                asset_key: out_key.clone(),
                 schema: None,
                 rows: row_count,
                 bytes: Some(byte_len),
             });
+            output_content_types.insert(out_key, fmt.content_type().to_string());
         }
         Ok(PhysicalExecOutcomeV1 {
             instances,
             output_specs,
+            output_content_types,
         })
     }
 
@@ -446,6 +642,7 @@ impl NativeOpRunner {
         run_dir: &Path,
         node: &NodeV1,
         inputs: &[AssetInstanceV1],
+        input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
         let col_name = canon_param_str(&node.params, "column");
         let op = canon_param_str(&node.params, "op").unwrap_or("eq");
@@ -453,61 +650,67 @@ impl NativeOpRunner {
 
         let mut instances = Vec::with_capacity(inputs.len());
         let mut output_specs = Vec::with_capacity(inputs.len());
+        let mut output_content_types = BTreeMap::new();
 
         for (idx, inp) in inputs.iter().enumerate() {
+            let fmt = Self::resolve_input_format(inp, input_content_types)?;
             let raw = read_verified_cas_input(run_dir, inp)?;
-            let (out_bytes, rows_kept) = if raw.first().copied() == Some(b'{') {
-                let table = ColumnarTableV1::from_json_bytes_strict(&raw)?;
-                let filtered_rows = if let (Some(col), Some(rhs)) = (col_name, target_val) {
-                    let col_idx = table
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("filter_rows column '{col}' not found in table schema"),
-                            )
-                        })?;
-                    table
-                        .rows
-                        .into_iter()
-                        .filter(|row| cell_matches_predicate(&row[col_idx], op, rhs))
-                        .collect()
-                } else {
-                    table.rows
-                };
-                let rows_kept = filtered_rows.len() as u64;
-                let filtered_table = ColumnarTableV1::try_new(table.columns, filtered_rows)?;
-                (filtered_table.to_canonical_json_bytes()?, rows_kept)
-            } else {
-                // Bounded NDJSON line filtering
-                let text = std::str::from_utf8(&raw)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                let mut out_lines = Vec::new();
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let obj: Value = serde_json::from_str(trimmed)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                    let keep = match (col_name, target_val) {
-                        (Some(col), Some(rhs)) => obj
-                            .get(col)
-                            .is_some_and(|cell| cell_matches_predicate(cell, op, rhs)),
-                        _ => true,
+            let (out_bytes, rows_kept) = match fmt {
+                ColumnarInputFormatV1::ColumnarTableV1 => {
+                    let table = ColumnarTableV1::from_json_bytes_strict(&raw)?;
+                    let filtered_rows = if let (Some(col), Some(rhs)) = (col_name, target_val) {
+                        let col_idx = table
+                            .columns
+                            .iter()
+                            .position(|c| c.name == col)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("filter_rows column '{col}' not found in table schema"),
+                                )
+                            })?;
+                        table
+                            .rows
+                            .into_iter()
+                            .filter(|row| cell_matches_predicate(&row[col_idx], op, rhs))
+                            .collect()
+                    } else {
+                        table.rows
                     };
-                    if keep {
-                        out_lines.push(trimmed.to_string());
+                    let rows_kept = filtered_rows.len() as u64;
+                    let filtered_table = ColumnarTableV1::try_new(table.columns, filtered_rows)?;
+                    (filtered_table.to_canonical_json_bytes()?, rows_kept)
+                }
+                ColumnarInputFormatV1::Ndjson => {
+                    let parsed = Self::parse_ndjson_rows(&raw)?;
+                    let mut out_lines = Vec::new();
+                    for (line, obj) in parsed {
+                        let keep = match (col_name, target_val) {
+                            (Some(col), Some(rhs)) => obj
+                                .get(col)
+                                .is_some_and(|cell| cell_matches_predicate(cell, op, rhs)),
+                            _ => true,
+                        };
+                        if keep {
+                            out_lines.push(line);
+                        }
                     }
+                    let count = out_lines.len() as u64;
+                    let mut buf = out_lines.join("\n").into_bytes();
+                    if !buf.is_empty() {
+                        buf.push(b'\n');
+                    }
+                    (buf, count)
                 }
-                let count = out_lines.len() as u64;
-                let mut buf = out_lines.join("\n").into_bytes();
-                if !buf.is_empty() {
-                    buf.push(b'\n');
+                ColumnarInputFormatV1::OpaqueBinary => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "filter_rows requires tabular content_type ('{CONTENT_TYPE_COLUMNAR_JSON_V1}' or '{CONTENT_TYPE_NDJSON}'), got '{CONTENT_TYPE_OCTET_STREAM}' for '{}'",
+                            inp.asset_key
+                        ),
+                    ));
                 }
-                (buf, count)
             };
 
             let (hex, uri, byte_len) = write_cas_bytes(run_dir, &out_bytes)?;
@@ -522,15 +725,17 @@ impl NativeOpRunner {
                 uri: Some(uri),
             });
             output_specs.push(OutputSpec {
-                asset_key: out_key,
+                asset_key: out_key.clone(),
                 schema: None,
                 rows: Some(rows_kept),
                 bytes: Some(byte_len),
             });
+            output_content_types.insert(out_key, fmt.content_type().to_string());
         }
         Ok(PhysicalExecOutcomeV1 {
             instances,
             output_specs,
+            output_content_types,
         })
     }
 
@@ -538,6 +743,7 @@ impl NativeOpRunner {
         run_dir: &Path,
         node: &NodeV1,
         inputs: &[AssetInstanceV1],
+        input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
         if inputs.is_empty() {
             return Err(io::Error::new(
@@ -546,44 +752,68 @@ impl NativeOpRunner {
             ));
         }
 
-        let first_raw = read_verified_cas_input(run_dir, &inputs[0])?;
-        let (out_bytes, total_rows) = if first_raw.first().copied() == Some(b'{') {
-            let first_table = ColumnarTableV1::from_json_bytes_strict(&first_raw)?;
-            let schema = first_table.columns;
-            let mut merged_rows = first_table.rows;
-            for inp in &inputs[1..] {
-                let raw = read_verified_cas_input(run_dir, inp)?;
-                let tbl = ColumnarTableV1::from_json_bytes_strict(&raw)?;
-                if tbl.columns != schema {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "union columnar schema mismatch across physical inputs",
-                    ));
-                }
-                merged_rows.extend(tbl.rows);
+        let first_fmt = Self::resolve_input_format(&inputs[0], input_content_types)?;
+        if first_fmt == ColumnarInputFormatV1::OpaqueBinary {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "union requires tabular content_type ('{CONTENT_TYPE_COLUMNAR_JSON_V1}' or '{CONTENT_TYPE_NDJSON}'), got '{CONTENT_TYPE_OCTET_STREAM}' for '{}'",
+                    inputs[0].asset_key
+                ),
+            ));
+        }
+        for inp in &inputs[1..] {
+            let fmt = Self::resolve_input_format(inp, input_content_types)?;
+            if fmt != first_fmt {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "union input '{}' content_type '{}' does not match first input format '{}'",
+                        inp.asset_key,
+                        fmt.content_type(),
+                        first_fmt.content_type()
+                    ),
+                ));
             }
-            let total_rows = merged_rows.len() as u64;
-            let merged = ColumnarTableV1::try_new(schema, merged_rows)?;
-            (merged.to_canonical_json_bytes()?, total_rows)
-        } else {
-            let mut merged_lines = Vec::new();
-            for inp in inputs {
-                let raw = read_verified_cas_input(run_dir, inp)?;
-                let text = std::str::from_utf8(&raw)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        merged_lines.push(trimmed.to_string());
+        }
+
+        let (out_bytes, total_rows) = match first_fmt {
+            ColumnarInputFormatV1::ColumnarTableV1 => {
+                let first_raw = read_verified_cas_input(run_dir, &inputs[0])?;
+                let first_table = ColumnarTableV1::from_json_bytes_strict(&first_raw)?;
+                let schema = first_table.columns;
+                let mut merged_rows = first_table.rows;
+                for inp in &inputs[1..] {
+                    let raw = read_verified_cas_input(run_dir, inp)?;
+                    let tbl = ColumnarTableV1::from_json_bytes_strict(&raw)?;
+                    if tbl.columns != schema {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "union columnar schema mismatch across physical inputs",
+                        ));
+                    }
+                    merged_rows.extend(tbl.rows);
+                }
+                let total_rows = merged_rows.len() as u64;
+                let merged = ColumnarTableV1::try_new(schema, merged_rows)?;
+                (merged.to_canonical_json_bytes()?, total_rows)
+            }
+            ColumnarInputFormatV1::Ndjson => {
+                let mut merged_lines = Vec::new();
+                for inp in inputs {
+                    let raw = read_verified_cas_input(run_dir, inp)?;
+                    for (trimmed, _) in Self::parse_ndjson_rows(&raw)? {
+                        merged_lines.push(trimmed);
                     }
                 }
+                let total_rows = merged_lines.len() as u64;
+                let mut buf = merged_lines.join("\n").into_bytes();
+                if !buf.is_empty() {
+                    buf.push(b'\n');
+                }
+                (buf, total_rows)
             }
-            let total_rows = merged_lines.len() as u64;
-            let mut buf = merged_lines.join("\n").into_bytes();
-            if !buf.is_empty() {
-                buf.push(b'\n');
-            }
-            (buf, total_rows)
+            ColumnarInputFormatV1::OpaqueBinary => unreachable!(),
         };
 
         let (hex, uri, byte_len) = write_cas_bytes(run_dir, &out_bytes)?;
@@ -592,6 +822,8 @@ impl NativeOpRunner {
             .first()
             .map(|o| o.asset_key.clone())
             .unwrap_or_else(|| format!("asset://union/{hex}"));
+        let mut output_content_types = BTreeMap::new();
+        output_content_types.insert(out_key.clone(), first_fmt.content_type().to_string());
         Ok(PhysicalExecOutcomeV1 {
             instances: vec![AssetInstanceV1 {
                 asset_key: out_key.clone(),
@@ -604,6 +836,7 @@ impl NativeOpRunner {
                 rows: Some(total_rows),
                 bytes: Some(byte_len),
             }],
+            output_content_types,
         })
     }
 
@@ -722,21 +955,6 @@ fn canon_param_str<'a>(params: &'a CanonParams, key: &str) -> Option<&'a str> {
         Some(CanonValue::Str(s)) => Some(s.as_str()),
         _ => None,
     }
-}
-
-fn infer_row_count(raw: &[u8]) -> Option<u64> {
-    if raw.first().copied() == Some(b'{') {
-        if let Ok(tbl) = ColumnarTableV1::from_json_bytes_strict(raw) {
-            return Some(tbl.row_count);
-        }
-    }
-    if let Ok(text) = std::str::from_utf8(raw) {
-        let lines = text.lines().filter(|l| !l.trim().is_empty()).count() as u64;
-        if lines > 0 {
-            return Some(lines);
-        }
-    }
-    None
 }
 
 fn cell_matches_predicate(cell: &Value, op: &str, rhs_raw: &str) -> bool {
@@ -870,7 +1088,7 @@ mod tests {
     fn passthrough_preserves_inputs() {
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
         let node = test_node("passthrough");
         let inputs = test_inputs();
 
@@ -898,7 +1116,7 @@ mod tests {
     fn filter_rows_metadata_only() {
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
         let node = test_node("filter_rows");
         let inputs = test_inputs();
 
@@ -920,7 +1138,7 @@ mod tests {
     fn union_metadata_only_forwards_inputs() {
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
         let node = test_node("union");
         let inputs = test_inputs();
 
@@ -957,7 +1175,7 @@ mod tests {
     fn unsupported_op_type_returns_error() {
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
         let node = test_node("nonexistent_op");
         let inputs = test_inputs();
 
@@ -971,7 +1189,7 @@ mod tests {
     fn native_runner_spans_use_swarmtorch_namespace() {
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::with_mode(RunnerExecutionModeV1::MetadataOnlyForTests);
         let node = test_node("passthrough");
         let inputs = test_inputs();
 
@@ -1001,7 +1219,7 @@ mod tests {
 
         let ctx = test_ctx();
         let emitter = TestEmitter::new();
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::new();
         let node = test_node("wasm_transform");
         let policy = SandboxedExtensionPolicyV1::default();
         let registry = BTreeMap::new();
@@ -1076,25 +1294,38 @@ mod tests {
             fingerprint: None,
         }];
 
-        let runner = NativeOpRunner;
+        let runner = NativeOpRunner::new();
         let ctx = ExecutionContext {
             run_id: RunId::from_bytes([7; 16]),
             clock_nanos: || 1_000_000,
         };
         let emitter = TestEmitter::new();
+        let mut cts = BTreeMap::new();
+        cts.insert(
+            "dataset://ns/shard1".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
 
         let filter_out = runner
-            .run_in_session(
+            .run_in_session_with_content_types(
                 &ctx,
                 &run_dir,
                 &filter_node,
                 std::slice::from_ref(&in1),
                 &emitter,
                 None,
+                &cts,
             )
             .unwrap();
         assert_eq!(filter_out.output_specs[0].rows, Some(2));
         assert!(filter_out.output_specs[0].bytes.unwrap() > 0);
+        assert_eq!(
+            filter_out
+                .output_content_types
+                .get("dataset://ns/filtered")
+                .map(String::as_str),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
         let kept_raw = read_verified_cas_input(&run_dir, &filter_out.instances[0]).unwrap();
         let kept_tbl = ColumnarTableV1::from_json_bytes_strict(&kept_raw).unwrap();
         assert_eq!(kept_tbl.row_count, 2);
@@ -1109,22 +1340,35 @@ mod tests {
             fingerprint_v0: hex2,
             uri: Some(uri2),
         };
+        cts.extend(filter_out.output_content_types.clone());
+        cts.insert(
+            "dataset://ns/shard2".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
         let mut union_node = test_node("union");
         union_node.outputs = vec![AssetRefV1 {
             asset_key: "dataset://ns/merged".to_string(),
             fingerprint: None,
         }];
         let union_out = runner
-            .run_in_session(
+            .run_in_session_with_content_types(
                 &ctx,
                 &run_dir,
                 &union_node,
                 &[filter_out.instances[0].clone(), in2],
                 &emitter,
                 None,
+                &cts,
             )
             .unwrap();
         assert_eq!(union_out.output_specs[0].rows, Some(3));
+        assert_eq!(
+            union_out
+                .output_content_types
+                .get("dataset://ns/merged")
+                .map(String::as_str),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
 
         // Incompatible schema union fails closed with InvalidData
         let bad_cols = vec![ColumnSchemaV1 {
@@ -1140,10 +1384,175 @@ mod tests {
             fingerprint_v0: hex3,
             uri: Some(uri3),
         };
+        cts.insert(
+            "dataset://ns/bad".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
         let err = runner
-            .run_in_session(&ctx, &run_dir, &union_node, &[in1, in_bad], &emitter, None)
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &union_node,
+                &[in1, in_bad],
+                &emitter,
+                None,
+                &cts,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn st10_physical_strict_rejects_missing_or_non_cas_inputs_and_run_with_context() {
+        let pid = std::process::id();
+        let run_dir = std::env::temp_dir().join(format!("swarmtorch_native_strict_{pid}"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let runner = NativeOpRunner::new();
+        assert_eq!(runner.mode(), RunnerExecutionModeV1::PhysicalStrict);
+        assert_eq!(
+            NativeOpRunner::default().mode(),
+            RunnerExecutionModeV1::PhysicalStrict
+        );
+
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let node = test_node("passthrough");
+        let non_cas_inputs = test_inputs();
+
+        // Direct OpRunner metadata-only execution rejects PhysicalStrict
+        let err = runner
+            .run_with_context(&ctx, &node, &non_cas_inputs, &emitter)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+
+        // Session execution rejects empty inputs and s3:// URIs rather than falling back to metadata-only
+        let err_empty = runner
+            .run_in_session(&ctx, &run_dir, &node, &[], &emitter, None)
+            .unwrap_err();
+        assert_eq!(err_empty.kind(), io::ErrorKind::InvalidInput);
+
+        let err_s3 = runner
+            .run_in_session(&ctx, &run_dir, &node, &non_cas_inputs, &emitter, None)
+            .unwrap_err();
+        assert_eq!(err_s3.kind(), io::ErrorKind::InvalidInput);
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn st10_content_type_dispatch_rejects_sniffing_and_parses_ndjson_starting_with_brace() {
+        let pid = std::process::id();
+        let run_dir = std::env::temp_dir().join(format!("swarmtorch_native_ct_{pid}"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        // Multi-row NDJSON starts with `{`, which previously triggered false ColumnarTableV1 sniffing!
+        let ndjson_bytes = br#"{"id":1,"score":0.9}
+{"id":2,"score":0.2}
+{"id":3,"score":0.85}
+"#;
+        let (hex_nd, uri_nd, _) = write_cas_bytes(&run_dir, ndjson_bytes).unwrap();
+        let inp_nd = AssetInstanceV1 {
+            asset_key: "dataset://ns/nd".to_string(),
+            fingerprint_v0: hex_nd,
+            uri: Some(uri_nd),
+        };
+        let mut filter_node = test_node("filter_rows");
+        filter_node
+            .params
+            .insert("column".to_string(), CanonValue::Str("score".to_string()));
+        filter_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        filter_node
+            .params
+            .insert("value".to_string(), CanonValue::Str("0.8".to_string()));
+        filter_node.outputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/nd_filtered".to_string(),
+            fingerprint: None,
+        }];
+
+        let runner = NativeOpRunner::new();
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+
+        // 1. Missing declared content_type fails closed (no `{` sniffing fallback)
+        let err_missing_ct = runner
+            .run_in_session(
+                &ctx,
+                &run_dir,
+                &filter_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err_missing_ct.kind(), io::ErrorKind::InvalidInput);
+
+        // 2. Wrong declared content_type (e.g. application/octet-stream or mismatched ColumnarTableV1) fails closed
+        let mut wrong_cts = BTreeMap::new();
+        wrong_cts.insert(
+            "dataset://ns/nd".to_string(),
+            CONTENT_TYPE_OCTET_STREAM.to_string(),
+        );
+        let err_wrong_ct = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &filter_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+                &wrong_cts,
+            )
+            .unwrap_err();
+        assert_eq!(err_wrong_ct.kind(), io::ErrorKind::InvalidInput);
+
+        wrong_cts.insert(
+            "dataset://ns/nd".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        let err_mislabeled = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &filter_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+                &wrong_cts,
+            )
+            .unwrap_err();
+        assert_eq!(err_mislabeled.kind(), io::ErrorKind::InvalidData);
+
+        // 3. Declared NDJSON content_type parses cleanly even though payload starts with `{`
+        let mut nd_cts = BTreeMap::new();
+        nd_cts.insert(
+            "dataset://ns/nd".to_string(),
+            CONTENT_TYPE_NDJSON.to_string(),
+        );
+        let out = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &filter_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+                &nd_cts,
+            )
+            .unwrap();
+        assert_eq!(out.output_specs[0].rows, Some(2));
+        assert_eq!(
+            out.output_content_types
+                .get("dataset://ns/nd_filtered")
+                .map(String::as_str),
+            Some(CONTENT_TYPE_NDJSON)
+        );
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

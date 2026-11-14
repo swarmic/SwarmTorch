@@ -194,9 +194,29 @@ pub(crate) fn read_and_hash_bounded(
     Ok((out, sha))
 }
 
-pub(crate) fn append_ndjson<T: serde::Serialize>(path: &Path, record: &T) -> io::Result<()> {
+/// Persistence durability policy for append-only NDJSON streams (`ST-05`, `ADR-0023` §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DurabilityPolicyV1 {
+    /// Write, flush userspace buffers, invoke `File::sync_all()`, and sync the parent directory
+    /// on POSIX (`sync_parent_dir`) after every appended record.
+    ///
+    /// Default for privacy release ledgers (`dp/ledger.ndjson`) and DataOps state streams.
+    #[default]
+    SyncEachAppend,
+    /// Write and flush userspace buffers on each append; defer `File::sync_all()` until commit
+    /// or [`super::RunArtifactBundle::sync_required_v1`] prior to manifest signing.
+    SyncAtCommit,
+}
+
+pub(crate) fn append_ndjson_with_policy<T: serde::Serialize>(
+    path: &Path,
+    record: &T,
+    policy: DurabilityPolicyV1,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(record).map_err(io::Error::other)?;
@@ -204,6 +224,10 @@ pub(crate) fn append_ndjson<T: serde::Serialize>(path: &Path, record: &T) -> io:
     buf.push(b'\n');
     file.write_all(&buf)?;
     file.flush()?;
+    if policy == DurabilityPolicyV1::SyncEachAppend {
+        file.sync_all()?;
+        sync_parent_dir(path)?;
+    }
     Ok(())
 }
 
@@ -267,15 +291,30 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Sync the parent directory of `path` on Unix/POSIX (`File::open(parent)?.sync_all()`).
+///
+/// On non-Unix platforms (including Windows NTFS), `File::sync_all()` on regular file handles
+/// invokes `FlushFileBuffers`, whereas directory handles opened via `CreateFile` +
+/// `FILE_FLAG_BACKUP_SEMANTICS` do not guarantee uniform filesystem-level directory-entry flush
+/// semantics across all Windows drivers and filesystems. Callers must not assume POSIX-identical
+/// directory `fsync` guarantees on Windows; durability on Windows rests on regular-file
+/// `FlushFileBuffers` (`sync_all()`), kernel handle locking (`LockFileEx`), and atomic staging
+/// renames.
 #[cfg(unix)]
 pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent)?;
-        dir.sync_all()?;
+        if !parent.as_os_str().is_empty() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
     }
     Ok(())
 }
 
+/// Non-Unix (`Windows` / other) parent directory sync boundary (`ST-05`).
+///
+/// Intentionally a documented no-op rather than misrepresenting Windows directory handle behavior;
+/// regular files still call `File::sync_all()` (`FlushFileBuffers` on Windows).
 #[cfg(not(unix))]
 pub(crate) fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
@@ -324,15 +363,43 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn verify_existing_cas_blob(
+    blob_path: &Path,
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+    hex_digest: &str,
+) -> io::Result<()> {
+    let meta = fs::symlink_metadata(blob_path)?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("existing CAS entry {hex_digest} is not a regular file"),
+        ));
+    }
+    let (_, disk_sha) = read_and_hash_bounded(
+        blob_path,
+        expected_len,
+        expected_len.max(MAX_SINGLE_ARTIFACT_BYTES),
+    )?;
+    if &disk_sha != expected_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("existing CAS blob {hex_digest} failed SHA-256 verification"),
+        ));
+    }
+    Ok(())
+}
+
 /// Write-once content-addressed blob publication under `runs/<run_id>/blobs/sha256/<hex_digest>`
-/// (`ADR-0023` §2.2).
+/// (`ADR-0023` §2.2, `ST-05`).
 ///
 /// - Verifies `SHA-256(bytes) == expected_sha256`.
-/// - If the target CAS object already exists on disk, verifies its exact byte length and SHA-256
-///   digest before returning `Ok(blob_path)` (never overwriting an existing CAS object, and
-///   failing closed with `InvalidData` if the existing file is corrupt).
-/// - Otherwise writes to a unique `.staging.*` file, calls `sync_all()?`, and renames into
-///   `blobs/sha256/<hex_digest>`.
+/// - If the target CAS object already exists on disk (either prior to staging or via concurrent
+///   collision), verifies that it is a regular non-symlink file with exact byte length and
+///   SHA-256 digest before returning `Ok(blob_path)` (never overwriting an existing CAS object,
+///   and failing closed with `InvalidData` if corrupt).
+/// - Otherwise writes to a unique `.staging.*` file, calls `flush()` + `sync_all()`, and
+///   publishes via `hard_link` (never clobbering existing targets) before unlinking staging.
 pub(crate) fn write_once_cas_blob(
     run_dir: &Path,
     expected_sha256: &[u8; 32],
@@ -347,26 +414,18 @@ pub(crate) fn write_once_cas_blob(
     }
 
     let hex_digest = hex_lower(expected_sha256);
+    let expected_len = bytes.len() as u64;
     let cas_dir = run_dir.join("blobs").join("sha256");
     fs::create_dir_all(&cas_dir)?;
     let blob_path = cas_dir.join(&hex_digest);
 
-    if blob_path.exists() {
-        let (_, disk_sha) = read_and_hash_bounded(
-            &blob_path,
-            bytes.len() as u64,
-            (bytes.len() as u64).max(MAX_SINGLE_ARTIFACT_BYTES),
-        )?;
-        if &disk_sha != expected_sha256 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "existing CAS blob {} failed SHA-256 verification",
-                    hex_digest
-                ),
-            ));
+    match fs::symlink_metadata(&blob_path) {
+        Ok(_) => {
+            verify_existing_cas_blob(&blob_path, expected_len, expected_sha256, &hex_digest)?;
+            return Ok(blob_path);
         }
-        return Ok(blob_path);
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
 
     let tmp_path = next_unique_staging_path(&blob_path)?;
@@ -386,34 +445,42 @@ pub(crate) fn write_once_cas_blob(
         return Err(e);
     }
 
-    // Use hard_link + unlink where supported so an existing target is never overwritten,
-    // falling back to rename if hard_link is unsupported on the filesystem.
+    // Prefer `hard_link` + unlink so existing targets can never be overwritten even under races.
     match fs::hard_link(&tmp_path, &blob_path) {
         Ok(()) => {
             let _ = fs::remove_file(&tmp_path);
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&tmp_path);
-            let (_, disk_sha) = read_and_hash_bounded(
-                &blob_path,
-                bytes.len() as u64,
-                (bytes.len() as u64).max(MAX_SINGLE_ARTIFACT_BYTES),
-            )?;
-            if &disk_sha != expected_sha256 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "concurrent CAS blob {} failed SHA-256 verification",
-                        hex_digest
-                    ),
-                ));
-            }
+            verify_existing_cas_blob(&blob_path, expected_len, expected_sha256, &hex_digest)?;
             return Ok(blob_path);
         }
-        Err(_) => {
-            if let Err(rename_err) = fs::rename(&tmp_path, &blob_path) {
+        Err(link_err) => {
+            // Re-check destination before any fallback rename: never clobber an existing CAS blob
+            // (corrupt or valid) on filesystems where `hard_link` returns another error (e.g.
+            // `Unsupported` on FAT/overlay mounts).
+            if fs::symlink_metadata(&blob_path).is_ok() {
                 let _ = fs::remove_file(&tmp_path);
-                return Err(rename_err);
+                verify_existing_cas_blob(&blob_path, expected_len, expected_sha256, &hex_digest)?;
+                return Ok(blob_path);
+            }
+            if link_err.kind() == io::ErrorKind::Unsupported {
+                if let Err(rename_err) = fs::rename(&tmp_path, &blob_path) {
+                    let _ = fs::remove_file(&tmp_path);
+                    if fs::symlink_metadata(&blob_path).is_ok() {
+                        verify_existing_cas_blob(
+                            &blob_path,
+                            expected_len,
+                            expected_sha256,
+                            &hex_digest,
+                        )?;
+                        return Ok(blob_path);
+                    }
+                    return Err(rename_err);
+                }
+            } else {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(link_err);
             }
         }
     }

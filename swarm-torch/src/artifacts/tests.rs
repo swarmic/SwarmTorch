@@ -3430,3 +3430,256 @@ fn validate_manifest_strict_rejects_unsigned_manifest() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+// -------------------------------------------------------------------------
+// Wave 13 Phase 13B-2 (ST-05): Kernel Locks, Checked NDJSON, & CAS Integrity
+// -------------------------------------------------------------------------
+
+#[test]
+fn st05_persistent_bundle_lock_preserves_inode_and_survives_process_crash_and_contention() {
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    if let Ok(run_dir) = std::env::var("SWARM_TORCH_LOCK_CHILD_RUN_DIR") {
+        let _guard = BundleLockGuard::acquire(
+            std::path::Path::new(&run_dir),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .expect("child process should acquire persistent .bundle.lock");
+        println!("LOCKED");
+        io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
+
+    let base = temp_dir("st05_kernel_lock_crash");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0xB1; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    let lock_path = bundle.run_dir().join(BUNDLE_LOCK_FILE_NAME);
+    assert!(
+        lock_path.exists(),
+        "persistent .bundle.lock must remain on disk after RunArtifactBundle::create drops its lock"
+    );
+
+    // Pre-existing junk in unlocked .bundle.lock must be replaced only after locking.
+    fs::write(&lock_path, b"stale-corrupt-lock-bytes").unwrap();
+    let g1 = bundle
+        .acquire_lock(LockAcquisitionPolicy::FailFast)
+        .expect("locking over persistent inode must succeed");
+    let g1_nonce = g1.lease_nonce();
+    drop(g1);
+    assert!(
+        lock_path.exists(),
+        "Drop must unlock without unlinking persistent .bundle.lock"
+    );
+    let lock_json: serde_json::Value = read_json(&lock_path).unwrap();
+    assert_eq!(lock_json["schema_version"].as_u64(), Some(1));
+    assert_eq!(lock_json["lease_nonce"].as_u64(), Some(g1_nonce));
+
+    // Real cross-process exclusive contention + forced child crash (SIGKILL / TerminateProcess).
+    let exe = std::env::current_exe().expect("locate current test executable");
+    let mut child = Command::new(exe)
+        .arg("--exact")
+        .arg("artifacts::tests::st05_persistent_bundle_lock_preserves_inode_and_survives_process_crash_and_contention")
+        .arg("--nocapture")
+        .env("SWARM_TORCH_LOCK_CHILD_RUN_DIR", bundle.run_dir())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn child process lock holder");
+
+    let stdout = child.stdout.take().expect("child stdout pipe");
+    let mut reader = io::BufReader::new(stdout);
+    let mut line = String::new();
+    let mut locked_seen = false;
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .expect("read child LOCKED handshake");
+        if n == 0 {
+            break;
+        }
+        if line.trim() == "LOCKED" {
+            locked_seen = true;
+            break;
+        }
+    }
+    assert!(
+        locked_seen,
+        "child should report LOCKED before contention test; last line: {line:?}"
+    );
+
+    // FailFast must reject while child process holds kernel lock.
+    let err = BundleLockGuard::acquire(bundle.run_dir(), LockAcquisitionPolicy::FailFast)
+        .expect_err("parent must see BundleBusy while child holds kernel lock");
+    assert!(matches!(err, BundleLockError::BundleBusy { .. }));
+
+    // BoundedWait with short timeout must also fail closed while child holds lock.
+    let err_wait = BundleLockGuard::acquire(
+        bundle.run_dir(),
+        LockAcquisitionPolicy::BoundedWait {
+            timeout: Duration::from_millis(35),
+            poll_interval: Duration::from_millis(5),
+        },
+    )
+    .expect_err("short BoundedWait must fail closed when contender holds lock");
+    assert!(matches!(err_wait, BundleLockError::BundleBusy { .. }));
+
+    // Force-kill child process without running Drop -> kernel releases lock automatically.
+    child.kill().expect("kill child lock holder");
+    let _ = child.wait();
+    assert!(
+        lock_path.exists(),
+        "persistent .bundle.lock remains after crash"
+    );
+
+    let recovered = BundleLockGuard::acquire(bundle.run_dir(), LockAcquisitionPolicy::FailFast)
+        .expect("kernel must auto-release flock/LockFileEx on child crash");
+
+    // Verify BoundedWait acquires cleanly once holder drops on another thread.
+    let run_dir_owned = bundle.run_dir().to_path_buf();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        drop(recovered);
+    });
+    let reacquired = BundleLockGuard::acquire(
+        &run_dir_owned,
+        LockAcquisitionPolicy::BoundedWait {
+            timeout: Duration::from_millis(2_000),
+            poll_interval: Duration::from_millis(5),
+        },
+    )
+    .expect("BoundedWait should succeed once contender drops");
+    drop(reacquired);
+    releaser.join().unwrap();
+
+    // Manifest finalization must continue to exclude persistent .bundle.lock.
+    let manifest = bundle
+        .finalize_signed_manifest(
+            &swarm_torch_core::crypto::KeyPair::from_seed([0xB2; 32]).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        !manifest
+            .entries
+            .iter()
+            .any(|e| e.path.ends_with(BUNDLE_LOCK_FILE_NAME)),
+        ".bundle.lock must never be hashed into manifest.json"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st05_cas_write_once_collision_verifies_sha256_and_rejects_corrupt_target() {
+    use sha2::{Digest, Sha256};
+
+    let base = temp_dir("st05_cas_collision");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0xB3; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    let payload = b"authentic-cas-payload-v1";
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+
+    let path = write_once_cas_blob(bundle.run_dir(), &digest, payload).unwrap();
+    // Idempotent duplicate write succeeds when on-disk SHA-256 matches.
+    let path_again = write_once_cas_blob(bundle.run_dir(), &digest, payload).unwrap();
+    assert_eq!(path, path_again);
+
+    // Same-length bit-flip corruption in existing CAS blob must fail closed without overwriting.
+    let mut corrupt_same_len = payload.to_vec();
+    corrupt_same_len[0] ^= 0xFF;
+    fs::write(&path, &corrupt_same_len).unwrap();
+    let err_same = write_once_cas_blob(bundle.run_dir(), &digest, payload)
+        .expect_err("corrupt existing CAS blob must fail SHA-256 verification");
+    assert_eq!(err_same.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        corrupt_same_len,
+        "write_once_cas_blob must never overwrite an existing corrupt CAS file"
+    );
+
+    // Length-mismatch corruption must also fail closed without overwriting.
+    let corrupt_diff_len = b"truncated";
+    fs::write(&path, corrupt_diff_len).unwrap();
+    let err_diff = write_once_cas_blob(bundle.run_dir(), &digest, payload)
+        .expect_err("size-mismatched CAS blob must fail closed");
+    assert_eq!(err_diff.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path).unwrap(), corrupt_diff_len);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st05_ndjson_durability_policy_and_sink_write_graph_unlocked() {
+    use swarm_torch_core::crypto::KeyPair;
+
+    let base = temp_dir("st05_ndjson_and_sink_graph");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0xB4; 16]);
+    let session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+    // Writing graph through session.sink() while holding lock_guard must succeed without self-contention.
+    let graph = GraphV1::default();
+    session
+        .sink()
+        .write_graph(&graph)
+        .expect("sink.write_graph must reuse held lock_guard without BundleBusy");
+
+    let trace_id = TraceId::from_bytes([0x11; 16]);
+    {
+        let bundle = session.sink().bundle();
+        bundle
+            .append_metric_with_durability(
+                &MetricRecord {
+                    schema_version: 1,
+                    ts_unix_nanos: 100,
+                    trace_id,
+                    span_id: None,
+                    name: "loss".to_string(),
+                    value: 0.25,
+                    unit: None,
+                    attrs: AttrMap::new(),
+                },
+                DurabilityPolicyV1::SyncEachAppend,
+            )
+            .unwrap();
+        bundle
+            .append_event(&EventRecord {
+                schema_version: 1,
+                ts_unix_nanos: 101,
+                trace_id,
+                span_id: None,
+                name: "step".to_string(),
+                attrs: AttrMap::new(),
+            })
+            .unwrap();
+        bundle.sync_required_v1().unwrap();
+    }
+
+    let signer = KeyPair::from_seed([0xB5; 32]).unwrap();
+    session.commit_and_close(Some(&signer)).unwrap();
+
+    let loaded = RunArtifactBundle::open(&run_dir)
+        .unwrap()
+        .verify_and_load(&TrustPolicy::strict_with_key(*signer.public_key()))
+        .expect("strict verification after durability sync & seal should pass");
+    assert!(loaded.status().is_strict());
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -530,3 +530,106 @@ fn pre_seed_merkle_commitment_and_residual_compressor_prevent_adaptive_tampering
         CompressionError::CommitmentVerificationFailed
     );
 }
+
+#[test]
+fn sparse_round_context_verifier_and_bandwidth_report_enforce_common_support() {
+    use crate::traits::PeerId;
+    let p1 = PeerId::new([1u8; 32]);
+    let p2 = PeerId::new([2u8; 32]);
+    let roster = [p1, p2].into_iter().collect();
+
+    let ctx = SparseRoundContextV1 {
+        swarm_instance_id: [0x10; 16],
+        run_id: [0x20; 16],
+        round_id: 7,
+        base_checkpoint_digest: [0x30; 32],
+        frozen_roster: roster,
+        original_len: 10,
+        sparsity_k: 4,
+        scaling: SharedSeedScalingProfile::UnscaledProjectionV1,
+        sampler_version: SHARED_SEED_SAMPLER_VERSION_V1,
+    };
+    let ctx_digest = ctx.context_digest().unwrap();
+
+    let u1 = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let u2 = [
+        -1.0f32, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0,
+    ];
+    let c1 = PreSeedVectorCommitmentV1::commit(&u1).unwrap();
+    let c2 = PreSeedVectorCommitmentV1::commit(&u2).unwrap();
+
+    // Order-invariant transcript root over sorted PeerIds
+    let root_a = compute_commitments_root_v1(&ctx_digest, &[(p1, c1), (p2, c2)]).unwrap();
+    let root_b = compute_commitments_root_v1(&ctx_digest, &[(p2, c2), (p1, c1)]).unwrap();
+    assert_eq!(root_a, root_b);
+    assert_eq!(
+        compute_commitments_root_v1(&ctx_digest, &[(p1, c1), (p1, c1)]).unwrap_err(),
+        CompressionError::InvalidData
+    );
+
+    let beacon = [0x99u8; 32];
+    let shared_seed = derive_context_bound_round_seed_v1(&ctx_digest, &root_a, &beacon);
+    let verifier = SharedSeedCoordinateVerifier::try_new(ctx, root_a, shared_seed).unwrap();
+
+    let (payload1, openings1) = c1
+        .open_for_seed(
+            &u1,
+            4,
+            shared_seed,
+            SharedSeedScalingProfile::UnscaledProjectionV1,
+        )
+        .unwrap();
+    let msg1 = SharedSeedOpeningMessageV1 {
+        context_digest: ctx_digest,
+        commitments_root: root_a,
+        shared_round_seed: shared_seed,
+        payload: payload1,
+        openings: openings1.clone(),
+    };
+    assert!(verifier.verify_opening_message(&c1, &msg1).is_ok());
+
+    // Per-sender seed divergence must fail closed.
+    let rogue_seed = [0xAAu8; 32];
+    let (rogue_payload, rogue_openings) = c2
+        .open_for_seed(
+            &u2,
+            4,
+            rogue_seed,
+            SharedSeedScalingProfile::UnscaledProjectionV1,
+        )
+        .unwrap();
+    let rogue_msg = SharedSeedOpeningMessageV1 {
+        context_digest: ctx_digest,
+        commitments_root: root_a,
+        shared_round_seed: rogue_seed,
+        payload: rogue_payload,
+        openings: rogue_openings,
+    };
+    assert_eq!(
+        verifier
+            .verify_opening_message(&c2, &rogue_msg)
+            .unwrap_err(),
+        CompressionError::CommitmentVerificationFailed
+    );
+
+    // Honest bandwidth reporting accounts for Merkle proof overhead + framing alongside 4*k values.
+    let p1_bytes = SharedSeedCommitmentMessageV1 {
+        context_digest: ctx_digest,
+        commitment: c1,
+    }
+    .to_bytes()
+    .unwrap();
+    let p2_bytes = msg1.to_bytes().unwrap();
+    let mut report = SharedSeedBandwidthReportV1::new(10, 4);
+    report.record_peer_delivery(p1_bytes.len(), p2_bytes.len(), &openings1);
+    assert_eq!(report.peer_count, 1);
+    assert_eq!(report.raw_dense_bytes_total, 40);
+    assert_eq!(report.projected_values_bytes_total, 16);
+    assert!(report.merkle_proof_bytes_total > report.projected_values_bytes_total);
+    assert_eq!(
+        report.projected_values_bytes_total
+            + report.merkle_proof_bytes_total
+            + report.envelope_and_framing_bytes_total,
+        report.total_two_phase_wire_bytes
+    );
+}

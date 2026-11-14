@@ -24,7 +24,8 @@ path = "src/lib.rs"
 default = ["tokio"]
 tokio = ["dep:tokio", "std", "tokio/rt", "tokio/rt-multi-thread", "tokio/time", "tokio/sync", "tokio/macros"]
 embassy = ["dep:embassy-executor", "dep:embassy-time"]
-std = ["alloc"]
+embassy-std-test = ["embassy", "std", "embassy-executor/arch-std", "embassy-executor/executor-thread", "embassy-time/generic-queue-8"]
+std = ["alloc", "embassy-time?/std"]
 alloc = []
 
 [dependencies]

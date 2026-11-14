@@ -309,6 +309,87 @@ fn bulyan_iterative_krum_v1_golden_selection_and_output_fixture() {
 
 #[test]
 #[cfg(feature = "bulyan")]
+fn bulyan_stage2_q9_lower_observed_median_and_peer_id_tiebreak() {
+    // Q9 even-theta (theta = 4, f = 1 => beta = 2) boundary fixture: [0.0, 1.0, 2.0, 100.0].
+    // Lower observed median is sorted[(4 - 1) / 2] = sorted[1] = 1.0 (NOT arithmetic midpoint 1.5).
+    // Distances to 1.0: |1.0 - 1.0| = 0.0; |0.0 - 1.0| = 1.0; |2.0 - 1.0| = 1.0; |100.0 - 1.0| = 99.0.
+    // Exact distance tie between 0.0 and 2.0 breaks strictly by PeerId (never by value):
+    // - When peer(0.0) < peer(2.0), nearest beta=2 are [1.0, 0.0] -> mean = 0.5.
+    // - When peer(2.0) < peer(0.0), nearest beta=2 are [1.0, 2.0] -> mean = 1.5.
+    let v0 = [0.0f32];
+    let v1 = [1.0f32];
+    let v2 = [2.0f32];
+    let v3 = [100.0f32];
+
+    let low_zero = [
+        (PeerId::new([1; 32]), v0.as_slice()),
+        (PeerId::new([2; 32]), v1.as_slice()),
+        (PeerId::new([3; 32]), v2.as_slice()),
+        (PeerId::new([4; 32]), v3.as_slice()),
+    ];
+    assert_eq!(
+        bulyan_stage2_with_peers(&low_zero, 1).unwrap(),
+        vec![0.5f32]
+    );
+
+    let low_two = [
+        (PeerId::new([3; 32]), v0.as_slice()),
+        (PeerId::new([2; 32]), v1.as_slice()),
+        (PeerId::new([1; 32]), v2.as_slice()),
+        (PeerId::new([4; 32]), v3.as_slice()),
+    ];
+    assert_eq!(bulyan_stage2_with_peers(&low_two, 1).unwrap(), vec![1.5f32]);
+
+    // Permutation invariance across input order when PeerIds are fixed:
+    let permuted = [low_zero[3], low_zero[1], low_zero[0], low_zero[2]];
+    assert_eq!(
+        bulyan_stage2_with_peers(&permuted, 1).unwrap(),
+        vec![0.5f32]
+    );
+
+    // Mathematical non-equivariance under sign-flip (Q9 ADR-0019 note):
+    // Lower observed median sorted[(theta - 1) / 2] shifts [-100, -2, -1, 0] median to -2.0,
+    // yielding nearest 2 values [-2.0, -1.0] -> mean = -1.5 rather than -0.5.
+    let n0 = [-0.0f32];
+    let n1 = [-1.0f32];
+    let n2 = [-2.0f32];
+    let n3 = [-100.0f32];
+    let negated = [
+        (PeerId::new([1; 32]), n0.as_slice()),
+        (PeerId::new([2; 32]), n1.as_slice()),
+        (PeerId::new([3; 32]), n2.as_slice()),
+        (PeerId::new([4; 32]), n3.as_slice()),
+    ];
+    let pos_out = bulyan_stage2_with_peers(&low_zero, 1).unwrap()[0];
+    let neg_out = bulyan_stage2_with_peers(&negated, 1).unwrap()[0];
+    assert_eq!(neg_out, -1.5f32);
+    assert_ne!(pos_out, -neg_out);
+}
+
+#[test]
+#[cfg(feature = "bulyan")]
+fn bulyan_end_to_end_even_n_permutation_invariance() {
+    // n = 8, f = 1 => theta = 4 (even), beta = 2. Permuting input order must produce bit-identical output.
+    let base = vec![
+        update_with_meta(10, 1, 1, vec![0.0, 2.0]),
+        update_with_meta(11, 1, 1, vec![1.0, 3.0]),
+        update_with_meta(12, 1, 1, vec![2.0, 4.0]),
+        update_with_meta(13, 1, 1, vec![1.5, 3.5]),
+        update_with_meta(14, 1, 1, vec![0.5, 2.5]),
+        update_with_meta(15, 1, 1, vec![1.25, 3.25]),
+        update_with_meta(16, 1, 1, vec![100.0, -100.0]),
+        update_with_meta(17, 1, 1, vec![-50.0, 50.0]),
+    ];
+    let reversed: Vec<GradientUpdate> = base.iter().rev().cloned().collect();
+    let bulyan = Bulyan::new(1);
+    assert_eq!(
+        bulyan.aggregate(&base).unwrap(),
+        bulyan.aggregate(&reversed).unwrap()
+    );
+}
+
+#[test]
+#[cfg(feature = "bulyan")]
 fn bulyan_enforces_preconditions_and_budget() {
     assert!(matches!(
         Bulyan::try_new(0, BulyanProfile::IterativeKrumV1),

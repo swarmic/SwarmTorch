@@ -679,35 +679,93 @@ pub fn bulyan_stage1_iterative_krum_v1(
     Ok(selected)
 }
 
-/// Stage 2 of Bulyan (`ADR-0019`, `W9-01`): given `theta` selected vectors and `f = max_byzantine`,
-/// computes each coordinate's median $m_j$ over the `theta` values and averages the
-/// $\beta = \theta - 2f$ values minimizing $|v - m_j|$ in `f64`.
+/// Internal Stage 2 kernel parameterized by candidate `(PeerId, &[f32])` pairs (`ADR-0019`, `ST-11`).
+///
+/// Uses the lower observed coordinate median `sorted[(theta - 1) / 2]` and breaks distance ties
+/// strictly by `PeerId` (never by coordinate magnitude), preserving permutation invariance across
+/// unique-peer cohorts. Because `sorted[(theta - 1) / 2]` selects the lower median on even `theta`
+/// and ties break by `PeerId`, universal sign-flip equivariance `B(-x) == -B(x)` does not hold
+/// for even-`theta` asymmetric or tied inputs (`ADR-0019` Q9 amendment).
 #[cfg(all(feature = "alloc", feature = "bulyan"))]
-pub fn bulyan_stage2_nearest_to_median(
-    selected_updates: &[&[f32]],
+fn bulyan_stage2_core<F>(
+    theta: usize,
+    dim: usize,
     max_byzantine: usize,
-) -> Result<Vec<f32>> {
+    mut coord_at: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(usize, usize) -> (PeerId, f32),
+{
+    let beta = theta - 2 * max_byzantine;
+    let inv_beta = 1.0f64 / (beta as f64);
+    let mut out = alloc::vec![0.0f32; dim];
+    let mut sorted = alloc::vec![0.0f32; theta];
+    let mut ranked: Vec<(PeerId, usize, f32, f64)> = Vec::with_capacity(theta);
+    let lower_median_idx = (theta - 1) / 2;
+
+    for (coord, slot) in out.iter_mut().enumerate().take(dim) {
+        for (idx, elem) in sorted.iter_mut().enumerate().take(theta) {
+            *elem = coord_at(idx, coord).1;
+        }
+        sorted.sort_by(f32::total_cmp);
+
+        // Q9 ratified lower observed median (`sorted[(theta - 1) / 2]`), never arithmetic mean.
+        let median = sorted[lower_median_idx] as f64;
+
+        ranked.clear();
+        for idx in 0..theta {
+            let (peer, val) = coord_at(idx, coord);
+            let dist = crate::num::abs_f64((val as f64) - median);
+            ranked.push((peer, idx, val, dist));
+        }
+
+        ranked.sort_by(
+            |&(peer_a, idx_a, _val_a, dist_a), &(peer_b, idx_b, _val_b, dist_b)| {
+                dist_a
+                    .total_cmp(&dist_b)
+                    .then_with(|| peer_a.cmp(&peer_b))
+                    .then_with(|| idx_a.cmp(&idx_b))
+            },
+        );
+
+        let sum: f64 = ranked
+            .iter()
+            .take(beta)
+            .map(|&(_, _, val, _)| val as f64)
+            .sum();
+        *slot = (sum * inv_beta) as f32;
+    }
+
+    validate_finite_output(&out)?;
+    Ok(out)
+}
+
+#[cfg(all(feature = "alloc", feature = "bulyan"))]
+fn validate_stage2_inputs<'a>(
+    count: usize,
+    max_byzantine: usize,
+    first_len: Option<usize>,
+    slices: impl Iterator<Item = &'a [f32]>,
+) -> Result<usize> {
     if max_byzantine == 0 {
         return Err(Error::InvalidThreshold);
     }
-    let theta = selected_updates.len();
     let min_theta = max_byzantine
         .checked_mul(2)
         .and_then(|two_f| two_f.checked_add(1))
         .ok_or(Error::ResourceExhausted)?;
-    if theta < min_theta {
+    if count < min_theta {
         return Err(Error::InsufficientPeers);
     }
-
-    let dim = selected_updates[0].len();
+    let dim = first_len.unwrap_or(0);
     if dim == 0 || dim > MAX_GRADIENT_DIM {
         return Err(Error::InvalidGradient);
     }
-    for slice in selected_updates {
+    for slice in slices {
         if slice.len() != dim {
             return Err(Error::InvalidGradient);
         }
-        for &val in *slice {
+        for &val in slice {
             if val.is_nan() {
                 return Err(Error::NanDetected);
             }
@@ -716,49 +774,50 @@ pub fn bulyan_stage2_nearest_to_median(
             }
         }
     }
+    Ok(dim)
+}
 
-    let beta = theta - 2 * max_byzantine;
-    let inv_beta = 1.0f64 / (beta as f64);
-    let mut out = alloc::vec![0.0f32; dim];
-    let mut sorted = alloc::vec![0.0f32; theta];
-    let mut ranked: Vec<(usize, f32, f64)> = Vec::with_capacity(theta);
+/// Stage 2 of Bulyan (`ADR-0019`, `W9-01`, `ST-11`) preserving explicit `(PeerId, &[f32])` identity.
+///
+/// Computes the lower observed median `sorted[(theta - 1) / 2]` per coordinate and averages the
+/// $\beta = \theta - 2f$ nearest values ranked by `(|v - M|, PeerId)`.
+#[cfg(all(feature = "alloc", feature = "bulyan"))]
+pub fn bulyan_stage2_with_peers(
+    selected_updates: &[(PeerId, &[f32])],
+    max_byzantine: usize,
+) -> Result<Vec<f32>> {
+    let dim = validate_stage2_inputs(
+        selected_updates.len(),
+        max_byzantine,
+        selected_updates.first().map(|(_, s)| s.len()),
+        selected_updates.iter().map(|(_, s)| *s),
+    )?;
+    bulyan_stage2_core(selected_updates.len(), dim, max_byzantine, |idx, coord| {
+        (selected_updates[idx].0, selected_updates[idx].1[coord])
+    })
+}
 
-    for (coord, slot) in out.iter_mut().enumerate().take(dim) {
-        for (idx, slice) in selected_updates.iter().enumerate() {
-            sorted[idx] = slice[coord];
-        }
-        sorted.sort_by(f32::total_cmp);
-
-        let median = if theta % 2 == 0 {
-            ((sorted[theta / 2 - 1] as f64) + (sorted[theta / 2] as f64)) * 0.5
-        } else {
-            sorted[theta / 2] as f64
-        };
-
-        ranked.clear();
-        for (idx, slice) in selected_updates.iter().enumerate() {
-            let val = slice[coord];
-            let dist = crate::num::abs_f64((val as f64) - median);
-            ranked.push((idx, val, dist));
-        }
-
-        ranked.sort_by(|&(idx_a, val_a, dist_a), &(idx_b, val_b, dist_b)| {
-            dist_a
-                .total_cmp(&dist_b)
-                .then_with(|| val_a.total_cmp(&val_b))
-                .then_with(|| idx_a.cmp(&idx_b))
-        });
-
-        let sum: f64 = ranked
-            .iter()
-            .take(beta)
-            .map(|&(_, val, _)| val as f64)
-            .sum();
-        *slot = (sum * inv_beta) as f32;
-    }
-
-    validate_finite_output(&out)?;
-    Ok(out)
+/// Stage 2 of Bulyan (`ADR-0019`, `W9-01`, `ST-11`) over coordinate slices using caller order for ties.
+///
+/// Computes each coordinate's lower observed median `sorted[(theta - 1) / 2]` and averages the
+/// $\beta = \theta - 2f$ values minimizing $|v - m_j|$ in `f64` (prefer [`bulyan_stage2_with_peers`]
+/// when canonical `PeerId` permutation invariance under exact distance ties is required).
+#[cfg(all(feature = "alloc", feature = "bulyan"))]
+pub fn bulyan_stage2_nearest_to_median(
+    selected_updates: &[&[f32]],
+    max_byzantine: usize,
+) -> Result<Vec<f32>> {
+    let dim = validate_stage2_inputs(
+        selected_updates.len(),
+        max_byzantine,
+        selected_updates.first().map(|s| s.len()),
+        selected_updates.iter().copied(),
+    )?;
+    bulyan_stage2_core(selected_updates.len(), dim, max_byzantine, |idx, coord| {
+        let mut key = [0u8; 32];
+        key[24..32].copy_from_slice(&(idx as u64).to_be_bytes());
+        (PeerId::new(key), selected_updates[idx][coord])
+    })
 }
 
 /// Bulyan Byzantine-resilient aggregator (`ADR-0019`, `W9-01`).
@@ -818,11 +877,16 @@ impl RobustAggregator for Bulyan {
     #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
         let selected_indices = self.select_indices(updates)?;
-        let selected_slices: Vec<&[f32]> = selected_indices
+        let selected_with_peers: Vec<(PeerId, &[f32])> = selected_indices
             .iter()
-            .map(|&idx| updates[idx].gradients.as_slice())
+            .map(|&idx| {
+                (
+                    PeerId::new(updates[idx].sender),
+                    updates[idx].gradients.as_slice(),
+                )
+            })
             .collect();
-        bulyan_stage2_nearest_to_median(&selected_slices, self.max_byzantine)
+        bulyan_stage2_with_peers(&selected_with_peers, self.max_byzantine)
     }
 
     fn byzantine_tolerance(&self) -> f32 {

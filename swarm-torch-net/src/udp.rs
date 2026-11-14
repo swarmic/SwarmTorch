@@ -12,7 +12,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use swarm_torch_core::replay::ReplayProtection;
 use swarm_torch_core::traits::PeerId;
@@ -122,10 +123,16 @@ impl PacketTransport for StdUdpPacketTransport {
 
 type DatagramQueueMap = BTreeMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>;
 
+#[derive(Default)]
+struct InMemoryUdpHubState {
+    queues: DatagramQueueMap,
+    waiters: BTreeMap<SocketAddr, crate::waiters::WaiterQueue>,
+}
+
 /// Shared in-memory UDP datagram bus used when OS socket creation is restricted by sandbox policy.
 #[derive(Default, Clone)]
 pub struct InMemoryUdpDatagramHub {
-    queues: Arc<Mutex<DatagramQueueMap>>,
+    inner: Arc<Mutex<InMemoryUdpHubState>>,
 }
 
 impl InMemoryUdpDatagramHub {
@@ -135,8 +142,34 @@ impl InMemoryUdpDatagramHub {
     }
 }
 
+enum OsUdpSocketSlot {
+    Std(UdpSocket),
+    #[cfg(feature = "udp-transport")]
+    Tokio(Arc<tokio::net::UdpSocket>),
+    #[cfg(feature = "udp-transport")]
+    Empty,
+}
+
+impl OsUdpSocketSlot {
+    #[cfg(feature = "udp-transport")]
+    fn ensure_tokio(&mut self) -> Result<Arc<tokio::net::UdpSocket>> {
+        if matches!(self, Self::Std(_)) {
+            let Self::Std(std_socket) = core::mem::replace(self, Self::Empty) else {
+                return Err(Error::TransportUnavailable);
+            };
+            let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)
+                .map_err(|_| Error::TransportUnavailable)?;
+            *self = Self::Tokio(Arc::new(tokio_socket));
+        }
+        match self {
+            Self::Tokio(ref socket) => Ok(Arc::clone(socket)),
+            Self::Std(_) | Self::Empty => Err(Error::TransportUnavailable),
+        }
+    }
+}
+
 enum UdpBackend {
-    OsSocket(UdpSocket),
+    OsSocket(Mutex<OsUdpSocketSlot>),
     InMemory(InMemoryUdpDatagramHub),
 }
 
@@ -187,7 +220,7 @@ impl UdpGossipTransport {
             local_addr,
             adapter_generation,
             limits,
-            backend: UdpBackend::OsSocket(socket),
+            backend: UdpBackend::OsSocket(Mutex::new(OsUdpSocketSlot::Std(socket))),
             next_transfer_id: AtomicU32::new(1),
             start_instant: Instant::now(),
             peers: RwLock::new(BTreeMap::new()),
@@ -208,8 +241,8 @@ impl UdpGossipTransport {
     ) -> Result<Arc<Self>> {
         let reassembler =
             ObservedSourceReassembler::new(limits).map_err(|_| Error::InvalidMessage)?;
-        if let Ok(mut map) = hub.queues.lock() {
-            map.entry(virtual_addr).or_default();
+        if let Ok(mut state) = hub.inner.lock() {
+            state.queues.entry(virtual_addr).or_default();
         }
         Ok(Arc::new(Self {
             local_peer,
@@ -244,8 +277,12 @@ impl UdpGossipTransport {
         self.start_instant.elapsed().as_millis() as u64
     }
 
-    /// Fragment `msg` via [`ChunkedFrameCodec::encode_message`] and transmit all chunk frames to `dest`.
-    pub fn send_to_addr(&self, dest: SocketAddr, msg: &[u8]) -> Result<u32> {
+    fn lookup_peer_addr(&self, peer: PeerId) -> Result<SocketAddr> {
+        let guard = self.peers.read().map_err(|_| Error::TransportUnavailable)?;
+        guard.get(&peer).copied().ok_or(Error::PeerNotFound)
+    }
+
+    fn encode_chunk_frames(&self, msg: &[u8]) -> Result<(u32, Vec<Vec<u8>>)> {
         let transfer_id = self.next_transfer_id.fetch_add(1, Ordering::Relaxed);
         let frames = ChunkedFrameCodec::encode_message(
             transfer_id,
@@ -255,19 +292,190 @@ impl UdpGossipTransport {
             msg,
         )
         .map_err(|_| Error::InvalidMessage)?;
+        Ok((transfer_id, frames))
+    }
+
+    fn send_in_memory(
+        &self,
+        hub: &InMemoryUdpDatagramHub,
+        dest: SocketAddr,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let wakers = {
+            let mut state = hub.inner.lock().map_err(|_| Error::TransportUnavailable)?;
+            let q = state.queues.get_mut(&dest).ok_or(Error::PeerNotFound)?;
+            for frame in frames {
+                q.push_back((self.local_addr, frame));
+            }
+            state
+                .waiters
+                .get_mut(&dest)
+                .map(crate::waiters::WaiterQueue::take_all)
+                .unwrap_or_default()
+        };
+        crate::waiters::wake_all(wakers);
+        Ok(())
+    }
+
+    fn ingest_datagram(&self, source_addr: SocketAddr, datagram: &[u8]) -> Result<()> {
+        let now_ms = self.elapsed_mono_ms();
+        let completed = {
+            let mut reasm = self
+                .reassembler
+                .lock()
+                .map_err(|_| Error::TransportUnavailable)?;
+            reasm.ingest_frame(self.adapter_generation, source_addr, datagram, now_ms)
+        };
+        if let Ok(Some(done)) = completed {
+            let mut inbox = self.inbox.lock().map_err(|_| Error::TransportUnavailable)?;
+            inbox.push_back((done.key.observed_source, done.payload));
+        }
+        Ok(())
+    }
+
+    fn pop_inbox_observed(&self) -> Result<Option<crate::traits::ObservedTransportMessage>> {
+        let next = self
+            .inbox
+            .lock()
+            .map_err(|_| Error::TransportUnavailable)?
+            .pop_front();
+        Ok(next.map(
+            |(source_addr, payload)| crate::traits::ObservedTransportMessage {
+                observed_source: crate::traits::ObservedSourceRef::from(source_addr),
+                payload,
+            },
+        ))
+    }
+
+    fn poll_recv_in_memory(
+        &self,
+        hub: &InMemoryUdpDatagramHub,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<crate::traits::ObservedTransportMessage>> {
+        loop {
+            match self.pop_inbox_observed() {
+                Ok(Some(msg)) => return Poll::Ready(Ok(msg)),
+                Ok(None) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let pending: Vec<(SocketAddr, Vec<u8>)> = {
+                let Ok(mut state) = hub.inner.lock() else {
+                    return Poll::Ready(Err(Error::TransportUnavailable));
+                };
+                state
+                    .queues
+                    .get_mut(&self.local_addr)
+                    .map(|q| q.drain(..).collect())
+                    .unwrap_or_default()
+            };
+            for (source_addr, frame) in pending {
+                if let Err(err) = self.ingest_datagram(source_addr, &frame) {
+                    return Poll::Ready(Err(err));
+                }
+            }
+
+            match self.pop_inbox_observed() {
+                Ok(Some(msg)) => return Poll::Ready(Ok(msg)),
+                Ok(None) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            let Ok(mut state) = hub.inner.lock() else {
+                return Poll::Ready(Err(Error::TransportUnavailable));
+            };
+            let is_empty = state
+                .queues
+                .get(&self.local_addr)
+                .map_or(true, VecDeque::is_empty);
+            if is_empty {
+                state
+                    .waiters
+                    .entry(self.local_addr)
+                    .or_default()
+                    .register(cx.waker());
+                return Poll::Pending;
+            }
+        }
+    }
+
+    #[cfg(feature = "udp-transport")]
+    async fn send_os_async(
+        &self,
+        socket_slot: &Mutex<OsUdpSocketSlot>,
+        dest: SocketAddr,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let sock = {
+            let mut slot = socket_slot
+                .lock()
+                .map_err(|_| Error::TransportUnavailable)?;
+            slot.ensure_tokio()?
+        };
+        for frame in &frames {
+            sock.send_to(frame, dest)
+                .await
+                .map_err(|_| Error::SendFailed)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "udp-transport")]
+    async fn recv_os_async(
+        &self,
+        socket_slot: &Mutex<OsUdpSocketSlot>,
+    ) -> Result<crate::traits::ObservedTransportMessage> {
+        if let Some(msg) = self.pop_inbox_observed()? {
+            return Ok(msg);
+        }
+        let sock = {
+            let mut slot = socket_slot
+                .lock()
+                .map_err(|_| Error::TransportUnavailable)?;
+            slot.ensure_tokio()?
+        };
+        let mut frame_buf = vec![0u8; self.limits.mtu + 64];
+        loop {
+            if let Some(msg) = self.pop_inbox_observed()? {
+                return Ok(msg);
+            }
+            let (len, source_addr) = sock
+                .recv_from(&mut frame_buf)
+                .await
+                .map_err(|_| Error::ReceiveFailed)?;
+            self.ingest_datagram(source_addr, &frame_buf[..len])?;
+        }
+    }
+
+    /// Fragment `msg` via [`ChunkedFrameCodec::encode_message`] and transmit all chunk frames to `dest`.
+    pub fn send_to_addr(&self, dest: SocketAddr, msg: &[u8]) -> Result<u32> {
+        let (transfer_id, frames) = self.encode_chunk_frames(msg)?;
 
         match &self.backend {
-            UdpBackend::OsSocket(socket) => {
-                for frame in &frames {
-                    socket.send_to(frame, dest).map_err(|_| Error::SendFailed)?;
+            UdpBackend::OsSocket(socket_slot) => {
+                let slot = socket_slot
+                    .lock()
+                    .map_err(|_| Error::TransportUnavailable)?;
+                match &*slot {
+                    OsUdpSocketSlot::Std(socket) => {
+                        for frame in &frames {
+                            socket.send_to(frame, dest).map_err(|_| Error::SendFailed)?;
+                        }
+                    }
+                    #[cfg(feature = "udp-transport")]
+                    OsUdpSocketSlot::Tokio(socket) => {
+                        for frame in &frames {
+                            socket
+                                .try_send_to(frame, dest)
+                                .map_err(|_| Error::SendFailed)?;
+                        }
+                    }
+                    #[cfg(feature = "udp-transport")]
+                    OsUdpSocketSlot::Empty => return Err(Error::TransportUnavailable),
                 }
             }
             UdpBackend::InMemory(hub) => {
-                let mut guard = hub.queues.lock().map_err(|_| Error::TransportUnavailable)?;
-                let q = guard.get_mut(&dest).ok_or(Error::PeerNotFound)?;
-                for frame in frames {
-                    q.push_back((self.local_addr, frame));
-                }
+                self.send_in_memory(hub, dest, frames)?;
             }
         }
         Ok(transfer_id)
@@ -286,27 +494,22 @@ impl UdpGossipTransport {
         }
 
         match &self.backend {
-            UdpBackend::OsSocket(socket) => {
+            UdpBackend::OsSocket(socket_slot) => {
                 let mut frame_buf = vec![0u8; self.limits.mtu + 64];
+                let slot = socket_slot
+                    .lock()
+                    .map_err(|_| Error::TransportUnavailable)?;
                 loop {
-                    match socket.recv_from(&mut frame_buf) {
+                    let recv_res = match &*slot {
+                        OsUdpSocketSlot::Std(socket) => socket.recv_from(&mut frame_buf),
+                        #[cfg(feature = "udp-transport")]
+                        OsUdpSocketSlot::Tokio(socket) => socket.try_recv_from(&mut frame_buf),
+                        #[cfg(feature = "udp-transport")]
+                        OsUdpSocketSlot::Empty => return Err(Error::TransportUnavailable),
+                    };
+                    match recv_res {
                         Ok((len, source_addr)) => {
-                            let now_ms = self.elapsed_mono_ms();
-                            let mut reasm = self
-                                .reassembler
-                                .lock()
-                                .map_err(|_| Error::TransportUnavailable)?;
-                            if let Ok(Some(done)) = reasm.ingest_frame(
-                                self.adapter_generation,
-                                source_addr,
-                                &frame_buf[..len],
-                                now_ms,
-                            ) {
-                                drop(reasm);
-                                if let Ok(mut inbox) = self.inbox.lock() {
-                                    inbox.push_back((done.key.observed_source, done.payload));
-                                }
-                            }
+                            self.ingest_datagram(source_addr, &frame_buf[..len])?;
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(_) => return Err(Error::ReceiveFailed),
@@ -315,26 +518,15 @@ impl UdpGossipTransport {
             }
             UdpBackend::InMemory(hub) => {
                 let pending: Vec<(SocketAddr, Vec<u8>)> = {
-                    let mut guard = hub.queues.lock().map_err(|_| Error::TransportUnavailable)?;
-                    guard
+                    let mut state = hub.inner.lock().map_err(|_| Error::TransportUnavailable)?;
+                    state
+                        .queues
                         .get_mut(&self.local_addr)
                         .map(|q| q.drain(..).collect())
                         .unwrap_or_default()
                 };
                 for (source_addr, frame) in pending {
-                    let now_ms = self.elapsed_mono_ms();
-                    let mut reasm = self
-                        .reassembler
-                        .lock()
-                        .map_err(|_| Error::TransportUnavailable)?;
-                    if let Ok(Some(done)) =
-                        reasm.ingest_frame(self.adapter_generation, source_addr, &frame, now_ms)
-                    {
-                        drop(reasm);
-                        if let Ok(mut inbox) = self.inbox.lock() {
-                            inbox.push_back((done.key.observed_source, done.payload));
-                        }
-                    }
+                    self.ingest_datagram(source_addr, &frame)?;
                 }
             }
         }
@@ -389,27 +581,49 @@ impl SwarmTransport for UdpGossipTransport {
 
     fn send<'a>(&'a self, peer: PeerId, msg: &'a [u8]) -> Self::SendFuture<'a> {
         Box::pin(async move {
-            let dest = {
-                let guard = self.peers.read().map_err(|_| Error::TransportUnavailable)?;
-                *guard.get(&peer).ok_or(Error::PeerNotFound)?
-            };
-            let _ = self.send_to_addr(dest, msg)?;
-            Ok(())
+            let dest = self.lookup_peer_addr(peer)?;
+            let (_, frames) = self.encode_chunk_frames(msg)?;
+            match &self.backend {
+                UdpBackend::InMemory(hub) => self.send_in_memory(hub, dest, frames),
+                UdpBackend::OsSocket(socket_slot) => {
+                    #[cfg(feature = "udp-transport")]
+                    {
+                        self.send_os_async(socket_slot, dest, frames).await
+                    }
+                    #[cfg(not(feature = "udp-transport"))]
+                    {
+                        let _ = (socket_slot, dest, frames);
+                        Err(Error::TransportUnavailable)
+                    }
+                }
+            }
         })
     }
 
     fn recv(&self) -> Self::RecvFuture<'_> {
         Box::pin(async move {
-            for _ in 0..200 {
-                if let Some((source_addr, payload)) = self.poll_reassembled_once()? {
-                    return Ok(crate::traits::ObservedTransportMessage {
-                        observed_source: crate::traits::ObservedSourceRef::from(source_addr),
-                        payload,
-                    });
+            match &self.backend {
+                UdpBackend::InMemory(hub) => {
+                    core::future::poll_fn(|cx| self.poll_recv_in_memory(hub, cx)).await
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                UdpBackend::OsSocket(socket_slot) => {
+                    #[cfg(feature = "udp-transport")]
+                    {
+                        self.recv_os_async(socket_slot).await
+                    }
+                    #[cfg(not(feature = "udp-transport"))]
+                    {
+                        let _ = socket_slot;
+                        let (source_addr, payload) = self
+                            .poll_reassembled_once()?
+                            .ok_or(Error::TransportUnavailable)?;
+                        Ok(crate::traits::ObservedTransportMessage {
+                            observed_source: crate::traits::ObservedSourceRef::from(source_addr),
+                            payload,
+                        })
+                    }
+                }
             }
-            Err(Error::Timeout)
         })
     }
 
@@ -546,23 +760,93 @@ mod tests {
             .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
             .with_cohort_allowlist(allowlist);
 
-        // Poll and verify through the MessageEnvelope gate on receiver B
-        let mut verified = None;
-        for _ in 0..100 {
-            if let Some(res) = udp_b
-                .poll_recv_verified_envelope_v1(&swarm_id, 5, &mut replay, 1_700_000_000)
-                .unwrap()
-            {
-                verified = Some(res);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        let (obs_addr, verified_peer, verified_env) =
-            verified.expect("multi-chunk UDP envelope must reassemble and verify");
+        // Poll and verify through the MessageEnvelope gate on receiver B without polling sleeps
+        let (obs_addr, verified_peer, verified_env) = udp_b
+            .poll_recv_verified_envelope_v1(&swarm_id, 5, &mut replay, 1_700_000_000)
+            .unwrap()
+            .expect("multi-chunk UDP envelope must reassemble and verify");
         assert_eq!(obs_addr, udp_a.local_addr());
         assert_eq!(verified_peer, peer_a);
         assert_eq!(verified_env.payload, body);
+    }
+
+    #[tokio::test]
+    async fn udp_in_memory_recv_suspends_across_multi_chunk_delivery() {
+        use std::time::Duration;
+
+        let peer_a = PeerId::new([0x71; 32]);
+        let peer_b = PeerId::new([0x72; 32]);
+        let hub = InMemoryUdpDatagramHub::new();
+        let limits = ReassemblerLimits {
+            mtu: 256,
+            max_message_bytes: 8_192,
+            ..ReassemblerLimits::default()
+        };
+        let udp_a = UdpGossipTransport::bind_in_memory(
+            peer_a,
+            "127.0.0.1:42101".parse().unwrap(),
+            1,
+            limits,
+            hub.clone(),
+        )
+        .unwrap();
+        let udp_b = UdpGossipTransport::bind_in_memory(
+            peer_b,
+            "127.0.0.1:42102".parse().unwrap(),
+            1,
+            limits,
+            hub,
+        )
+        .unwrap();
+        udp_a.register_peer(peer_b, udp_b.local_addr()).unwrap();
+
+        let rx_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), udp_b.recv())
+                .await
+                .expect("in-memory UDP recv must wake after multi-chunk send")
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        let payload = vec![0x5Au8; 1024];
+        udp_a.send(peer_b, &payload).await.unwrap();
+        let observed = rx_task.await.unwrap();
+        assert_eq!(observed.payload, payload);
+    }
+
+    #[cfg(feature = "udp-transport")]
+    #[tokio::test]
+    async fn udp_os_socket_concurrent_recv_before_send_reassembles_chunks() {
+        use std::time::Duration;
+
+        let peer_a = PeerId::new([0x81; 32]);
+        let peer_b = PeerId::new([0x82; 32]);
+        let limits = ReassemblerLimits {
+            mtu: 256,
+            max_message_bytes: 8_192,
+            ..ReassemblerLimits::default()
+        };
+        let Ok(udp_a) = UdpGossipTransport::bind(peer_a, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+        let Ok(udp_b) = UdpGossipTransport::bind(peer_b, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+        udp_a.register_peer(peer_b, udp_b.local_addr()).unwrap();
+
+        let rx_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), udp_b.recv())
+                .await
+                .expect("OS UDP recv must complete asynchronously via reactor")
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        let payload = vec![0x6Bu8; 1024];
+        udp_a.send(peer_b, &payload).await.unwrap();
+        let observed = rx_task.await.unwrap();
+        assert_eq!(observed.payload, payload);
     }
 }

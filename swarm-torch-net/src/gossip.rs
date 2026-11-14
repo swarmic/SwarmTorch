@@ -33,6 +33,10 @@ pub enum PayloadKindV1 {
     GradientV1 = 2,
     /// Stateful `EF21` compressed gradient innovation $c_i^{(r)}$.
     Ef21InnovationV1 = 3,
+    /// Phase-1 pre-seed Merkle vector commitment for collective `SharedSeedSparse` (`ST-12`).
+    SharedSeedCommitmentV1 = 4,
+    /// Phase-2 shared-seed projected opening + Merkle proofs for collective `SharedSeedSparse` (`ST-12`).
+    SharedSeedOpeningV1 = 5,
 }
 
 /// Originator-signed immutable round contribution (`ADR-0022` §3.1, `W10-03`).

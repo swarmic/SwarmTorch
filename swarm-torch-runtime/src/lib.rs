@@ -75,18 +75,13 @@ pub trait SwarmRuntime: SwarmClock + Send + Sync + 'static
 where
     for<'a> <Self as SwarmClock>::SleepFuture<'a>: Send,
 {
+    /// Handle representing an admitted task on the concrete runtime executor.
+    type TaskHandle: Send + 'static;
+
     /// Attempt to admit a background task, returning an explicit [`SpawnError`] if unsupported or full.
-    fn try_spawn<F>(&self, future: F) -> core::result::Result<(), SpawnError>
+    fn try_spawn<F>(&self, future: F) -> core::result::Result<Self::TaskHandle, SpawnError>
     where
         F: Future<Output = ()> + Send + 'static;
-
-    /// Spawn a background task (ignores `SpawnError` for legacy callers; prefer [`SwarmRuntime::try_spawn`]).
-    fn spawn<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let _ = self.try_spawn(future);
-    }
 }
 
 #[cfg(feature = "tokio")]
@@ -127,15 +122,16 @@ pub mod tokio_runtime {
     }
 
     impl SwarmRuntime for TokioRuntime {
-        fn try_spawn<F>(&self, future: F) -> core::result::Result<(), SpawnError>
+        type TaskHandle = tokio::task::JoinHandle<()>;
+
+        fn try_spawn<F>(&self, future: F) -> core::result::Result<Self::TaskHandle, SpawnError>
         where
             F: Future<Output = ()> + Send + 'static,
         {
             if tokio::runtime::Handle::try_current().is_err() {
                 return Err(SpawnError::RuntimeUnavailable);
             }
-            tokio::spawn(future);
-            Ok(())
+            Ok(tokio::spawn(future))
         }
     }
 
@@ -158,30 +154,58 @@ pub mod tokio_runtime {
         fn tokio_try_spawn_reports_unavailable_outside_runtime() {
             let rt = TokioRuntime::new();
             let res = rt.try_spawn(async {});
-            assert_eq!(res, Err(SpawnError::RuntimeUnavailable));
+            assert!(matches!(res, Err(SpawnError::RuntimeUnavailable)));
+        }
+
+        #[tokio::test]
+        async fn tokio_try_spawn_returns_joinable_task_handle() {
+            let rt = TokioRuntime::new();
+            let flag = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            let flag_clone = std::sync::Arc::clone(&flag);
+            let handle = rt
+                .try_spawn(async move {
+                    flag_clone.store(true, core::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("TokioRuntime::try_spawn inside runtime must succeed");
+            handle.await.expect("spawned task must finish cleanly");
+            assert!(flag.load(core::sync::atomic::Ordering::SeqCst));
         }
     }
 }
 
 #[cfg(feature = "embassy")]
 pub mod embassy_runtime {
-    //! Embassy-based runtime adapter (`ADR-0003`, `P2-06`).
+    //! Embassy-based runtime adapter (`ADR-0003`, `P2-06`, `ST-07`).
     //!
-    //! Uses an injectable monotonic clock function (or deterministic tick counter when
-    //! no hardware driver is attached) and reports [`SpawnError::ExecutorSpawnerRequired`]
-    //! on `try_spawn` rather than silently discarding tasks.
+    //! Wires [`SwarmClock`] directly to [`embassy_time::Instant`] (or an explicit hardware clock
+    //! hook when provided) and [`embassy_time::Timer`], and supports static task admission through
+    //! [`EmbassyRuntime::try_spawn_task`] backed by [`embassy_executor::SendSpawner`]. Dynamic
+    //! [`SwarmRuntime::try_spawn`] cannot synthesize Embassy static `'static` task pools and
+    //! returns [`SpawnError::ExecutorSpawnerRequired`] rather than discarding tasks.
 
     use super::*;
 
-    /// Embassy runtime wrapper with injectable monotonic clock hook.
+    fn duration_to_embassy(duration: Duration) -> embassy_time::Duration {
+        let millis = duration_to_millis_saturating(duration);
+        if millis >= embassy_time::Duration::MAX.as_millis() {
+            embassy_time::Duration::MAX
+        } else {
+            embassy_time::Duration::from_millis(millis)
+        }
+    }
+
+    /// Embassy runtime wrapper supporting [`embassy_time`] timers and [`embassy_executor::SendSpawner`].
+    #[derive(Clone)]
     pub struct EmbassyRuntime {
         clock_fn: Option<fn() -> u64>,
+        spawner: Option<embassy_executor::SendSpawner>,
     }
 
     impl core::fmt::Debug for EmbassyRuntime {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("EmbassyRuntime")
                 .field("has_clock_driver", &self.clock_fn.is_some())
+                .field("has_spawner", &self.spawner.is_some())
                 .finish()
         }
     }
@@ -193,40 +217,119 @@ pub mod embassy_runtime {
     }
 
     impl EmbassyRuntime {
-        /// Create a new Embassy runtime adapter without a hardware clock hook.
+        /// Create a new Embassy runtime adapter backed by [`embassy_time`] clocks/timers without an attached executor spawner.
         pub const fn new() -> Self {
-            Self { clock_fn: None }
+            Self {
+                clock_fn: None,
+                spawner: None,
+            }
         }
 
-        /// Create a new Embassy runtime adapter backed by a monotonic millisecond clock function.
+        /// Create a new Embassy runtime adapter backed by an explicit monotonic millisecond clock function.
         pub const fn with_clock(clock_fn: fn() -> u64) -> Self {
             Self {
                 clock_fn: Some(clock_fn),
+                spawner: None,
             }
+        }
+
+        /// Create an Embassy runtime adapter attached to an [`embassy_executor::SendSpawner`].
+        pub const fn with_spawner(spawner: embassy_executor::SendSpawner) -> Self {
+            Self {
+                clock_fn: None,
+                spawner: Some(spawner),
+            }
+        }
+
+        /// Create an Embassy runtime adapter with both an [`embassy_executor::SendSpawner`] and custom clock hook.
+        pub const fn with_spawner_and_clock(
+            spawner: embassy_executor::SendSpawner,
+            clock_fn: fn() -> u64,
+        ) -> Self {
+            Self {
+                clock_fn: Some(clock_fn),
+                spawner: Some(spawner),
+            }
+        }
+
+        /// Attempt to spawn a static `#[embassy_executor::task]` into the attached [`embassy_executor::SendSpawner`].
+        ///
+        /// Accepts a constructor closure so [`embassy_executor::SpawnToken`] is never instantiated
+        /// when no spawner is configured (preventing [`embassy_executor::SpawnToken`] drop panics).
+        pub fn try_spawn_task<S: Send>(
+            &self,
+            make_token: impl FnOnce() -> embassy_executor::SpawnToken<S>,
+        ) -> core::result::Result<(), SpawnError> {
+            let Some(ref spawner) = self.spawner else {
+                return Err(SpawnError::ExecutorSpawnerRequired);
+            };
+            spawner.spawn(make_token()).map_err(|err| match err {
+                embassy_executor::SpawnError::Busy => SpawnError::CapacityExhausted,
+            })
         }
     }
 
     impl SwarmClock for EmbassyRuntime {
-        type SleepFuture<'a> = core::future::Ready<()>;
+        type SleepFuture<'a> = embassy_time::Timer;
 
         fn now(&self) -> u64 {
             match self.clock_fn {
                 Some(f) => f(),
-                None => 0,
+                None => embassy_time::Instant::now().as_millis(),
             }
         }
 
-        fn sleep(&self, _duration: Duration) -> Self::SleepFuture<'_> {
-            core::future::ready(())
+        fn sleep(&self, duration: Duration) -> Self::SleepFuture<'_> {
+            embassy_time::Timer::after(duration_to_embassy(duration))
         }
     }
 
     impl SwarmRuntime for EmbassyRuntime {
-        fn try_spawn<F>(&self, _future: F) -> core::result::Result<(), SpawnError>
+        type TaskHandle = ();
+
+        fn try_spawn<F>(&self, _future: F) -> core::result::Result<Self::TaskHandle, SpawnError>
         where
             F: Future<Output = ()> + Send + 'static,
         {
             Err(SpawnError::ExecutorSpawnerRequired)
+        }
+    }
+
+    #[cfg(all(test, feature = "embassy-std-test"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn duration_to_embassy_saturates_safely_at_max() {
+            let clamped = duration_to_embassy(Duration::MAX);
+            assert_eq!(clamped, embassy_time::Duration::MAX);
+            let small = duration_to_embassy(Duration::from_millis(25));
+            assert_eq!(small.as_millis(), 25);
+        }
+
+        #[test]
+        fn embassy_runtime_without_spawner_rejects_dynamic_spawn_and_task_closure() {
+            let rt = EmbassyRuntime::new();
+            assert_eq!(
+                rt.try_spawn(async {}),
+                Err(SpawnError::ExecutorSpawnerRequired)
+            );
+            assert_eq!(
+                rt.try_spawn_task(embassy_executor::SpawnToken::<()>::new_failed),
+                Err(SpawnError::ExecutorSpawnerRequired)
+            );
+        }
+
+        #[tokio::test]
+        async fn embassy_runtime_clock_and_timer_progress_under_std_driver() {
+            let rt = EmbassyRuntime::new();
+            let t0 = rt.now();
+            rt.sleep(Duration::from_millis(5)).await;
+            let t1 = rt.now();
+            assert!(
+                t1 >= t0,
+                "Embassy Instant clock must progress monotonically across Timer::after"
+            );
         }
     }
 }
@@ -648,9 +751,24 @@ pub mod mock_runtime {
         }
     }
 
+    /// Handle identifying a task admitted to [`MockRuntime`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MockTaskHandle {
+        id: u64,
+    }
+
+    impl MockTaskHandle {
+        /// Monotonic task identifier assigned at admission time.
+        pub const fn id(&self) -> u64 {
+            self.id
+        }
+    }
+
     impl SwarmRuntime for MockRuntime {
+        type TaskHandle = MockTaskHandle;
+
         #[cfg(feature = "std")]
-        fn try_spawn<F>(&self, future: F) -> core::result::Result<(), SpawnError>
+        fn try_spawn<F>(&self, future: F) -> core::result::Result<Self::TaskHandle, SpawnError>
         where
             F: Future<Output = ()> + Send + 'static,
         {
@@ -669,11 +787,11 @@ pub mod mock_runtime {
             guard.active_task_count += 1;
             guard.tasks.insert(task_id, Box::pin(future));
             guard.enqueue_runnable(task_id);
-            Ok(())
+            Ok(MockTaskHandle { id: task_id })
         }
 
         #[cfg(not(feature = "std"))]
-        fn try_spawn<F>(&self, _future: F) -> core::result::Result<(), SpawnError>
+        fn try_spawn<F>(&self, _future: F) -> core::result::Result<Self::TaskHandle, SpawnError>
         where
             F: Future<Output = ()> + Send + 'static,
         {

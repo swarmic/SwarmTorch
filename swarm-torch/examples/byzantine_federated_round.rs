@@ -16,7 +16,9 @@ use swarm_torch::core::aggregation::{
     BucketRemainderPolicy, BucketingConfig, CenteredClipping, PostBucketingRule,
 };
 use swarm_torch::core::compression::{
-    derive_verifiable_round_seed_v1, SharedSeedResidualCompressor,
+    compute_commitments_root_v1, derive_context_bound_round_seed_v1, SharedSeedBandwidthReportV1,
+    SharedSeedCommitmentMessageV1, SharedSeedOpeningMessageV1, SharedSeedResidualCompressor,
+    SharedSeedScalingProfile, SparseRoundContextV1, SHARED_SEED_SAMPLER_VERSION_V1,
 };
 use swarm_torch::core::traits::{GradientUpdate, PeerId, SwarmModel};
 use swarm_torch::models::safetensors_v1::{ModelTensorSchemaV1, SafeTensorsLimitsV1};
@@ -33,21 +35,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let round_id = 1u64;
     let run_id = [0x11u8; 16];
 
-    // 1. Simulate 5 honest peers + 2 Byzantine sign-flipping peers using Verifiable SharedSeedSparse (W11-02)
-    let mut compressors: Vec<SharedSeedResidualCompressor> = (0..7)
+    // 1. Simulate 9 honest peers + 2 Byzantine sign-flipping peers using Verifiable SharedSeedSparse (W11-02 / ST-12)
+    let total_peers = 11usize;
+    let mut compressors: Vec<SharedSeedResidualCompressor> = (0..total_peers)
         .map(|_| SharedSeedResidualCompressor::new(dim, top_k).unwrap())
         .collect();
 
-    let mut pre_seed_vectors = Vec::with_capacity(7);
-    let mut commitments = Vec::with_capacity(7);
-    let mut dense_updates = Vec::with_capacity(7);
+    let mut pre_seed_vectors = Vec::with_capacity(total_peers);
+    let mut commitments = Vec::with_capacity(total_peers);
+    let mut dense_updates = Vec::with_capacity(total_peers);
 
     for (i, comp) in compressors.iter().enumerate() {
         let sender = [(i as u8) + 1; 32];
-        let raw_grad: Vec<f32> = if i < 5 {
-            // Honest peer gradient around -0.10
+        let raw_grad: Vec<f32> = if i < 9 {
+            // Honest peer gradient around -0.20 (bucket norm ~0.60 > tau=0.5 so 3 honest buckets outweigh 2 clipped Byzantine buckets)
             (0..dim)
-                .map(|j| -0.10 + (j as f32) * 0.002 + (i as f32) * 0.001)
+                .map(|j| -0.20 + (j as f32) * 0.002 + (i as f32) * 0.001)
                 .collect()
         } else {
             // Byzantine peer attempting sign-flip + amplification attack
@@ -64,14 +67,44 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         commitments.push((PeerId::new(sender), commitment));
     }
 
-    // Derive deterministic post-commitment round seed (Fiat-Shamir over all peer Merkle roots)
-    let round_seed = derive_verifiable_round_seed_v1(&run_id, round_id, &commitments, &[0x55; 32])?;
+    // Derive deterministic post-commitment round seed bound to cohort context + commitments_root
+    let roster = commitments.iter().map(|(p, _)| *p).collect();
+    let sparse_ctx = SparseRoundContextV1 {
+        swarm_instance_id: [0x22; 16],
+        run_id,
+        round_id,
+        base_checkpoint_digest: [0x33; 32],
+        frozen_roster: roster,
+        original_len: dim as u32,
+        sparsity_k: top_k as u32,
+        scaling: SharedSeedScalingProfile::UnscaledProjectionV1,
+        sampler_version: SHARED_SEED_SAMPLER_VERSION_V1,
+    };
+    let ctx_digest = sparse_ctx.context_digest()?;
+    let commitments_root = compute_commitments_root_v1(&ctx_digest, &commitments)?;
+    let round_seed =
+        derive_context_bound_round_seed_v1(&ctx_digest, &commitments_root, &[0x55; 32]);
 
-    let mut verifiable_submissions = Vec::with_capacity(7);
+    let mut verifiable_submissions = Vec::with_capacity(total_peers);
+    let mut bw_report = SharedSeedBandwidthReportV1::new(dim as u32, top_k as u32);
     for (i, comp) in compressors.iter_mut().enumerate() {
         let (peer_id, commitment) = commitments[i];
         let (payload, proof_batch) =
             comp.finalize_with_seed(&pre_seed_vectors[i], &commitment, round_seed)?;
+        let phase1_bytes = SharedSeedCommitmentMessageV1 {
+            context_digest: ctx_digest,
+            commitment,
+        }
+        .to_bytes()?;
+        let phase2_bytes = SharedSeedOpeningMessageV1 {
+            context_digest: ctx_digest,
+            commitments_root,
+            shared_round_seed: round_seed,
+            payload: payload.clone(),
+            openings: proof_batch.clone(),
+        }
+        .to_bytes()?;
+        bw_report.record_peer_delivery(phase1_bytes.len(), phase2_bytes.len(), &proof_batch);
         verifiable_submissions.push((peer_id, commitment, payload, proof_batch));
     }
 
@@ -84,8 +117,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &budget,
     )?;
     println!(
-        "[W11-02] Verifiable SharedSeedSparse + CClip aggregated {} non-zero coordinates",
+        "[W11-02 / ST-12] Verifiable SharedSeedSparse + CClip aggregated {} non-zero coordinates (values={}B, merkle_proofs={}B, total={}B vs dense={}B)",
         sparse_aggregated.iter().filter(|&&v| v != 0.0).count(),
+        bw_report.projected_values_bytes_total,
+        bw_report.merkle_proof_bytes_total,
+        bw_report.total_two_phase_wire_bytes,
+        bw_report.raw_dense_bytes_total,
     );
 
     // 2. Transmit a multi-chunk payload over UdpGossipTransport + ChunkedFrameCodec (W11-03)
@@ -124,10 +161,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         transfer_id
     );
 
-    // 3. Run conservative s-Bucketing + CenteredClipping over the 7 peer updates (W11-01)
+    // 3. Run conservative s-Bucketing (5 buckets, 2 Byzantines < 5/2) + CenteredClipping (W11-01)
     let bucket_cfg = BucketingConfig {
         bucket_size: 2,
-        byzantine_count: 1,
+        byzantine_count: 2,
         round_seed,
         remainder_policy: BucketRemainderPolicy::DropRemainderDeterministic,
     };

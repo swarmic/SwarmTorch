@@ -234,6 +234,7 @@ struct HubInner {
     blocked_links: std::collections::BTreeSet<(PeerId, PeerId)>,
     drop_budgets: std::collections::BTreeMap<(PeerId, PeerId), usize>,
     messages: VecDeque<(PeerId, PeerId, Vec<u8>)>,
+    waiters: std::collections::BTreeMap<PeerId, crate::waiters::WaiterQueue>,
 }
 
 /// Multi-peer deterministic network hub with configurable topology and link fault injection
@@ -263,6 +264,7 @@ impl MockNetworkHub {
                 blocked_links: std::collections::BTreeSet::new(),
                 drop_budgets: std::collections::BTreeMap::new(),
                 messages: VecDeque::new(),
+                waiters: std::collections::BTreeMap::new(),
             })),
         }
     }
@@ -362,25 +364,63 @@ impl MockNetworkHub {
 
     /// Send a message from `from` to `to` if permitted by topology and queue bounds.
     pub fn send_from(&self, from: PeerId, to: PeerId, payload: &[u8]) -> crate::Result<()> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| crate::Error::TransportUnavailable)?;
-        let neighbors = Self::neighbors_locked(&guard, from);
-        if !neighbors.contains(&to) {
-            return Err(crate::Error::PeerNotFound);
-        }
-        if let Some(rem) = guard.drop_budgets.get_mut(&(from, to)) {
-            if *rem > 0 {
-                *rem -= 1;
-                return Ok(());
+        let wakers = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| crate::Error::TransportUnavailable)?;
+            let neighbors = Self::neighbors_locked(&guard, from);
+            if !neighbors.contains(&to) {
+                return Err(crate::Error::PeerNotFound);
             }
-        }
-        if guard.messages.len() >= guard.max_queue_depth {
-            return Err(crate::Error::SendFailed);
-        }
-        guard.messages.push_back((from, to, payload.to_vec()));
+            if let Some(rem) = guard.drop_budgets.get_mut(&(from, to)) {
+                if *rem > 0 {
+                    *rem -= 1;
+                    return Ok(());
+                }
+            }
+            if guard.messages.len() >= guard.max_queue_depth {
+                return Err(crate::Error::SendFailed);
+            }
+            guard.messages.push_back((from, to, payload.to_vec()));
+            guard
+                .waiters
+                .get_mut(&to)
+                .map(crate::waiters::WaiterQueue::take_all)
+                .unwrap_or_default()
+        };
+        crate::waiters::wake_all(wakers);
         Ok(())
+    }
+
+    fn format_observed_message(
+        from: PeerId,
+        payload: Vec<u8>,
+    ) -> crate::traits::ObservedTransportMessage {
+        let bytes = from.as_bytes();
+        let label = alloc::format!(
+            "mock-link:{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3]
+        );
+        crate::traits::ObservedTransportMessage {
+            observed_source: crate::traits::ObservedSourceRef::LinkLabel(label),
+            payload,
+        }
+    }
+
+    fn take_message_for_locked(
+        guard: &mut HubInner,
+        recipient: PeerId,
+    ) -> Option<crate::traits::ObservedTransportMessage> {
+        let pos = guard
+            .messages
+            .iter()
+            .position(|(_, to, _)| *to == recipient)?;
+        let (from, _, payload) = guard.messages.remove(pos)?;
+        Some(Self::format_observed_message(from, payload))
     }
 
     /// Pop the next queued message addressed to `recipient` with an unauthenticated observed
@@ -393,26 +433,47 @@ impl MockNetworkHub {
             .inner
             .lock()
             .map_err(|_| crate::Error::TransportUnavailable)?;
-        let Some(pos) = guard
-            .messages
-            .iter()
-            .position(|(_, to, _)| *to == recipient)
-        else {
-            return Err(crate::Error::Timeout);
+        Self::take_message_for_locked(&mut guard, recipient).ok_or(crate::Error::Timeout)
+    }
+
+    fn poll_recv_for(
+        &self,
+        recipient: PeerId,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<crate::Result<crate::traits::ObservedTransportMessage>> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return core::task::Poll::Ready(Err(crate::Error::TransportUnavailable));
         };
-        let (from, _, payload) = guard.messages.remove(pos).ok_or(crate::Error::Timeout)?;
-        let bytes = from.as_bytes();
-        let label = alloc::format!(
-            "mock-link:{:02x}{:02x}{:02x}{:02x}",
-            bytes[0],
-            bytes[1],
-            bytes[2],
-            bytes[3]
-        );
-        Ok(crate::traits::ObservedTransportMessage {
-            observed_source: crate::traits::ObservedSourceRef::LinkLabel(label),
-            payload,
-        })
+        if let Some(msg) = Self::take_message_for_locked(&mut guard, recipient) {
+            return core::task::Poll::Ready(Ok(msg));
+        }
+        guard
+            .waiters
+            .entry(recipient)
+            .or_default()
+            .register(cx.waker());
+        core::task::Poll::Pending
+    }
+}
+
+/// Evented async receive future for [`MockPeerTransport`] (`ST-06`).
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct MockRecvFuture<'a> {
+    transport: &'a MockPeerTransport,
+}
+
+#[cfg(feature = "std")]
+impl<'a> core::future::Future for MockRecvFuture<'a> {
+    type Output = crate::Result<crate::traits::ObservedTransportMessage>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        self.transport
+            .hub
+            .poll_recv_for(self.transport.local_peer, cx)
     }
 }
 
@@ -435,8 +496,7 @@ impl MockPeerTransport {
 #[cfg(feature = "std")]
 impl crate::traits::SwarmTransport for MockPeerTransport {
     type SendFuture<'a> = core::future::Ready<crate::Result<()>>;
-    type RecvFuture<'a> =
-        core::future::Ready<crate::Result<crate::traits::ObservedTransportMessage>>;
+    type RecvFuture<'a> = MockRecvFuture<'a>;
     type BroadcastFuture<'a> = core::future::Ready<crate::Result<crate::traits::BroadcastStats>>;
     type DiscoverFuture<'a> = core::future::Ready<crate::Result<Vec<PeerId>>>;
 
@@ -445,7 +505,7 @@ impl crate::traits::SwarmTransport for MockPeerTransport {
     }
 
     fn recv(&self) -> Self::RecvFuture<'_> {
-        core::future::ready(self.hub.recv_for(self.local_peer))
+        MockRecvFuture { transport: self }
     }
 
     fn broadcast<'a>(&'a self, msg: &'a [u8]) -> Self::BroadcastFuture<'a> {
@@ -555,5 +615,31 @@ mod tests {
         let b = net.peers[1];
         assert!(net.send(a, b, vec![1]).is_ok());
         assert!(net.send(a, b, vec![2]).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[tokio::test]
+    async fn mock_peer_transport_recv_suspends_until_send_wakes_waiter() {
+        use crate::traits::SwarmTransport;
+        use core::time::Duration;
+
+        let peer_a = PeerId::new([0xA1; 32]);
+        let peer_b = PeerId::new([0xB2; 32]);
+        let hub = MockNetworkHub::new(alloc::vec![peer_a, peer_b], Topology::FullMesh, 8);
+        let t_a = hub.peer_transport(peer_a);
+        let t_b = hub.peer_transport(peer_b);
+
+        let rx_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), t_b.recv())
+                .await
+                .expect("evented recv must be woken cleanly by send")
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        t_a.send(peer_b, b"wake-after-pending").await.unwrap();
+
+        let observed = rx_task.await.unwrap();
+        assert_eq!(observed.payload, b"wake-after-pending");
     }
 }

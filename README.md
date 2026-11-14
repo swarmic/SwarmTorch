@@ -22,14 +22,14 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
 - [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 12 + Wave 13 `13-0` & `13A` Hardening)
+## Implementation Reality (Wave 12 + Wave 13 `13-0` .. `13C` Hardening)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
-- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`).
+- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`, and `swarm-torch-runtime` `EmbassyRuntime`).
 - **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-13 work, and `VerifiedMechanismProtected` fails closed.
 - **Wasm Sandbox Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1` and `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` isolation lands (`Phase 13D-1`).
-- **End-to-End Authenticated Admission & Replay Recovery V2 (`13A`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) failing closed on legacy unverified `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` without sentinel `PeerId` attribution; and `ObservedSourceReassembler<E>` bounds full heap reservation with non-evicting tombstones.
-- **Remaining Active Wave 13 Hardening:** Atomic durable commits + `fs4` locking + `PhysicalStrict` runner + numerical atomicity (`13B`), evented async I/O + Bulyan Stage 2 + two-phase `SharedSeedSparse` (`13C`), and live external SDK + `wasmi` wiring (`13D`) proceed sequentially across Wave 13.
+- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, & Two-Phase Sparse (`13A`–`13C`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `Verified*SubmissionV1`) failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O (zero `thread::sleep` polling); `SwarmRuntime::try_spawn` is primary fallible alongside `embassy_time`/`SendSpawner` `EmbassyRuntime` & ARM CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; and two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation.
+- **Remaining Active Wave 13 Hardening:** Live external SDK wiring (`wasmi 2.0.x` + `iroh` + `zenoh` + `burn`/`candle` `[W | b]` SafeTensors layout mapping in `13D`) completes Wave 13.
 
 ### Adapter & Capability Maturity Matrix
 

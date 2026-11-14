@@ -1250,6 +1250,415 @@ impl SharedSeedResidualCompressor {
     }
 }
 
+/// Domain separation tag for canonical [`SparseRoundContextV1`] hashing (`ST-12`).
+pub const SPARSE_ROUND_CONTEXT_DOMAIN_V1: &[u8] = b"swarmtorch.sparse_round.context.v1";
+
+/// Domain separation tag for Phase-1 pre-seed commitment transcript hashing (`ST-12`).
+pub const COMMITMENTS_ROOT_DOMAIN_V1: &[u8] = b"swarmtorch.shared_sparse.commitments_root.v1";
+
+/// Domain separation tag for collective post-commitment `SharedSeedSparse` seed derivation (`ST-12`).
+pub const COLLECTIVE_ROUND_SEED_DOMAIN_V1: &[u8] = b"swarmtorch.shared_sparse.collective_seed.v1";
+
+/// Version identifier for [`sample_shared_indices_v1`] deterministic coordinate sampling (`ST-12`).
+pub const SHARED_SEED_SAMPLER_VERSION_V1: u16 = 1;
+
+/// Frozen cohort context published before Phase-1 pre-seed commitments begin (`ST-12`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseRoundContextV1 {
+    /// Scoped swarm deployment / cohort instance identifier.
+    pub swarm_instance_id: [u8; 16],
+    /// Bound training/coordination run identifier.
+    pub run_id: [u8; 16],
+    /// Round identifier for which this sparse projection context is valid.
+    pub round_id: u64,
+    /// Expected parent checkpoint SHA-256 content digest for `round_id`.
+    pub base_checkpoint_digest: [u8; 32],
+    /// Frozen set of peers authorized to commit and open in this round.
+    pub frozen_roster: BTreeSet<crate::traits::PeerId>,
+    /// Original dense vector dimension $d$.
+    pub original_len: u32,
+    /// Shared projection support cardinality $k \in [1, d]$.
+    pub sparsity_k: u32,
+    /// Projection scaling profile shared identically by all contributors in this round.
+    pub scaling: SharedSeedScalingProfile,
+    /// Sampler version (`SHARED_SEED_SAMPLER_VERSION_V1 = 1`).
+    pub sampler_version: u16,
+}
+
+#[cfg(feature = "alloc")]
+impl SparseRoundContextV1 {
+    /// Validate invariants of this [`SparseRoundContextV1`].
+    pub fn validate(&self) -> core::result::Result<(), CompressionError> {
+        let d = self.original_len as usize;
+        let k = self.sparsity_k as usize;
+        if d == 0 || d > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        if k == 0 || k > d {
+            return Err(CompressionError::InvalidRatio);
+        }
+        if self.frozen_roster.is_empty() {
+            return Err(CompressionError::InvalidData);
+        }
+        if self.sampler_version != SHARED_SEED_SAMPLER_VERSION_V1 {
+            return Err(CompressionError::UnsupportedMethod);
+        }
+        Ok(())
+    }
+
+    /// Compute the canonical SHA-256 digest of this validated [`SparseRoundContextV1`].
+    pub fn context_digest(&self) -> core::result::Result<[u8; 32], CompressionError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(SPARSE_ROUND_CONTEXT_DOMAIN_V1);
+        hasher.update(self.swarm_instance_id);
+        hasher.update(self.run_id);
+        hasher.update(self.round_id.to_le_bytes());
+        hasher.update(self.base_checkpoint_digest);
+        hasher.update((self.frozen_roster.len() as u32).to_le_bytes());
+        for peer in &self.frozen_roster {
+            hasher.update(peer.as_bytes());
+        }
+        hasher.update(self.original_len.to_le_bytes());
+        hasher.update(self.sparsity_k.to_le_bytes());
+        let scaling_tag: u8 = match self.scaling {
+            SharedSeedScalingProfile::UnscaledProjectionV1 => 1,
+            SharedSeedScalingProfile::ScaledUnbiasedV1 => 2,
+        };
+        hasher.update([scaling_tag]);
+        hasher.update(self.sampler_version.to_le_bytes());
+        Ok(hasher.finalize().into())
+    }
+}
+
+/// Authenticated Phase-1 wire payload binding a peer's [`PreSeedVectorCommitmentV1`] to
+/// `context_digest` (`ST-12`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSeedCommitmentMessageV1 {
+    /// Canonical [`SparseRoundContextV1::context_digest`].
+    pub context_digest: [u8; 32],
+    /// Pre-seed binary SHA-256 Merkle vector commitment over $u_r^{(i)} \in \mathbb{R}^d$.
+    pub commitment: PreSeedVectorCommitmentV1,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedCommitmentMessageV1 {
+    /// Serialize this Phase-1 commitment payload using canonical `postcard` encoding.
+    pub fn to_bytes(&self) -> core::result::Result<Vec<u8>, CompressionError> {
+        postcard::to_allocvec(self).map_err(|_| CompressionError::InvalidData)
+    }
+
+    /// Bounded-deserialize and structurally validate a Phase-1 commitment payload.
+    pub fn from_bytes_bounded(
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> core::result::Result<Self, CompressionError> {
+        if bytes.len() > max_bytes {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        let msg: Self = postcard::from_bytes(bytes).map_err(|_| CompressionError::InvalidData)?;
+        let d = msg.commitment.original_len as usize;
+        if d == 0 || d > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        Ok(msg)
+    }
+}
+
+/// Authenticated Phase-2 wire payload binding a peer's projected coordinates and Merkle
+/// opening proofs to `(context_digest, commitments_root, shared_round_seed)` (`ST-12`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedSeedOpeningMessageV1 {
+    /// Canonical [`SparseRoundContextV1::context_digest`].
+    pub context_digest: [u8; 32],
+    /// Canonical [`compute_commitments_root_v1`] transcript digest locking Phase-1 commitments.
+    pub commitments_root: [u8; 32],
+    /// Single collective [`derive_context_bound_round_seed_v1`] seed shared by the entire cohort.
+    pub shared_round_seed: [u8; 32],
+    /// Compact `SharedSeedSparse` payload evaluated strictly on `shared_round_seed`.
+    pub payload: SharedSeedSparsePayloadV1,
+    /// Merkle coordinate opening proofs linking every opened value to the Phase-1 commitment.
+    pub openings: MerkleOpeningBatchV1,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedOpeningMessageV1 {
+    /// Serialize this Phase-2 opening payload using canonical `postcard` encoding.
+    pub fn to_bytes(&self) -> core::result::Result<Vec<u8>, CompressionError> {
+        postcard::to_allocvec(self).map_err(|_| CompressionError::InvalidData)
+    }
+
+    /// Bounded-deserialize and structurally validate a Phase-2 opening payload.
+    pub fn from_bytes_bounded(
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> core::result::Result<Self, CompressionError> {
+        if bytes.len() > max_bytes {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        let msg: Self = postcard::from_bytes(bytes).map_err(|_| CompressionError::InvalidData)?;
+        let d = msg.payload.original_len as usize;
+        let k = msg.payload.k as usize;
+        if d == 0 || d > DEFAULT_MAX_COMPRESSION_ELEMENTS {
+            return Err(CompressionError::ResourceLimitExceeded);
+        }
+        if k == 0 || k > d {
+            return Err(CompressionError::InvalidRatio);
+        }
+        if msg.payload.values.len() != k || msg.openings.proofs.len() != k {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+        if msg.payload.seed != msg.shared_round_seed {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+        if msg.payload.values.iter().any(|v| !v.is_finite())
+            || msg.openings.proofs.iter().any(|p| !p.raw_value.is_finite())
+        {
+            return Err(CompressionError::NonFiniteValue);
+        }
+        Ok(msg)
+    }
+}
+
+/// Compute the deterministic `commitments_root` binding `context_digest` and the canonical
+/// `PeerId`-sorted Phase-1 pre-seed commitments (`ST-12`).
+#[cfg(feature = "alloc")]
+pub fn compute_commitments_root_v1(
+    context_digest: &[u8; 32],
+    commitments: &[(crate::traits::PeerId, PreSeedVectorCommitmentV1)],
+) -> core::result::Result<[u8; 32], CompressionError> {
+    if commitments.is_empty() {
+        return Err(CompressionError::InvalidData);
+    }
+
+    let mut sorted = commitments.to_vec();
+    sorted.sort_by_key(|a| a.0);
+    for window in sorted.windows(2) {
+        if window[0].0 == window[1].0 {
+            return Err(CompressionError::InvalidData);
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(COMMITMENTS_ROOT_DOMAIN_V1);
+    hasher.update(context_digest);
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for (peer_id, commitment) in &sorted {
+        hasher.update(peer_id.as_bytes());
+        hasher.update(commitment.original_len.to_le_bytes());
+        hasher.update(commitment.merkle_root);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Derive the single collective 32-byte round seed shared by every participant in a two-phase
+/// `SharedSeedSparse` round from `(context_digest, commitments_root, beacon_r)` (`ST-12`).
+///
+/// Because `beacon_r` is revealed only after `commitments_root` closes and no per-sender nonce or
+/// `PeerId` enters the seed derivation, all honest peers project onto an identical support $S_r$.
+#[cfg(feature = "alloc")]
+pub fn derive_context_bound_round_seed_v1(
+    context_digest: &[u8; 32],
+    commitments_root: &[u8; 32],
+    beacon_r: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(COLLECTIVE_ROUND_SEED_DOMAIN_V1);
+    hasher.update(context_digest);
+    hasher.update(commitments_root);
+    hasher.update(beacon_r);
+    hasher.finalize().into()
+}
+
+/// Coordinator-side verifier enforcing one common shared-seed support $S_{\text{round}}$ and
+/// validating Phase-2 Merkle openings against frozen Phase-1 commitments (`ST-12`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct SharedSeedCoordinateVerifier {
+    context: SparseRoundContextV1,
+    context_digest: [u8; 32],
+    commitments_root: [u8; 32],
+    shared_round_seed: [u8; 32],
+    expected_indices: Vec<u32>,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedCoordinateVerifier {
+    /// Construct a [`SharedSeedCoordinateVerifier`] and precompute the single cohort-wide
+    /// projection support $S_{\text{round}} = \text{sample\_shared\_indices\_v1}(d, k, R)$.
+    pub fn try_new(
+        context: SparseRoundContextV1,
+        commitments_root: [u8; 32],
+        shared_round_seed: [u8; 32],
+    ) -> core::result::Result<Self, CompressionError> {
+        let context_digest = context.context_digest()?;
+        let expected_indices = sample_shared_indices_v1(
+            context.original_len as usize,
+            context.sparsity_k as usize,
+            &shared_round_seed,
+        )?;
+        Ok(Self {
+            context,
+            context_digest,
+            commitments_root,
+            shared_round_seed,
+            expected_indices,
+        })
+    }
+
+    /// Borrow the frozen round context.
+    pub const fn context(&self) -> &SparseRoundContextV1 {
+        &self.context
+    }
+
+    /// Canonical SHA-256 digest of `context`.
+    pub const fn context_digest(&self) -> [u8; 32] {
+        self.context_digest
+    }
+
+    /// Frozen Phase-1 commitment transcript root.
+    pub const fn commitments_root(&self) -> [u8; 32] {
+        self.commitments_root
+    }
+
+    /// Single cohort-wide shared round seed.
+    pub const fn shared_round_seed(&self) -> [u8; 32] {
+        self.shared_round_seed
+    }
+
+    /// Strictly ascending shared coordinate indices $S_{\text{round}}$ opened by all cohort peers.
+    pub fn expected_indices(&self) -> &[u32] {
+        &self.expected_indices
+    }
+
+    /// Verify a peer's Phase-2 [`SharedSeedOpeningMessageV1`] against its frozen Phase-1
+    /// `recorded_commitment`, failing closed on any transcript divergence, scaling mismatch,
+    /// non-finite coordinate, wrong coordinate index, or Merkle proof forgery.
+    pub fn verify_opening_message(
+        &self,
+        recorded_commitment: &PreSeedVectorCommitmentV1,
+        msg: &SharedSeedOpeningMessageV1,
+    ) -> core::result::Result<(), CompressionError> {
+        if msg.context_digest != self.context_digest
+            || msg.commitments_root != self.commitments_root
+            || msg.shared_round_seed != self.shared_round_seed
+        {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+        if recorded_commitment.original_len != self.context.original_len
+            || msg.payload.original_len != self.context.original_len
+            || msg.payload.k != self.context.sparsity_k
+            || msg.payload.seed != self.shared_round_seed
+            || msg.payload.scaling != self.context.scaling
+        {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+        verify_shared_seed_openings_v1(recorded_commitment, &msg.payload, &msg.openings)?;
+        if msg.openings.proofs.len() != self.expected_indices.len() {
+            return Err(CompressionError::CommitmentVerificationFailed);
+        }
+        for (proof, &expected_idx) in msg.openings.proofs.iter().zip(self.expected_indices.iter()) {
+            if proof.index != expected_idx {
+                return Err(CompressionError::CommitmentVerificationFailed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Honest two-phase wire bandwidth breakdown for collective `SharedSeedSparse` delivery (`ST-12`).
+///
+/// Explicitly separates $4k$ projected scalar value bytes from Merkle opening proof overhead
+/// ($\approx k \lceil \log_2 d \rceil \times 32\text{ B}$) and Phase-1/2 authenticated envelope
+/// framing so small-dimension regimes (`total_two_phase_wire_bytes > raw_dense_bytes_total`) are
+/// never masked behind compressed scalar-only claims.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedSeedBandwidthReportV1 {
+    /// Number of verified Phase-2 peer deliveries accounted for in this report.
+    pub peer_count: usize,
+    /// Dense parameter dimension $d$.
+    pub original_len: u32,
+    /// Shared sparse coordinate count $k$.
+    pub sparsity_k: u32,
+    /// Uncompressed raw dense scalar payload baseline across the cohort (`peer_count * 4 * d`).
+    pub raw_dense_bytes_total: usize,
+    /// Projected scalar value bytes across the cohort (`peer_count * 4 * k`).
+    pub projected_values_bytes_total: usize,
+    /// Merkle coordinate opening proof payload bytes (`sum_proofs (8 + siblings.len() * 32)`).
+    pub merkle_proof_bytes_total: usize,
+    /// Serialized Phase-1 commitment delivery bytes across the cohort (`BundledGossipDeliveryV2`).
+    pub phase1_commitment_wire_bytes_total: usize,
+    /// Serialized Phase-2 opening delivery bytes across the cohort (`BundledGossipDeliveryV2`).
+    pub phase2_opening_wire_bytes_total: usize,
+    /// Remaining protocol/envelope/signature framing bytes (`total - values - merkle_proofs`).
+    pub envelope_and_framing_bytes_total: usize,
+    /// Total wire bytes across both Phase-1 commitments and Phase-2 openings.
+    pub total_two_phase_wire_bytes: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl SharedSeedBandwidthReportV1 {
+    /// Build a zeroed report header for `(original_len, sparsity_k)`.
+    pub const fn new(original_len: u32, sparsity_k: u32) -> Self {
+        Self {
+            peer_count: 0,
+            original_len,
+            sparsity_k,
+            raw_dense_bytes_total: 0,
+            projected_values_bytes_total: 0,
+            merkle_proof_bytes_total: 0,
+            phase1_commitment_wire_bytes_total: 0,
+            phase2_opening_wire_bytes_total: 0,
+            envelope_and_framing_bytes_total: 0,
+            total_two_phase_wire_bytes: 0,
+        }
+    }
+
+    /// Accumulate one peer's Phase-1 commitment frame, Phase-2 opening frame, and opening batch.
+    pub fn record_peer_delivery(
+        &mut self,
+        phase1_wire_bytes: usize,
+        phase2_wire_bytes: usize,
+        openings: &MerkleOpeningBatchV1,
+    ) {
+        let k = self.sparsity_k as usize;
+        let d = self.original_len as usize;
+        let peer_raw_dense = d.saturating_mul(4);
+        let peer_projected = k.saturating_mul(4);
+        let peer_proof_bytes: usize = openings
+            .proofs
+            .iter()
+            .map(|p| 8usize.saturating_add(p.siblings.len().saturating_mul(32)))
+            .sum();
+        let peer_total = phase1_wire_bytes.saturating_add(phase2_wire_bytes);
+
+        self.peer_count = self.peer_count.saturating_add(1);
+        self.raw_dense_bytes_total = self.raw_dense_bytes_total.saturating_add(peer_raw_dense);
+        self.projected_values_bytes_total = self
+            .projected_values_bytes_total
+            .saturating_add(peer_projected);
+        self.merkle_proof_bytes_total = self
+            .merkle_proof_bytes_total
+            .saturating_add(peer_proof_bytes);
+        self.phase1_commitment_wire_bytes_total = self
+            .phase1_commitment_wire_bytes_total
+            .saturating_add(phase1_wire_bytes);
+        self.phase2_opening_wire_bytes_total = self
+            .phase2_opening_wire_bytes_total
+            .saturating_add(phase2_wire_bytes);
+        self.total_two_phase_wire_bytes =
+            self.total_two_phase_wire_bytes.saturating_add(peer_total);
+        self.envelope_and_framing_bytes_total = self.total_two_phase_wire_bytes.saturating_sub(
+            self.projected_values_bytes_total
+                .saturating_add(self.merkle_proof_bytes_total),
+        );
+    }
+}
+
 #[cfg(all(test, feature = "alloc"))]
 #[path = "compression_tests.rs"]
 mod tests;

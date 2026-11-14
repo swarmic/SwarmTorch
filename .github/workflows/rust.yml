@@ -40,6 +40,10 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo test --workspace --verbose --locked
 
+      - name: Test (stable runtime & net all-features)
+        if: matrix.rust == 'stable'
+        run: cargo test -p swarm-torch-runtime -p swarm-torch-net --all-features --verbose --locked
+
       - name: Build (MSRV core std)
         if: matrix.rust == '1.75'
         run: cargo build -p swarm-torch-core --lib --verbose --locked
@@ -139,3 +143,29 @@ jobs:
 
       - name: Report loader trust checks (Windows)
         run: cargo test -p swarm-torch report::tests::load_report_ --locked
+
+  embedded_targets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: thumbv6m-none-eabi,thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Check core minimal no_std (Cortex-M0+ thumbv6m)
+        run: cargo check -p swarm-torch-core --target thumbv6m-none-eabi --no-default-features --locked
+
+      - name: Check core alloc no_std (Cortex-M0+ thumbv6m)
+        run: cargo check -p swarm-torch-core --target thumbv6m-none-eabi --no-default-features --features alloc --locked
+
+      - name: Check portable crates alloc no_std (Cortex-M4F/M7 thumbv7em)
+        run: cargo check -p swarm-torch-core -p swarm-torch-models -p swarm-torch-net -p swarm-torch-runtime --target thumbv7em-none-eabihf --no-default-features --features alloc --locked
+
+      - name: Check Embassy runtime minimal no_std (thumbv6m)
+        run: cargo check -p swarm-torch-runtime --target thumbv6m-none-eabi --no-default-features --features embassy --locked
+
+      - name: Check Embassy runtime alloc no_std (thumbv7em)
+        run: cargo check -p swarm-torch-runtime --target thumbv7em-none-eabihf --no-default-features --features "alloc,embassy" --locked

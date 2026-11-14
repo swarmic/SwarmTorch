@@ -17,8 +17,15 @@ use swarm_torch_core::aggregation::{
 };
 #[cfg(feature = "robust-aggregation")]
 use swarm_torch_core::aggregation::{Bulyan, BulyanProfile, Krum};
-use swarm_torch_core::compression::CompressedGradient;
-use swarm_torch_core::crypto::{sha256_slices, KeyPair, SessionHandshakeChallengeV2, Signature};
+use swarm_torch_core::compression::{
+    compute_commitments_root_v1, derive_context_bound_round_seed_v1, CompressedGradient,
+    PreSeedVectorCommitmentV1, SharedSeedBandwidthReportV1, SharedSeedCommitmentMessageV1,
+    SharedSeedCoordinateVerifier, SharedSeedOpeningMessageV1, SharedSeedScalingProfile,
+    SparseRoundContextV1, SHARED_SEED_SAMPLER_VERSION_V1,
+};
+use swarm_torch_core::crypto::{
+    sha256_slices, KeyPair, MessageAuth, SessionHandshakeChallengeV2, Signature,
+};
 use swarm_torch_core::dataops::{
     AuthModeMarker, CacheDecisionV0, SourceDescriptorV0, TransformAuditV0, TrustClass,
 };
@@ -283,9 +290,15 @@ pub const COMPRESSION_SCHEMA_DENSE_F32_LE_V1: u16 = 0;
 pub const COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1: u16 = 1;
 /// Compression schema version `2`: JSON-serialized [`LoraAdapterPairV1`] (`swarm-torch-models`).
 pub const COMPRESSION_SCHEMA_LORA_PAIR_V1: u16 = 2;
+/// Compression schema version `3`: Postcard-serialized [`SharedSeedCommitmentMessageV1`] (`ST-12`).
+pub const COMPRESSION_SCHEMA_SHARED_SEED_COMMITMENT_V1: u16 = 3;
+/// Compression schema version `4`: Postcard-serialized [`SharedSeedOpeningMessageV1`] (`ST-12`).
+pub const COMPRESSION_SCHEMA_SHARED_SEED_OPENING_V1: u16 = 4;
 
 const ROUND_SUBMISSION_DIGEST_DOMAIN_V2: &[u8] = b"swarmtorch.round.submission.v2";
 const CONTEXT_POLICY_DIGEST_DOMAIN_V1: &[u8] = b"swarmtorch.coordinator.policy.v1";
+const SPARSE_COMMITMENT_DIGEST_DOMAIN_V1: &[u8] = b"swarmtorch.round.sparse_commitment.v1";
+const SPARSE_OPENING_DIGEST_DOMAIN_V1: &[u8] = b"swarmtorch.round.sparse_opening.v1";
 
 /// Encode a dense `f32` slice into canonical little-endian bytes (`compression_schema_version = 0`).
 pub fn encode_dense_update_payload_v2(values: &[f32]) -> Result<Vec<u8>, RoundError> {
@@ -329,6 +342,219 @@ pub fn encode_lora_update_payload_v2(pair: &LoraAdapterPairV1) -> Result<Vec<u8>
     serde_json::to_vec(pair).map_err(|e| {
         RoundError::InvalidWirePayload(format!("failed to serialize LoRA adapter pair: {e}"))
     })
+}
+
+/// Encode a Phase-1 [`SharedSeedCommitmentMessageV1`] for [`InnerUpdateV2`]
+/// (`compression_schema_version = 3`, `ST-12`).
+pub fn encode_shared_seed_commitment_payload_v2(
+    msg: &SharedSeedCommitmentMessageV1,
+) -> Result<Vec<u8>, RoundError> {
+    msg.to_bytes().map_err(|e| {
+        RoundError::InvalidWirePayload(format!("failed to serialize sparse commitment: {e:?}"))
+    })
+}
+
+/// Encode a Phase-2 [`SharedSeedOpeningMessageV1`] for [`InnerUpdateV2`]
+/// (`compression_schema_version = 4`, `ST-12`).
+pub fn encode_shared_seed_opening_payload_v2(
+    msg: &SharedSeedOpeningMessageV1,
+) -> Result<Vec<u8>, RoundError> {
+    msg.to_bytes().map_err(|e| {
+        RoundError::InvalidWirePayload(format!("failed to serialize sparse opening: {e:?}"))
+    })
+}
+
+/// Current phase of an active two-phase collective `SharedSeedSparse` round (`ST-12`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseRoundPhaseV1 {
+    /// Context published; collecting authenticated Phase-1 pre-seed Merkle commitments.
+    CollectingCommitments,
+    /// `commitments_root` frozen and collective `shared_round_seed` derived from verified beacon;
+    /// collecting authenticated Phase-2 projected openings on common support $S_{\text{round}}$.
+    CollectingOpenings,
+}
+
+/// Cryptographic policy governing the post-commitment beacon reveal in two-phase `SharedSeedSparse`
+/// (`ST-12`). Prevents seed grinding after Phase-1 commitments close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseBeaconPolicyV1 {
+    /// Pre-committed SHA-256 hash lock published before Phase-1 commitments open.
+    PrecommittedHashLock { commitment_digest: [u8; 32] },
+    /// Designated Ed25519 beacon signer endorsing `(context_digest, commitments_root, beacon_r)`.
+    Ed25519TranscriptBeacon { beacon_public_key: [u8; 32] },
+}
+
+impl SparseBeaconPolicyV1 {
+    /// Domain separation tag for [`Self::precommit_digest`].
+    pub const BEACON_COMMIT_DOMAIN_V1: &[u8] = b"swarmtorch.sparse_round.beacon_commit.v1";
+    /// Domain separation tag for [`Self::sign_transcript_beacon`].
+    pub const BEACON_SIG_DOMAIN_V1: &[u8] = b"swarmtorch.sparse_round.beacon_sig.v1";
+
+    /// Compute the canonical pre-commitment digest binding `(swarm_instance_id, run_id, round_id, beacon_r)`.
+    pub fn precommit_digest(
+        swarm_instance_id: &[u8; 16],
+        run_id: RunId,
+        round_id: u64,
+        beacon_r: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(Self::BEACON_COMMIT_DOMAIN_V1);
+        hasher.update(swarm_instance_id);
+        hasher.update(run_id.as_bytes());
+        hasher.update(round_id.to_le_bytes());
+        hasher.update(beacon_r);
+        hasher.finalize().into()
+    }
+
+    fn transcript_digest(
+        context_digest: &[u8; 32],
+        commitments_root: &[u8; 32],
+        beacon_r: &[u8; 32],
+    ) -> [u8; 32] {
+        sha256_slices(&[
+            Self::BEACON_SIG_DOMAIN_V1,
+            context_digest,
+            commitments_root,
+            beacon_r,
+        ])
+    }
+
+    /// Sign a post-commitment beacon transcript using an Ed25519 [`MessageAuth`].
+    pub fn sign_transcript_beacon(
+        auth: &MessageAuth,
+        context_digest: &[u8; 32],
+        commitments_root: &[u8; 32],
+        beacon_r: &[u8; 32],
+    ) -> Signature {
+        let digest = Self::transcript_digest(context_digest, commitments_root, beacon_r);
+        auth.sign_prehashed_domain(Self::BEACON_SIG_DOMAIN_V1, &digest)
+    }
+}
+
+/// Post-commitment randomness beacon reveal verified against [`SparseBeaconPolicyV1`] (`ST-12`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseBeaconRevealV1 {
+    /// 32-byte post-commitment beacon entropy mixed into `derive_context_bound_round_seed_v1`.
+    pub beacon_r: [u8; 32],
+    /// Optional 64-byte Ed25519 signature required by [`SparseBeaconPolicyV1::Ed25519TranscriptBeacon`].
+    pub signature: Option<[u8; 64]>,
+}
+
+fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+impl SparseBeaconRevealV1 {
+    /// Verify this beacon reveal against `policy` before freezing the collective round seed.
+    pub fn verify(
+        &self,
+        policy: &SparseBeaconPolicyV1,
+        swarm_instance_id: &[u8; 16],
+        run_id: RunId,
+        round_id: u64,
+        context_digest: &[u8; 32],
+        commitments_root: &[u8; 32],
+    ) -> Result<(), RoundError> {
+        match policy {
+            SparseBeaconPolicyV1::PrecommittedHashLock { commitment_digest } => {
+                let actual = SparseBeaconPolicyV1::precommit_digest(
+                    swarm_instance_id,
+                    run_id,
+                    round_id,
+                    &self.beacon_r,
+                );
+                if !ct_eq_32(&actual, commitment_digest) {
+                    return Err(RoundError::InvalidWirePayload(
+                        "sparse round beacon pre-commitment verification failed".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            SparseBeaconPolicyV1::Ed25519TranscriptBeacon { beacon_public_key } => {
+                let sig_bytes = self.signature.ok_or_else(|| {
+                    RoundError::InvalidWirePayload(
+                        "missing Ed25519 beacon signature for Ed25519TranscriptBeacon".to_string(),
+                    )
+                })?;
+                let sig = Signature::from_bytes(sig_bytes);
+                let digest = SparseBeaconPolicyV1::transcript_digest(
+                    context_digest,
+                    commitments_root,
+                    &self.beacon_r,
+                );
+                MessageAuth::verify_prehashed_domain(
+                    beacon_public_key,
+                    SparseBeaconPolicyV1::BEACON_SIG_DOMAIN_V1,
+                    &digest,
+                    &sig,
+                )
+                .map_err(|_| {
+                    RoundError::InvalidWirePayload(
+                        "sparse round beacon Ed25519 signature verification failed".to_string(),
+                    )
+                })
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_sparse_commitment_digest_v2(
+    swarm_instance_id: &[u8; 16],
+    run_id: RunId,
+    round_id: u64,
+    base_checkpoint_digest: &CheckpointContentDigestV1,
+    context_policy_digest: &[u8; 32],
+    sender: PeerId,
+    msg: &SharedSeedCommitmentMessageV1,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SPARSE_COMMITMENT_DIGEST_DOMAIN_V1);
+    hasher.update(swarm_instance_id);
+    hasher.update(run_id.as_bytes());
+    hasher.update(round_id.to_le_bytes());
+    hasher.update(base_checkpoint_digest.as_bytes());
+    hasher.update(context_policy_digest);
+    hasher.update(sender.as_bytes());
+    hasher.update(msg.context_digest);
+    hasher.update(msg.commitment.original_len.to_le_bytes());
+    hasher.update(msg.commitment.merkle_root);
+    hasher.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_sparse_opening_digest_v2(
+    swarm_instance_id: &[u8; 16],
+    run_id: RunId,
+    round_id: u64,
+    base_checkpoint_digest: &CheckpointContentDigestV1,
+    context_policy_digest: &[u8; 32],
+    sender: PeerId,
+    msg: &SharedSeedOpeningMessageV1,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SPARSE_OPENING_DIGEST_DOMAIN_V1);
+    hasher.update(swarm_instance_id);
+    hasher.update(run_id.as_bytes());
+    hasher.update(round_id.to_le_bytes());
+    hasher.update(base_checkpoint_digest.as_bytes());
+    hasher.update(context_policy_digest);
+    hasher.update(sender.as_bytes());
+    hasher.update(msg.context_digest);
+    hasher.update(msg.commitments_root);
+    hasher.update(msg.shared_round_seed);
+    hasher.update(msg.payload.original_len.to_le_bytes());
+    hasher.update(msg.payload.k.to_le_bytes());
+    hasher.update((msg.payload.values.len() as u64).to_le_bytes());
+    for &v in &msg.payload.values {
+        let bits = if v == 0.0 { 0u32 } else { v.to_bits() };
+        hasher.update(bits.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -382,6 +608,12 @@ fn check_update_kind_compatible(
         (_, PayloadKindV1::Ef21InnovationV1) => Err(RoundError::InvalidWirePayload(
             "EF21 innovation payload is unsupported on dense/LoRA coordinator ingress".to_string(),
         )),
+        (_, PayloadKindV1::SharedSeedCommitmentV1 | PayloadKindV1::SharedSeedOpeningV1) => {
+            Err(RoundError::InvalidWirePayload(
+                "two-phase SharedSeedSparse payload must enter the sparse submission pipeline"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -393,6 +625,16 @@ enum PreparedPayloadV2 {
     },
     Lora {
         pair: LoraAdapterPairV1,
+    },
+    SparseCommitment {
+        msg: SharedSeedCommitmentMessageV1,
+        canonical_payload_digest: [u8; 32],
+        wire_bytes: usize,
+    },
+    SparseOpening {
+        msg: SharedSeedOpeningMessageV1,
+        canonical_payload_digest: [u8; 32],
+        wire_bytes: usize,
     },
 }
 
@@ -471,6 +713,15 @@ impl PreparedSubmissionV1 {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ExpectedSparseRoundSnapshotV1 {
+    context: SparseRoundContextV1,
+    context_digest: [u8; 32],
+    phase: SparseRoundPhaseV1,
+    committed_roots: BTreeMap<PeerId, PreSeedVectorCommitmentV1>,
+    verifier: Option<SharedSeedCoordinateVerifier>,
+}
+
 /// Immutable coordinator context snapshot used in Stage B to validate [`PreparedSubmissionV1`]
 /// with zero mutation to coordinator or replay state (`ST-01`).
 #[derive(Debug, Clone)]
@@ -490,6 +741,7 @@ pub struct ExpectedRoundContextV1 {
     context_policy_digest: [u8; 32],
     fedasync_policy: Option<swarm_torch_core::aggregation::FedAsyncStalenessDescriptorV1>,
     coordinator_generation: u64,
+    active_sparse_round: Option<ExpectedSparseRoundSnapshotV1>,
 }
 
 impl ExpectedRoundContextV1 {
@@ -567,6 +819,12 @@ impl ExpectedRoundContextV1 {
         prepared: PreparedSubmissionV1,
     ) -> Result<ValidatedRoundSubmissionV1, RoundError> {
         self.validate_common_context(&prepared)?;
+        if self.active_sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "dense update submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
 
         if prepared.round_id > self.active_round_id {
             return Err(RoundError::FutureRoundRejected {
@@ -621,6 +879,13 @@ impl ExpectedRoundContextV1 {
                     "LoRA adapter payload must use validate_lora_submission".to_string(),
                 ));
             }
+            PreparedPayloadV2::SparseCommitment { .. }
+            | PreparedPayloadV2::SparseOpening { .. } => {
+                return Err(RoundError::InvalidWirePayload(
+                    "two-phase SharedSeedSparse payload cannot enter dense validate_sync_submission"
+                        .to_string(),
+                ));
+            }
         };
         if values.len() != self.expected_param_count {
             return Err(RoundError::DimensionMismatch {
@@ -650,6 +915,12 @@ impl ExpectedRoundContextV1 {
             .fedasync_policy
             .ok_or(RoundError::Aggregation(CoreError::InvalidThreshold))?;
         self.validate_common_context(&prepared)?;
+        if self.active_sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "FedAsync submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
 
         if !matches!(self.expected_update_kind, UpdateKindV1::ModelDeltaV1 { .. })
             || prepared.payload_kind != PayloadKindV1::ModelDeltaV1
@@ -696,9 +967,12 @@ impl ExpectedRoundContextV1 {
 
         let values = match prepared.payload {
             PreparedPayloadV2::Dense { values, .. } => values,
-            PreparedPayloadV2::Lora { .. } => {
+            PreparedPayloadV2::Lora { .. }
+            | PreparedPayloadV2::SparseCommitment { .. }
+            | PreparedPayloadV2::SparseOpening { .. } => {
                 return Err(RoundError::InvalidWirePayload(
-                    "LoRA adapter payload is unsupported in dense FedAsync step".to_string(),
+                    "LoRA/SharedSeedSparse payload is unsupported in dense FedAsync step"
+                        .to_string(),
                 ));
             }
         };
@@ -753,9 +1027,12 @@ impl ExpectedRoundContextV1 {
 
         let pair = match prepared.payload {
             PreparedPayloadV2::Lora { pair, .. } => pair,
-            PreparedPayloadV2::Dense { .. } => {
+            PreparedPayloadV2::Dense { .. }
+            | PreparedPayloadV2::SparseCommitment { .. }
+            | PreparedPayloadV2::SparseOpening { .. } => {
                 return Err(RoundError::InvalidWirePayload(
-                    "dense vector payload cannot enter validate_lora_submission".to_string(),
+                    "dense/SharedSeedSparse payload cannot enter validate_lora_submission"
+                        .to_string(),
                 ));
             }
         };
@@ -765,6 +1042,163 @@ impl ExpectedRoundContextV1 {
             round_id: prepared.round_id,
             sender: prepared.sender,
             pair,
+            replay_admission: prepared.replay_admission,
+        })
+    }
+
+    fn validate_sparse_round_header(
+        &self,
+        prepared: &PreparedSubmissionV1,
+    ) -> Result<&ExpectedSparseRoundSnapshotV1, RoundError> {
+        self.validate_common_context(prepared)?;
+
+        if prepared.round_id > self.active_round_id {
+            return Err(RoundError::FutureRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+            });
+        }
+        if prepared.round_id < self.active_round_id {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+                max_staleness: 0,
+            });
+        }
+        if prepared.base_checkpoint_digest != self.accepted_parent_digest {
+            return Err(RoundError::BaseCheckpointMismatch {
+                expected: self.accepted_parent_digest,
+                got: prepared.base_checkpoint_digest,
+            });
+        }
+        if self.equivocated_snapshot.contains(&prepared.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: prepared.sender,
+                round_id: self.active_round_id,
+            });
+        }
+
+        let sparse = self.active_sparse_round.as_ref().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "no two-phase SharedSeedSparse round is active".to_string(),
+            )
+        })?;
+        if !sparse.context.frozen_roster.contains(&prepared.sender) {
+            return Err(RoundError::UnauthorizedPeer(prepared.sender));
+        }
+        Ok(sparse)
+    }
+
+    /// Stage B (two-phase `SharedSeedSparse` Phase 1): validate an authenticated pre-seed Merkle
+    /// commitment against the active frozen context with zero state mutation (`ST-12`).
+    pub fn validate_sparse_commitment_submission(
+        &self,
+        prepared: PreparedSubmissionV1,
+    ) -> Result<ValidatedSparseCommitmentV1, RoundError> {
+        let sparse = self.validate_sparse_round_header(&prepared)?;
+        if sparse.phase != SparseRoundPhaseV1::CollectingCommitments {
+            return Err(RoundError::InvalidWirePayload(
+                "Phase-1 commitment window is closed for the active sparse round".to_string(),
+            ));
+        }
+        if prepared.payload_kind != PayloadKindV1::SharedSeedCommitmentV1 {
+            return Err(RoundError::InvalidWirePayload(
+                "expected PayloadKindV1::SharedSeedCommitmentV1".to_string(),
+            ));
+        }
+        let (msg, canonical_payload_digest, wire_bytes) = match prepared.payload {
+            PreparedPayloadV2::SparseCommitment {
+                msg,
+                canonical_payload_digest,
+                wire_bytes,
+            } => (msg, canonical_payload_digest, wire_bytes),
+            _ => {
+                return Err(RoundError::InvalidWirePayload(
+                    "non-commitment payload cannot enter validate_sparse_commitment_submission"
+                        .to_string(),
+                ));
+            }
+        };
+        if msg.context_digest != sparse.context_digest {
+            return Err(RoundError::InvalidWirePayload(
+                "SharedSeedCommitmentMessageV1 context_digest mismatch".to_string(),
+            ));
+        }
+        if msg.commitment.original_len != sparse.context.original_len {
+            return Err(RoundError::DimensionMismatch {
+                expected: sparse.context.original_len as usize,
+                got: msg.commitment.original_len as usize,
+            });
+        }
+
+        Ok(ValidatedSparseCommitmentV1 {
+            coordinator_generation: self.coordinator_generation,
+            round_id: self.active_round_id,
+            sender: prepared.sender,
+            context_digest: msg.context_digest,
+            commitment: msg.commitment,
+            canonical_payload_digest,
+            wire_bytes,
+            replay_admission: prepared.replay_admission,
+        })
+    }
+
+    /// Stage B (two-phase `SharedSeedSparse` Phase 2): cryptographically verify an authenticated
+    /// projected opening against the sender's frozen Phase-1 commitment and the single common
+    /// support $S_{\text{round}}$ with zero state mutation (`ST-12`).
+    pub fn validate_sparse_opening_submission(
+        &self,
+        prepared: PreparedSubmissionV1,
+    ) -> Result<ValidatedSparseOpeningV1, RoundError> {
+        let sparse = self.validate_sparse_round_header(&prepared)?;
+        if sparse.phase != SparseRoundPhaseV1::CollectingOpenings {
+            return Err(RoundError::InvalidWirePayload(
+                "Phase-2 opening window has not opened yet for the active sparse round".to_string(),
+            ));
+        }
+        let verifier = sparse.verifier.as_ref().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "sparse round coordinate verifier is not initialized".to_string(),
+            )
+        })?;
+        if prepared.payload_kind != PayloadKindV1::SharedSeedOpeningV1 {
+            return Err(RoundError::InvalidWirePayload(
+                "expected PayloadKindV1::SharedSeedOpeningV1".to_string(),
+            ));
+        }
+        let (msg, canonical_payload_digest, wire_bytes) = match prepared.payload {
+            PreparedPayloadV2::SparseOpening {
+                msg,
+                canonical_payload_digest,
+                wire_bytes,
+            } => (msg, canonical_payload_digest, wire_bytes),
+            _ => {
+                return Err(RoundError::InvalidWirePayload(
+                    "non-opening payload cannot enter validate_sparse_opening_submission"
+                        .to_string(),
+                ));
+            }
+        };
+        let recorded_commitment = sparse
+            .committed_roots
+            .get(&prepared.sender)
+            .ok_or(RoundError::UnauthorizedPeer(prepared.sender))?;
+        verifier
+            .verify_opening_message(recorded_commitment, &msg)
+            .map_err(|e| {
+                RoundError::InvalidWirePayload(format!(
+                    "SharedSeedSparse Merkle opening verification failed: {e:?}"
+                ))
+            })?;
+
+        Ok(ValidatedSparseOpeningV1 {
+            coordinator_generation: self.coordinator_generation,
+            round_id: self.active_round_id,
+            sender: prepared.sender,
+            msg,
+            canonical_payload_digest,
+            reported_examples: prepared.reported_examples,
+            wire_bytes,
             replay_admission: prepared.replay_admission,
         })
     }
@@ -837,6 +1271,66 @@ pub struct ValidatedLoraSubmissionV1 {
 }
 
 impl ValidatedLoraSubmissionV1 {
+    /// Coordinator generation stamped during Stage B validation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Target round identifier.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+}
+
+/// Stage B output for two-phase `SharedSeedSparse` Phase-1 pre-seed commitment (`ST-12`).
+#[derive(Debug)]
+pub struct ValidatedSparseCommitmentV1 {
+    coordinator_generation: u64,
+    round_id: u64,
+    sender: PeerId,
+    context_digest: [u8; 32],
+    commitment: PreSeedVectorCommitmentV1,
+    canonical_payload_digest: [u8; 32],
+    wire_bytes: usize,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl ValidatedSparseCommitmentV1 {
+    /// Coordinator generation stamped during Stage B validation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Target round identifier.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+}
+
+/// Stage B output for two-phase `SharedSeedSparse` Phase-2 Merkle-verified opening (`ST-12`).
+#[derive(Debug)]
+pub struct ValidatedSparseOpeningV1 {
+    coordinator_generation: u64,
+    round_id: u64,
+    sender: PeerId,
+    msg: SharedSeedOpeningMessageV1,
+    canonical_payload_digest: [u8; 32],
+    reported_examples: Option<u64>,
+    wire_bytes: usize,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl ValidatedSparseOpeningV1 {
     /// Coordinator generation stamped during Stage B validation.
     pub const fn coordinator_generation(&self) -> u64 {
         self.coordinator_generation
@@ -1199,6 +1693,33 @@ pub(crate) enum CommitFailPoint {
     AfterCommittedHeadBeforeMemory,
 }
 
+#[derive(Debug, Clone)]
+struct AdmittedSparseCommitmentV1 {
+    payload_digest: [u8; 32],
+    commitment: PreSeedVectorCommitmentV1,
+    wire_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AdmittedSparseOpeningV1 {
+    payload_digest: [u8; 32],
+    msg: SharedSeedOpeningMessageV1,
+    sequence: u64,
+    reported_examples: Option<u64>,
+    wire_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSparseRoundV1 {
+    context: SparseRoundContextV1,
+    context_digest: [u8; 32],
+    beacon_policy: SparseBeaconPolicyV1,
+    phase: SparseRoundPhaseV1,
+    commitments: BTreeMap<PeerId, AdmittedSparseCommitmentV1>,
+    verifier: Option<SharedSeedCoordinateVerifier>,
+    openings: BTreeMap<PeerId, AdmittedSparseOpeningV1>,
+}
+
 /// Unified round coordinator state machine (`ADR-0023` §1, `W10-01`).
 pub struct SwarmRoundCoordinator<M: SwarmModel> {
     run_id: RunId,
@@ -1221,6 +1742,10 @@ pub struct SwarmRoundCoordinator<M: SwarmModel> {
     bucketing: Option<BucketingConfig>,
     /// Execution report from the most recent `$s$-Bucketing` step.
     last_bucketing_report: Option<BucketExecutionReport>,
+    /// Active two-phase collective `SharedSeedSparse` round state (`ST-12`).
+    sparse_round: Option<ActiveSparseRoundV1>,
+    /// Honest two-phase wire bandwidth report from the most recently committed sparse round (`ST-12`).
+    last_sparse_bandwidth_report: Option<SharedSeedBandwidthReportV1>,
     /// Optional stateful Rényi Differential Privacy accountant (`ADR-0023` §4.2, `W12-03`).
     dp_accountant: Option<swarm_torch_core::dp::RdpAccountantV1>,
     /// Optional bounded-staleness asynchronous policy (`ADR-0023` §4.1, `W12-03`).
@@ -1248,6 +1773,8 @@ struct StagedRoundCommit<M> {
     next_historical_anchors: BTreeMap<u64, Vec<f32>>,
     next_historical_digests_without_new: BTreeMap<u64, CheckpointContentDigestV1>,
     next_bucketing_report: Option<BucketExecutionReport>,
+    next_sparse_bandwidth_report: Option<SharedSeedBandwidthReportV1>,
+    clear_sparse_round: bool,
     checkpoint_asset_key: String,
     node_key: String,
     op_type: String,
@@ -1566,6 +2093,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             cclip_center: None,
             bucketing: None,
             last_bucketing_report: None,
+            sparse_round: None,
+            last_sparse_bandwidth_report: None,
             dp_accountant: None,
             fedasync_policy: None,
             fedasync_hinge_threshold: 0,
@@ -1631,6 +2160,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             cclip_center: None,
             bucketing: None,
             last_bucketing_report: None,
+            sparse_round: None,
+            last_sparse_bandwidth_report: None,
             dp_accountant: None,
             fedasync_policy: None,
             fedasync_hinge_threshold: 0,
@@ -1791,6 +2322,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             cclip_center: restored_cclip_center,
             bucketing: resume_v2.bucketing,
             last_bucketing_report: None,
+            sparse_round: None,
+            last_sparse_bandwidth_report: None,
             dp_accountant: None,
             fedasync_policy: resume_v2.fedasync_policy,
             fedasync_hinge_threshold: resume_v2.fedasync_hinge_threshold,
@@ -1905,6 +2438,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             cclip_center: None,
             bucketing: None,
             last_bucketing_report: None,
+            sparse_round: None,
+            last_sparse_bandwidth_report: None,
             dp_accountant: None,
             fedasync_policy: None,
             fedasync_hinge_threshold: 0,
@@ -2067,6 +2602,20 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
 
     /// Export an immutable [`ExpectedRoundContextV1`] snapshot for Stage B validation (`ST-01`).
     pub fn expected_round_context(&self) -> ExpectedRoundContextV1 {
+        let active_sparse_round =
+            self.sparse_round
+                .as_ref()
+                .map(|s| ExpectedSparseRoundSnapshotV1 {
+                    context: s.context.clone(),
+                    context_digest: s.context_digest,
+                    phase: s.phase,
+                    committed_roots: s
+                        .commitments
+                        .iter()
+                        .map(|(&p, entry)| (p, entry.commitment))
+                        .collect(),
+                    verifier: s.verifier.clone(),
+                });
         ExpectedRoundContextV1 {
             swarm_instance_id: self.swarm_instance_id,
             coordinator_peer_id: self.coordinator_peer_id,
@@ -2083,6 +2632,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             context_policy_digest: self.context_policy_digest(),
             fedasync_policy: self.fedasync_policy,
             coordinator_generation: self.coordinator_generation,
+            active_sparse_round,
         }
     }
 
@@ -2157,14 +2707,48 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.parent_recipe_key
     }
 
-    /// Number of currently admitted non-equivocating peers for `current_round`.
+    /// Number of currently admitted non-equivocating peers for `current_round`
+    /// (verified Phase-2 openings when a two-phase sparse round is active).
     pub fn admitted_count(&self) -> usize {
-        self.admitted.len()
+        if let Some(ref sparse) = self.sparse_round {
+            sparse.openings.len()
+        } else {
+            self.admitted.len()
+        }
     }
 
     /// Whether `admitted_count() >= config.min_quorum`.
     pub fn has_quorum(&self) -> bool {
-        self.admitted.len() >= self.config.min_quorum
+        self.admitted_count() >= self.config.min_quorum
+    }
+
+    /// Active two-phase `SharedSeedSparse` round context, if one has begun (`ST-12`).
+    pub fn active_sparse_round_context(&self) -> Option<&SparseRoundContextV1> {
+        self.sparse_round.as_ref().map(|s| &s.context)
+    }
+
+    /// Active two-phase `SharedSeedSparse` phase, if one has begun (`ST-12`).
+    pub fn active_sparse_round_phase(&self) -> Option<SparseRoundPhaseV1> {
+        self.sparse_round.as_ref().map(|s| s.phase)
+    }
+
+    /// Cohort Phase-1 commitment transcript root for the active sparse round once frozen (`ST-12`).
+    pub fn active_sparse_commitments_root(&self) -> Option<[u8; 32]> {
+        self.sparse_round
+            .as_ref()
+            .and_then(|s| s.verifier.as_ref().map(|v| v.commitments_root()))
+    }
+
+    /// Single cohort-wide shared round seed for the active sparse round once frozen (`ST-12`).
+    pub fn active_sparse_shared_seed(&self) -> Option<[u8; 32]> {
+        self.sparse_round
+            .as_ref()
+            .and_then(|s| s.verifier.as_ref().map(|v| v.shared_round_seed()))
+    }
+
+    /// Honest two-phase wire bandwidth breakdown for the most recently committed sparse round (`ST-12`).
+    pub fn last_sparse_bandwidth_report(&self) -> Option<&SharedSeedBandwidthReportV1> {
+        self.last_sparse_bandwidth_report.as_ref()
     }
 
     /// Legacy unverified round submission entrypoint — rejected fail-closed (`ST-01`).
@@ -2195,7 +2779,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     ) -> Result<PreparedSubmissionV1, RoundError> {
         let delivery =
             BundledGossipDeliveryV2::from_bytes_bounded(delivery_bytes, max_delivery_bytes)?;
-        self.prepare_verified_delivery_struct(&delivery, now_secs)
+        self.prepare_verified_delivery_inner(&delivery, delivery_bytes.len(), now_secs)
     }
 
     /// Stage A (`&self`, zero state mutation) over an already-deserialized
@@ -2203,6 +2787,19 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     pub fn prepare_verified_delivery_struct(
         &self,
         delivery: &BundledGossipDeliveryV2,
+        now_secs: u64,
+    ) -> Result<PreparedSubmissionV1, RoundError> {
+        let wire_bytes = delivery
+            .to_bytes()
+            .map(|b| b.len())
+            .unwrap_or(delivery.inner.encoded_payload.len());
+        self.prepare_verified_delivery_inner(delivery, wire_bytes, now_secs)
+    }
+
+    fn prepare_verified_delivery_inner(
+        &self,
+        delivery: &BundledGossipDeliveryV2,
+        wire_bytes: usize,
         now_secs: u64,
     ) -> Result<PreparedSubmissionV1, RoundError> {
         let now_u32 = u32::try_from(now_secs).map_err(|_| {
@@ -2217,7 +2814,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             &self.replay,
             now_u32,
         )?;
-        let payload = decode_prepared_payload_v2(&delivery.inner, originator)?;
+        let payload = decode_prepared_payload_v2(&delivery.inner, originator, wire_bytes)?;
         Ok(PreparedSubmissionV1 {
             sender: originator,
             swarm_instance_id: delivery.inner.swarm_instance_id,
@@ -2250,6 +2847,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 got: validated.coordinator_generation,
             });
         }
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "dense update submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
         let sequence = validated.replay_admission.sequence();
         self.replay
             .commit_prepared_admission(validated.replay_admission)
@@ -2270,6 +2873,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         &mut self,
         verified: VerifiedRoundSubmissionV1,
     ) -> Result<SubmissionDecision, RoundError> {
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "dense update submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
         if verified.coordinator_generation != self.coordinator_generation {
             return Err(RoundError::StaleCoordinatorGeneration {
                 expected: self.coordinator_generation,
@@ -2321,6 +2930,533 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             admitted_count: self.admitted.len(),
             min_quorum: self.config.min_quorum,
         })
+    }
+
+    /// Begin Step 1 of a two-phase collective `SharedSeedSparse` round inside `current_round`
+    /// (`ST-12`), freezing `frozen_roster = config.authorized_cohort` and publishing
+    /// [`SparseRoundContextV1`] prior to Phase-1 commitments.
+    pub fn begin_sparse_round_v1(
+        &mut self,
+        sparsity_k: u32,
+        scaling: SharedSeedScalingProfile,
+        beacon_policy: SparseBeaconPolicyV1,
+    ) -> Result<SparseRoundContextV1, RoundError> {
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "two-phase SharedSeedSparse round is already active in current_round".to_string(),
+            ));
+        }
+        if !self.admitted.is_empty() {
+            return Err(RoundError::InvalidWirePayload(
+                "cannot start SharedSeedSparse round after dense submissions were admitted"
+                    .to_string(),
+            ));
+        }
+        if self.config.authorized_cohort.is_empty() {
+            return Err(RoundError::Config(RoundConfigError::EmptyCohort));
+        }
+        let d_u32 = u32::try_from(self.model.num_parameters()).map_err(|_| {
+            RoundError::InvalidWirePayload("model parameter count exceeds u32".to_string())
+        })?;
+        let context = SparseRoundContextV1 {
+            swarm_instance_id: self.swarm_instance_id,
+            run_id: *self.run_id.as_bytes(),
+            round_id: self.current_round,
+            base_checkpoint_digest: *self.parent_digest.as_bytes(),
+            frozen_roster: self.config.authorized_cohort.clone(),
+            original_len: d_u32,
+            sparsity_k,
+            scaling,
+            sampler_version: SHARED_SEED_SAMPLER_VERSION_V1,
+        };
+        let context_digest = context.context_digest().map_err(|e| {
+            RoundError::InvalidWirePayload(format!("invalid SparseRoundContextV1: {e:?}"))
+        })?;
+        self.sparse_round = Some(ActiveSparseRoundV1 {
+            context: context.clone(),
+            context_digest,
+            beacon_policy,
+            phase: SparseRoundPhaseV1::CollectingCommitments,
+            commitments: BTreeMap::new(),
+            verifier: None,
+            openings: BTreeMap::new(),
+        });
+        Ok(context)
+    }
+
+    /// Stage C (two-phase `SharedSeedSparse` Phase 1): verify `coordinator_generation`,
+    /// consume replay state, detect equivocation, and record the peer's Phase-1 commitment (`ST-12`).
+    pub fn commit_sparse_commitment_submission(
+        &mut self,
+        validated: ValidatedSparseCommitmentV1,
+    ) -> Result<SubmissionDecision, RoundError> {
+        if validated.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: validated.coordinator_generation,
+            });
+        }
+        let current_round = self.current_round;
+        let min_quorum = self.config.min_quorum;
+        if validated.round_id != current_round {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: validated.round_id,
+                current_round,
+                max_staleness: 0,
+            });
+        }
+        if self.equivocated.contains(&validated.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: current_round,
+            });
+        }
+        let existing_digest = {
+            let sparse = self.sparse_round.as_ref().ok_or_else(|| {
+                RoundError::InvalidWirePayload(
+                    "no two-phase SharedSeedSparse round is active".to_string(),
+                )
+            })?;
+            if sparse.phase != SparseRoundPhaseV1::CollectingCommitments {
+                return Err(RoundError::InvalidWirePayload(
+                    "Phase-1 commitment window is closed for the active sparse round".to_string(),
+                ));
+            }
+            if validated.context_digest != sparse.context_digest {
+                return Err(RoundError::InvalidWirePayload(
+                    "SharedSeedCommitmentMessageV1 context_digest mismatch".to_string(),
+                ));
+            }
+            sparse
+                .commitments
+                .get(&validated.sender)
+                .map(|entry| entry.payload_digest)
+        };
+
+        self.replay
+            .commit_prepared_admission(validated.replay_admission)
+            .map_err(RoundError::ReplayRejected)?;
+
+        let sparse = self.sparse_round.as_mut().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "no two-phase SharedSeedSparse round is active".to_string(),
+            )
+        })?;
+        if let Some(prev_digest) = existing_digest {
+            if prev_digest == validated.canonical_payload_digest {
+                return Ok(SubmissionDecision::DuplicateIdempotentAck);
+            }
+            sparse.commitments.remove(&validated.sender);
+            self.equivocated.insert(validated.sender);
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: current_round,
+            });
+        }
+
+        sparse.commitments.insert(
+            validated.sender,
+            AdmittedSparseCommitmentV1 {
+                payload_digest: validated.canonical_payload_digest,
+                commitment: validated.commitment,
+                wire_bytes: validated.wire_bytes,
+            },
+        );
+        Ok(SubmissionDecision::Admitted {
+            admitted_count: sparse.commitments.len(),
+            min_quorum,
+        })
+    }
+
+    /// Execute Stages A -> B -> C + admission for a Phase-1 pre-seed commitment wire frame (`ST-12`).
+    pub fn submit_sparse_commitment_delivery(
+        &mut self,
+        delivery_bytes: &[u8],
+        max_delivery_bytes: usize,
+        now_secs: u64,
+    ) -> Result<SubmissionDecision, RoundError> {
+        let prepared =
+            self.prepare_verified_delivery(delivery_bytes, max_delivery_bytes, now_secs)?;
+        let ctx = self.expected_round_context();
+        let validated = ctx.validate_sparse_commitment_submission(prepared)?;
+        self.commit_sparse_commitment_submission(validated)
+    }
+
+    /// Steps 3 & 4 of two-phase `SharedSeedSparse`: freeze Phase-1 commitments into canonical
+    /// `commitments_root`, verify the post-commit randomness `beacon` against policy, and derive
+    /// the single collective `shared_round_seed` shared by all cohort contributors (`ST-12`).
+    pub fn finalize_sparse_commitments_with_beacon(
+        &mut self,
+        beacon: &SparseBeaconRevealV1,
+    ) -> Result<([u8; 32], [u8; 32]), RoundError> {
+        let min_quorum = self.config.min_quorum;
+        let swarm_instance_id = self.swarm_instance_id;
+        let run_id = self.run_id;
+        let current_round = self.current_round;
+
+        let sparse = self.sparse_round.as_ref().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "no two-phase SharedSeedSparse round is active".to_string(),
+            )
+        })?;
+        if sparse.phase != SparseRoundPhaseV1::CollectingCommitments {
+            return Err(RoundError::InvalidWirePayload(
+                "Phase-1 commitment transcript is already finalized".to_string(),
+            ));
+        }
+        if sparse.commitments.len() < min_quorum {
+            return Err(RoundError::InsufficientQuorum {
+                admitted: sparse.commitments.len(),
+                min_quorum,
+            });
+        }
+
+        let pairs: Vec<(PeerId, PreSeedVectorCommitmentV1)> = sparse
+            .commitments
+            .iter()
+            .map(|(&p, entry)| (p, entry.commitment))
+            .collect();
+        let commitments_root = compute_commitments_root_v1(&sparse.context_digest, &pairs)
+            .map_err(|e| {
+                RoundError::InvalidWirePayload(format!(
+                    "failed to compute Phase-1 commitments_root: {e:?}"
+                ))
+            })?;
+
+        beacon.verify(
+            &sparse.beacon_policy,
+            &swarm_instance_id,
+            run_id,
+            current_round,
+            &sparse.context_digest,
+            &commitments_root,
+        )?;
+
+        let shared_round_seed = derive_context_bound_round_seed_v1(
+            &sparse.context_digest,
+            &commitments_root,
+            &beacon.beacon_r,
+        );
+        let verifier = SharedSeedCoordinateVerifier::try_new(
+            sparse.context.clone(),
+            commitments_root,
+            shared_round_seed,
+        )
+        .map_err(|e| {
+            RoundError::InvalidWirePayload(format!(
+                "failed to construct SharedSeedCoordinateVerifier: {e:?}"
+            ))
+        })?;
+
+        let sparse_mut = self.sparse_round.as_mut().expect("verified above");
+        sparse_mut.verifier = Some(verifier);
+        sparse_mut.phase = SparseRoundPhaseV1::CollectingOpenings;
+        Ok((commitments_root, shared_round_seed))
+    }
+
+    /// Stage C (two-phase `SharedSeedSparse` Phase 2): verify `coordinator_generation`,
+    /// consume replay state, detect equivocation, and admit a Merkle-verified projected opening
+    /// onto common support $S_{\text{round}}$ (`ST-12`).
+    pub fn commit_sparse_opening_submission(
+        &mut self,
+        validated: ValidatedSparseOpeningV1,
+    ) -> Result<SubmissionDecision, RoundError> {
+        if validated.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: validated.coordinator_generation,
+            });
+        }
+        let current_round = self.current_round;
+        let min_quorum = self.config.min_quorum;
+        if validated.round_id != current_round {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: validated.round_id,
+                current_round,
+                max_staleness: 0,
+            });
+        }
+        if self.equivocated.contains(&validated.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: current_round,
+            });
+        }
+        let existing_digest = {
+            let sparse = self.sparse_round.as_ref().ok_or_else(|| {
+                RoundError::InvalidWirePayload(
+                    "no two-phase SharedSeedSparse round is active".to_string(),
+                )
+            })?;
+            if sparse.phase != SparseRoundPhaseV1::CollectingOpenings {
+                return Err(RoundError::InvalidWirePayload(
+                    "Phase-2 opening window has not opened yet".to_string(),
+                ));
+            }
+            let verifier = sparse.verifier.as_ref().ok_or_else(|| {
+                RoundError::InvalidWirePayload(
+                    "sparse round coordinate verifier is not initialized".to_string(),
+                )
+            })?;
+            let recorded_commitment = sparse
+                .commitments
+                .get(&validated.sender)
+                .ok_or(RoundError::UnauthorizedPeer(validated.sender))?;
+            verifier
+                .verify_opening_message(&recorded_commitment.commitment, &validated.msg)
+                .map_err(|e| {
+                    RoundError::InvalidWirePayload(format!(
+                        "SharedSeedSparse Merkle opening verification failed: {e:?}"
+                    ))
+                })?;
+            sparse
+                .openings
+                .get(&validated.sender)
+                .map(|entry| entry.payload_digest)
+        };
+
+        let sequence = validated.replay_admission.sequence();
+        self.replay
+            .commit_prepared_admission(validated.replay_admission)
+            .map_err(RoundError::ReplayRejected)?;
+
+        let sparse = self.sparse_round.as_mut().expect("verified above");
+        if let Some(prev_digest) = existing_digest {
+            if prev_digest == validated.canonical_payload_digest {
+                return Ok(SubmissionDecision::DuplicateIdempotentAck);
+            }
+            sparse.openings.remove(&validated.sender);
+            self.equivocated.insert(validated.sender);
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: current_round,
+            });
+        }
+
+        sparse.openings.insert(
+            validated.sender,
+            AdmittedSparseOpeningV1 {
+                payload_digest: validated.canonical_payload_digest,
+                msg: validated.msg,
+                sequence,
+                reported_examples: validated.reported_examples,
+                wire_bytes: validated.wire_bytes,
+            },
+        );
+        Ok(SubmissionDecision::Admitted {
+            admitted_count: sparse.openings.len(),
+            min_quorum,
+        })
+    }
+
+    /// Execute Stages A -> B -> C + admission for a Phase-2 Merkle-verified opening wire frame (`ST-12`).
+    pub fn submit_sparse_opening_delivery(
+        &mut self,
+        delivery_bytes: &[u8],
+        max_delivery_bytes: usize,
+        now_secs: u64,
+    ) -> Result<SubmissionDecision, RoundError> {
+        let prepared =
+            self.prepare_verified_delivery(delivery_bytes, max_delivery_bytes, now_secs)?;
+        let ctx = self.expected_round_context();
+        let validated = ctx.validate_sparse_opening_submission(prepared)?;
+        self.commit_sparse_opening_submission(validated)
+    }
+
+    /// Step 6 of two-phase `SharedSeedSparse` (`ST-12`) executed with transactional 5-step
+    /// commit (`ST-04`): aggregate verified cohort openings on the shared $k$-dimensional
+    /// support $S_{\text{round}}$, scatter back to dense $d$ coordinates, step model/optimizer,
+    /// commit CAS + `committed_head.json`, and emit `(RoundCommitSummaryV1, SharedSeedBandwidthReportV1)`.
+    pub fn finalize_sparse_round<O, F>(
+        &mut self,
+        transforms: &[&dyn UpdateTransform],
+        server_optimizer: Option<&mut O>,
+        fitness: Option<&F>,
+        session: &mut DataOpsSession,
+        ts_unix_nanos: u64,
+    ) -> Result<(RoundCommitSummaryV1, SharedSeedBandwidthReportV1), RoundError>
+    where
+        O: SwarmOptimizer<Model = M> + Clone,
+        F: FitnessFunction<Model = M>,
+    {
+        let sparse = self.sparse_round.as_ref().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "no two-phase SharedSeedSparse round is active".to_string(),
+            )
+        })?;
+        if sparse.phase != SparseRoundPhaseV1::CollectingOpenings {
+            return Err(RoundError::InvalidWirePayload(
+                "cannot finalize sparse round before Phase-1 commitments close".to_string(),
+            ));
+        }
+        if sparse.openings.len() < self.config.min_quorum {
+            return Err(RoundError::InsufficientQuorum {
+                admitted: sparse.openings.len(),
+                min_quorum: self.config.min_quorum,
+            });
+        }
+        let verifier = sparse.verifier.as_ref().ok_or_else(|| {
+            RoundError::InvalidWirePayload(
+                "sparse round coordinate verifier is not initialized".to_string(),
+            )
+        })?;
+        let next_round = self
+            .current_round
+            .checked_add(1)
+            .ok_or(RoundError::RoundIdOverflow {
+                round_id: self.current_round,
+            })?;
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
+
+        let expected_indices = verifier.expected_indices();
+        let d = self.model.num_parameters();
+        let mut admitted_peers = Vec::with_capacity(sparse.openings.len());
+        let mut frozen_raw_inputs = BTreeMap::new();
+        let mut working_updates = Vec::with_capacity(sparse.openings.len());
+        let mut weight_mismatch_warnings = Vec::new();
+        let mut bandwidth_report = SharedSeedBandwidthReportV1::new(
+            sparse.context.original_len,
+            sparse.context.sparsity_k,
+        );
+
+        for (&peer_id, opening_entry) in &sparse.openings {
+            let phase1_bytes = sparse
+                .commitments
+                .get(&peer_id)
+                .map(|c| c.wire_bytes)
+                .ok_or(RoundError::UnauthorizedPeer(peer_id))?;
+            bandwidth_report.record_peer_delivery(
+                phase1_bytes,
+                opening_entry.wire_bytes,
+                &opening_entry.msg.openings,
+            );
+
+            admitted_peers.push(peer_id);
+            let mut scattered_raw = vec![0.0f32; d];
+            for (&coord_idx, &val) in expected_indices
+                .iter()
+                .zip(opening_entry.msg.payload.values.iter())
+            {
+                scattered_raw[coord_idx as usize] = val;
+            }
+            frozen_raw_inputs.insert(peer_id, scattered_raw);
+            working_updates.push(GradientUpdate {
+                sender: *peer_id.as_bytes(),
+                sequence: opening_entry.sequence,
+                gradients: opening_entry.msg.payload.values.clone(),
+                round_id: self.current_round,
+            });
+            self.check_weight_mismatch_warning(
+                peer_id,
+                opening_entry.reported_examples,
+                &mut weight_mismatch_warnings,
+            );
+        }
+
+        let (working_updates, staged_transform_audits) =
+            apply_update_transforms_for_round(self.current_round, working_updates, transforms);
+        let projected_cclip_center: Option<Vec<f32>> = self.cclip_center.as_ref().map(|center| {
+            expected_indices
+                .iter()
+                .map(|&idx| center[idx as usize])
+                .collect()
+        });
+        let (aggregated_k, bucketing_report) = self.aggregate_working_updates_with_center(
+            &admitted_peers,
+            &working_updates,
+            projected_cclip_center.as_deref(),
+        )?;
+
+        let mut aggregated_vec = vec![0.0f32; d];
+        for (&coord_idx, &val) in expected_indices.iter().zip(aggregated_k.iter()) {
+            aggregated_vec[coord_idx as usize] = val;
+        }
+
+        let (candidate_model, staged_optimizer, optimizer_snapshot, fitness_score) =
+            stage_model_and_fitness_step(
+                &self.model,
+                self.config.update_kind,
+                &aggregated_vec,
+                server_optimizer.as_deref(),
+                fitness,
+            )?;
+
+        let committed_round = self.current_round;
+        let next_historical_anchors = self.compute_next_historical_anchors(
+            committed_round,
+            candidate_model.parameters().to_vec(),
+        );
+        let equivocated_peers: Vec<PeerId> = self.equivocated.iter().copied().collect();
+        let telemetry_admitted_count = admitted_peers.len();
+        let telemetry_equivocated_count = self.equivocated.len();
+        let total_cohort = self.config.authorized_cohort.len().max(1) as f64;
+        let subsampling_q = (admitted_peers.len().max(1) as f64 / total_cohort).clamp(0.0, 1.0);
+        let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
+        let node_key = format!("train/round_{committed_round}");
+
+        let plan = StagedRoundCommit {
+            committed_round,
+            next_round,
+            next_generation,
+            candidate_model,
+            optimizer_snapshot,
+            next_cclip_center: Some(aggregated_vec),
+            next_historical_anchors,
+            next_historical_digests_without_new: self.historical_digests.clone(),
+            next_bucketing_report: bucketing_report,
+            next_sparse_bandwidth_report: Some(bandwidth_report),
+            clear_sparse_round: true,
+            checkpoint_asset_key,
+            node_key,
+            op_type: "swarm_sparse_round_aggregate".to_string(),
+            output_rows: Some(admitted_peers.len() as u64),
+            admitted_peers,
+            equivocated_peers,
+            frozen_raw_inputs,
+            weight_mismatch_warnings,
+            fitness_score,
+            staged_transform_audits,
+            dp_subsampling_q_override: Some(subsampling_q),
+            dp_explicit_tau: None,
+            emit_standard_telemetry: true,
+            clear_round_admitted: true,
+            ts_unix_nanos,
+            telemetry_admitted_count,
+            telemetry_equivocated_count,
+        };
+
+        let summary = self.commit_round_plan_v1(plan, session)?;
+        if let (Some(opt), Some(committed_opt)) = (server_optimizer, staged_optimizer) {
+            *opt = committed_opt;
+        }
+        Ok((summary, bandwidth_report))
+    }
+
+    fn check_weight_mismatch_warning(
+        &self,
+        peer_id: PeerId,
+        reported_examples: Option<u64>,
+        warnings: &mut Vec<String>,
+    ) {
+        if let WeightingPolicyV1::RegistryCertified {
+            ref peer_weights, ..
+        } = self.config.weighting_policy
+        {
+            if let (Some(reported), Some(&certified)) =
+                (reported_examples, peer_weights.get(&peer_id))
+            {
+                if reported != certified {
+                    warnings.push(format!(
+                        "peer {:?} reported_examples={} differs from certified weight={}; using certified weight",
+                        peer_id, reported, certified
+                    ));
+                }
+            }
+        }
     }
 
     /// Execute Stages A -> B -> C + admission atomically for a synchronous signed wire frame (`ST-01`).
@@ -2392,110 +3528,27 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             frozen_raw_inputs.insert(peer_id, entry.update.gradients.clone());
             working_updates.push(entry.update.clone());
 
-            if let WeightingPolicyV1::RegistryCertified {
-                ref peer_weights, ..
-            } = self.config.weighting_policy
-            {
-                if let (Some(reported), Some(&certified)) =
-                    (entry.reported_examples, peer_weights.get(&peer_id))
-                {
-                    if reported != certified {
-                        weight_mismatch_warnings.push(format!(
-                            "peer {:?} reported_examples={} differs from certified weight={}; using certified weight",
-                            peer_id, reported, certified
-                        ));
-                    }
-                }
-            }
+            self.check_weight_mismatch_warning(
+                peer_id,
+                entry.reported_examples,
+                &mut weight_mismatch_warnings,
+            );
         }
 
-        let mut staged_transform_audits = Vec::with_capacity(transforms.len());
-        for &transform in transforms {
-            struct DynTransformRef<'a>(&'a dyn UpdateTransform);
-            impl UpdateTransform for DynTransformRef<'_> {
-                fn transform(&self, update: GradientUpdate) -> GradientUpdate {
-                    self.0.transform(update)
-                }
-                fn name(&self) -> &str {
-                    self.0.name()
-                }
-                fn is_core_trusted(&self) -> bool {
-                    self.0.is_core_trusted()
-                }
-            }
-            let wrapper = DynTransformRef(transform);
-            let (next_updates, mut audit): (Vec<GradientUpdate>, TransformAuditV0) =
-                apply_update_transforms(working_updates, &wrapper);
-            audit.round_id = self.current_round;
-            staged_transform_audits.push(audit);
-            working_updates = next_updates;
-        }
+        let (working_updates, staged_transform_audits) =
+            apply_update_transforms_for_round(self.current_round, working_updates, transforms);
 
         let (aggregated_vec, bucketing_report) =
             self.aggregate_working_updates(&admitted_peers, &working_updates)?;
 
-        let mut candidate_model = self.model.clone();
-        let mut staged_optimizer: Option<O> = None;
-        match self.config.update_kind {
-            UpdateKindV1::ModelDeltaV1 {
-                server_learning_rate,
-            } => {
-                let lr_f64 = server_learning_rate as f64;
-                let parent_params = self.model.parameters();
-                let mut new_params = Vec::with_capacity(parent_params.len());
-                for (&w_parent, &delta) in parent_params.iter().zip(aggregated_vec.iter()) {
-                    let updated = (w_parent as f64) + lr_f64 * (delta as f64);
-                    let updated_f32 = updated as f32;
-                    if !updated_f32.is_finite() {
-                        return Err(RoundError::Aggregation(CoreError::InfDetected));
-                    }
-                    new_params.push(updated_f32);
-                }
-                candidate_model
-                    .load_parameters(&new_params)
-                    .map_err(RoundError::Aggregation)?;
-            }
-            UpdateKindV1::GradientV1 => {
-                let opt = server_optimizer.as_deref().ok_or_else(|| {
-                    RoundError::OptimizerStep(
-                        "UpdateKindV1::GradientV1 requires a server SwarmOptimizer".to_string(),
-                    )
-                })?;
-                let mut candidate_opt = opt.clone();
-                candidate_opt
-                    .step(&mut candidate_model, &aggregated_vec)
-                    .map_err(|e| RoundError::OptimizerStep(format!("{e:?}")))?;
-                if candidate_model.parameters().iter().any(|p| !p.is_finite()) {
-                    return Err(RoundError::Aggregation(CoreError::NanDetected));
-                }
-                staged_optimizer = Some(candidate_opt);
-            }
-        }
-
-        let optimizer_snapshot = match (&staged_optimizer, server_optimizer.as_deref()) {
-            (Some(cand), _) => cand
-                .snapshot_state()
-                .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
-            (None, Some(opt)) => opt
-                .snapshot_state()
-                .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
-            (None, None) => None,
-        };
-
-        let fitness_score = match fitness {
-            Some(evaluator) => {
-                let score = evaluator
-                    .evaluate(&candidate_model)
-                    .map_err(|e| RoundError::FitnessEvaluation(format!("{e:?}")))?;
-                if !score.is_finite() {
-                    return Err(RoundError::FitnessEvaluation(
-                        "fitness evaluation returned non-finite score".to_string(),
-                    ));
-                }
-                Some(score)
-            }
-            None => None,
-        };
+        let (candidate_model, staged_optimizer, optimizer_snapshot, fitness_score) =
+            stage_model_and_fitness_step(
+                &self.model,
+                self.config.update_kind,
+                &aggregated_vec,
+                server_optimizer.as_deref(),
+                fitness,
+            )?;
 
         let committed_round = self.current_round;
         let next_historical_anchors = self.compute_next_historical_anchors(
@@ -2518,6 +3571,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             next_historical_anchors,
             next_historical_digests_without_new: self.historical_digests.clone(),
             next_bucketing_report: bucketing_report,
+            next_sparse_bandwidth_report: self.last_sparse_bandwidth_report,
+            clear_sparse_round: false,
             checkpoint_asset_key,
             node_key,
             op_type: "swarm_round_aggregate".to_string(),
@@ -2813,6 +3868,10 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.last_bucketing_report = plan.next_bucketing_report;
         self.current_round = plan.next_round;
         self.coordinator_generation = plan.next_generation;
+        if plan.clear_sparse_round {
+            self.sparse_round = None;
+            self.last_sparse_bandwidth_report = plan.next_sparse_bandwidth_report;
+        }
         if plan.clear_round_admitted {
             self.admitted.clear();
             self.equivocated.clear();
@@ -2836,6 +3895,19 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         &self,
         admitted_peers: &[PeerId],
         updates: &[GradientUpdate],
+    ) -> Result<(Vec<f32>, Option<BucketExecutionReport>), RoundError> {
+        self.aggregate_working_updates_with_center(
+            admitted_peers,
+            updates,
+            self.cclip_center.as_deref(),
+        )
+    }
+
+    fn aggregate_working_updates_with_center(
+        &self,
+        admitted_peers: &[PeerId],
+        updates: &[GradientUpdate],
+        cclip_center_override: Option<&[f32]>,
     ) -> Result<(Vec<f32>, Option<BucketExecutionReport>), RoundError> {
         if let WeightingPolicyV1::RegistryCertified {
             ref peer_weights,
@@ -2902,7 +3974,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 updates,
                 &b_cfg,
                 post_rule,
-                self.cclip_center.as_deref(),
+                cclip_center_override,
                 &budget,
             )?;
             return Ok((out, Some(report)));
@@ -2933,7 +4005,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 max_iterations,
             } => {
                 let cclip = CenteredClipping::try_new(*tau, *max_iterations, Vec::new())?;
-                if let Some(ref center) = self.cclip_center {
+                if let Some(center) = cclip_center_override {
                     cclip.aggregate_with_center(updates, center)
                 } else {
                     cclip.aggregate(updates)
@@ -3139,6 +4211,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 got: validated.coordinator_generation,
             });
         }
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "FedAsync submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
         self.replay
             .commit_prepared_admission(validated.replay_admission)
             .map_err(RoundError::ReplayRejected)?;
@@ -3264,6 +4342,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             next_historical_anchors,
             next_historical_digests_without_new: self.historical_digests.clone(),
             next_bucketing_report: self.last_bucketing_report.clone(),
+            next_sparse_bandwidth_report: self.last_sparse_bandwidth_report,
+            clear_sparse_round: false,
             checkpoint_asset_key,
             node_key,
             op_type: "fedasync_stale_step".to_string(),
@@ -3441,9 +4521,123 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     }
 }
 
+fn apply_update_transforms_for_round(
+    round_id: u64,
+    mut working_updates: Vec<GradientUpdate>,
+    transforms: &[&dyn UpdateTransform],
+) -> (Vec<GradientUpdate>, Vec<TransformAuditV0>) {
+    let mut staged_transform_audits = Vec::with_capacity(transforms.len());
+    for &transform in transforms {
+        struct DynTransformRef<'a>(&'a dyn UpdateTransform);
+        impl UpdateTransform for DynTransformRef<'_> {
+            fn transform(&self, update: GradientUpdate) -> GradientUpdate {
+                self.0.transform(update)
+            }
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn is_core_trusted(&self) -> bool {
+                self.0.is_core_trusted()
+            }
+        }
+        let wrapper = DynTransformRef(transform);
+        let (next_updates, mut audit): (Vec<GradientUpdate>, TransformAuditV0) =
+            apply_update_transforms(working_updates, &wrapper);
+        audit.round_id = round_id;
+        staged_transform_audits.push(audit);
+        working_updates = next_updates;
+    }
+    (working_updates, staged_transform_audits)
+}
+
+#[allow(clippy::type_complexity)]
+fn stage_model_and_fitness_step<M, O, F>(
+    model: &M,
+    update_kind: UpdateKindV1,
+    aggregated_vec: &[f32],
+    server_optimizer: Option<&O>,
+    fitness: Option<&F>,
+) -> Result<(M, Option<O>, Option<OptimizerStateSnapshotV1>, Option<f32>), RoundError>
+where
+    M: SwarmModel + Clone,
+    O: SwarmOptimizer<Model = M> + Clone,
+    F: FitnessFunction<Model = M>,
+{
+    let mut candidate_model = model.clone();
+    let mut staged_optimizer: Option<O> = None;
+    match update_kind {
+        UpdateKindV1::ModelDeltaV1 {
+            server_learning_rate,
+        } => {
+            let lr_f64 = server_learning_rate as f64;
+            let parent_params = model.parameters();
+            let mut new_params = Vec::with_capacity(parent_params.len());
+            for (&w_parent, &delta) in parent_params.iter().zip(aggregated_vec.iter()) {
+                let updated = (w_parent as f64) + lr_f64 * (delta as f64);
+                let updated_f32 = updated as f32;
+                if !updated_f32.is_finite() {
+                    return Err(RoundError::Aggregation(CoreError::InfDetected));
+                }
+                new_params.push(updated_f32);
+            }
+            candidate_model
+                .load_parameters(&new_params)
+                .map_err(RoundError::Aggregation)?;
+        }
+        UpdateKindV1::GradientV1 => {
+            let opt = server_optimizer.ok_or_else(|| {
+                RoundError::OptimizerStep(
+                    "UpdateKindV1::GradientV1 requires a server SwarmOptimizer".to_string(),
+                )
+            })?;
+            let mut candidate_opt = opt.clone();
+            candidate_opt
+                .step(&mut candidate_model, aggregated_vec)
+                .map_err(|e| RoundError::OptimizerStep(format!("{e:?}")))?;
+            if candidate_model.parameters().iter().any(|p| !p.is_finite()) {
+                return Err(RoundError::Aggregation(CoreError::NanDetected));
+            }
+            staged_optimizer = Some(candidate_opt);
+        }
+    }
+
+    let optimizer_snapshot = match (&staged_optimizer, server_optimizer) {
+        (Some(cand), _) => cand
+            .snapshot_state()
+            .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
+        (None, Some(opt)) => opt
+            .snapshot_state()
+            .map_err(|e| RoundError::OptimizerStateError(format!("{e:?}")))?,
+        (None, None) => None,
+    };
+
+    let fitness_score = match fitness {
+        Some(evaluator) => {
+            let score = evaluator
+                .evaluate(&candidate_model)
+                .map_err(|e| RoundError::FitnessEvaluation(format!("{e:?}")))?;
+            if !score.is_finite() {
+                return Err(RoundError::FitnessEvaluation(
+                    "fitness evaluation returned non-finite score".to_string(),
+                ));
+            }
+            Some(score)
+        }
+        None => None,
+    };
+
+    Ok((
+        candidate_model,
+        staged_optimizer,
+        optimizer_snapshot,
+        fitness_score,
+    ))
+}
+
 fn decode_prepared_payload_v2(
     inner: &InnerUpdateV2,
     originator: PeerId,
+    wire_bytes: usize,
 ) -> Result<PreparedPayloadV2, RoundError> {
     let expected_run = RunId::from_bytes(inner.run_id);
     let expected_base = CheckpointContentDigestV1(inner.base_checkpoint_digest);
@@ -3565,6 +4759,76 @@ fn decode_prepared_payload_v2(
                 });
             }
             Ok(PreparedPayloadV2::Lora { pair })
+        }
+        COMPRESSION_SCHEMA_SHARED_SEED_COMMITMENT_V1 => {
+            if inner.payload_kind != PayloadKindV1::SharedSeedCommitmentV1 {
+                return Err(RoundError::InvalidWirePayload(
+                    "compression_schema_version=3 requires PayloadKindV1::SharedSeedCommitmentV1"
+                        .to_string(),
+                ));
+            }
+            let msg = SharedSeedCommitmentMessageV1::from_bytes_bounded(
+                &inner.encoded_payload,
+                inner.encoded_payload.len(),
+            )
+            .map_err(|e| {
+                RoundError::InvalidWirePayload(format!("invalid sparse commitment payload: {e:?}"))
+            })?;
+            if msg.commitment.original_len != inner.num_elements {
+                return Err(RoundError::DimensionMismatch {
+                    expected: inner.num_elements as usize,
+                    got: msg.commitment.original_len as usize,
+                });
+            }
+            let canonical_payload_digest = canonical_sparse_commitment_digest_v2(
+                &inner.swarm_instance_id,
+                expected_run,
+                inner.round_id,
+                &expected_base,
+                &inner.context_policy_digest,
+                originator,
+                &msg,
+            );
+            Ok(PreparedPayloadV2::SparseCommitment {
+                msg,
+                canonical_payload_digest,
+                wire_bytes,
+            })
+        }
+        COMPRESSION_SCHEMA_SHARED_SEED_OPENING_V1 => {
+            if inner.payload_kind != PayloadKindV1::SharedSeedOpeningV1 {
+                return Err(RoundError::InvalidWirePayload(
+                    "compression_schema_version=4 requires PayloadKindV1::SharedSeedOpeningV1"
+                        .to_string(),
+                ));
+            }
+            let msg = SharedSeedOpeningMessageV1::from_bytes_bounded(
+                &inner.encoded_payload,
+                inner.encoded_payload.len(),
+            )
+            .map_err(|e| {
+                RoundError::InvalidWirePayload(format!("invalid sparse opening payload: {e:?}"))
+            })?;
+            if msg.payload.original_len != inner.num_elements {
+                return Err(RoundError::DimensionMismatch {
+                    expected: inner.num_elements as usize,
+                    got: msg.payload.original_len as usize,
+                });
+            }
+            let canonical_payload_digest = canonical_sparse_opening_digest_v2(
+                &inner.swarm_instance_id,
+                expected_run,
+                inner.round_id,
+                &expected_base,
+                &inner.context_policy_digest,
+                originator,
+                &msg,
+            );
+            Ok(PreparedPayloadV2::SparseOpening {
+                msg,
+                canonical_payload_digest,
+                wire_bytes,
+            })
         }
         other => Err(RoundError::InvalidWirePayload(format!(
             "unsupported compression_schema_version {other}"
@@ -6245,6 +7509,665 @@ mod tests {
             RoundError::RoundIdOverflow { round_id: u64::MAX }
         ));
         assert_eq!(coord.current_round(), u64::MAX);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_sparse_commitment_delivery<M: SwarmModel + Clone>(
+        peer: &TestPeer,
+        coord: &SwarmRoundCoordinator<M>,
+        session_id: [u8; 32],
+        epoch: u64,
+        seq: u64,
+        ts_secs: u32,
+        msg: &SharedSeedCommitmentMessageV1,
+    ) -> Vec<u8> {
+        let encoded_payload = encode_shared_seed_commitment_payload_v2(msg).unwrap();
+        let inner = InnerUpdateV2 {
+            originator_public_key: *peer.auth.key_pair().public_key(),
+            swarm_instance_id: coord.swarm_instance_id(),
+            run_id: *coord.run_id().as_bytes(),
+            round_id: coord.current_round(),
+            contribution_id: seq,
+            base_checkpoint_digest: *coord.parent_digest().as_bytes(),
+            context_policy_digest: coord.context_policy_digest(),
+            payload_kind: PayloadKindV1::SharedSeedCommitmentV1,
+            compression_schema_version: COMPRESSION_SCHEMA_SHARED_SEED_COMMITMENT_V1,
+            num_elements: msg.commitment.original_len,
+            reported_examples: 0,
+            encoded_payload,
+            originator_signature: Vec::new(),
+        };
+        BundledGossipDeliveryV2::new_signed(
+            &peer.auth,
+            inner,
+            coord.coordinator_peer_id(),
+            session_id,
+            epoch,
+            seq,
+            ts_secs,
+        )
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_sparse_opening_delivery<M: SwarmModel + Clone>(
+        peer: &TestPeer,
+        coord: &SwarmRoundCoordinator<M>,
+        session_id: [u8; 32],
+        epoch: u64,
+        seq: u64,
+        ts_secs: u32,
+        msg: &SharedSeedOpeningMessageV1,
+    ) -> Vec<u8> {
+        let encoded_payload = encode_shared_seed_opening_payload_v2(msg).unwrap();
+        let inner = InnerUpdateV2 {
+            originator_public_key: *peer.auth.key_pair().public_key(),
+            swarm_instance_id: coord.swarm_instance_id(),
+            run_id: *coord.run_id().as_bytes(),
+            round_id: coord.current_round(),
+            contribution_id: seq,
+            base_checkpoint_digest: *coord.parent_digest().as_bytes(),
+            context_policy_digest: coord.context_policy_digest(),
+            payload_kind: PayloadKindV1::SharedSeedOpeningV1,
+            compression_schema_version: COMPRESSION_SCHEMA_SHARED_SEED_OPENING_V1,
+            num_elements: msg.payload.original_len,
+            reported_examples: 0,
+            encoded_payload,
+            originator_signature: Vec::new(),
+        };
+        BundledGossipDeliveryV2::new_signed(
+            &peer.auth,
+            inner,
+            coord.coordinator_peer_id(),
+            session_id,
+            epoch,
+            seq,
+            ts_secs,
+        )
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn st12_two_phase_collective_shared_seed_end_to_end_and_adversarials() {
+        use swarm_torch_core::compression::SharedSeedResidualCompressor;
+
+        let base = temp_dir("st12_two_phase_sparse_e2e");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x71; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(11);
+        let p2 = TestPeer::new(12);
+        let p3 = TestPeer::new(13);
+        let p4 = TestPeer::new(14);
+        let p_byz = TestPeer::new(15);
+        let authorized: BTreeSet<PeerId> = [
+            p1.peer_id,
+            p2.peer_id,
+            p3.peer_id,
+            p4.peer_id,
+            p_byz.peer_id,
+        ]
+        .into_iter()
+        .collect();
+
+        // 4 honest peers + 1 Byzantine peer over a 6-dim LinearModel (4 weights + 2 biases).
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::TrimmedMean { trim_ratio: 0.25 },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: authorized,
+            min_quorum: 3,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let initial = LinearModel::new(2, 2).unwrap(); // d = 6 (4 weights + 2 biases)
+        let mut coord =
+            SwarmRoundCoordinator::initialize(run_id, config, initial.clone(), &mut session, 1_000)
+                .unwrap();
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x02, 100);
+        let s3 = p3.establish_session(&mut coord, 1, 0x03, 100);
+        let s4 = p4.establish_session(&mut coord, 1, 0x04, 100);
+        let sb = p_byz.establish_session(&mut coord, 1, 0x05, 100);
+
+        // PrecommittedHashLock beacon for round 1
+        let beacon_secret = [0x42u8; 32];
+        let beacon_digest = SparseBeaconPolicyV1::precommit_digest(
+            &coord.swarm_instance_id(),
+            run_id,
+            1,
+            &beacon_secret,
+        );
+        let sparse_ctx = coord
+            .begin_sparse_round_v1(
+                3,
+                SharedSeedScalingProfile::UnscaledProjectionV1,
+                SparseBeaconPolicyV1::PrecommittedHashLock {
+                    commitment_digest: beacon_digest,
+                },
+            )
+            .unwrap();
+        let ctx_digest = sparse_ctx.context_digest().unwrap();
+        assert_eq!(
+            coord.active_sparse_round_phase(),
+            Some(SparseRoundPhaseV1::CollectingCommitments)
+        );
+
+        // Mutual exclusion: dense frame cannot be submitted while sparse round is active.
+        let dense_try = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1; 6],
+            0,
+        );
+        assert!(matches!(
+            coord
+                .submit_verified_delivery(&dense_try, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap_err(),
+            RoundError::InvalidWirePayload(_)
+        ));
+
+        let mut comp1 = SharedSeedResidualCompressor::new(6, 3).unwrap();
+        let mut comp2 = SharedSeedResidualCompressor::new(6, 3).unwrap();
+        let mut comp3 = SharedSeedResidualCompressor::new(6, 3).unwrap();
+        let mut compb = SharedSeedResidualCompressor::new(6, 3).unwrap();
+
+        let (u1, c1) = comp1
+            .prepare_pre_seed_vector(&[0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
+            .unwrap();
+        let (u2, c2) = comp2
+            .prepare_pre_seed_vector(&[0.4, 0.4, 0.4, 0.4, 0.4, 0.4])
+            .unwrap();
+        let (u3, c3) = comp3
+            .prepare_pre_seed_vector(&[0.6, 0.6, 0.6, 0.6, 0.6, 0.6])
+            .unwrap();
+        let (ub, cb) = compb
+            .prepare_pre_seed_vector(&[-99.0, -99.0, -99.0, -99.0, -99.0, -99.0])
+            .unwrap();
+
+        for (peer, sid, comm, seq) in [
+            (&p1, s1, c1, 1u64),
+            (&p2, s2, c2, 1u64),
+            (&p3, s3, c3, 1u64),
+            (&p_byz, sb, cb, 1u64),
+        ] {
+            let wire = build_sparse_commitment_delivery(
+                peer,
+                &coord,
+                sid,
+                1,
+                seq,
+                100,
+                &SharedSeedCommitmentMessageV1 {
+                    context_digest: ctx_digest,
+                    commitment: comm,
+                },
+            );
+            assert!(coord
+                .submit_sparse_commitment_delivery(&wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .is_ok());
+        }
+        // Notice p4 deliberately skipped Phase 1!
+
+        // Negative beacon test: wrong preimage fails without advancing phase or altering state.
+        let wrong_beacon = SparseBeaconRevealV1 {
+            beacon_r: [0x99u8; 32],
+            signature: None,
+        };
+        assert!(matches!(
+            coord
+                .finalize_sparse_commitments_with_beacon(&wrong_beacon)
+                .unwrap_err(),
+            RoundError::InvalidWirePayload(_)
+        ));
+        assert_eq!(
+            coord.active_sparse_round_phase(),
+            Some(SparseRoundPhaseV1::CollectingCommitments)
+        );
+
+        let good_beacon = SparseBeaconRevealV1 {
+            beacon_r: beacon_secret,
+            signature: None,
+        };
+        let (commitments_root, shared_round_seed) = coord
+            .finalize_sparse_commitments_with_beacon(&good_beacon)
+            .unwrap();
+        assert_eq!(
+            coord.active_sparse_round_phase(),
+            Some(SparseRoundPhaseV1::CollectingOpenings)
+        );
+        assert_eq!(coord.active_sparse_shared_seed(), Some(shared_round_seed));
+
+        // Prepare openings for p1, p2, p3, p_byz
+        let (pl1, op1) = comp1
+            .finalize_with_seed(&u1, &c1, shared_round_seed)
+            .unwrap();
+        let (pl2, op2) = comp2
+            .finalize_with_seed(&u2, &c2, shared_round_seed)
+            .unwrap();
+        let (pl3, op3) = comp3
+            .finalize_with_seed(&u3, &c3, shared_round_seed)
+            .unwrap();
+        let (plb, opb) = compb
+            .finalize_with_seed(&ub, &cb, shared_round_seed)
+            .unwrap();
+
+        // Negative 1: Late peer p4 who missed Phase-1 commitments_root cannot open in Phase 2.
+        let mut comp4 = SharedSeedResidualCompressor::new(6, 3).unwrap();
+        let (u4, c4) = comp4.prepare_pre_seed_vector(&[0.5; 6]).unwrap();
+        let (pl4, op4) = comp4
+            .finalize_with_seed(&u4, &c4, shared_round_seed)
+            .unwrap();
+        let late_wire = build_sparse_opening_delivery(
+            &p4,
+            &coord,
+            s4,
+            1,
+            1,
+            100,
+            &SharedSeedOpeningMessageV1 {
+                context_digest: ctx_digest,
+                commitments_root,
+                shared_round_seed,
+                payload: pl4,
+                openings: op4,
+            },
+        );
+        assert!(matches!(
+            coord
+                .submit_sparse_opening_delivery(&late_wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap_err(),
+            RoundError::UnauthorizedPeer(id) if id == p4.peer_id
+        ));
+
+        // Negative 2: Forged coordinate value fails Stage B Merkle check BEFORE replay consumption!
+        let mut forged_pl1 = pl1.clone();
+        forged_pl1.values[0] = 555.0;
+        let forged_wire = build_sparse_opening_delivery(
+            &p1,
+            &coord,
+            s1,
+            1,
+            2,
+            100,
+            &SharedSeedOpeningMessageV1 {
+                context_digest: ctx_digest,
+                commitments_root,
+                shared_round_seed,
+                payload: forged_pl1,
+                openings: op1.clone(),
+            },
+        );
+        assert!(matches!(
+            coord
+                .submit_sparse_opening_delivery(
+                    &forged_wire,
+                    DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                    100
+                )
+                .unwrap_err(),
+            RoundError::InvalidWirePayload(_)
+        ));
+        assert_eq!(coord.admitted_count(), 0);
+
+        // Negative 3: Per-sender seed divergence fails Stage B check before replay consumption!
+        let divergent_seed = [0xAAu8; 32];
+        let mut comp1_dup = SharedSeedResidualCompressor::new(6, 3).unwrap();
+        let (u1_dup, c1_dup) = comp1_dup
+            .prepare_pre_seed_vector(&[0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
+            .unwrap();
+        let (div_pl, div_op) = comp1_dup
+            .finalize_with_seed(&u1_dup, &c1_dup, divergent_seed)
+            .unwrap();
+        let div_wire = build_sparse_opening_delivery(
+            &p1,
+            &coord,
+            s1,
+            1,
+            2,
+            100,
+            &SharedSeedOpeningMessageV1 {
+                context_digest: ctx_digest,
+                commitments_root,
+                shared_round_seed: divergent_seed,
+                payload: div_pl,
+                openings: div_op,
+            },
+        );
+        assert!(matches!(
+            coord
+                .submit_sparse_opening_delivery(&div_wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap_err(),
+            RoundError::InvalidWirePayload(_)
+        ));
+
+        // Now p1's honest opening with the SAME sequence 2 succeeds because Stage B failed without
+        // consuming replay state!
+        for (peer, sid, pl, op) in [
+            (&p1, s1, pl1, op1),
+            (&p2, s2, pl2, op2),
+            (&p3, s3, pl3, op3),
+            (&p_byz, sb, plb, opb),
+        ] {
+            let wire = build_sparse_opening_delivery(
+                peer,
+                &coord,
+                sid,
+                1,
+                2,
+                100,
+                &SharedSeedOpeningMessageV1 {
+                    context_digest: ctx_digest,
+                    commitments_root,
+                    shared_round_seed,
+                    payload: pl,
+                    openings: op,
+                },
+            );
+            assert!(coord
+                .submit_sparse_opening_delivery(&wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .is_ok());
+        }
+        assert!(coord.has_quorum());
+        assert_eq!(coord.admitted_count(), 4);
+
+        // Finalize sparse round using TrimmedMean (trim 20% of 4 = 0, wait: 0.2 * 4 = 0.8 floor = 0,
+        // wait: let's check what trim_ratio=0.25 does on 4 peers: trims min (-99.0) and max (0.6) -> mean(0.2, 0.4) = 0.3!).
+        // With 0.2 * 4 = 0, let's adjust or still check common support zero-outside! Actually let's check both!
+        let (summary, bw) = coord
+            .finalize_sparse_round::<swarm_torch_models::optim::SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(summary.round_id, 1);
+        assert_eq!(coord.current_round(), 2);
+        assert!(coord.active_sparse_round_context().is_none());
+        assert_eq!(bw.peer_count, 4);
+        assert_eq!(bw.raw_dense_bytes_total, 4 * 6 * 4);
+        assert_eq!(bw.projected_values_bytes_total, 4 * 3 * 4);
+        assert_eq!(
+            bw.projected_values_bytes_total
+                + bw.merkle_proof_bytes_total
+                + bw.envelope_and_framing_bytes_total,
+            bw.total_two_phase_wire_bytes
+        );
+        assert_eq!(coord.last_sparse_bandwidth_report(), Some(&bw));
+
+        // Coordinates outside S_round must remain untouched from initial weights (zero outside support).
+        let sampled =
+            swarm_torch_core::compression::sample_shared_indices_v1(6, 3, &shared_round_seed)
+                .unwrap();
+        // Coordinates on S_round must reflect TrimmedMean([0.2, 0.4, 0.6, -99.0], trim=1) = 0.3
+        // (Byzantine outlier defeated!), while coordinates outside S_round stay untouched.
+        for idx in 0..6usize {
+            let p_after = coord.model().parameters()[idx];
+            if sampled.contains(&(idx as u32)) {
+                assert!(
+                    (p_after - (initial.parameters()[idx] + 0.3)).abs() < 1e-6,
+                    "coord {idx}: expected +0.3 update, got {} -> {}",
+                    initial.parameters()[idx],
+                    p_after
+                );
+            } else {
+                assert_eq!(p_after, initial.parameters()[idx]);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st12_ed25519_beacon_equivocation_and_crash_seam_preserve_state() {
+        use swarm_torch_core::compression::SharedSeedResidualCompressor;
+
+        let base = temp_dir("st12_beacon_crash_equiv");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x72; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let signer_kp = KeyPair::from_seed([0x66; 32]).unwrap();
+        let signer_pub = *signer_kp.public_key();
+        let beacon_auth = MessageAuth::new(KeyPair::from_seed([0x55; 32]).unwrap());
+        let p1 = TestPeer::new(21);
+        let p2 = TestPeer::new(22);
+        let p3 = TestPeer::new(23);
+        let authorized: BTreeSet<PeerId> =
+            [p1.peer_id, p2.peer_id, p3.peer_id].into_iter().collect();
+
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::Median,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: authorized,
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer_kp);
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x02, 100);
+        let s3 = p3.establish_session(&mut coord, 1, 0x03, 100);
+
+        let ctx = coord
+            .begin_sparse_round_v1(
+                2,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+                SparseBeaconPolicyV1::Ed25519TranscriptBeacon {
+                    beacon_public_key: *beacon_auth.key_pair().public_key(),
+                },
+            )
+            .unwrap();
+        let ctx_digest = ctx.context_digest().unwrap();
+
+        let c1_state = SharedSeedResidualCompressor::new(3, 2).unwrap();
+        let c2_state = SharedSeedResidualCompressor::new(3, 2).unwrap();
+        let c3_state = SharedSeedResidualCompressor::new(3, 2).unwrap();
+
+        let (u1, comm1) = c1_state.prepare_pre_seed_vector(&[0.1, 0.1, 0.1]).unwrap();
+        let (u2, comm2) = c2_state.prepare_pre_seed_vector(&[0.3, 0.3, 0.3]).unwrap();
+        let (_u3_a, comm3_a) = c3_state.prepare_pre_seed_vector(&[0.2, 0.2, 0.2]).unwrap();
+        let (_u3_b, comm3_b) = c3_state.prepare_pre_seed_vector(&[9.0, 9.0, 9.0]).unwrap();
+
+        for (peer, sid, comm) in [(&p1, s1, comm1), (&p2, s2, comm2), (&p3, s3, comm3_a)] {
+            let wire = build_sparse_commitment_delivery(
+                peer,
+                &coord,
+                sid,
+                1,
+                1,
+                100,
+                &SharedSeedCommitmentMessageV1 {
+                    context_digest: ctx_digest,
+                    commitment: comm,
+                },
+            );
+            coord
+                .submit_sparse_commitment_delivery(&wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        // Conflicting second commitment from p3 must trigger EquivocationRejected & evict p3!
+        let equiv_wire = build_sparse_commitment_delivery(
+            &p3,
+            &coord,
+            s3,
+            1,
+            2,
+            100,
+            &SharedSeedCommitmentMessageV1 {
+                context_digest: ctx_digest,
+                commitment: comm3_b,
+            },
+        );
+        assert!(matches!(
+            coord
+                .submit_sparse_commitment_delivery(
+                    &equiv_wire,
+                    DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                    100
+                )
+                .unwrap_err(),
+            RoundError::EquivocationRejected { sender, round_id: 1 } if sender == p3.peer_id
+        ));
+        assert_eq!(coord.equivocated_count(), 1);
+
+        let commitments_root =
+            compute_commitments_root_v1(&ctx_digest, &[(p1.peer_id, comm1), (p2.peer_id, comm2)])
+                .unwrap();
+        let beacon_r = [0x77u8; 32];
+        let sig = SparseBeaconPolicyV1::sign_transcript_beacon(
+            &beacon_auth,
+            &ctx_digest,
+            &commitments_root,
+            &beacon_r,
+        );
+        // Forged beacon (unsigned / wrong sig) rejected cleanly
+        assert!(matches!(
+            coord
+                .finalize_sparse_commitments_with_beacon(&SparseBeaconRevealV1 {
+                    beacon_r,
+                    signature: Some([0x11u8; 64]),
+                })
+                .unwrap_err(),
+            RoundError::InvalidWirePayload(_)
+        ));
+        let (root_out, shared_seed) = coord
+            .finalize_sparse_commitments_with_beacon(&SparseBeaconRevealV1 {
+                beacon_r,
+                signature: Some(*sig.as_bytes()),
+            })
+            .unwrap();
+        assert_eq!(root_out, commitments_root);
+
+        // Open for p1 and p2 (honest un-scaled `open_for_seed` or `ScaledUnbiasedV1`)
+        let (pl1, op1) = comm1
+            .open_for_seed(
+                &u1,
+                2,
+                shared_seed,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+            )
+            .unwrap();
+        let (pl2, op2) = comm2
+            .open_for_seed(
+                &u2,
+                2,
+                shared_seed,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+            )
+            .unwrap();
+        for (peer, sid, pl, op) in [(&p1, s1, pl1, op1), (&p2, s2, pl2, op2)] {
+            let wire = build_sparse_opening_delivery(
+                peer,
+                &coord,
+                sid,
+                1,
+                2,
+                100,
+                &SharedSeedOpeningMessageV1 {
+                    context_digest: ctx_digest,
+                    commitments_root,
+                    shared_round_seed: shared_seed,
+                    payload: pl,
+                    openings: op,
+                },
+            );
+            coord
+                .submit_sparse_opening_delivery(&wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+
+        // Inject pre-commit crash seam -> state and current_round must remain untouched!
+        coord.fail_point = Some(CommitFailPoint::AfterManifestBeforeCommittedHead);
+        assert!(coord
+            .finalize_sparse_round::<swarm_torch_models::optim::SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .is_err());
+        assert_eq!(coord.current_round(), 1);
+        assert!(coord.active_sparse_round_context().is_some());
+        assert_eq!(coord.model().parameters(), &[1.0, 2.0, 0.5]);
+
+        // Retry after clearing fault succeeds transactionally!
+        let (summary, _bw) = coord
+            .finalize_sparse_round::<swarm_torch_models::optim::SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(summary.round_id, 1);
+        assert_eq!(coord.current_round(), 2);
+        assert!(coord.active_sparse_round_context().is_none());
+
+        // Strict restart recovers committed round-1 model weights cleanly!
+        let restored = SwarmRoundCoordinator::restore_with_mode::<
+            swarm_torch_models::optim::SgdOptimizer<LinearModel, 16>,
+        >(
+            RestoreModeV1::ExactTrainingResume,
+            config,
+            LinearModel::new(2, 1).unwrap(),
+            None,
+            &session,
+            &TrustPolicy::Strict {
+                trusted_public_keys: vec![signer_pub],
+                expected_run_id: Some(run_id),
+                min_signed_unix_nanos: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(restored.current_round(), 2);
+        assert_eq!(restored.model().parameters(), coord.model().parameters());
 
         let _ = fs::remove_dir_all(&base);
     }

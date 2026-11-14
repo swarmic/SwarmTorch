@@ -5,7 +5,17 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0`, `13A`, & `13B`)
+## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0`, `13A`, `13B`, & `13C`)
+
+### Security, Async Runtime, & Aggregation (`Phase 13C` — Evented I/O, Embassy Runtime, Bulyan Stage 2, & Two-Phase `SharedSeedSparse`)
+- **Evented Transport Waiters, Fallible `SwarmRuntime::try_spawn`, & Real `EmbassyRuntime` (`ST-06`, `ST-07`, `13C-1`):**
+  - Replaced polling `std::thread::sleep` loops across `swarm-torch-net` (`MockNetworkHub`, `TcpTransport`, `UdpGossipTransport`) with bounded deduplicated `WaiterQueue` waker notifications (`waiters.rs`) and evented Tokio OS socket I/O, verified by concurrent receive-before-send integration tests.
+  - Replaced fire-and-forget task spawning with primary fallible `SwarmRuntime::try_spawn -> Result<Self::TaskHandle, SpawnError>` across `TokioRuntime`, `MockRuntime`, and `EmbassyRuntime`, wired `EmbassyRuntime` (`SwarmClock`) to `embassy_time::{Instant, Timer}` plus `EmbassyRuntime::try_spawn_task` (`embassy_executor::SendSpawner` with `embassy-std-test` integration), and added embedded ARM CI lanes (`thumbv6m-none-eabi`, `thumbv7em-none-eabihf`) in `.github/workflows/rust.yml`.
+- **Q9 Bulyan Stage 2 Canonical Peer Tie-Breaking (`ST-11`, `13C-2`):**
+  - Updated `swarm-torch-core::aggregation::bulyan_stage2_core` (`Bulyan::aggregate` passing `PeerId::new(updates[idx].sender)`, plus `bulyan_stage2_with_peers` and `bulyan_stage2_nearest_to_median`) to select the lower observed median `sorted[(theta - 1) / 2]` per coordinate and rank $\beta = \theta - 2f$ nearest survivors by `(|val - M|, PeerId)`, documenting even-$\theta$ non-equivariance (`Q9`).
+- **End-to-End Two-Phase Collective `SharedSeedSparse` Protocol (`ST-12`, `13C-3`):**
+  - Added `SparseRoundContextV1`, `SharedSeedCommitmentMessageV1`, `SharedSeedOpeningMessageV1`, `compute_commitments_root_v1`, `derive_context_bound_round_seed_v1`, `SharedSeedCoordinateVerifier`, and honest `SharedSeedBandwidthReportV1` (tracking projected values, Merkle opening proof overhead, and Phase-1/Phase-2 wire framing) in `swarm-torch-core::compression`.
+  - Extended `PayloadKindV1` with `SharedSeedCommitmentV1 = 4` and `SharedSeedOpeningV1 = 5` (`swarm-torch-net::gossip`), implemented `SparseBeaconPolicyV1::{PrecommittedHashLock, Ed25519TranscriptBeacon}` + `ExpectedRoundContextV1::{validate_sparse_commitment_submission, validate_sparse_opening_submission}` + `SwarmRoundCoordinator::{begin_sparse_round_v1, commit_sparse_commitment_submission, submit_sparse_commitment_delivery, finalize_sparse_commitments_with_beacon, commit_sparse_opening_submission, submit_sparse_opening_delivery, finalize_sparse_round}` with active-sparse mutual exclusion checked before replay commitment (`ST-01` prepare -> validate -> commit), and updated `examples/byzantine_federated_round.rs`.
 
 ### Security & Reliability (`Phase 13B` — Transactional Learning, Durable Storage, & `PhysicalStrict` Execution)
 - **Transactional Coordinator Commits & Resumable Training State (`ST-04`, `13B-1`):**

@@ -26,6 +26,9 @@ pub mod traits;
 #[cfg(feature = "std")]
 pub mod udp;
 
+#[cfg(feature = "std")]
+mod waiters;
+
 mod mock;
 pub use mock::MockTransport;
 #[cfg(feature = "alloc")]

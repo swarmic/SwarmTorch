@@ -1,7 +1,14 @@
 #![forbid(unsafe_code)]
-//! Isolated QUIC / `Iroh` 1-RTT carrier adapter (`ADR-0022` §4, `W12-02`).
+//! Isolated QUIC / `Iroh` 1-RTT carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`).
+//!
+//! **Maturity Tier:** `Simulation verified` — deterministic ALPN, 1-RTT stage gating, bounded
+//! framing, link-vs-originator binding (`StrictOneToOne` / `DecoupledRelayAllowed`), and bounded
+//! sliding-window pre-auth rate limiting are enforced and tested locally. Live `iroh` QUIC endpoint
+//! handshake integration is isolated for Phase `13D-2`.
 
-use std::collections::BTreeMap;
+use core::fmt;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use swarm_torch_core::replay::ReplayProtection;
 use swarm_torch_core::traits::PeerId;
@@ -15,6 +22,16 @@ use swarm_torch_net::gossip::{
 };
 use swarm_torch_net::protocol::{MessageEnvelope, VerifyError};
 
+/// Default maximum number of distinct QUIC link principals tracked simultaneously in
+/// [`LinkFrameQuotaTrackerV1`] before fail-closed saturation (`ST-08`).
+pub const DEFAULT_MAX_TRACKED_LINK_PRINCIPALS: usize = 1024;
+
+/// Default maximum number of per-frame timestamps retained per link principal window (`ST-08`).
+pub const DEFAULT_MAX_WINDOW_TIMESTAMPS_PER_LINK: usize = 1024;
+
+/// Default sliding-window duration (in seconds) for [`LinkFrameQuotaTrackerV1`] (`ST-08`).
+pub const DEFAULT_LINK_QUOTA_WINDOW_SECS: u64 = 60;
+
 /// Errors produced while decoding or authenticating an Iroh bi-stream frame.
 #[derive(Debug)]
 pub enum IrohCarrierError {
@@ -22,10 +39,38 @@ pub enum IrohCarrierError {
     Carrier(CarrierError),
     /// Per-link principal rate limit exceeded before cryptographic admission.
     LinkRateLimited { link_peer: PeerId },
+    /// Per-link quota table saturated (`max_tracked_links`) with active non-expired principals.
+    LinkQuotaTableFull { max_tracked_links: usize },
     /// Direct envelope verification failed.
     Envelope(VerifyError),
     /// Multi-hop gossip envelope verification failed.
     Gossip(GossipVerifyError),
+}
+
+impl fmt::Display for IrohCarrierError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Carrier(e) => write!(f, "iroh carrier error: {e}"),
+            Self::LinkRateLimited { .. } => write!(f, "per-link pre-auth frame quota exceeded"),
+            Self::LinkQuotaTableFull { max_tracked_links } => write!(
+                f,
+                "per-link quota table saturated at max_tracked_links={max_tracked_links}"
+            ),
+            Self::Envelope(e) => write!(f, "envelope verification failed: {e}"),
+            Self::Gossip(e) => write!(f, "gossip verification failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for IrohCarrierError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Carrier(e) => Some(e),
+            Self::Envelope(e) => Some(e),
+            Self::Gossip(e) => Some(e),
+            Self::LinkRateLimited { .. } | Self::LinkQuotaTableFull { .. } => None,
+        }
+    }
 }
 
 impl From<CarrierError> for IrohCarrierError {
@@ -52,39 +97,153 @@ pub struct AcceptedIrohGossipV1 {
     pub delivery: BundledGossipDeliveryV1,
 }
 
-/// Per-link pre-auth frame budget tracker keyed strictly on the TLS/QUIC link principal (`PeerId`),
-/// ensuring spoofed inner sender headers cannot poison another peer's quota (`ADR-0022` §4).
-#[derive(Debug, Clone, Default)]
+/// Bounded sliding-window per-link pre-auth frame budget tracker keyed strictly on the TLS/QUIC
+/// link principal (`PeerId`), ensuring spoofed inner sender headers or Sybil ephemeral keys cannot
+/// poison another peer's quota or trigger unbounded memory growth (`ADR-0022` §4, `ST-08`).
+#[derive(Debug, Clone)]
 pub struct LinkFrameQuotaTrackerV1 {
     max_frames_per_link: u64,
-    counts: BTreeMap<PeerId, u64>,
+    window_secs: u64,
+    max_tracked_links: usize,
+    max_timestamps_per_link: usize,
+    counts: BTreeMap<PeerId, VecDeque<u64>>,
+}
+
+impl Default for LinkFrameQuotaTrackerV1 {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl LinkFrameQuotaTrackerV1 {
-    /// Construct a per-link frame quota tracker (`max_frames_per_link = 0` disables throttling).
+    /// Construct a per-link sliding-window frame quota tracker (`max_frames_per_link = 0` disables
+    /// throttling) using default bounded table limits (`1024` tracked links, `1024` timestamps/link,
+    /// `60s` sliding window).
     pub fn new(max_frames_per_link: u64) -> Self {
+        Self::with_limits(
+            max_frames_per_link,
+            DEFAULT_LINK_QUOTA_WINDOW_SECS,
+            DEFAULT_MAX_TRACKED_LINK_PRINCIPALS,
+            DEFAULT_MAX_WINDOW_TIMESTAMPS_PER_LINK,
+        )
+    }
+
+    /// Construct a per-link sliding-window quota tracker with explicit table and window limits.
+    pub fn with_limits(
+        max_frames_per_link: u64,
+        window_secs: u64,
+        max_tracked_links: usize,
+        max_timestamps_per_link: usize,
+    ) -> Self {
         Self {
             max_frames_per_link,
+            window_secs,
+            max_tracked_links,
+            max_timestamps_per_link,
             counts: BTreeMap::new(),
         }
     }
 
-    /// Record one frame arrival against `link_principal.link_peer_id`.
-    pub fn record_frame(
+    /// Current number of tracked link principals in the quota map.
+    pub fn tracked_link_count(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Current number of retained frame timestamps for `link_peer`.
+    pub fn active_window_count(&self, link_peer: &PeerId) -> usize {
+        self.counts.get(link_peer).map_or(0, VecDeque::len)
+    }
+
+    fn prune_deque(q: &mut VecDeque<u64>, now_secs: u64, window_secs: u64) {
+        while let Some(&ts) = q.front() {
+            let expired = if window_secs == 0 {
+                ts < now_secs
+            } else {
+                now_secs.saturating_sub(ts) >= window_secs
+            };
+            if expired {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn insert_sorted_timestamp(q: &mut VecDeque<u64>, ts: u64) {
+        if q.back().map_or(true, |&last| ts >= last) {
+            q.push_back(ts);
+        } else {
+            let (front_slice, back_slice) = q.as_slices();
+            let pos = if back_slice.first().map_or(true, |&b| ts < b) {
+                front_slice.partition_point(|&x| x <= ts)
+            } else {
+                front_slice.len() + back_slice.partition_point(|&x| x <= ts)
+            };
+            q.insert(pos, ts);
+        }
+    }
+
+    /// Record one frame arrival at `now_secs` against `link_principal.link_peer_id`, enforcing lazy
+    /// window expiry and fail-closed table saturation.
+    pub fn record_frame_at(
         &mut self,
         link_principal: &VerifiedLinkPrincipalV1,
+        now_secs: u64,
     ) -> Result<(), IrohCarrierError> {
         if self.max_frames_per_link == 0 {
             return Ok(());
         }
-        let count = self.counts.entry(link_principal.link_peer_id).or_insert(0);
-        if *count >= self.max_frames_per_link {
-            return Err(IrohCarrierError::LinkRateLimited {
-                link_peer: link_principal.link_peer_id,
+        let link_peer = link_principal.link_peer_id;
+        if let Some(q) = self.counts.get_mut(&link_peer) {
+            Self::prune_deque(q, now_secs, self.window_secs);
+            if q.len() as u64 >= self.max_frames_per_link || q.len() >= self.max_timestamps_per_link
+            {
+                return Err(IrohCarrierError::LinkRateLimited { link_peer });
+            }
+            Self::insert_sorted_timestamp(q, now_secs);
+            return Ok(());
+        }
+
+        if self.max_tracked_links == 0 {
+            return Err(IrohCarrierError::LinkQuotaTableFull {
+                max_tracked_links: self.max_tracked_links,
             });
         }
-        *count = count.saturating_add(1);
+
+        if self.counts.len() >= self.max_tracked_links {
+            let window_secs = self.window_secs;
+            self.counts.retain(|_, q| {
+                Self::prune_deque(q, now_secs, window_secs);
+                !q.is_empty()
+            });
+            if self.counts.len() >= self.max_tracked_links {
+                return Err(IrohCarrierError::LinkQuotaTableFull {
+                    max_tracked_links: self.max_tracked_links,
+                });
+            }
+        }
+
+        if self.max_timestamps_per_link == 0 {
+            return Err(IrohCarrierError::LinkRateLimited { link_peer });
+        }
+
+        let mut q = VecDeque::new();
+        q.push_back(now_secs);
+        self.counts.insert(link_peer, q);
         Ok(())
+    }
+
+    /// Record one frame arrival using the host Unix clock. Prefer [`Self::record_frame_at`] for
+    /// deterministic time-window evaluation.
+    pub fn record_frame(
+        &mut self,
+        link_principal: &VerifiedLinkPrincipalV1,
+    ) -> Result<(), IrohCarrierError> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.record_frame_at(link_principal, now_secs)
     }
 }
 
@@ -128,8 +287,13 @@ impl IrohCarrierAdapterV1 {
         }
     }
 
-    /// Validate connection handshake (`ALPN_SWARMTORCH_DELIVERY_V1` + `OneRttComplete` only).
-    pub fn accept_connection(
+    /// **Test / simulation helper only:** construct a simulated [`VerifiedLinkPrincipalV1`] from a
+    /// raw 32-byte public key, validating `ALPN_SWARMTORCH_DELIVERY_V1` + `OneRttComplete`.
+    ///
+    /// Live QUIC deployment will bind [`VerifiedLinkPrincipalV1`] strictly to authenticated
+    /// `iroh` 1-RTT endpoint connections (`Phase 13D-2`).
+    #[doc(hidden)]
+    pub fn simulated_link_principal_for_test(
         &self,
         negotiated_alpn: &[u8],
         handshake_stage: QuicHandshakeStageV1,
@@ -148,7 +312,8 @@ impl IrohCarrierAdapterV1 {
     }
 
     /// Accept one length-prefixed direct [`MessageEnvelope`] frame from `stream_bytes`,
-    /// verify signature & replay admission, bind originator policy, and return `(accepted, remaining_bytes)`.
+    /// enforcing per-link quota and link-vs-originator binding policy **before** replay admission,
+    /// and return `(accepted, remaining_bytes)`.
     pub fn accept_envelope_frame<'a>(
         &self,
         link_principal: VerifiedLinkPrincipalV1,
@@ -158,23 +323,24 @@ impl IrohCarrierAdapterV1 {
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
     ) -> Result<(AcceptedIrohEnvelopeV1, &'a [u8]), IrohCarrierError> {
         if let Some(tracker) = quota {
-            tracker.record_frame(&link_principal)?;
+            tracker.record_frame_at(&link_principal, u64::from(current_time_secs))?;
         }
         let (frame, rest) = self.codec.decode_next_frame(stream_bytes)?;
         let envelope = MessageEnvelope::deserialize_bounded(frame, self.policy.max_frame_bytes)
-            .map_err(IrohCarrierError::Envelope)?;
-        envelope
-            .verify_authenticated(replay_guard, current_time_secs)
             .map_err(IrohCarrierError::Envelope)?;
         let originator = envelope
             .sender_peer_id()
             .map_err(|_| IrohCarrierError::Envelope(VerifyError::InvalidSenderKey))?;
         let binding = self.policy.bind_originator(link_principal, originator)?;
+        envelope
+            .verify_authenticated(replay_guard, current_time_secs)
+            .map_err(IrohCarrierError::Envelope)?;
         Ok((AcceptedIrohEnvelopeV1 { binding, envelope }, rest))
     }
 
     /// Accept one length-prefixed bundled gossip delivery frame (`BundledGossipDeliveryV1`),
-    /// authenticating recipient wrapper + originator payload BEFORE replay commit.
+    /// checking wrapper/inner originator parity and carrier binding policy **before** mutating
+    /// `replay_guard`.
     pub fn accept_gossip_frame<'a>(
         &self,
         link_principal: VerifiedLinkPrincipalV1,
@@ -185,7 +351,7 @@ impl IrohCarrierAdapterV1 {
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
     ) -> Result<(AcceptedIrohGossipV1, &'a [u8]), IrohCarrierError> {
         if let Some(tracker) = quota {
-            tracker.record_frame(&link_principal)?;
+            tracker.record_frame_at(&link_principal, u64::from(current_time_secs))?;
         }
         let (frame, rest) = self.codec.decode_next_frame(stream_bytes)?;
         let max_gossip = self
@@ -194,10 +360,18 @@ impl IrohCarrierAdapterV1 {
             .min(DEFAULT_MAX_GOSSIP_DELIVERY_BYTES);
         let delivery = BundledGossipDeliveryV1::from_bytes_bounded(frame, max_gossip)
             .map_err(IrohCarrierError::Gossip)?;
-        let originator = delivery
+        if delivery.wrapper.originator_public_key != delivery.inner.originator_public_key {
+            return Err(IrohCarrierError::Gossip(
+                GossipVerifyError::OriginatorKeyMismatch,
+            ));
+        }
+        let originator = PeerId::try_from_public_key_bytes(&delivery.wrapper.originator_public_key)
+            .map_err(|_| IrohCarrierError::Gossip(GossipVerifyError::InvalidOriginatorKey))?;
+        let binding = self.policy.bind_originator(link_principal, originator)?;
+        let verified_originator = delivery
             .verify_for_recipient(recipient_peer, replay_guard, current_time_secs)
             .map_err(IrohCarrierError::Gossip)?;
-        let binding = self.policy.bind_originator(link_principal, originator)?;
+        debug_assert_eq!(verified_originator, originator);
         Ok((AcceptedIrohGossipV1 { binding, delivery }, rest))
     }
 }
@@ -222,7 +396,7 @@ mod tests {
 
         // 0-RTT & wrong ALPN rejected pre-admission
         assert!(matches!(
-            relay_adapter.accept_connection(
+            relay_adapter.simulated_link_principal_for_test(
                 ALPN_SWARMTORCH_DELIVERY_V1,
                 QuicHandshakeStageV1::ZeroRtt,
                 relay_kp.public_key()
@@ -230,7 +404,7 @@ mod tests {
             Err(IrohCarrierError::Carrier(CarrierError::EarlyDataRejected))
         ));
         assert!(matches!(
-            relay_adapter.accept_connection(
+            relay_adapter.simulated_link_principal_for_test(
                 b"other/proto",
                 QuicHandshakeStageV1::OneRttComplete,
                 relay_kp.public_key()
@@ -238,11 +412,18 @@ mod tests {
             Err(IrohCarrierError::Carrier(CarrierError::AlpnMismatch))
         ));
 
-        let link = relay_adapter
-            .accept_connection(
+        let relay_link = relay_adapter
+            .simulated_link_principal_for_test(
                 ALPN_SWARMTORCH_DELIVERY_V1,
                 QuicHandshakeStageV1::OneRttComplete,
                 relay_kp.public_key(),
+            )
+            .unwrap();
+        let direct_origin_link = strict_adapter
+            .simulated_link_principal_for_test(
+                ALPN_SWARMTORCH_DELIVERY_V1,
+                QuicHandshakeStageV1::OneRttComplete,
+                origin_kp.public_key(),
             )
             .unwrap();
 
@@ -269,10 +450,10 @@ mod tests {
             .unwrap()
             .with_cohort_allowlist(allowlist.clone());
 
-        // StrictOneToOne rejects relay link != originator
+        // StrictOneToOne rejects relay link != originator WITHOUT mutating strict_replay!
         assert!(matches!(
             strict_adapter.accept_envelope_frame(
-                link,
+                relay_link,
                 &wire_frame,
                 &mut strict_replay,
                 env.timestamp,
@@ -282,10 +463,28 @@ mod tests {
                 CarrierError::StrictBindingMismatch { .. }
             ))
         ));
+        // Prove strict_replay remained clean: the exact same envelope succeeds over direct_origin_link!
+        let (strict_direct, strict_rest) = strict_adapter
+            .accept_envelope_frame(
+                direct_origin_link,
+                &wire_frame,
+                &mut strict_replay,
+                env.timestamp,
+                None,
+            )
+            .unwrap();
+        assert!(strict_rest.is_empty());
+        assert!(!strict_direct.binding.relayed_via_intermediary);
 
         // DecoupledRelayAllowed admits and flags relayed_via_intermediary = true
         let (accepted_env, rest) = relay_adapter
-            .accept_envelope_frame(link, &wire_frame, &mut relay_replay, env.timestamp, None)
+            .accept_envelope_frame(
+                relay_link,
+                &wire_frame,
+                &mut relay_replay,
+                env.timestamp,
+                None,
+            )
             .unwrap();
         assert!(rest.is_empty());
         assert!(accepted_env.binding.relayed_via_intermediary);
@@ -316,12 +515,51 @@ mod tests {
         let gossip_frame = relay_adapter
             .encode_wire_frame(&gossip.to_bytes().unwrap())
             .unwrap();
+
+        let mut strict_gossip_replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(allowlist.clone());
+        // StrictOneToOne rejects relayed gossip before touching strict_gossip_replay!
+        assert!(matches!(
+            strict_adapter.accept_gossip_frame(
+                relay_link,
+                coord_kp.peer_id(),
+                &gossip_frame,
+                &mut strict_gossip_replay,
+                1000,
+                None,
+            ),
+            Err(IrohCarrierError::Carrier(
+                CarrierError::StrictBindingMismatch { .. }
+            ))
+        ));
+        // Tampered inner payload over DecoupledRelayAllowed must fail without mutating replay!
+        let mut tampered_gossip = gossip.clone();
+        tampered_gossip.inner.encoded_payload[0] ^= 0xFF;
+        let tampered_frame = relay_adapter
+            .encode_wire_frame(&tampered_gossip.to_bytes().unwrap())
+            .unwrap();
+        assert!(matches!(
+            relay_adapter.accept_gossip_frame(
+                relay_link,
+                coord_kp.peer_id(),
+                &tampered_frame,
+                &mut strict_gossip_replay,
+                1000,
+                None,
+            ),
+            Err(IrohCarrierError::Gossip(
+                GossipVerifyError::InnerDigestMismatch
+            ))
+        ));
+
+        // After both rejected attempts, the valid frame must still be admitted cleanly!
         let mut coord_replay = ReplayProtection::try_with_config(64, 120)
             .unwrap()
             .with_cohort_allowlist(allowlist);
         let (accepted_gossip, tail) = relay_adapter
             .accept_gossip_frame(
-                link,
+                relay_link,
                 coord_kp.peer_id(),
                 &gossip_frame,
                 &mut coord_replay,
@@ -335,5 +573,79 @@ mod tests {
             accepted_gossip.binding.originator_peer_id,
             origin_kp.peer_id()
         );
+        // Also prove strict_gossip_replay stayed clean across StrictBindingMismatch + InnerDigestMismatch!
+        assert!(strict_adapter
+            .accept_gossip_frame(
+                direct_origin_link,
+                coord_kp.peer_id(),
+                &gossip_frame,
+                &mut strict_gossip_replay,
+                1000,
+                None,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn link_quota_tracker_enforces_sliding_window_expiry_and_fail_closed_table_saturation() {
+        let adapter = IrohCarrierAdapterV1::default();
+        let kp1 = KeyPair::from_seed([0x41; 32]).unwrap();
+        let kp2 = KeyPair::from_seed([0x42; 32]).unwrap();
+        let kp3 = KeyPair::from_seed([0x43; 32]).unwrap();
+
+        let p1 = adapter
+            .simulated_link_principal_for_test(
+                ALPN_SWARMTORCH_DELIVERY_V1,
+                QuicHandshakeStageV1::OneRttComplete,
+                kp1.public_key(),
+            )
+            .unwrap();
+        let p2 = adapter
+            .simulated_link_principal_for_test(
+                ALPN_SWARMTORCH_DELIVERY_V1,
+                QuicHandshakeStageV1::OneRttComplete,
+                kp2.public_key(),
+            )
+            .unwrap();
+        let p3 = adapter
+            .simulated_link_principal_for_test(
+                ALPN_SWARMTORCH_DELIVERY_V1,
+                QuicHandshakeStageV1::OneRttComplete,
+                kp3.public_key(),
+            )
+            .unwrap();
+
+        let mut tracker = LinkFrameQuotaTrackerV1::with_limits(2, 60, 2, 16);
+
+        // 2 frames allowed within the 60s window for p1; 3rd fails until window rolls over.
+        tracker.record_frame_at(&p1, 100).unwrap();
+        tracker.record_frame_at(&p1, 120).unwrap();
+        assert!(matches!(
+            tracker.record_frame_at(&p1, 159),
+            Err(IrohCarrierError::LinkRateLimited { .. })
+        ));
+        assert_eq!(tracker.active_window_count(&p1.link_peer_id), 2);
+
+        // At t = 160, t=100 entry has expired (`160 - 100 >= 60`), freeing one slot.
+        tracker.record_frame_at(&p1, 160).unwrap();
+        assert_eq!(tracker.active_window_count(&p1.link_peer_id), 2);
+
+        // Second active principal fills max_tracked_links = 2.
+        tracker.record_frame_at(&p2, 170).unwrap();
+        assert_eq!(tracker.tracked_link_count(), 2);
+
+        // Third principal at t = 175 must fail closed (`LinkQuotaTableFull`), NOT evict active p1/p2.
+        assert!(matches!(
+            tracker.record_frame_at(&p3, 175),
+            Err(IrohCarrierError::LinkQuotaTableFull {
+                max_tracked_links: 2
+            })
+        ));
+        assert_eq!(tracker.tracked_link_count(), 2);
+
+        // Once p1 and p2 entries both expire (`170 + 60 = 230`), lazy pruning reclaims them for p3.
+        tracker.record_frame_at(&p3, 230).unwrap();
+        assert_eq!(tracker.tracked_link_count(), 1);
+        assert_eq!(tracker.active_window_count(&p3.link_peer_id), 1);
     }
 }

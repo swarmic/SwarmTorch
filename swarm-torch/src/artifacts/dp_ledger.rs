@@ -1,9 +1,14 @@
-//! Durable pre-release Rényi Differential Privacy (`RDP`) accounting ledger (`ADR-0023` §4.2, `W12-03`).
+//! Experimental hypothetical Rényi Differential Privacy (`RDP`) accounting ledger
+//! (`ADR-0023` §4.2, `W12-03`, `ST-02`).
+//!
+//! > **Security Notice (`ST-02` Containment):** Records written here track **hypothetical budget
+//! > consumption only**; no Poisson client subsampling or calibrated Gaussian noise injection is
+//! > performed in `v0.2`, so `guarantees_differential_privacy` is `false`.
 //!
 //! Enforces strict fail-closed **pre-release debit**:
 //! - Every round/step privacy debit is appended and `fsync`ed (`sync_all()`) to `dp/ledger.ndjson`
 //!   **before** any aggregated checkpoint or update is published to CAS or emitted externally.
-//! - A crash between durable ledger debit and checkpoint publication leaves the spent privacy budget
+//! - A crash between durable ledger debit and checkpoint publication leaves the spent accounting budget
 //!   debited and **non-refundable**.
 //! - Idempotent retries keyed on `receipt_id` observe the persisted debit without double-charging.
 
@@ -14,8 +19,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use swarm_torch_core::crypto::{sha256_slices, CryptoError, PrivacyAccountantHook};
 use swarm_torch_core::dp::{
-    DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1, RdpAccountantV1,
-    RDP_GRID_LEN,
+    DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+    PrivacyAccountingClassificationV1, RdpAccountantV1, RDP_GRID_LEN,
 };
 use swarm_torch_core::observe::RunId;
 
@@ -30,7 +35,14 @@ pub const DP_LEDGER_REL_PATH: &str = "dp/ledger.ndjson";
 /// Schema identifier embedded in durable DP ledger entries.
 pub const DP_LEDGER_SCHEMA_V1: &str = "swarmtorch.dp_ledger.v1";
 
-/// One durable pre-release DP debit record appended to `dp/ledger.ndjson` (`ADR-0023` §4.2).
+/// Explicit accounting classification string emitted into `dp/ledger.ndjson` (`ST-02`).
+pub const EXPERIMENTAL_DP_CLASSIFICATION_V1: &str = "experimental_hypothetical_budget_only";
+
+fn default_accounting_classification() -> String {
+    EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string()
+}
+
+/// One durable pre-release experimental DP accounting record appended to `dp/ledger.ndjson` (`ADR-0023` §4.2, `ST-02`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DpLedgerEntryV1 {
     /// Schema marker (`"swarmtorch.dp_ledger.v1"`).
@@ -65,6 +77,12 @@ pub struct DpLedgerEntryV1 {
     pub committed_rounds: u64,
     /// Monotonic Unix nanosecond timestamp when the pre-release debit was sealed.
     pub ts_unix_ns: u64,
+    /// Whether genuine Differential Privacy protection was executed (`false` in `v0.2` experimental accounting mode).
+    #[serde(default)]
+    pub guarantees_differential_privacy: bool,
+    /// Explicit accounting classification (`"experimental_hypothetical_budget_only"`).
+    #[serde(default = "default_accounting_classification")]
+    pub accounting_classification: String,
 }
 
 /// Derive a deterministic 64-char hex idempotency `receipt_id` for a DP debit step.
@@ -99,10 +117,12 @@ pub fn read_dp_ledger_entries(run_dir: &Path) -> io::Result<Vec<DpLedgerEntryV1>
         if entry.schema_version != DP_LEDGER_SCHEMA_V1
             || entry.cumulative_rdp_orders.len() != RDP_GRID_LEN
             || entry.receipt_id.is_empty()
+            || entry.guarantees_differential_privacy
+            || entry.accounting_classification != EXPERIMENTAL_DP_CLASSIFICATION_V1
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "malformed dp/ledger.ndjson entry",
+                "malformed or unsupported dp/ledger.ndjson entry",
             ));
         }
     }
@@ -123,10 +143,12 @@ pub fn append_dp_release_record_durable(
     if entry.schema_version != DP_LEDGER_SCHEMA_V1
         || entry.cumulative_rdp_orders.len() != RDP_GRID_LEN
         || entry.receipt_id.is_empty()
+        || entry.guarantees_differential_privacy
+        || entry.accounting_classification != EXPERIMENTAL_DP_CLASSIFICATION_V1
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid DpLedgerEntryV1 payload",
+            "invalid or unsupported DpLedgerEntryV1 payload",
         ));
     }
     if entry
@@ -201,13 +223,21 @@ pub fn pre_release_debit_dp_accountant(
     subsampling_rate_q: f64,
     ts_unix_ns: u64,
 ) -> Result<(bool, DpLedgerEntryV1), CryptoErrorOrIo> {
+    let profile = *accountant.profile();
+    if profile.classification
+        != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+        || accountant.guarantees_differential_privacy()
+    {
+        return Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter,
+        ));
+    }
     let (desc, next_orders, next_eps) = accountant
         .preview_clipped_round(tau, subsampling_rate_q)
         .map_err(CryptoErrorOrIo::Crypto)?;
 
     let committed_before = accountant.committed_rounds();
     let receipt_id = derive_dp_receipt_id(run_id, round_id, parent_digest_hex, committed_before);
-    let profile = *accountant.profile();
     let entry = DpLedgerEntryV1 {
         schema_version: DP_LEDGER_SCHEMA_V1.to_string(),
         receipt_id,
@@ -225,6 +255,8 @@ pub fn pre_release_debit_dp_accountant(
         conversion_formula: profile.conversion_formula,
         committed_rounds: committed_before.saturating_add(1),
         ts_unix_ns,
+        guarantees_differential_privacy: false,
+        accounting_classification: EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string(),
     };
 
     let newly_appended =
@@ -243,6 +275,13 @@ pub fn reconstruct_dp_accountant_from_ledger(
     run_dir: &Path,
     profile: DpMechanismProfileV1,
 ) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
+    if profile.classification
+        != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+    {
+        return Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter,
+        ));
+    }
     let entries = read_dp_ledger_entries(run_dir).map_err(CryptoErrorOrIo::Io)?;
     match entries.last() {
         None => RdpAccountantV1::new(profile).map_err(CryptoErrorOrIo::Crypto),

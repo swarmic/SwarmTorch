@@ -739,6 +739,9 @@ fn tool_trace_aggregation_budget(
 
     Ok(json!({
         "strict_signature_verified": verified.is_strict_verified(),
+        "guarantees_differential_privacy": false,
+        "accounting_classification": crate::artifacts::dp_ledger::EXPERIMENTAL_DP_CLASSIFICATION_V1,
+        "privacy_notice": "Experimental hypothetical RDP budget accounting only: SwarmRoundCoordinator does not execute Poisson client subsampling or calibrated Gaussian noise injection.",
         "dp_ledger_present_in_signed_manifest": verified.get_bytes(DP_LEDGER_REL_PATH).is_some(),
         "dp_ledger_entry_count": ledger_entries.len(),
         "committed_rounds": latest_ledger.map(|e| e.committed_rounds).unwrap_or(0),
@@ -824,7 +827,8 @@ mod tests {
         MaterializationRecordV2, TransformAuditV0, UnsafeReasonV0,
     };
     use swarm_torch_core::dp::{
-        DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1, RdpAccountantV1,
+        DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+        PrivacyAccountingClassificationV1, RdpAccountantV1,
     };
     use swarm_torch_core::observe::{AttrMap, MetricRecord, RunId};
     use swarm_torch_core::run_graph::{
@@ -985,6 +989,7 @@ mod tests {
             target_delta: 1e-5,
             max_epsilon: 3.0,
             conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
         })
         .unwrap();
         pre_release_debit_dp_accountant(
@@ -1173,6 +1178,14 @@ mod tests {
         assert_eq!(
             lines[3]["result"]["structuredContent"]["dp_ledger_present_in_signed_manifest"],
             true
+        );
+        assert_eq!(
+            lines[3]["result"]["structuredContent"]["guarantees_differential_privacy"],
+            false
+        );
+        assert_eq!(
+            lines[3]["result"]["structuredContent"]["accounting_classification"],
+            "experimental_hypothetical_budget_only"
         );
         assert_eq!(
             lines[3]["result"]["structuredContent"]["committed_rounds"],

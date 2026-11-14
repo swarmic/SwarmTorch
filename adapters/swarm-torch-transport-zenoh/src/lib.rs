@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
-//! Isolated `Zenoh` topic contract carrier adapter (`ADR-0022` §4, `W12-02`).
+//! Isolated `Zenoh` topic contract carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`).
+//!
+//! **Maturity Tier:** `Simulation verified` — strict topic key-expression parsing and pre-replay
+//! `(scope, round_id, originator)` enforcement are tested against serialized wire frames. Live `zenoh`
+//! SDK session / pub-sub integration is deferred to Phase `13D-3`.
 
 use swarm_torch_core::replay::ReplayProtection;
 use swarm_torch_core::traits::PeerId;

@@ -31,7 +31,7 @@ use crate::artifacts::{
     hex_lower, parse_cas_uri_digest, read_bytes_bounded, write_once_cas_blob, OutputSpec,
     MAX_SINGLE_ARTIFACT_BYTES,
 };
-use crate::wasm_sandbox::{SandboxedExtensionPolicyV1, WasmSandboxRunnerV1};
+use crate::wasm_sandbox::{SandboxedExtensionPolicyV1, WasmSandboxError};
 
 /// Canonical column data type discriminator matching `schemas/v1/columnar_table.schema.json` (`P2-20b`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,82 +350,13 @@ impl NativeOpRunner {
         let span_id = deterministic_span_id(node_id.as_bytes(), start_nanos);
         let trace_id = TraceId::from_bytes(*ctx.run_id.as_bytes());
 
+        let _ = wasm_isolation;
         if node.op_type == "wasm_transform" {
-            let (policy, registry) = wasm_isolation.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "wasm_transform requires SandboxedExtensionPolicyV1 isolation",
-                )
-            })?;
-            let hex_digest = canon_param_str(&node.params, "module_sha256").ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "wasm_transform missing required param 'module_sha256'",
-                )
-            })?;
-            let module_hash = decode_sha256_hex(hex_digest)?;
-            let wasm_bytes = registry.get(&module_hash).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("wasm module {hex_digest} missing from sandbox registry"),
-                )
-            })?;
-            let export_name = canon_param_str(&node.params, "export").unwrap_or("transform");
-
-            let in_bytes = if let Some(first) = inputs.first() {
-                if first
-                    .uri
-                    .as_deref()
-                    .and_then(parse_cas_uri_digest)
-                    .is_some()
-                {
-                    read_verified_cas_input(run_dir, first)?
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            let receipt = WasmSandboxRunnerV1::execute_byte_transform(
-                policy,
-                wasm_bytes,
-                export_name,
-                &in_bytes,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
-
-            let (out_hex, out_uri, out_bytes) = write_cas_bytes(run_dir, &receipt.output_bytes)?;
-            let out_key = node
-                .outputs
-                .first()
-                .map(|o| o.asset_key.clone())
-                .unwrap_or_else(|| format!("asset://wasm/{out_hex}"));
-            let instances = vec![AssetInstanceV1 {
-                asset_key: out_key.clone(),
-                fingerprint_v0: out_hex,
-                uri: Some(out_uri),
-            }];
-            let output_specs = vec![OutputSpec {
-                asset_key: out_key,
-                schema: None,
-                rows: None,
-                bytes: Some(out_bytes),
-            }];
-            let end_nanos = (ctx.clock_nanos)();
-            Self::emit_op_span(
-                trace_id,
-                span_id,
-                node,
-                inputs.len(),
-                instances.len(),
-                (start_nanos, end_nanos),
-                emitter,
-            )?;
-            return Ok(PhysicalExecOutcomeV1 {
-                instances,
-                output_specs,
-            });
+            // ST-09 containment: untrusted Wasm extension execution fails closed until `wasmi` isolation lands (`13D-1`).
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                WasmSandboxError::UnsupportedUntrustedWasmSandbox.to_string(),
+            ));
         }
 
         let has_cas_inputs = !inputs.is_empty()
@@ -793,35 +724,6 @@ fn canon_param_str<'a>(params: &'a CanonParams, key: &str) -> Option<&'a str> {
     }
 }
 
-fn decode_sha256_hex(s: &str) -> io::Result<[u8; 32]> {
-    if s.len() != 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("expected 64-char sha256 hex, got {} chars", s.len()),
-        ));
-    }
-    let b = s.as_bytes();
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        let hi = hex_val(b[i * 2])?;
-        let lo = hex_val(b[i * 2 + 1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn hex_val(c: u8) -> io::Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid hex character",
-        )),
-    }
-}
-
 fn infer_row_count(raw: &[u8]) -> Option<u64> {
     if raw.first().copied() == Some(b'{') {
         if let Ok(tbl) = ColumnarTableV1::from_json_bytes_strict(raw) {
@@ -1088,6 +990,37 @@ mod tests {
         assert!(!attrs.contains_key("node_key"));
         assert!(!attrs.contains_key("input_count"));
         assert!(!attrs.contains_key("output_count"));
+    }
+
+    #[test]
+    fn wasm_transform_fails_closed_until_wasmi_sandbox_integration() {
+        let pid = std::process::id();
+        let run_dir = std::env::temp_dir().join(format!("swarmtorch_native_wasm_deny_{pid}"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let runner = NativeOpRunner;
+        let node = test_node("wasm_transform");
+        let policy = SandboxedExtensionPolicyV1::default();
+        let registry = BTreeMap::new();
+
+        let err = runner
+            .run_in_session(
+                &ctx,
+                &run_dir,
+                &node,
+                &[],
+                &emitter,
+                Some((&policy, &registry)),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err
+            .to_string()
+            .contains(&WasmSandboxError::UnsupportedUntrustedWasmSandbox.to_string()));
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     #[test]

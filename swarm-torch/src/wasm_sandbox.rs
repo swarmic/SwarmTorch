@@ -1,17 +1,12 @@
-//! Deterministic, zero-unsafe WebAssembly (`MVP`) sandbox & fuel-metered bytecode VM (`ADR-0018`, `W12-04`).
+//! Experimental fallback WebAssembly (`MVP`) test-fixture VM (`ADR-0018`, `W12-04`, `ST-09`).
 //!
-//! Enforces strict fail-closed pre-execution & runtime confinement without adding heavy JIT/Wasmtime
-//! dependency graphs to root `Cargo.lock`:
-//! 1. **Cryptographic allowlist BEFORE parsing:** Computes `SHA-256(wasm_bytes)` and verifies
-//!    membership in `allowed_module_hashes` ([`crate::wasm_sandbox::SandboxedExtensionPolicyV1`])
-//!    before touching untrusted module bytes.
-//! 2. **Strict Wasm MVP decoding & import quarantine:** Rejects malformed LEB128/sections, ALL WASI
-//!    or host OS imports (`wasi_snapshot_preview1`, `wasi_unstable`, filesystem, sockets, clocks,
-//!    randomness), multiple memories/tables, and oversized initial memory/table declarations.
-//! 3. **Deterministic execution traps:** Enforces [`crate::wasm_sandbox::WasmFuelMeterV1`] (every opcode consumes fuel),
-//!    capped linear memory growth with `trap_on_grow_failure: true` (`MemoryGrowTrap`), call-depth
-//!    caps (`64`), `Start` section execution before exports, and checked guest `(ptr, len)` slice
-//!    bounds (`u32::checked_add`).
+//! > **Security Notice (`ST-09` Fail-Closed Containment):** Production untrusted WebAssembly execution
+//! > via `WasmSandboxRunnerV1::execute_byte_transform`, `WasmSandboxRunnerV1::execute_scalar_i32`,
+//! > `Scheduler` (`RunnerIsolationProfile::WasmSandboxedV1`), and `NativeOpRunner` **fails closed**
+//! > with `WasmSandboxError::UnsupportedUntrustedWasmSandbox` until the isolated `wasmi` adapter
+//! > (`adapters/swarm-torch-wasm`) is connected in `13D-1`. The subset interpreter below is kept
+//! > exclusively behind `#[doc(hidden)]` `WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only`
+//! > for internal unit tests.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,9 +22,14 @@ pub const WASM_PAGE_BYTES: usize = 65_536;
 /// Default maximum call stack depth enforced against unbounded guest recursion.
 pub const DEFAULT_WASM_MAX_CALL_DEPTH: usize = 64;
 
+/// Hard cap on total declared locals per function across all local declaration groups (`ST-09`).
+pub const DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION: usize = 4_096;
+
 /// Errors raised during pre-parse verification, static validation, or sandboxed Wasm execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasmSandboxError {
+    /// Untrusted Wasm sandbox execution is disabled until the external `wasmi` adapter lands (`ST-09`).
+    UnsupportedUntrustedWasmSandbox,
     /// Module digest was not present in [`SandboxedExtensionPolicyV1::allowed_module_hashes`].
     UntrustedModuleHash { actual: [u8; 32] },
     /// Module byte length exceeded [`WasmStoreLimitsV1::max_module_bytes`].
@@ -76,6 +76,10 @@ pub enum WasmSandboxError {
 impl fmt::Display for WasmSandboxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedUntrustedWasmSandbox => write!(
+                f,
+                "UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until the isolated wasmi adapter is integrated"
+            ),
             Self::UntrustedModuleHash { actual } => {
                 write!(
                     f,
@@ -289,7 +293,6 @@ enum WasmValType {
     I32,
     I64,
     F32,
-    F64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,7 +477,9 @@ impl<'a> Cursor<'a> {
             0x7f => Ok(WasmValType::I32),
             0x7e => Ok(WasmValType::I64),
             0x7d => Ok(WasmValType::F32),
-            0x7c => Ok(WasmValType::F64),
+            0x7c => Err(WasmSandboxError::ExecutionTrap(
+                "f64 value type is unsupported in experimental test fixture".to_string(),
+            )),
             _ => Err(WasmSandboxError::MalformedSectionOrLeb128),
         }
     }
@@ -516,6 +521,7 @@ fn eval_const_init_expr(cur: &mut Cursor<'_>) -> Result<WasmValue, WasmSandboxEr
 fn decode_and_validate_module(
     wasm_bytes: &[u8],
     limits: &WasmStoreLimitsV1,
+    fuel: &mut WasmFuelMeterV1,
 ) -> Result<DecodedWasmModule, WasmSandboxError> {
     if wasm_bytes.len() > limits.max_module_bytes {
         return Err(WasmSandboxError::ModuleTooLarge {
@@ -541,6 +547,7 @@ fn decode_and_validate_module(
     let mut last_non_custom_section = 0u8;
 
     while cur.remaining() > 0 {
+        fuel.consume(1)?;
         let section_id = cur.read_u8()?;
         let section_len = cur.read_u32_leb()? as usize;
         let section_bytes = cur.read_exact(section_len)?;
@@ -560,17 +567,20 @@ fn decode_and_validate_module(
             1 => {
                 let count = sc.read_u32_leb()?;
                 for _ in 0..count {
+                    fuel.consume(1)?;
                     if sc.read_u8()? != 0x60 {
                         return Err(WasmSandboxError::MalformedSectionOrLeb128);
                     }
                     let p_len = sc.read_u32_leb()?;
-                    let mut params = Vec::with_capacity(p_len as usize);
+                    let mut params = Vec::with_capacity((p_len as usize).min(256));
                     for _ in 0..p_len {
+                        fuel.consume(1)?;
                         params.push(sc.read_val_type()?);
                     }
                     let r_len = sc.read_u32_leb()?;
-                    let mut results = Vec::with_capacity(r_len as usize);
+                    let mut results = Vec::with_capacity((r_len as usize).min(256));
                     for _ in 0..r_len {
+                        fuel.consume(1)?;
                         results.push(sc.read_val_type()?);
                     }
                     types.push(WasmFuncType { params, results });
@@ -693,22 +703,33 @@ fn decode_and_validate_module(
                     return Err(WasmSandboxError::MalformedSectionOrLeb128);
                 }
                 for _ in 0..count {
+                    fuel.consume(1)?;
                     let body_len = sc.read_u32_leb()? as usize;
                     let body_slice = sc.read_exact(body_len)?;
                     let mut bc = Cursor::new(body_slice);
                     let local_decls = bc.read_u32_leb()?;
                     let mut locals = Vec::new();
+                    let mut total_locals = 0usize;
                     for _ in 0..local_decls {
+                        fuel.consume(1)?;
                         let rep = bc.read_u32_leb()?;
                         let ty = bc.read_val_type()?;
-                        for _ in 0..rep.min(4096) {
-                            locals.push(ty);
+                        total_locals = total_locals
+                            .checked_add(rep as usize)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+                        if total_locals > DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION {
+                            return Err(WasmSandboxError::ExecutionTrap(format!(
+                                "wasm function local count {total_locals} exceeds cap {DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION}"
+                            )));
                         }
-                        if rep > 4096 {
-                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                        for _ in 0..rep {
+                            fuel.consume(1)?;
+                            locals.push(ty);
                         }
                     }
                     let expr = bc.bytes[bc.pos..].to_vec();
+                    let scan_cost = (expr.len() as u64).max(1) / 8 + 1;
+                    fuel.consume(scan_cost)?;
                     if expr.last().copied() != Some(0x0b) {
                         return Err(WasmSandboxError::MalformedSectionOrLeb128);
                     }
@@ -794,6 +815,7 @@ impl<'a> WasmVm<'a> {
     fn instantiate(
         module: &'a DecodedWasmModule,
         limits: &'a WasmStoreLimitsV1,
+        fuel: WasmFuelMeterV1,
     ) -> Result<Self, WasmSandboxError> {
         let initial_bytes = (module.initial_memory_pages as usize)
             .checked_mul(WASM_PAGE_BYTES)
@@ -826,7 +848,7 @@ impl<'a> WasmVm<'a> {
             memory,
             peak_memory_bytes: initial_bytes,
             globals,
-            fuel: WasmFuelMeterV1::new(limits.max_fuel),
+            fuel,
             call_depth: 0,
         })
     }
@@ -897,7 +919,6 @@ impl<'a> WasmVm<'a> {
                 WasmValType::I32 => WasmValue::i32(0),
                 WasmValType::I64 => WasmValue::i64(0),
                 WasmValType::F32 => WasmValue::f32(0.0),
-                WasmValType::F64 => WasmValue::i64(0),
             };
             locals.push(z);
         }
@@ -921,6 +942,7 @@ impl<'a> WasmVm<'a> {
         {
             let mut sc = Cursor::new(expr);
             while sc.remaining() > 0 {
+                self.fuel.consume(1)?;
                 let op_pos = sc.pos;
                 let op = sc.read_u8()?;
                 match op {
@@ -1384,95 +1406,60 @@ impl<'a> WasmVm<'a> {
     }
 }
 
-/// Fail-closed WebAssembly extension runner (`ADR-0018`, `W12-04`).
+/// Invocation mode for internal test-only experimental fallback fixtures (`ST-09`).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub enum ExperimentalTrustedFixtureCallV1<'a> {
+    /// Invoke `(ptr: i32, len: i32) -> i32` over guest memory initialized with the given payload.
+    ByteTransform(&'a [u8]),
+    /// Invoke scalar `(arg: i32) -> i32`.
+    ScalarI32(i32),
+}
+
+/// Fail-closed WebAssembly extension runner (`ADR-0018`, `W12-04`, `ST-09`).
+///
+/// Production entrypoints ([`Self::execute_byte_transform`] and [`Self::execute_scalar_i32`])
+/// unconditionally fail closed with [`WasmSandboxError::UnsupportedUntrustedWasmSandbox`] until
+/// the isolated `wasmi` adapter (`adapters/swarm-torch-wasm`) is wired in `13D-1`.
 pub struct WasmSandboxRunnerV1;
 
 impl WasmSandboxRunnerV1 {
-    /// Validate `wasm_bytes` against `policy` (hash allowlist BEFORE decode + import/memory/table
-    /// checks) and invoke `(ptr: i32, len: i32) -> i32` byte-transform export cleanly.
+    /// Production untrusted Wasm byte-transform execution is **disabled (fail-closed)** in `13-0`
+    /// pending external `wasmi` sandbox integration (`ST-09`).
     pub fn execute_byte_transform(
-        policy: &SandboxedExtensionPolicyV1,
-        wasm_bytes: &[u8],
-        export_name: &str,
-        input_payload: &[u8],
+        _policy: &SandboxedExtensionPolicyV1,
+        _wasm_bytes: &[u8],
+        _export_name: &str,
+        _input_payload: &[u8],
     ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
-        let module_sha256 = SandboxedExtensionPolicyV1::sha256_module(wasm_bytes);
-        if !policy.allowed_module_hashes.contains(&module_sha256) {
-            return Err(WasmSandboxError::UntrustedModuleHash {
-                actual: module_sha256,
-            });
-        }
-        if !policy.allowed_exports.is_empty() && !policy.allowed_exports.contains(export_name) {
-            return Err(WasmSandboxError::ExportNotAllowed(export_name.to_string()));
-        }
-
-        let module = decode_and_validate_module(wasm_bytes, &policy.limits)?;
-        let export_fn_idx = *module
-            .exports
-            .get(export_name)
-            .ok_or_else(|| WasmSandboxError::ExportNotAllowed(export_name.to_string()))?;
-
-        let mut vm = WasmVm::instantiate(&module, &policy.limits)?;
-
-        // Always execute optional Section 8 start function before exports under fuel/memory limits.
-        if let Some(start_idx) = module.start_func {
-            let _ = vm.call(start_idx, &[])?;
-        }
-
-        // Write input payload safely at offset 0 of linear memory.
-        if input_payload.len() > vm.memory.len() {
-            return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: 0,
-                len: input_payload.len(),
-                mem_len: vm.memory.len(),
-            });
-        }
-        vm.memory[..input_payload.len()].copy_from_slice(input_payload);
-
-        let input_len_i32 = i32::try_from(input_payload.len()).map_err(|_| {
-            WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: 0,
-                len: input_payload.len(),
-                mem_len: vm.memory.len(),
-            }
-        })?;
-        let results = vm.call(
-            export_fn_idx,
-            &[WasmValue::i32(0), WasmValue::i32(input_len_i32)],
-        )?;
-        let return_code = results
-            .first()
-            .copied()
-            .ok_or_else(|| WasmSandboxError::ExportSignatureMismatch(export_name.to_string()))?
-            .as_i32()?;
-
-        // Checked slice read `[0..return_code)` when positive (negative return code signals trap/status)
-        let output_bytes = if return_code < 0 {
-            return Err(WasmSandboxError::ExecutionTrap(format!(
-                "export '{export_name}' returned error code {return_code}"
-            )));
-        } else {
-            read_guest_slice(&vm.memory, 0, return_code)?
-        };
-
-        Ok(WasmExecutionReceiptV1 {
-            module_sha256,
-            fuel_consumed: vm.fuel.consumed(),
-            peak_memory_bytes: vm.peak_memory_bytes,
-            return_code,
-            output_bytes,
-        })
+        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
     }
 
-    /// Validate `wasm_bytes` against `policy` and invoke scalar export `(arg: i32) -> i32`.
+    /// Production untrusted Wasm scalar execution is **disabled (fail-closed)** in `13-0`
+    /// pending external `wasmi` sandbox integration (`ST-09`).
     pub fn execute_scalar_i32(
+        _policy: &SandboxedExtensionPolicyV1,
+        _wasm_bytes: &[u8],
+        _export_name: &str,
+        _arg: i32,
+    ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
+    }
+
+    /// **Experimental trusted local test fixture runner ONLY** (`#[doc(hidden)]`, `ST-09`).
+    ///
+    /// Must NEVER be called on untrusted manifests or in production scheduler/runner paths.
+    #[doc(hidden)]
+    pub fn run_experimental_trusted_test_fixture_only(
         policy: &SandboxedExtensionPolicyV1,
         wasm_bytes: &[u8],
         export_name: &str,
-        arg: i32,
-    ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+        invocation: ExperimentalTrustedFixtureCallV1<'_>,
+    ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
         let module_sha256 = SandboxedExtensionPolicyV1::sha256_module(wasm_bytes);
-        if !policy.allowed_module_hashes.contains(&module_sha256) {
+        if policy.allowed_module_hashes.is_empty()
+            || !policy.allowed_module_hashes.contains(&module_sha256)
+        {
             return Err(WasmSandboxError::UntrustedModuleHash {
                 actual: module_sha256,
             });
@@ -1481,31 +1468,79 @@ impl WasmSandboxRunnerV1 {
             return Err(WasmSandboxError::ExportNotAllowed(export_name.to_string()));
         }
 
-        let module = decode_and_validate_module(wasm_bytes, &policy.limits)?;
+        let mut fuel = WasmFuelMeterV1::new(policy.limits.max_fuel);
+        let module = decode_and_validate_module(wasm_bytes, &policy.limits, &mut fuel)?;
         let export_fn_idx = *module
             .exports
             .get(export_name)
             .ok_or_else(|| WasmSandboxError::ExportNotAllowed(export_name.to_string()))?;
 
-        let mut vm = WasmVm::instantiate(&module, &policy.limits)?;
+        let mut vm = WasmVm::instantiate(&module, &policy.limits, fuel)?;
         if let Some(start_idx) = module.start_func {
             let _ = vm.call(start_idx, &[])?;
         }
 
-        let results = vm.call(export_fn_idx, &[WasmValue::i32(arg)])?;
-        let ret = results
-            .first()
-            .copied()
-            .ok_or_else(|| WasmSandboxError::ExportSignatureMismatch(export_name.to_string()))?
-            .as_i32()?;
-        let receipt = WasmExecutionReceiptV1 {
-            module_sha256,
-            fuel_consumed: vm.fuel.consumed(),
-            peak_memory_bytes: vm.peak_memory_bytes,
-            return_code: ret,
-            output_bytes: Vec::new(),
-        };
-        Ok((ret, receipt))
+        match invocation {
+            ExperimentalTrustedFixtureCallV1::ByteTransform(input_payload) => {
+                if input_payload.len() > vm.memory.len() {
+                    return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                        addr: 0,
+                        len: input_payload.len(),
+                        mem_len: vm.memory.len(),
+                    });
+                }
+                vm.memory[..input_payload.len()].copy_from_slice(input_payload);
+                let input_len_i32 = i32::try_from(input_payload.len()).map_err(|_| {
+                    WasmSandboxError::OutOfBoundsMemoryAccess {
+                        addr: 0,
+                        len: input_payload.len(),
+                        mem_len: vm.memory.len(),
+                    }
+                })?;
+                let results = vm.call(
+                    export_fn_idx,
+                    &[WasmValue::i32(0), WasmValue::i32(input_len_i32)],
+                )?;
+                let return_code = results
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        WasmSandboxError::ExportSignatureMismatch(export_name.to_string())
+                    })?
+                    .as_i32()?;
+                let output_bytes = if return_code < 0 {
+                    return Err(WasmSandboxError::ExecutionTrap(format!(
+                        "export '{export_name}' returned error code {return_code}"
+                    )));
+                } else {
+                    read_guest_slice(&vm.memory, 0, return_code)?
+                };
+                Ok(WasmExecutionReceiptV1 {
+                    module_sha256,
+                    fuel_consumed: vm.fuel.consumed(),
+                    peak_memory_bytes: vm.peak_memory_bytes,
+                    return_code,
+                    output_bytes,
+                })
+            }
+            ExperimentalTrustedFixtureCallV1::ScalarI32(arg) => {
+                let results = vm.call(export_fn_idx, &[WasmValue::i32(arg)])?;
+                let ret = results
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        WasmSandboxError::ExportSignatureMismatch(export_name.to_string())
+                    })?
+                    .as_i32()?;
+                Ok(WasmExecutionReceiptV1 {
+                    module_sha256,
+                    fuel_consumed: vm.fuel.consumed(),
+                    peak_memory_bytes: vm.peak_memory_bytes,
+                    return_code: ret,
+                    output_bytes: Vec::new(),
+                })
+            }
+        }
     }
 }
 
@@ -1616,19 +1651,40 @@ mod tests {
         sec2.push(0x00);
         push_section(&mut with_wasi, 2, &sec2);
 
-        // First: unallowlisted module fails BEFORE decoding WASI import
+        // Production entrypoints MUST fail closed even for pinned modules until wasmi lands (`ST-09`).
+        let pinned = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&with_wasi),
+        );
+        assert_eq!(
+            WasmSandboxRunnerV1::execute_scalar_i32(&pinned, &with_wasi, "run", 0).unwrap_err(),
+            WasmSandboxError::UnsupportedUntrustedWasmSandbox
+        );
+        assert_eq!(
+            WasmSandboxRunnerV1::execute_byte_transform(&pinned, &with_wasi, "run", b"x")
+                .unwrap_err(),
+            WasmSandboxError::UnsupportedUntrustedWasmSandbox
+        );
+
+        // First: unallowlisted module fails BEFORE decoding WASI import on experimental fixture path
         let empty_policy = SandboxedExtensionPolicyV1::default();
         assert!(matches!(
-            WasmSandboxRunnerV1::execute_scalar_i32(&empty_policy, &with_wasi, "run", 0),
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &empty_policy,
+                &with_wasi,
+                "run",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
             Err(WasmSandboxError::UntrustedModuleHash { .. })
         ));
 
         // Even if explicitly pinned in hash allowlist, WASI import MUST fail closed!
-        let pinned = SandboxedExtensionPolicyV1::with_allowed_hash(
-            SandboxedExtensionPolicyV1::sha256_module(&with_wasi),
-        );
         assert!(matches!(
-            WasmSandboxRunnerV1::execute_scalar_i32(&pinned, &with_wasi, "run", 0),
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &pinned,
+                &with_wasi,
+                "run",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
             Err(WasmSandboxError::ForbiddenImport { module, field })
                 if module == "wasi_snapshot_preview1" && field == "fd_read"
         ));
@@ -1650,7 +1706,12 @@ mod tests {
         );
         policy.limits.max_fuel = 50;
         assert!(matches!(
-            WasmSandboxRunnerV1::execute_scalar_i32(&policy, &loop_wasm, "spin", 0),
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &policy,
+                &loop_wasm,
+                "spin",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
             Err(WasmSandboxError::OutOfFuel { limit: 50, .. })
         ));
 
@@ -1669,7 +1730,12 @@ mod tests {
         grow_policy.limits.max_memory_pages = 4;
         grow_policy.limits.trap_on_grow_failure = true;
         assert!(matches!(
-            WasmSandboxRunnerV1::execute_scalar_i32(&grow_policy, &grow_wasm, "grow_bomb", 0),
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &grow_policy,
+                &grow_wasm,
+                "grow_bomb",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
             Err(WasmSandboxError::MemoryGrowTrap {
                 current_pages: 1,
                 delta_pages: 32,
@@ -1711,9 +1777,13 @@ mod tests {
         let policy = SandboxedExtensionPolicyV1::with_allowed_hash(
             SandboxedExtensionPolicyV1::sha256_module(&wasm),
         );
-        let receipt =
-            WasmSandboxRunnerV1::execute_byte_transform(&policy, &wasm, "transform", b"abcDEF")
-                .unwrap();
+        let receipt = WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+            &policy,
+            &wasm,
+            "transform",
+            ExperimentalTrustedFixtureCallV1::ByteTransform(b"abcDEF"),
+        )
+        .unwrap();
         assert_eq!(receipt.output_bytes, b"ABCdef");
         assert!(receipt.fuel_consumed > 0);
         assert_eq!(receipt.peak_memory_bytes, WASM_PAGE_BYTES);
@@ -1756,10 +1826,96 @@ mod tests {
             SandboxedExtensionPolicyV1::sha256_module(&m),
         );
         policy.limits.max_fuel = 128;
-        let err = WasmSandboxRunnerV1::execute_scalar_i32(&policy, &m, "noop", 0).unwrap_err();
+        let err = WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+            &policy,
+            &m,
+            "noop",
+            ExperimentalTrustedFixtureCallV1::ScalarI32(0),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, WasmSandboxError::OutOfFuel { limit: 128, .. }),
             "expected OutOfFuel from Start section infinite loop, got {err:?}"
         );
+    }
+
+    #[test]
+    fn wasm_fixture_rejects_f64_types_cumulative_local_bomb_and_decode_fuel_exhaustion() {
+        // 1. Module declaring f64 local MUST fail closed cleanly instead of coercing to i64(0).
+        let mut f64_mod = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut f64_mod, 1, &[1, 0x60, 0, 1, 0x7f]);
+        push_section(&mut f64_mod, 3, &[1, 0]);
+        let mut sec7 = vec![1];
+        push_name(&mut sec7, "bad_f64");
+        sec7.push(0x00);
+        sec7.push(0x00);
+        push_section(&mut f64_mod, 7, &sec7);
+        // body: 1 decl (rep=1, type=0x7c f64), i32.const 0, end
+        let body = [0x01u8, 0x01, 0x7c, 0x41, 0x00, 0x0b];
+        let mut sec10 = vec![1];
+        push_leb_u32(&mut sec10, body.len() as u32);
+        sec10.extend_from_slice(&body);
+        push_section(&mut f64_mod, 10, &sec10);
+        let f64_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&f64_mod),
+        );
+        assert!(matches!(
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &f64_policy,
+                &f64_mod,
+                "bad_f64",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
+            Err(WasmSandboxError::ExecutionTrap(msg)) if msg.contains("f64")
+        ));
+
+        // 2. Cumulative local declarations > DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION across 2 groups MUST fail.
+        let mut locals_bomb = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut locals_bomb, 1, &[1, 0x60, 0, 1, 0x7f]);
+        push_section(&mut locals_bomb, 3, &[1, 0]);
+        let mut sec7_b = vec![1];
+        push_name(&mut sec7_b, "bomb");
+        sec7_b.push(0x00);
+        sec7_b.push(0x00);
+        push_section(&mut locals_bomb, 7, &sec7_b);
+        let mut bomb_body = vec![2u8]; // 2 decl groups: 3000 + 3000 > 4096
+        push_leb_u32(&mut bomb_body, 3000);
+        bomb_body.push(0x7f);
+        push_leb_u32(&mut bomb_body, 3000);
+        bomb_body.push(0x7f);
+        bomb_body.extend_from_slice(&[0x41, 0x00, 0x0b]);
+        let mut sec10_b = vec![1];
+        push_leb_u32(&mut sec10_b, bomb_body.len() as u32);
+        sec10_b.extend_from_slice(&bomb_body);
+        push_section(&mut locals_bomb, 10, &sec10_b);
+        let mut bomb_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&locals_bomb),
+        );
+        bomb_policy.limits.max_fuel = 100_000;
+        assert!(matches!(
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &bomb_policy,
+                &locals_bomb,
+                "bomb",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(0)
+            ),
+            Err(WasmSandboxError::ExecutionTrap(msg)) if msg.contains("local count")
+        ));
+
+        // 3. Tiny max_fuel triggers OutOfFuel during decode/local-allocation before execution!
+        let ok_mod = build_single_export_wasm(&[0x7f], &[0x7f], None, 32, "id", &[0x20, 0x00]);
+        let mut low_fuel_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&ok_mod),
+        );
+        low_fuel_policy.limits.max_fuel = 5;
+        assert!(matches!(
+            WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only(
+                &low_fuel_policy,
+                &ok_mod,
+                "id",
+                ExperimentalTrustedFixtureCallV1::ScalarI32(7)
+            ),
+            Err(WasmSandboxError::OutOfFuel { limit: 5, .. })
+        ));
     }
 }

@@ -126,6 +126,8 @@ pub enum RoundConfigError {
     IncompatibleWeightingPolicy,
     InvalidMaxWeightShare(f64),
     MissingOrZeroCertifiedWeight(PeerId),
+    /// Caller requested certified Differential Privacy enforcement before a noise-injecting mechanism (`DpFedAvgV1`) is active (`ST-02`).
+    UnsupportedCertifiedDifferentialPrivacy,
 }
 
 impl core::fmt::Display for RoundConfigError {
@@ -152,6 +154,10 @@ impl core::fmt::Display for RoundConfigError {
             Self::MissingOrZeroCertifiedWeight(peer) => {
                 write!(f, "missing or zero certified weight for cohort peer {peer:?}")
             }
+            Self::UnsupportedCertifiedDifferentialPrivacy => write!(
+                f,
+                "certified Differential Privacy enforcement is unsupported in experimental accounting mode"
+            ),
         }
     }
 }
@@ -1269,6 +1275,11 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         let Some(acc) = self.dp_accountant.as_mut() else {
             return Ok(None);
         };
+        if acc.guarantees_differential_privacy() {
+            return Err(RoundError::Config(
+                RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
+            ));
+        }
         let tau = explicit_tau.unwrap_or_else(|| match self.config.aggregation {
             RobustAggregation::CenteredClipping { tau, .. } => tau,
             _ => acc.profile().clipping_radius_tau,
@@ -1295,15 +1306,35 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         Ok(Some(entry))
     }
 
-    /// Configure a durable Rényi Differential Privacy accountant backed by `dp/ledger.ndjson` (`ADR-0023` §4.2, `W12-03`).
+    /// Whether this coordinator enforces a certified noise-injecting Differential Privacy
+    /// mechanism (`false` in `v0.2` experimental hypothetical accounting mode, `ST-02`).
+    pub const fn supports_certified_differential_privacy(&self) -> bool {
+        false
+    }
+
+    /// Configure an **experimental hypothetical** Rényi Differential Privacy budget accountant
+    /// backed by `dp/ledger.ndjson` (`ADR-0023` §4.2, `W12-03`, `ST-02`).
+    ///
+    /// **Important (`ST-02`):** Neither [`SwarmRoundCoordinator`] nor the ledger currently injects
+    /// Poisson client subsampling or calibrated Gaussian noise. Fails closed with
+    /// [`RoundConfigError::UnsupportedCertifiedDifferentialPrivacy`] if `profile.classification`
+    /// requests [`swarm_torch_core::dp::PrivacyAccountingClassificationV1::VerifiedMechanismProtected`].
     ///
     /// Replays any already-committed entries from `run_dir/dp/ledger.ndjson` so a crash or restart
-    /// never refunds previously debited privacy budget.
+    /// never refunds previously debited hypothetical accounting budget.
     pub fn configure_dp_accountant(
         &mut self,
         run_dir: &std::path::Path,
         profile: swarm_torch_core::dp::DpMechanismProfileV1,
     ) -> Result<(), RoundError> {
+        if profile.classification
+            != swarm_torch_core::dp::PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+            || !self.supports_certified_differential_privacy() && profile.guarantees_differential_privacy()
+        {
+            return Err(RoundError::Config(
+                RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
+            ));
+        }
         let acc =
             reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(|err| match err {
                 CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
@@ -1613,17 +1644,42 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         )
         .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
 
-        if let Some(base_w) = base_weights_to_merge {
-            if let swarm_torch_models::lora::LoraAggregationOutcomeV1::FloraStacked { stacked } =
-                &outcome
-            {
-                stacked
-                    .apply_exact_to_base_weights(base_w)
-                    .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
+        // Prepare & validate the candidate base-weight merge in a staging copy BEFORE attempting
+        // durable DP pre-debit, and commit the mutation to `base_weights_to_merge` ONLY AFTER the
+        // debit succeeds (`ST-02` failure atomicity).
+        let mut staged_base_weights = match base_weights_to_merge.as_deref() {
+            Some(base_w) => {
+                if base_w.iter().any(|v| v.is_nan()) {
+                    return Err(RoundError::Aggregation(CoreError::NanDetected));
+                }
+                if base_w.iter().any(|v| !v.is_finite()) {
+                    return Err(RoundError::Aggregation(CoreError::InfDetected));
+                }
+                let mut staged = base_w.to_vec();
+                match &outcome {
+                    swarm_torch_models::lora::LoraAggregationOutcomeV1::FloraStacked { stacked } => {
+                        stacked
+                            .apply_exact_to_base_weights(&mut staged)
+                            .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
+                    }
+                    swarm_torch_models::lora::LoraAggregationOutcomeV1::SingleFactorAggregated {
+                        adapter,
+                    }
+                    | swarm_torch_models::lora::LoraAggregationOutcomeV1::BiasedFactorFedAvg {
+                        adapter,
+                        ..
+                    } => {
+                        adapter
+                            .apply_to_base_weights(&mut staged)
+                            .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
+                    }
+                }
+                Some(staged)
             }
-        }
+            None => None,
+        };
 
-        // Fail-closed DP debit before releasing aggregated adapter factors.
+        // Fail-closed DP debit before committing base-weight merge or releasing aggregated factors.
         self.pre_release_dp_debit_if_enabled(
             session,
             self.current_round,
@@ -1631,6 +1687,10 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             None,
             Some(subsampling_rate_q),
         )?;
+
+        if let (Some(base_w), Some(staged)) = (base_weights_to_merge, staged_base_weights.take()) {
+            base_w.copy_from_slice(&staged);
+        }
 
         Ok(outcome)
     }
@@ -2381,6 +2441,7 @@ mod tests {
         use swarm_torch_core::crypto::CryptoError;
         use swarm_torch_core::dp::{
             DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
         };
 
         let base = temp_dir("dp_ledger_recovery");
@@ -2422,6 +2483,7 @@ mod tests {
             target_delta: 1e-5,
             max_epsilon: 5.0,
             conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
         };
 
         let model = linear_model_2_1(&[1.0, 2.0, 0.5]);
@@ -2497,6 +2559,7 @@ mod tests {
         use swarm_torch_core::aggregation::FedAvg;
         use swarm_torch_core::dp::{
             DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
         };
         use swarm_torch_models::lora::{
             LoraAdapterPairV1, LoraAggregationModeV1, LoraAggregationOutcomeV1,
@@ -2548,6 +2611,8 @@ mod tests {
                     target_delta: 1e-5,
                     max_epsilon: 10.0,
                     conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+                    classification:
+                        PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
                 },
             )
             .unwrap();
@@ -2621,6 +2686,191 @@ mod tests {
         ));
         assert_eq!(coord.dp_accountant().unwrap().committed_rounds(), 1);
         assert!(base_w.iter().any(|&v| v != 0.0));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn certified_dp_fails_closed_and_lora_preserves_state_on_invalid_merge_or_dp_exhaustion() {
+        use swarm_torch_core::aggregation::FedAvg;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+        use swarm_torch_models::lora::{LoraAdapterPairV1, LoraAggregationModeV1};
+        use swarm_torch_models::safetensors_v1::LoRaAdapterDescriptorV1;
+
+        let base = temp_dir("st02_lora_atomicity");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x9a; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        let p1 = peer(1);
+        let p2 = peer(2);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::default(),
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1, p2].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config,
+            linear_model_2_1(&[0.0, 1.0, 1.0]),
+            &mut session,
+            1_000,
+        )
+        .unwrap();
+        assert!(!coord.supports_certified_differential_privacy());
+
+        // Certified DP mode MUST fail closed in v0.2 before configuring any accountant.
+        let certified_profile = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 5.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
+        };
+        assert!(matches!(
+            coord.configure_dp_accountant(&run_dir, certified_profile),
+            Err(RoundError::Config(
+                RoundConfigError::UnsupportedCertifiedDifferentialPrivacy
+            ))
+        ));
+        assert!(coord.dp_accountant().is_none());
+
+        // Configure experimental hypothetical accountant with tight max_epsilon that allows 1 round but rejects round 2.
+        coord
+            .configure_dp_accountant(
+                &run_dir,
+                DpMechanismProfileV1 {
+                    unit: DpUnitV1::ClientLevel,
+                    adjacency: DpAdjacencyV1::AddRemoveOne,
+                    clipping_radius_tau: 1.0,
+                    noise_multiplier: 1.5,
+                    target_delta: 1e-5,
+                    max_epsilon: 3.0,
+                    conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+                    classification:
+                        PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+                },
+            )
+            .unwrap();
+        assert!(!coord
+            .dp_accountant()
+            .unwrap()
+            .guarantees_differential_privacy());
+
+        let pair1 = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+        )
+        .unwrap();
+        let pair2 = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![0.0, 1.0],
+            vec![0.0, 2.0],
+        )
+        .unwrap();
+
+        // 1. Mismatched `base_weights_to_merge` length MUST fail BEFORE pre_release_dp_debit_if_enabled!
+        let mut wrong_len_base = vec![1.25f32; 3];
+        let wrong_len_err = coord.aggregate_lora_cohort_round(
+            &[(p1, pair1.clone()), (p2, pair2.clone())],
+            LoraAggregationModeV1::FloraStackingV1 {
+                max_stacked_rank: 8,
+            },
+            &FedAvg,
+            Some(&mut wrong_len_base),
+            1.0,
+            &mut session,
+            2_000,
+        );
+        assert!(wrong_len_err.is_err());
+        assert_eq!(wrong_len_base, vec![1.25f32; 3]);
+        assert_eq!(coord.dp_accountant().unwrap().committed_rounds(), 0);
+        assert!(crate::artifacts::read_dp_ledger_entries(&run_dir)
+            .unwrap()
+            .is_empty());
+
+        // 2. First valid LoRA round consumes budget cleanly (committed_rounds = 1).
+        let mut base_w = vec![0.5f32; 4];
+        coord
+            .aggregate_lora_cohort_round(
+                &[(p1, pair1.clone()), (p2, pair2.clone())],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 8,
+                },
+                &FedAvg,
+                Some(&mut base_w),
+                1.0,
+                &mut session,
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(coord.dp_accountant().unwrap().committed_rounds(), 1);
+        let after_first = base_w.clone();
+
+        // 3. Budget exhaustion on subsequent LoRA round MUST fail WITHOUT mutating `base_w`!
+        let mut hit_budget_err = false;
+        for step in 0..8u64 {
+            let mut candidate_w = after_first.clone();
+            match coord.aggregate_lora_cohort_round(
+                &[(p1, pair1.clone()), (p2, pair2.clone())],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 8,
+                },
+                &FedAvg,
+                Some(&mut candidate_w),
+                1.0,
+                &mut session,
+                2_200 + step,
+            ) {
+                Ok(_) => {}
+                Err(RoundError::PrivacyBudget(_)) => {
+                    assert_eq!(
+                        candidate_w, after_first,
+                        "DP budget failure must leave base_weights_to_merge untouched"
+                    );
+                    hit_budget_err = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error on exhaustion step: {other}"),
+            }
+        }
+        assert!(hit_budget_err, "expected PrivacyBudget exhaustion error");
 
         let _ = fs::remove_dir_all(&base);
     }

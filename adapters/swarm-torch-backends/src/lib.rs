@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 //! Workspace-excluded tensor backend bridges for `Burn` and `Candle` (`ADR-0024` §4, `W12-01`).
 //!
+//! **Maturity Tier:** `Simulation verified` — canonical `ModelTensorSchemaV1` (`model_schema_hash`),
+//! schema-sorted parameter serialization, and `.is_finite()` boundary verification run against
+//! in-memory/simulated handles. Live `burn` / `candle` tensor SDK integration lands in Phase `13D-4`.
+//!
 //! Keeps heavy DL SDK trees isolated outside root `Cargo.lock` while enforcing canonical
 //! `ModelTensorSchemaV1` (`model_schema_hash`), schema-sorted parameter serialization, and
 //! transactional `.is_finite()` verification across device synchronization boundaries.

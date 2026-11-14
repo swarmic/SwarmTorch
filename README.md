@@ -16,18 +16,32 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 ## Canonical Docs
 
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
+- [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md) (public reference bibliography)
 - [`ADRs.md`](ADRs.md) (architecture decisions)
-- [`CHANGELOG.md`](CHANGELOG.md) (release history & wave milestones)
-- [`SECURITY.md`](SECURITY.md) (security policy + supply chain gates)
+- [`ROADMAP.md`](ROADMAP.md) (milestone history & active Wave 13 remediation)
+- [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
+- [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 11 — `v0.1.0` Release Candidate)
+## Implementation Reality (Wave 12 + Wave 13 Phase `13-0` Containment)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
 - `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`).
-- Receiver-bound `SessionId` replay/auth enforcement (`ADR-0020`, `swarmtorch.envelope.v1`, expiry-indexed safe `BTreeMap` cache), hardened `Multi-Krum`, `Bulyan` (`BulyanProfile::IterativeKrumV1`), stateful `CenteredClippingAggregator` (`CClip`), and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`SBucketingTransformer`, `ADR-0019`) are implemented.
-- Bounded decompression, `ClassicResidual` / `EF21` error feedback, and verifiable `SharedSeedSparse` (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`, `ADR-0021`) are implemented alongside contiguous `LinearModel` / `MlpModel`, analytical losses (`MSE`, `CrossEntropy`, `Huber`, `FedProx`), `SgdOptimizer`, and zero-dependency `SwarmTorchCheckpointV1` SafeTensors v1 persistence (`ADR-0023`, `ADR-0024`).
-- `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), Ed25519-signed `RunArtifactBundle` v1 (`TrustPolicy::Strict`, cross-process `BundleLockGuard`), and Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`) are implemented in `swarm-torch`.
-- Concrete `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), 16-byte `ChunkedFrameCodec` (`CRC-16/IBM-3740`), originator-authenticated gossip wrappers, `LoopbackPacketTransport`, and `MockTransport` are implemented in `swarm-torch-net` (`ADR-0004`, `ADR-0022`). Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) and optional `Zenoh`/`Iroh` adapter crates remain planned for `v0.2.0`.
+- **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-13 work, and `VerifiedMechanismProtected` fails closed.
+- **Wasm Sandbox Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1` and `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` isolation lands (`Phase 13D-1`).
+- **Active Wave 13 Hardening:** Core crates pass the baseline test suite while end-to-end cryptographic coordinator admission (`13A`), atomic durable commits + `fs4` locking (`13B`), evented I/O + Bulyan Stage 2 + two-phase `SharedSeedSparse` (`13C`), and live external SDK wiring (`13D`) are executed incrementally across Wave 13.
+
+### Adapter & Capability Maturity Matrix
+
+| Surface | Maturity Tier | Notes |
+|---------|---------------|-------|
+| `adapters/swarm-torch-transport-iroh` | `Simulation verified` | Pre-replay `bind_originator` + bounded quota (`ST-08`); live `iroh` endpoint SDK in `13D-2` |
+| `adapters/swarm-torch-transport-zenoh` | `Simulation verified` | Strict topic/envelope contract check; live `zenoh` session SDK in `13D-3` |
+| `adapters/swarm-torch-backends` | `Simulation verified` | Canonical schema + finiteness contract; live `burn`/`candle` SDKs in `13D-4` |
+| `adapters/swarm-torch-mcp` | `Simulation verified` | Zero-port read-only stdio inspector; honest experimental DP notice (`ST-02`) |
+| `adapters/swarm-torch-wasm` | Planned (`13D-1`) | Untrusted Wasm fails closed (`ST-09`) until `wasmi` sandbox ships |
+| `ble-transport` / `lora-transport` | Placeholder flag only | Feature flag reservations; no radio drivers implemented yet |
+
+> **6-Tier Scale:** `Contract defined` < `Simulation verified` < `SDK integrated` < `Integration verified` < `Adversarial conformance passed` < `Deployment supported`.
 
 -----
 
@@ -233,8 +247,8 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`robust-aggregation`|Enable robust aggregation strategies (`krum`, `bulyan`)|✅ Yes|
 |`tcp-transport`     |Enable Tokio TCP length-prefixed packet transport (`TcpPacketTransport`)|❌ No|
 |`udp-transport`     |Enable Tokio UDP chunk-multiplexed packet transport (`UdpPacketTransport`)|❌ No|
-|`ble-transport`     |Transport feature flag surface (hardware radio backend planned)|❌ No|
-|`lora-transport`    |Transport feature flag surface (hardware radio backend planned)|❌ No|
+|`ble-transport`     |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
+|`lora-transport`    |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
 |`telemetry`         |Core telemetry module re-exports         |❌ No        |
 
 External framework bridges (such as Burn and Candle in `swarm-torch-backends`, WGPU/CUDA acceleration, and PyO3 bindings) are isolated to optional adapter crates and roadmap waves (`ADR-0015`, `ADR-0024`).

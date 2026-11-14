@@ -5,6 +5,23 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-14 (Wave 13 Phase `13-0` Containment & Governance)
+
+### Security
+- **Differential Privacy Accounting Containment (`ST-02`):**
+  - Reclassified `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`swarm-torch::artifacts::dp_ledger`), and `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) as **`ExperimentalHypotheticalBudgetOnly`** (`guarantees_differential_privacy = false`).
+  - Added fail-closed `VerifiedMechanismProtected` rejection across `RdpAccountantV1`, `dp_ledger.rs`, and `SwarmRoundCoordinator` (`supports_certified_differential_privacy() == false`, `RoundConfigError::UnsupportedCertifiedDifferentialPrivacy`), and staged `base_weights_to_merge` validation/application prior to pre-release DP debit in `SwarmRoundCoordinator::aggregate_lora_cohort_round`.
+- **Wasm Sandbox Containment (`ST-09`):**
+  - Made `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, `Scheduler` (`RunnerIsolationProfile::WasmSandboxedV1`), and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` integration lands (`Phase 13D-1`).
+  - Moved the bespoke interpreter strictly behind `#[doc(hidden)] WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only`, rejecting `F64` (`0x7c`), bounding cumulative locals per function (`4096`), and metering decode/pre-scan fuel.
+- **Iroh Carrier Adapter Hardening (`ST-08`):**
+  - Fixed `IrohCarrierAdapterV1::{accept_envelope_frame, accept_gossip_frame}` (`adapters/swarm-torch-transport-iroh`) to enforce `bind_originator` and wrapper/inner originator parity **before** mutating `ReplayProtection`, replaced unbounded `counts` with sliding-window bounded `LinkFrameQuotaTrackerV1` (`DEFAULT_MAX_TRACKED_LINK_PRINCIPALS = 1024`, `DEFAULT_MAX_WINDOW_TIMESTAMPS_PER_LINK = 1024`, lazy expiry + fail-closed `LinkQuotaTableFull`), and hid `simulated_link_principal_for_test` behind `#[doc(hidden)]`.
+
+### Documentation
+- **Public Bibliography & Adapter Maturity Transparency (`ST-15`):**
+  - Restored `SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md` as a public file in `SwarmTorch`.
+  - Updated `README.md`, `ROADMAP.md`, `SECURITY.md`, `ADRs.md`, adapter crate docs, and `Cargo.toml` radio-feature comments with explicit 6-tier adapter maturity labels and honest Wave 13 remediation scope.
+
 ## [0.2.0] - 2026-11-13 (Wave 12)
 
 ### Added

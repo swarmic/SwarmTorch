@@ -2,6 +2,10 @@
 
 //! Isolated zero-port read-only strict MCP inspector adapter wrapping
 //! [`swarm_torch::mcp_inspector::McpInspectorServerV1`].
+//!
+//! **Maturity Tier:** `Simulation verified` — strict stdio JSON-RPC 2.0 request/response framing
+//! and read-only bundle verification run deterministically without network listeners. Differential
+//! privacy tool fields explicitly surface experimental accounting-only metadata (`ST-02`).
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;

@@ -47,6 +47,7 @@ embassy-runtime = ["swarm-torch-runtime/embassy"]
 # Transport selection
 tcp-transport = ["swarm-torch-net/tcp-transport"]
 udp-transport = ["swarm-torch-net/udp-transport"]
+# Placeholder Cargo feature flags reserved for future hardware radio drivers (no backend implemented yet).
 ble-transport = ["swarm-torch-net/ble-transport"]
 lora-transport = ["swarm-torch-net/lora-transport"]
 

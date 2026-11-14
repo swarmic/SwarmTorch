@@ -1,5 +1,11 @@
-//! Rényi Differential Privacy (`RDP`) accounting and Poisson-Subsampled Gaussian Mechanism (`SGM`)
-//! composition (`ADR-0023` §4.2, `W12-03`).
+//! Experimental hypothetical Rényi Differential Privacy (`RDP`) accounting and Poisson-Subsampled
+//! Gaussian Mechanism (`SGM`) composition arithmetic (`ADR-0023` §4.2, `W12-03`, `ST-02`).
+//!
+//! > **Security Notice (`ST-02` Containment):** This module computes **hypothetical accounting bounds
+//! > only**. Neither [`RdpAccountantV1`] nor `SwarmRoundCoordinator` injects Poisson client subsampling
+//! > or calibrated Gaussian noise in `v0.2`; [`RdpAccountantV1::guarantees_differential_privacy`]
+//! > returns `false`, and `VerifiedMechanismProtected` profiles fail closed until a real noise-injecting
+//! > mechanism (e.g. `DpFedAvgV1`) is integrated.
 //!
 //! This module is `no_std` compatible and implements [`RdpAccountantV1`] over the canonical
 //! 16-order Rényi grid $\Lambda$, supporting:
@@ -8,7 +14,7 @@
 //!   (`Mironov, Talwar, & Zhang 2019`, $0 < q < 1$),
 //! - Both `Mironov (2017)` standard and `Balle et al. (2020)` tight $(\alpha, \rho(\alpha)) \to (\varepsilon, \delta)$-DP
 //!   conversions, and
-//! - Fail-closed budget gating via [`PrivacyAccountantHook`].
+//! - Fail-closed hypothetical budget gating via [`PrivacyAccountantHook`].
 
 use crate::crypto::{CryptoError, PrivacyAccountantHook, RdpBudgetDescriptorV1};
 use crate::num::{abs_f64, ln_f64_soft, log_sum_exp_pair_f64};
@@ -53,7 +59,23 @@ pub enum DpConversionFormulaV1 {
     Balle2020Tight,
 }
 
-/// Normative configuration profile for a Differential Privacy mechanism (`ADR-0023` §4.2).
+/// Explicit privacy guarantee classification for [`DpMechanismProfileV1`] and [`RdpAccountantV1`] (`ST-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "alloc", serde(rename_all = "snake_case"))]
+pub enum PrivacyAccountingClassificationV1 {
+    /// Experimental hypothetical RDP budget accounting only.
+    ///
+    /// **No** Poisson client subsampling, calibrated Gaussian noise injection, or formal Differential
+    /// Privacy protection is claimed or enforced.
+    #[default]
+    ExperimentalHypotheticalBudgetOnly,
+    /// Guarded classification reserved for future genuine noise-injecting mechanisms (e.g., `DpFedAvgV1`).
+    /// Fails closed in standalone accountants and current coordinator paths until a certified mechanism lands.
+    VerifiedMechanismProtected,
+}
+
+/// Normative configuration profile for Differential Privacy accounting (`ADR-0023` §4.2, `ST-02`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "alloc", derive(serde::Serialize, serde::Deserialize))]
 pub struct DpMechanismProfileV1 {
@@ -71,9 +93,22 @@ pub struct DpMechanismProfileV1 {
     pub max_epsilon: f64,
     /// Conversion formula from RDP to $(\varepsilon, \delta)$-DP.
     pub conversion_formula: DpConversionFormulaV1,
+    /// Accounting classification (`ExperimentalHypotheticalBudgetOnly` when used as a standalone budget tracker).
+    #[cfg_attr(feature = "alloc", serde(default))]
+    pub classification: PrivacyAccountingClassificationV1,
 }
 
 impl DpMechanismProfileV1 {
+    /// Whether this profile claims genuine noise-injected Differential Privacy guarantees
+    /// (`false` for [`PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly`]).
+    #[inline]
+    pub const fn guarantees_differential_privacy(&self) -> bool {
+        matches!(
+            self.classification,
+            PrivacyAccountingClassificationV1::VerifiedMechanismProtected
+        )
+    }
+
     /// Validate all privacy mechanism parameters.
     pub fn validate(&self) -> Result<(), CryptoError> {
         if !self.clipping_radius_tau.is_finite()
@@ -289,9 +324,18 @@ pub struct RdpAccountantV1 {
 }
 
 impl RdpAccountantV1 {
-    /// Construct a new [`RdpAccountantV1`] after validating `profile`.
+    /// Construct a new hypothetical [`RdpAccountantV1`] after validating `profile`.
+    ///
+    /// Fails closed with [`CryptoError::InvalidPrivacyParameter`] if `profile.classification` is
+    /// [`PrivacyAccountingClassificationV1::VerifiedMechanismProtected`], because a standalone
+    /// accountant does not execute Poisson subsampling or calibrated Gaussian noise injection (`ST-02`).
     pub fn new(profile: DpMechanismProfileV1) -> Result<Self, CryptoError> {
         profile.validate()?;
+        if profile.classification
+            != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+        {
+            return Err(CryptoError::InvalidPrivacyParameter);
+        }
         Ok(Self {
             profile,
             cumulative_rdp_orders: [0.0; RDP_GRID_LEN],
@@ -305,13 +349,19 @@ impl RdpAccountantV1 {
     ///
     /// Verifies that `profile` and every persisted `cumulative_rdp_orders[i]` are finite and $\ge 0$,
     /// recomputes $(\varepsilon(\delta), \alpha^*)$, and fails closed with [`CryptoError::PrivacyBudgetExhausted`]
-    /// if the replayed cumulative spend already exceeds `profile.max_epsilon`.
+    /// if the replayed cumulative spend already exceeds `profile.max_epsilon`, or [`CryptoError::InvalidPrivacyParameter`]
+    /// if `profile.classification` claims [`PrivacyAccountingClassificationV1::VerifiedMechanismProtected`].
     pub fn restore_from_orders(
         profile: DpMechanismProfileV1,
         cumulative_rdp_orders: [f64; RDP_GRID_LEN],
         committed_rounds: u64,
     ) -> Result<Self, CryptoError> {
         profile.validate()?;
+        if profile.classification
+            != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+        {
+            return Err(CryptoError::InvalidPrivacyParameter);
+        }
         for &rho in &cumulative_rdp_orders {
             if !rho.is_finite() || rho < 0.0 {
                 return Err(CryptoError::InvalidPrivacyParameter);
@@ -343,6 +393,16 @@ impl RdpAccountantV1 {
     /// Return the configured [`DpMechanismProfileV1`].
     pub const fn profile(&self) -> &DpMechanismProfileV1 {
         &self.profile
+    }
+
+    /// Whether this accountant backs an active certified Differential Privacy mechanism.
+    ///
+    /// Always returns `false` for [`PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly`] (`ST-02`).
+    pub const fn guarantees_differential_privacy(&self) -> bool {
+        matches!(
+            self.profile.classification,
+            PrivacyAccountingClassificationV1::VerifiedMechanismProtected
+        )
     }
 
     /// Return the cumulative Rényi divergence array $\sum_t \rho_t(\alpha)$ across [`RDP_ALPHA_GRID_V1`].
@@ -461,8 +521,10 @@ mod tests {
             target_delta: 1e-5,
             max_epsilon: 6.0,
             conversion_formula: DpConversionFormulaV1::Mironov2017,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
         };
         let mut acc = RdpAccountantV1::new(profile).unwrap();
+        assert!(!acc.guarantees_differential_privacy());
 
         // Record 4 full-participation rounds (q = 1.0): cumulative rho(alpha) = 4 * alpha / 8 = alpha / 2.
         for _ in 0..4 {
@@ -491,6 +553,7 @@ mod tests {
             target_delta: 1e-5,
             max_epsilon: 2.5,
             conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
         };
         let mut acc = RdpAccountantV1::new(profile).unwrap();
 
@@ -529,5 +592,28 @@ mod tests {
         assert!(acc.committed_rounds() >= rounds_before);
         let (eps, _delta, _alpha) = acc.current_approx_dp();
         assert!(eps <= profile.max_epsilon);
+    }
+
+    #[test]
+    fn certified_dp_classification_fails_closed_on_standalone_accountant() {
+        let certified_attempt = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 2.5,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
+        };
+        assert_eq!(
+            RdpAccountantV1::new(certified_attempt).unwrap_err(),
+            CryptoError::InvalidPrivacyParameter
+        );
+        assert_eq!(
+            RdpAccountantV1::restore_from_orders(certified_attempt, [0.0; RDP_GRID_LEN], 0)
+                .unwrap_err(),
+            CryptoError::InvalidPrivacyParameter
+        );
     }
 }

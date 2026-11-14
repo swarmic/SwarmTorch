@@ -85,7 +85,10 @@ pub enum RunnerIsolationProfile {
     /// Execute trusted core operators in-process (`ExecutionTrust::Core`).
     #[default]
     InProcessTrusted,
-    /// Wave 12 (`W12-04`) real deterministic WebAssembly sandboxed executor (`ExecutionTrust::SandboxedExtension`).
+    /// Scheduled profile for future isolated `wasmi` extension execution (`ExecutionTrust::SandboxedExtension`).
+    ///
+    /// **Fails closed (`UnsupportedUntrustedWasmSandbox`) in `13-0`** until the external
+    /// `adapters/swarm-torch-wasm` (`wasmi`) integration lands (`ST-09`).
     WasmSandboxedV1(crate::wasm_sandbox::SandboxedExtensionPolicyV1),
     /// Legacy placeholder stub for external process isolation.
     ExternalSandboxedStub {
@@ -272,7 +275,7 @@ pub fn execute_graph_with_isolation(
     run_id: RunId,
     clock_nanos: fn() -> u64,
 ) -> Result<SchedulerReport, SchedulerError> {
-    let empty_registry = std::collections::BTreeMap::new();
+    let _ = wasm_registry;
     let ordered = topological_sort_nodes(graph)?;
     let mut report = SchedulerReport::default();
     let trace_id = TraceId::from_bytes(*run_id.as_bytes());
@@ -422,8 +425,23 @@ pub fn execute_graph_with_isolation(
             }
             (
                 swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension,
-                RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
-            ) => Some((wasm_policy, wasm_registry.unwrap_or(&empty_registry))),
+                RunnerIsolationProfile::WasmSandboxedV1(_),
+            ) => {
+                let error_code =
+                    "isolation_denied:UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until the isolated wasmi adapter is configured"
+                        .to_string();
+                session.record_node_error(&node, started, 0, error_code.clone())?;
+                emit_scheduler_event(
+                    session.sink().as_ref(),
+                    trace_id,
+                    started,
+                    "scheduler/node_denied",
+                    &node.node_key,
+                    Some(&error_code),
+                )?;
+                report.failed_nodes.push(node.node_key.clone());
+                continue;
+            }
             (swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension, _) => {
                 let error_code =
                     "isolation_denied:SandboxedExtension requires RunnerIsolationProfile::WasmSandboxedV1"
@@ -1287,11 +1305,11 @@ mod tests {
         .unwrap();
         assert_eq!(r_denied.failed_nodes, vec!["node/wasm_op"]);
 
-        // 2. Under WasmSandboxedV1 with allowlisted module, SandboxedExtension executes cleanly!
+        // 2. Under WasmSandboxedV1 in Phase 13-0, untrusted Wasm MUST also fail closed cleanly!
         let wasm_policy = SandboxedExtensionPolicyV1::with_allowed_hash(hash);
         let mut registry = BTreeMap::new();
         registry.insert(hash, wasm);
-        let r_ok = execute_graph_with_isolation(
+        let r_blocked = execute_graph_with_isolation(
             &graph,
             &mut session,
             &NativeOpRunner,
@@ -1302,8 +1320,8 @@ mod tests {
             test_clock,
         )
         .unwrap();
-        assert!(r_ok.failed_nodes.is_empty());
-        assert_eq!(r_ok.executed_nodes, vec!["node/wasm_op"]);
+        assert_eq!(r_blocked.failed_nodes, vec!["node/wasm_op"]);
+        assert!(r_blocked.executed_nodes.is_empty());
 
         let _ = fs::remove_dir_all(&base);
     }

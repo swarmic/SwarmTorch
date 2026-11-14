@@ -45,10 +45,12 @@ SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its imp
   - `RunArtifactBundle` enforces cross-process exclusive `.bundle.lock` (`BundleLockGuard`), unique `.staging.*` atomic writes, Ed25519 `ManifestSignatureV1` over raw 16-byte `RunId` preimages, single-pass zero-TOCTOU `VerifiedBundleV1` (`TrustPolicy::Strict`), and Draft 2020-12 JSON Schema validation (`schemas/v1/*.schema.json`), rejecting path traversal (`..`), absolute paths, and symlink escapes on Unix and Windows CI lanes.
   - `SwarmTorchCheckpointV1` enforces `HEADER_SIZE_LIMIT = 65_536` and strict contiguous `F32` byte-interval validation before parameter loading.
 
-### Known Current Boundaries & Planned Hardening (Wave 12 / `v0.2.0`)
+### Known Current Boundaries & Active Wave 13 Remediation (`v0.2.0` -> Wave 13)
 
-- **Optional Transport & Framework Adapter Crates:** Optional `Zenoh` / `Iroh` transport crates (`W12-02`) and `Burn` / `Candle` model adapter crates (`W12-01`) are isolated outside the core workspace for Wave 12.
-- **Sandboxed Extension Host (`wasmi`):** Pipeline extension sandboxing with installed memory/table limiters and engine fuel (`ADR-0018`, `ADR-0025`) is scheduled for Wave 12 (`W12-04`).
+- **Experimental Differential Privacy Accounting (`ST-02`, Phase `13-0`):** `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`dp_ledger.rs`), and `trace_aggregation_budget` (`mcp_inspector.rs`) currently perform **experimental accounting-only tracking** (`guarantees_differential_privacy = false`). `SwarmRoundCoordinator::supports_certified_differential_privacy()` returns `false`, and any `VerifiedMechanismProtected` profile fails closed until a certified `DpFedAvgV1` mechanism profile ships post-Wave-13.
+- **Untrusted Wasm Extension Containment (`ST-09`, Phase `13-0` -> `13D-1`):** `RunnerIsolationProfile::WasmSandboxedV1`, `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) pending isolated `wasmi` integration (`adapters/swarm-torch-wasm`, Phase `13D-1`).
+- **Optional Transport & Framework Adapter Crates (`ST-08`, Phase `13-0` -> `13D-2..4`):** Standalone crates under `adapters/` (`swarm-torch-transport-iroh`, `swarm-torch-transport-zenoh`, `swarm-torch-backends`, `swarm-torch-mcp`) are isolated outside root `Cargo.lock` and currently sit at **`Simulation verified`** (contract/policy/framing tested with bounded sliding-window rate limits and pre-replay binding checks; live external SDK wiring lands in Phase `13D`).
+- **Placeholder Radio Feature Flags:** `ble-transport` and `lora-transport` in `swarm-torch` / `swarm-torch-net` are empty feature-flag surface reservations with no hardware radio drivers implemented yet.
 
 ---
 

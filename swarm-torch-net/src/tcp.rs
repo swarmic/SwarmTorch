@@ -166,14 +166,16 @@ pub fn encode_length_prefixed_frame(payload: &[u8], max_message_bytes: usize) ->
 struct ActiveConnection {
     stream: TcpStream,
     reader_state: TcpFrameReaderState,
-    known_peer: Option<PeerId>,
+    remote_addr: SocketAddr,
 }
+
+type InMemoryStreamQueueMap = BTreeMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>;
 
 /// Shared in-memory raw byte-stream hub used when OS socket creation is restricted or for
 /// deterministic framed stream testing.
 #[derive(Default, Clone)]
 pub struct InMemoryTcpStreamHub {
-    streams: Arc<Mutex<BTreeMap<SocketAddr, VecDeque<Vec<u8>>>>>,
+    streams: Arc<Mutex<InMemoryStreamQueueMap>>,
 }
 
 impl InMemoryTcpStreamHub {
@@ -191,19 +193,19 @@ enum TcpBackend {
     },
 }
 
-/// Concrete length-prefixed TCP [`SwarmTransport`] (`ADR-0022` §1.3, `W11-03`).
+/// Concrete length-prefixed TCP [`SwarmTransport`] (`ADR-0022` §1.3, `W11-03`, `ST-06`).
 ///
-/// Keyed by authenticated/registered `PeerId <-> SocketAddr` directory entries and backed by
-/// cancellation-safe [`TcpFrameReaderState`] connection readers.
+/// Keyed for outbound routing by `PeerId -> SocketAddr` and backed on receive by
+/// cancellation-safe [`TcpFrameReaderState`] readers that surface only an
+/// unauthenticated [`crate::traits::ObservedSourceRef`].
 pub struct TcpTransport {
     local_peer: PeerId,
     local_addr: SocketAddr,
     max_message_bytes: usize,
     backend: TcpBackend,
     peers: RwLock<BTreeMap<PeerId, SocketAddr>>,
-    addr_to_peer: RwLock<BTreeMap<SocketAddr, PeerId>>,
     connections: Mutex<Vec<ActiveConnection>>,
-    inbox: Mutex<VecDeque<(PeerId, Vec<u8>)>>,
+    inbox: Mutex<VecDeque<crate::traits::ObservedTransportMessage>>,
 }
 
 impl core::fmt::Debug for TcpTransport {
@@ -238,7 +240,6 @@ impl TcpTransport {
             max_message_bytes,
             backend: TcpBackend::OsSocket(listener),
             peers: RwLock::new(BTreeMap::new()),
-            addr_to_peer: RwLock::new(BTreeMap::new()),
             connections: Mutex::new(Vec::new()),
             inbox: Mutex::new(VecDeque::new()),
         }))
@@ -264,10 +265,9 @@ impl TcpTransport {
             max_message_bytes,
             backend: TcpBackend::InMemory {
                 hub,
-                reader_state: Mutex::new(TcpFrameReaderState::new(max_message_bytes + 32)),
+                reader_state: Mutex::new(TcpFrameReaderState::new(max_message_bytes)),
             },
             peers: RwLock::new(BTreeMap::new()),
-            addr_to_peer: RwLock::new(BTreeMap::new()),
             connections: Mutex::new(Vec::new()),
             inbox: Mutex::new(VecDeque::new()),
         }))
@@ -278,21 +278,18 @@ impl TcpTransport {
         self.local_addr
     }
 
-    /// Register a peer's `SocketAddr` in the transport directory.
+    /// Register a peer's outbound `SocketAddr` in the transport directory (`PeerId` lookup is
+    /// strictly outbound; inbound identity always comes from downstream cryptographic verification).
     pub fn register_peer(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {
         self.peers
             .write()
             .map_err(|_| Error::TransportUnavailable)?
             .insert(peer, addr);
-        self.addr_to_peer
-            .write()
-            .map_err(|_| Error::TransportUnavailable)?
-            .insert(addr, peer);
         Ok(())
     }
 
-    /// Synchronous framed send: transmits `u32_le(len) || [32-byte local_peer prologue || msg]`
-    /// to `peer`.
+    /// Synchronous framed send: transmits `u32_le(len) || msg` to `peer` with no spoofable
+    /// unauthenticated `PeerId` header prologue.
     pub fn send_sync(&self, peer: PeerId, msg: &[u8]) -> Result<()> {
         if msg.is_empty() || msg.len() > self.max_message_bytes {
             return Err(Error::InvalidMessage);
@@ -302,10 +299,7 @@ impl TcpTransport {
             *guard.get(&peer).ok_or(Error::PeerNotFound)?
         };
 
-        let mut wire_payload = Vec::with_capacity(32 + msg.len());
-        wire_payload.extend_from_slice(self.local_peer.as_bytes());
-        wire_payload.extend_from_slice(msg);
-        let frame = encode_length_prefixed_frame(&wire_payload, self.max_message_bytes + 32)?;
+        let frame = encode_length_prefixed_frame(msg, self.max_message_bytes)?;
 
         match &self.backend {
             TcpBackend::OsSocket(_) => {
@@ -324,15 +318,15 @@ impl TcpTransport {
                     .lock()
                     .map_err(|_| Error::TransportUnavailable)?;
                 let queue = guard.get_mut(&addr).ok_or(Error::ConnectionFailed)?;
-                queue.push_back(frame);
+                queue.push_back((self.local_addr, frame));
                 Ok(())
             }
         }
     }
 
     /// Poll non-blocking listener and active connections once, returning the next complete
-    /// `(PeerId, message_bytes)` frame if available.
-    pub fn poll_recv_once(&self) -> Result<Option<(PeerId, Vec<u8>)>> {
+    /// [`crate::traits::ObservedTransportMessage`] if available.
+    pub fn poll_recv_once(&self) -> Result<Option<crate::traits::ObservedTransportMessage>> {
         if let Some(item) = self
             .inbox
             .lock()
@@ -344,27 +338,23 @@ impl TcpTransport {
 
         match &self.backend {
             TcpBackend::InMemory { hub, reader_state } => {
-                let raw_bytes_opt = {
+                let item_opt = {
                     let mut guard = hub
                         .streams
                         .lock()
                         .map_err(|_| Error::TransportUnavailable)?;
                     guard.get_mut(&self.local_addr).and_then(|q| q.pop_front())
                 };
-                if let Some(raw_bytes) = raw_bytes_opt {
+                if let Some((source_addr, raw_bytes)) = item_opt {
                     let mut cursor = Cursor::new(raw_bytes);
                     let mut r_state = reader_state
                         .lock()
                         .map_err(|_| Error::TransportUnavailable)?;
-                    if let Some(wire_frame) = r_state.try_read_frame(&mut cursor)? {
-                        if wire_frame.len() <= 32 {
-                            return Err(Error::InvalidMessage);
-                        }
-                        let mut peer_bytes = [0u8; 32];
-                        peer_bytes.copy_from_slice(&wire_frame[0..32]);
-                        let sender = PeerId::new(peer_bytes);
-                        let msg = wire_frame[32..].to_vec();
-                        return Ok(Some((sender, msg)));
+                    if let Some(payload) = r_state.try_read_frame(&mut cursor)? {
+                        return Ok(Some(crate::traits::ObservedTransportMessage {
+                            observed_source: crate::traits::ObservedSourceRef::from(source_addr),
+                            payload,
+                        }));
                     }
                 }
                 Ok(None)
@@ -374,18 +364,11 @@ impl TcpTransport {
                     match listener.accept() {
                         Ok((stream, remote_addr)) => {
                             let _ = stream.set_nonblocking(true);
-                            let known_peer = self
-                                .addr_to_peer
-                                .read()
-                                .ok()
-                                .and_then(|map| map.get(&remote_addr).copied());
                             if let Ok(mut conns) = self.connections.lock() {
                                 conns.push(ActiveConnection {
                                     stream,
-                                    reader_state: TcpFrameReaderState::new(
-                                        self.max_message_bytes + 32,
-                                    ),
-                                    known_peer,
+                                    reader_state: TcpFrameReaderState::new(self.max_message_bytes),
+                                    remote_addr,
                                 });
                             }
                         }
@@ -404,20 +387,14 @@ impl TcpTransport {
                 while idx < conns.len() {
                     let conn = &mut conns[idx];
                     match conn.reader_state.try_read_frame(&mut conn.stream) {
-                        Ok(Some(wire_frame)) => {
-                            if wire_frame.len() <= 32 {
-                                conns.swap_remove(idx);
-                                if first_error.is_none() {
-                                    first_error = Some(Error::InvalidMessage);
-                                }
-                                continue;
-                            }
-                            let mut peer_bytes = [0u8; 32];
-                            peer_bytes.copy_from_slice(&wire_frame[0..32]);
-                            let sender = conn.known_peer.unwrap_or_else(|| PeerId::new(peer_bytes));
-                            let msg = wire_frame[32..].to_vec();
+                        Ok(Some(payload)) => {
+                            let observed_source =
+                                crate::traits::ObservedSourceRef::from(conn.remote_addr);
                             if let Ok(mut inbox) = self.inbox.lock() {
-                                inbox.push_back((sender, msg));
+                                inbox.push_back(crate::traits::ObservedTransportMessage {
+                                    observed_source,
+                                    payload,
+                                });
                             }
                             idx += 1;
                         }
@@ -453,8 +430,13 @@ impl TcpTransport {
 
 impl SwarmTransport for TcpTransport {
     type SendFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<()>> + Send + 'a>>;
-    type RecvFuture<'a> =
-        Pin<Box<dyn core::future::Future<Output = Result<(PeerId, Vec<u8>)>> + Send + 'a>>;
+    type RecvFuture<'a> = Pin<
+        Box<
+            dyn core::future::Future<Output = Result<crate::traits::ObservedTransportMessage>>
+                + Send
+                + 'a,
+        >,
+    >;
     type BroadcastFuture<'a> =
         Pin<Box<dyn core::future::Future<Output = Result<BroadcastStats>> + Send + 'a>>;
     type DiscoverFuture<'a> =
@@ -604,9 +586,17 @@ mod tests {
         let message = vec![0x42u8; 4096];
         node_a.send(peer_b, &message).await.unwrap();
 
-        let (sender, received) = node_b.recv().await.unwrap();
-        assert_eq!(sender, peer_a);
-        assert_eq!(received, message);
+        let msg_rx = node_b.recv().await.unwrap();
+        assert_eq!(
+            msg_rx.observed_source,
+            crate::traits::ObservedSourceRef::from(addr_a)
+        );
+        assert_eq!(msg_rx.payload, message);
+
+        // Short frames (< 32 bytes) pass untouched without bogus 32-byte PeerId prologue stripping.
+        node_a.send(peer_b, b"short-raw").await.unwrap();
+        let short_rx = node_b.recv().await.unwrap();
+        assert_eq!(short_rx.payload, b"short-raw");
 
         // Also exercise OS socket bind + connect when the host environment permits loopback connections.
         let addr_any: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -617,9 +607,12 @@ mod tests {
             os_a.register_peer(peer_b, os_b.local_addr()).unwrap();
             os_b.register_peer(peer_a, os_a.local_addr()).unwrap();
             if os_a.send(peer_b, &message).await.is_ok() {
-                let (os_sender, os_received) = os_b.recv().await.unwrap();
-                assert_eq!(os_sender, peer_a);
-                assert_eq!(os_received, message);
+                let os_rx = os_b.recv().await.unwrap();
+                assert!(matches!(
+                    os_rx.observed_source,
+                    crate::traits::ObservedSourceRef::Ipv4 { .. }
+                ));
+                assert_eq!(os_rx.payload, message);
             }
         }
     }

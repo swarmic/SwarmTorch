@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::{KeyPair, MessageAuth, SessionHandshakeChallenge};
+use crate::crypto::{KeyPair, MessageAuth, SessionHandshakeChallenge, SessionHandshakeChallengeV2};
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,9 +8,13 @@ fn make_peer(id: u8) -> PeerId {
     PeerId::new([id; 32])
 }
 
+fn new_genesis_guard() -> ReplayProtection {
+    ReplayProtection::new().with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+}
+
 #[test]
-fn validate_accepts_first_message_from_peer() {
-    let mut guard = ReplayProtection::new();
+fn validate_accepts_first_message_from_peer_under_genesis_bootstrap() {
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -31,7 +35,7 @@ fn try_with_config_accepts_valid_capacity() {
 
 #[test]
 fn validate_accepts_monotonic_sequence() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -43,7 +47,7 @@ fn validate_accepts_monotonic_sequence() {
 
 #[test]
 fn validate_rejects_duplicate_sequence() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -55,7 +59,7 @@ fn validate_rejects_duplicate_sequence() {
 
 #[test]
 fn validate_rejects_retrograde_sequence() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -74,7 +78,7 @@ fn validate_rejects_retrograde_sequence() {
 
 #[test]
 fn validate_accepts_out_of_order_within_window() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -85,7 +89,7 @@ fn validate_accepts_out_of_order_within_window() {
 
 #[test]
 fn sequence_window_check_no_overflow_at_u64_max() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(42);
     let now = 1000;
 
@@ -147,7 +151,9 @@ fn validate_accepts_timestamp_within_skew_window() {
 
 #[test]
 fn expiry_indexed_reclamation_prevents_in_window_eviction_and_reclaims_after_window() {
-    let mut guard = ReplayProtection::try_with_config(10, 60).unwrap();
+    let mut guard = ReplayProtection::try_with_config(10, 60)
+        .unwrap()
+        .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap);
     let now = 1000;
 
     // Fill cache with 10 peers at t = 1000 (expires_at = 1060).
@@ -198,7 +204,7 @@ fn cohort_allowlist_rejects_unauthorized_peer_without_state_mutation() {
     let peer_allowed = make_peer(1);
     let peer_blocked = make_peer(2);
     let allowlist = CohortAllowlist::from_peers([peer_allowed]);
-    let mut guard = ReplayProtection::new().with_cohort_allowlist(allowlist);
+    let mut guard = new_genesis_guard().with_cohort_allowlist(allowlist);
 
     assert!(guard.validate(&peer_allowed, 1, 1000, 1000).is_ok());
     assert_eq!(guard.cache_size(), 1);
@@ -217,7 +223,7 @@ fn epoch_recovery_requires_signed_receiver_challenge_handshake() {
     let receiver_kp = KeyPair::from_seed([32u8; 32]).unwrap();
     let sender_auth = MessageAuth::new(sender_kp.clone());
     let sender_peer = sender_kp.peer_id();
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let now = 2000;
 
     // Epoch 1 established at seq = 10.
@@ -274,7 +280,7 @@ fn epoch_recovery_requires_signed_receiver_challenge_handshake() {
 
 #[test]
 fn peer_state_isolation() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer_a = make_peer(1);
     let peer_b = make_peer(2);
     let now = 1000;
@@ -288,7 +294,7 @@ fn peer_state_isolation() {
 
 #[test]
 fn sequence_window_prunes_correctly() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
     let now = 1000;
 
@@ -344,7 +350,7 @@ fn check_timestamp_only_does_not_mutate_state() {
 
 #[test]
 fn validate_sequence_mutates_state() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(1);
 
     assert!(guard.validate_sequence(&peer, 1).is_ok());
@@ -383,7 +389,7 @@ fn display_error_formats_correctly() {
 
 #[test]
 fn c01_boundary_sequence_rejected_on_second_submission() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(99);
     let now = 1000;
 
@@ -406,7 +412,7 @@ fn c01_boundary_sequence_rejected_on_second_submission() {
 
 #[test]
 fn c01_sequence_inside_window_still_accepted() {
-    let mut guard = ReplayProtection::new();
+    let mut guard = new_genesis_guard();
     let peer = make_peer(98);
     let now = 1000;
 
@@ -432,7 +438,9 @@ fn c01_sequence_inside_window_still_accepted() {
 
 #[test]
 fn configurable_tolerance_window_smaller_rejects_further_out_of_order() {
-    let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 4).unwrap();
+    let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 4)
+        .unwrap()
+        .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap);
     let peer = make_peer(200);
     let now = 1000;
 
@@ -452,7 +460,9 @@ fn configurable_tolerance_window_smaller_rejects_further_out_of_order() {
 
 #[test]
 fn configurable_tolerance_window_zero_enforces_strict_monotonic() {
-    let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 0).unwrap();
+    let mut guard = ReplayProtection::try_with_tolerance_window(100, 60, 0)
+        .unwrap()
+        .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap);
     let peer = make_peer(201);
     let now = 1000;
 
@@ -489,4 +499,355 @@ fn tolerance_window_too_large_rejected() {
     );
 
     assert!(ReplayProtection::try_with_tolerance_window(100, 60, 256).is_ok());
+}
+
+#[test]
+fn default_startup_policy_requires_session_handshake_before_delivery() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let sender_kp = KeyPair::from_seed([41u8; 32]).unwrap();
+    let receiver_kp = KeyPair::from_seed([42u8; 32]).unwrap();
+    let sender_peer = sender_kp.peer_id();
+    let mut guard = ReplayProtection::new();
+    assert_eq!(
+        guard.startup_policy(),
+        ReplayStartupPolicyV1::RequireSessionHandshake
+    );
+
+    let now = 2_000;
+    let fake_sid = [0x99u8; 32];
+    let v1_key = ReplayRecordKey::new(swarm_id, sender_peer, 1);
+    assert_eq!(
+        guard.validate_scoped(&v1_key, 1, now, now),
+        Err(ReplayError::RecoveryRequired {
+            peer: sender_peer,
+            current_epoch: 0,
+            requested_epoch: 1,
+        })
+    );
+
+    let v2_key_unestablished = ReplayRecordKeyV2::new(swarm_id, run_id, sender_peer, 1, fake_sid);
+    assert_eq!(
+        guard.validate_session_v2_at(&v2_key_unestablished, 1, now, now),
+        Err(ReplayError::RecoveryRequired {
+            peer: sender_peer,
+            current_epoch: 0,
+            requested_epoch: 1,
+        })
+    );
+
+    // Register & complete v2 handshake -> peer is now admitted for its bound session_id only.
+    let challenge = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer,
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0x55u8; 32],
+        issued_at_secs: now,
+    };
+    guard.register_recovery_challenge_v2(challenge).unwrap();
+    let hs_sig = MessageAuth::new(sender_kp.clone())
+        .sign_session_handshake_v2(&challenge)
+        .unwrap();
+    let active_key = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &hs_sig, now)
+        .unwrap();
+
+    assert_eq!(
+        guard.validate_session_v2_at(&v2_key_unestablished, 1, now, now),
+        Err(ReplayError::SessionIdMismatch { peer: sender_peer })
+    );
+    assert!(guard
+        .validate_session_v2_at(&active_key, 1, now, now)
+        .is_ok());
+}
+
+#[test]
+fn crash_restart_invalidates_prior_session_id_even_within_same_wall_clock_second() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let sender_kp = KeyPair::from_seed([43u8; 32]).unwrap();
+    let receiver_kp = KeyPair::from_seed([44u8; 32]).unwrap();
+    let sender_auth = MessageAuth::new(sender_kp.clone());
+    let sender_peer = sender_kp.peer_id();
+    let now = 5_000;
+
+    let mut pre_crash_guard = ReplayProtection::new();
+    let challenge_1 = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer,
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0xAAu8; 32],
+        issued_at_secs: now,
+    };
+    pre_crash_guard
+        .register_recovery_challenge_v2(challenge_1)
+        .unwrap();
+    let sig_1 = sender_auth.sign_session_handshake_v2(&challenge_1).unwrap();
+    let key_1 = pre_crash_guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &sig_1, now)
+        .unwrap();
+    assert!(pre_crash_guard
+        .validate_session_v2_at(&key_1, 1, now, now)
+        .is_ok());
+
+    // Process crashes and restarts in the SAME wall-clock second (`now = 5_000`) with empty replay state.
+    let mut restarted_guard = ReplayProtection::new().with_timestamp_floor(now);
+    assert_eq!(
+        restarted_guard.validate_session_v2_at(&key_1, 1, now, now),
+        Err(ReplayError::RecoveryRequired {
+            peer: sender_peer,
+            current_epoch: 0,
+            requested_epoch: 1,
+        })
+    );
+
+    // Receiver issues a fresh 256-bit nonce (`0xBB`) even at same epoch=1 and same second `now = 5_000`.
+    let challenge_2 = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer,
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0xBBu8; 32],
+        issued_at_secs: now,
+    };
+    restarted_guard
+        .register_recovery_challenge_v2(challenge_2)
+        .unwrap();
+    let sig_2 = sender_auth.sign_session_handshake_v2(&challenge_2).unwrap();
+    let key_2 = restarted_guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &sig_2, now)
+        .unwrap();
+    assert_ne!(key_1.session_id, key_2.session_id);
+
+    // Pre-crash captured delivery carrying old `session_id` MUST still fail closed at same wall-clock second.
+    assert_eq!(
+        restarted_guard.validate_session_v2_at(&key_1, 1, now, now),
+        Err(ReplayError::SessionIdMismatch { peer: sender_peer })
+    );
+    assert!(restarted_guard
+        .validate_session_v2_at(&key_2, 1, now, now)
+        .is_ok());
+}
+
+#[test]
+fn atomic_handshake_preserves_challenge_and_prior_epoch_on_cache_full_or_bad_sig() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver_kp = KeyPair::from_seed([50u8; 32]).unwrap();
+    let kp1 = KeyPair::from_seed([51u8; 32]).unwrap();
+    let kp2 = KeyPair::from_seed([52u8; 32]).unwrap();
+    let kp3 = KeyPair::from_seed([53u8; 32]).unwrap();
+    let mut guard = ReplayProtection::try_with_config(2, 60).unwrap();
+
+    // Fill cache to capacity=2 at t=1000 (`expires_at=1060`).
+    for (idx, kp) in [&kp1, &kp2].iter().enumerate() {
+        let ch = SessionHandshakeChallengeV2 {
+            swarm_instance_id: swarm_id,
+            run_id,
+            policy_digest,
+            receiver_peer: receiver_kp.peer_id(),
+            sender_peer: kp.peer_id(),
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [(idx as u8) + 1; 32],
+            issued_at_secs: 1000,
+        };
+        guard.register_recovery_challenge_v2(ch).unwrap();
+        let sig = MessageAuth::new((*kp).clone())
+            .sign_session_handshake_v2(&ch)
+            .unwrap();
+        guard
+            .complete_recovery_handshake_v2(swarm_id, run_id, kp.public_key(), &sig, 1000)
+            .unwrap();
+    }
+    assert_eq!(guard.cache_size(), 2);
+
+    // New peer 3 registers challenge at t=1050; completion at t=1050 MUST fail closed with CacheFull
+    // AND preserve pending challenge without mutating peers 1 & 2.
+    let ch3 = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp3.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0x77u8; 32],
+        issued_at_secs: 1050,
+    };
+    guard.register_recovery_challenge_v2(ch3).unwrap();
+    let sig3 = MessageAuth::new(kp3.clone())
+        .sign_session_handshake_v2(&ch3)
+        .unwrap();
+    assert_eq!(
+        guard.complete_recovery_handshake_v2(swarm_id, run_id, kp3.public_key(), &sig3, 1050),
+        Err(ReplayError::CacheFull { capacity: 2 })
+    );
+    assert_eq!(guard.pending_challenge_count(), 1);
+    assert_eq!(guard.cache_size(), 2);
+
+    // Existing peer 1 rotating epoch 1->2 while full MUST preserve prior epoch if signature is wrong...
+    let ch1_rot = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp1.peer_id(),
+        requested_epoch: 2,
+        initial_sequence: 0,
+        receiver_nonce: [0x88u8; 32],
+        issued_at_secs: 1050,
+    };
+    guard.register_recovery_challenge_v2(ch1_rot).unwrap();
+    let wrong_sig = MessageAuth::new(kp2.clone())
+        .sign_session_handshake_v2(&ch1_rot)
+        .unwrap();
+    assert_eq!(
+        guard.complete_recovery_handshake_v2(swarm_id, run_id, kp1.public_key(), &wrong_sig, 1050),
+        Err(ReplayError::HandshakeVerificationFailed)
+    );
+    // Peer 1's prior epoch 1 remains active!
+    assert_eq!(
+        guard
+            .active_v2_session(swarm_id, run_id, &kp1.peer_id())
+            .map(|(ep, _)| ep),
+        Some(1)
+    );
+    // ...and succeeds atomically once peer 1 presents the valid signature because its superseded slot frees!
+    let good_sig1 = MessageAuth::new(kp1.clone())
+        .sign_session_handshake_v2(&ch1_rot)
+        .unwrap();
+    let rotated_key1 = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, kp1.public_key(), &good_sig1, 1050)
+        .unwrap();
+    assert_eq!(rotated_key1.session_epoch, 2);
+
+    // At t=1061 peer 2 (last active t=1000, expires_at=1060) expired, so peer 3 can now complete its
+    // previously preserved challenge ch3 without re-registration!
+    let key3 = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, kp3.public_key(), &sig3, 1061)
+        .unwrap();
+    assert_eq!(key3.peer, kp3.peer_id());
+    assert_eq!(guard.pending_challenge_count(), 0);
+}
+
+#[test]
+fn pending_challenges_table_is_bounded_and_fails_closed() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver_kp = KeyPair::from_seed([60u8; 32]).unwrap();
+    assert_eq!(
+        ReplayProtection::try_with_config(8, 60)
+            .unwrap()
+            .try_with_max_pending_challenges(0)
+            .unwrap_err(),
+        ReplayConfigError::ZeroPendingChallengesCapacity
+    );
+
+    let mut guard = ReplayProtection::try_with_config(8, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(2)
+        .unwrap();
+    let kp1 = KeyPair::from_seed([61u8; 32]).unwrap();
+    let kp2 = KeyPair::from_seed([62u8; 32]).unwrap();
+    let kp3 = KeyPair::from_seed([63u8; 32]).unwrap();
+
+    let mk = |kp: &KeyPair, nonce_byte: u8| SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [nonce_byte; 32],
+        issued_at_secs: 1000,
+    };
+
+    guard.register_recovery_challenge_v2(mk(&kp1, 1)).unwrap();
+    guard.register_recovery_challenge_v2(mk(&kp2, 2)).unwrap();
+    // Refreshing existing pending key succeeds; new 3rd key fails closed with PendingChallengesFull.
+    guard.register_recovery_challenge_v2(mk(&kp1, 11)).unwrap();
+    assert_eq!(
+        guard.register_recovery_challenge_v2(mk(&kp3, 3)),
+        Err(ReplayError::PendingChallengesFull { capacity: 2 })
+    );
+    assert_eq!(guard.pending_challenge_count(), 2);
+}
+
+#[test]
+fn timestamp_floor_and_readonly_preflight_enforce_bounds_without_mutation() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver_kp = KeyPair::from_seed([70u8; 32]).unwrap();
+    let sender_kp = KeyPair::from_seed([71u8; 32]).unwrap();
+    let sender_auth = MessageAuth::new(sender_kp.clone());
+    let mut guard = ReplayProtection::try_with_config(8, 60)
+        .unwrap()
+        .with_timestamp_floor(2_000);
+
+    let ch = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: sender_kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0x12u8; 32],
+        issued_at_secs: 2_000,
+    };
+    guard.register_recovery_challenge_v2(ch).unwrap();
+    let hs_sig = sender_auth.sign_session_handshake_v2(&ch).unwrap();
+    let key = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &hs_sig, 2_000)
+        .unwrap();
+
+    // Timestamp 1999 is within 60s skew of now=2000, but MUST fail TimestampBelowFloor.
+    assert_eq!(
+        guard
+            .check_v2_admission_readonly(&key, 1, 1_999, 2_000)
+            .unwrap_err(),
+        ReplayError::TimestampBelowFloor {
+            ts: 1_999,
+            floor: 2_000,
+        }
+    );
+
+    // Read-only preflight at ts=2000 succeeds and does NOT advance sequence state.
+    let prepared = guard
+        .check_v2_admission_readonly(&key, 1, 2_000, 2_000)
+        .unwrap();
+    let _ = prepared;
+    let prepared_again = guard
+        .check_v2_admission_readonly(&key, 1, 2_000, 2_000)
+        .unwrap();
+    guard.commit_prepared_admission(prepared_again).unwrap();
+
+    // Replaying sequence 1 after commit fails.
+    assert_eq!(
+        guard
+            .check_v2_admission_readonly(&key, 1, 2_000, 2_000)
+            .unwrap_err(),
+        ReplayError::Replay {
+            peer: sender_kp.peer_id(),
+            seq: 1,
+        }
+    );
 }

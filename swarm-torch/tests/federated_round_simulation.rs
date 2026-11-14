@@ -8,23 +8,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use swarm_torch::artifacts::{
-    put_checkpoint_model, ArtifactWriteProfile, DataOpsSession, LockAcquisitionPolicy, TrustPolicy,
+    put_checkpoint_model, ArtifactWriteProfile, CheckpointContentDigestV1, DataOpsSession,
+    LockAcquisitionPolicy, TrustPolicy,
 };
 use swarm_torch::coordinator::{
-    PeerRoundSubmissionV1, RoundCoordinatorConfig, RoundError, SubmissionDecision,
+    encode_compressed_update_payload_v2, RoundCoordinatorConfig, RoundError, SubmissionDecision,
     SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
+    COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1, COMPRESSION_SCHEMA_DENSE_F32_LE_V1,
 };
 use swarm_torch::native_runner::NativeOpRunner;
 use swarm_torch::report::load_report_strict;
 use swarm_torch::scheduler::execute_graph_sequential;
 use swarm_torch_core::aggregation::{BulyanProfile, RobustAggregation};
-use swarm_torch_core::compression::{
-    ClassicResidualCompressor, CompressedGradient, CompressionMethod,
-};
-use swarm_torch_core::crypto::{KeyPair, MessageAuth};
+use swarm_torch_core::compression::{ClassicResidualCompressor, CompressionMethod};
+use swarm_torch_core::crypto::{KeyPair, MessageAuth, SessionHandshakeChallengeV2};
 use swarm_torch_core::execution::PermissivePolicy;
 use swarm_torch_core::observe::{AttrMap, EventRecord, RunEventEmitter, RunId, TraceId};
-use swarm_torch_core::replay::{CohortAllowlist, ReplayProtection};
+use swarm_torch_core::replay::ReplayError;
 use swarm_torch_core::run_graph::{
     AssetRefV1, CachePolicyV0, CanonParams, ExecutionTrust, GraphV1, NodeV1, OpKind,
 };
@@ -33,9 +33,9 @@ use swarm_torch_models::loss::{FedProxRegularizer, MseLoss};
 use swarm_torch_models::optim::SgdOptimizer;
 use swarm_torch_models::simple::LinearModel;
 use swarm_torch_net::gossip::{
-    BundledGossipDeliveryV1, InnerUpdateV1, PayloadKindV1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+    BundledGossipDeliveryV2, InnerUpdateV2, PayloadKindV1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
 };
-use swarm_torch_net::traits::SwarmTransport;
+use swarm_torch_net::traits::{ObservedSourceRef, SwarmTransport};
 use swarm_torch_net::{MockNetworkHub, Topology};
 use swarm_torch_runtime::mock_runtime::MockRuntime;
 use swarm_torch_runtime::SwarmClock;
@@ -69,6 +69,78 @@ impl PeerNode {
             auth,
             shard,
         }
+    }
+
+    fn establish_session<M: SwarmModel + Clone>(
+        &self,
+        coord: &mut SwarmRoundCoordinator<M>,
+        epoch: u64,
+        nonce_seed: u8,
+        now_secs: u32,
+    ) -> [u8; 32] {
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: coord.swarm_instance_id(),
+            run_id: *coord.run_id().as_bytes(),
+            policy_digest: coord.context_policy_digest(),
+            receiver_peer: coord.coordinator_peer_id(),
+            sender_peer: self.peer_id,
+            requested_epoch: epoch,
+            initial_sequence: 0,
+            receiver_nonce: [nonce_seed; 32],
+            issued_at_secs: now_secs,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        coord.register_session_challenge_v2(challenge).unwrap();
+        let sig = self.auth.sign_session_handshake_v2(&challenge).unwrap();
+        coord
+            .complete_session_handshake_v2(self.keypair.public_key(), &sig, now_secs)
+            .unwrap();
+        session_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_dense_delivery<M: SwarmModel + Clone>(
+        &self,
+        coord: &SwarmRoundCoordinator<M>,
+        session_id: [u8; 32],
+        epoch: u64,
+        seq: u64,
+        ts_secs: u32,
+        round_id: u64,
+        base_digest: CheckpointContentDigestV1,
+        values: &[f32],
+        reported_examples: u64,
+    ) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let inner = InnerUpdateV2 {
+            originator_public_key: *self.keypair.public_key(),
+            swarm_instance_id: coord.swarm_instance_id(),
+            run_id: *coord.run_id().as_bytes(),
+            round_id,
+            contribution_id: seq,
+            base_checkpoint_digest: *base_digest.as_bytes(),
+            context_policy_digest: coord.context_policy_digest(),
+            payload_kind: PayloadKindV1::ModelDeltaV1,
+            compression_schema_version: COMPRESSION_SCHEMA_DENSE_F32_LE_V1,
+            num_elements: values.len() as u32,
+            reported_examples,
+            encoded_payload: raw,
+            originator_signature: Vec::new(),
+        };
+        BundledGossipDeliveryV2::new_signed(
+            &self.auth,
+            inner,
+            coord.coordinator_peer_id(),
+            session_id,
+            epoch,
+            seq,
+            ts_secs,
+        )
+        .to_bytes()
+        .unwrap()
     }
 
     /// Perform multi-step local SGD with `FedProx` regularization ($\mu > 0$) and return
@@ -193,29 +265,32 @@ fn scenario_1_honest_model_delta_fedprox_converges_and_strict_report_verifies() 
     let mut coord =
         SwarmRoundCoordinator::initialize(run_id, config, init_model, &mut session, 1_000_000)
             .unwrap();
+    let sessions: Vec<[u8; 32]> = peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| p.establish_session(&mut coord, 1, 0x10 + i as u8, 100))
+        .collect();
 
     let mut last_mse = initial_mse;
     for r in 1..=10u64 {
         rt.advance(Duration::from_secs(1));
         let now_secs = (rt.now() / 1000) + 100;
         let parent_digest = coord.parent_digest();
-        for peer in &peers {
+        for (i, peer) in peers.iter().enumerate() {
             let delta = peer.train_local_delta(coord.model(), 4, 0.08, 0.05);
+            let bytes = peer.build_dense_delivery(
+                &coord,
+                sessions[i],
+                1,
+                r,
+                now_secs as u32,
+                r,
+                parent_digest,
+                &delta,
+                peer.shard.len() as u64,
+            );
             coord
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id,
-                        round_id: r,
-                        base_checkpoint_digest: parent_digest,
-                        sender: peer.peer_id,
-                        sequence: r,
-                        timestamp_secs: now_secs,
-                        update_kind: UpdateKindV1::default(),
-                        values: delta,
-                        reported_examples: Some(peer.shard.len() as u64),
-                    },
-                    now_secs,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, now_secs)
                 .unwrap();
         }
         let summary = coord
@@ -307,66 +382,65 @@ fn scenario_2_and_3_byzantine_bulyan_and_multikrum_defeat_outliers_and_weight_sp
         1_000,
     )
     .unwrap();
+    let sessions: Vec<[u8; 32]> = peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| p.establish_session(&mut coord, 1, 0x20 + i as u8, 100))
+        .collect();
 
     for r in 1..=8u64 {
         let parent_digest = coord.parent_digest();
         // 6 honest peers (0..6) and 1 extreme Byzantine peer (6) that also spoofs reported_examples = 10_000_000_000!
-        // First verify that if peer 6 sends NaN, it is rejected at admission without corrupting state:
+        // First verify that if peer 6 sends NaN, it is rejected at Stage A without consuming sequence r:
+        let nan_bytes = peers[6].build_dense_delivery(
+            &coord,
+            sessions[6],
+            1,
+            r,
+            (100 + r) as u32,
+            r,
+            parent_digest,
+            &[0.1, f32::NAN, 0.1],
+            10_000_000_000,
+        );
         let nan_err = coord
-            .submit_peer_update(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: r,
-                    base_checkpoint_digest: parent_digest,
-                    sender: peers[6].peer_id,
-                    sequence: r,
-                    timestamp_secs: 100 + r,
-                    update_kind: UpdateKindV1::default(),
-                    values: vec![0.1, f32::NAN, 0.1],
-                    reported_examples: Some(10_000_000_000),
-                },
-                100 + r,
-            )
+            .submit_verified_delivery(&nan_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
             .unwrap_err();
         assert!(matches!(nan_err, RoundError::NonFiniteInput { .. }));
 
-        for peer in &peers[..6] {
+        for (i, peer) in peers[..6].iter().enumerate() {
             let delta = peer.train_local_delta(coord.model(), 4, 0.08, 0.05);
+            let bytes = peer.build_dense_delivery(
+                &coord,
+                sessions[i],
+                1,
+                r,
+                (100 + r) as u32,
+                r,
+                parent_digest,
+                &delta,
+                6,
+            );
             coord
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id,
-                        round_id: r,
-                        base_checkpoint_digest: parent_digest,
-                        sender: peer.peer_id,
-                        sequence: r,
-                        timestamp_secs: 100 + r,
-                        update_kind: UpdateKindV1::default(),
-                        values: delta,
-                        reported_examples: Some(6),
-                    },
-                    100 + r,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
                 .unwrap();
         }
 
         // Byzantine peer 6 submits an extreme sign-flipped poison vector [-500.0, 500.0, -500.0]
-        // and claims 10 billion examples to attempt sample-weight amplification:
+        // reusing sequence r (not consumed by Stage A NaN rejection!) and claiming 10B examples:
+        let poison_bytes = peers[6].build_dense_delivery(
+            &coord,
+            sessions[6],
+            1,
+            r,
+            (100 + r) as u32,
+            r,
+            parent_digest,
+            &[-500.0, 500.0, -500.0],
+            10_000_000_000,
+        );
         coord
-            .submit_peer_update(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: r,
-                    base_checkpoint_digest: parent_digest,
-                    sender: peers[6].peer_id,
-                    sequence: r,
-                    timestamp_secs: 100 + r,
-                    update_kind: UpdateKindV1::default(),
-                    values: vec![-500.0, 500.0, -500.0],
-                    reported_examples: Some(10_000_000_000),
-                },
-                100 + r,
-            )
+            .submit_verified_delivery(&poison_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
             .unwrap();
 
         let _ = coord
@@ -410,42 +484,43 @@ fn scenario_2_and_3_byzantine_bulyan_and_multikrum_defeat_outliers_and_weight_sp
     let mut coord_mk =
         SwarmRoundCoordinator::initialize(run_id_mk, mk_cfg, init_model, &mut session_mk, 1_000)
             .unwrap();
+    let sessions_mk: Vec<[u8; 32]> = peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| p.establish_session(&mut coord_mk, 1, 0x30 + i as u8, 100))
+        .collect();
     for r in 1..=8u64 {
         let parent_digest = coord_mk.parent_digest();
-        for peer in &peers[..6] {
+        for (i, peer) in peers[..6].iter().enumerate() {
             let delta = peer.train_local_delta(coord_mk.model(), 4, 0.08, 0.05);
+            let bytes = peer.build_dense_delivery(
+                &coord_mk,
+                sessions_mk[i],
+                1,
+                r,
+                (100 + r) as u32,
+                r,
+                parent_digest,
+                &delta,
+                6,
+            );
             coord_mk
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id: run_id_mk,
-                        round_id: r,
-                        base_checkpoint_digest: parent_digest,
-                        sender: peer.peer_id,
-                        sequence: r,
-                        timestamp_secs: 100 + r,
-                        update_kind: UpdateKindV1::default(),
-                        values: delta,
-                        reported_examples: Some(6),
-                    },
-                    100 + r,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
                 .unwrap();
         }
+        let poison_bytes = peers[6].build_dense_delivery(
+            &coord_mk,
+            sessions_mk[6],
+            1,
+            r,
+            (100 + r) as u32,
+            r,
+            parent_digest,
+            &[-500.0, 500.0, -500.0],
+            10_000_000_000,
+        );
         coord_mk
-            .submit_peer_update(
-                PeerRoundSubmissionV1 {
-                    run_id: run_id_mk,
-                    round_id: r,
-                    base_checkpoint_digest: parent_digest,
-                    sender: peers[6].peer_id,
-                    sequence: r,
-                    timestamp_secs: 100 + r,
-                    update_kind: UpdateKindV1::default(),
-                    values: vec![-500.0, 500.0, -500.0],
-                    reported_examples: Some(10_000_000_000),
-                },
-                100 + r,
-            )
+            .submit_verified_delivery(&poison_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100 + r)
             .unwrap();
         coord_mk
             .finalize_round::<SgdOptimizer<LinearModel>, ValidationMseEvaluator>(
@@ -503,11 +578,13 @@ fn scenario_4_and_5_gossip_relay_forwarding_classic_residual_and_equivocation_de
     };
     let mut model = LinearModel::new(2, 1).unwrap();
     model.load_parameters(&[0.5, -0.5, 0.1]).unwrap();
-    let mut coord =
-        SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
+    let mut coord = SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000)
+        .unwrap()
+        .with_coordinator_identity(*run_id.as_bytes(), coord_peer);
+    let session0 = peers[0].establish_session(&mut coord, 1, 0x44, 200);
 
     // Originator (peer0) compresses its local delta ONCE using ClassicResidualCompressor (TopK 2/3)
-    // and fans out the same signed InnerUpdateV1 through relay_peer1 without double-mutating residual!
+    // and fans out the same signed InnerUpdateV2 through relay_peer1 without double-mutating residual!
     let mut compressor =
         ClassicResidualCompressor::new(3, CompressionMethod::TopK { k_ratio: 0.5 }).unwrap();
     let raw_delta = [0.6f32, -0.4f32, 0.05f32];
@@ -516,77 +593,126 @@ fn scenario_4_and_5_gossip_relay_forwarding_classic_residual_and_equivocation_de
     // Residual must hold the dropped smallest coordinate (0.05) while the larger 2 coordinates were sent:
     assert!((residual_snapshot[2] - 0.05).abs() < 1e-6);
 
-    let encoded_payload = serde_json::to_vec(&compressed).unwrap();
-    let inner = InnerUpdateV1 {
+    let encoded_payload = encode_compressed_update_payload_v2(&compressed).unwrap();
+    let inner1 = InnerUpdateV2 {
         originator_public_key: *peers[0].keypair.public_key(),
-        swarm_instance_id: *run_id.as_bytes(),
+        swarm_instance_id: coord.swarm_instance_id(),
+        run_id: *run_id.as_bytes(),
         round_id: 1,
         contribution_id: 1,
         base_checkpoint_digest: *coord.parent_digest().as_bytes(),
+        context_policy_digest: coord.context_policy_digest(),
         payload_kind: PayloadKindV1::ModelDeltaV1,
-        compression_schema_version: 1,
+        compression_schema_version: COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1,
         num_elements: 3,
         reported_examples: 6,
-        encoded_payload,
+        encoded_payload: encoded_payload.clone(),
         originator_signature: Vec::new(),
     };
-    let delivery =
-        BundledGossipDeliveryV1::new_signed(&peers[0].auth, inner, coord_peer, 1, 1, 200);
-    let wire_bytes = delivery.to_bytes().unwrap();
+    let delivery1 = BundledGossipDeliveryV2::new_signed(
+        &peers[0].auth,
+        inner1,
+        coord_peer,
+        session0,
+        1,
+        1,
+        200,
+    );
+    let wire_bytes1 = delivery1.to_bytes().unwrap();
 
     // Hop 1: peer0 -> relay_peer1 (residual state on peer0 is NOT touched again on re-hop/fanout)
-    futures_poll_ready(t_orig.send(peers[1].peer_id, &wire_bytes)).unwrap();
+    futures_poll_ready(t_orig.send(peers[1].peer_id, &wire_bytes1)).unwrap();
     assert_eq!(compressor.residual(), &residual_snapshot[..]);
 
-    // Hop 2: relay_peer1 receives and forwards unchanged to coord_peer
-    let (hop1_from, relayed_bytes) = futures_poll_ready(t_relay.recv()).unwrap();
-    assert_eq!(hop1_from, peers[0].peer_id);
-    futures_poll_ready(t_relay.send(coord_peer, &relayed_bytes)).unwrap();
+    // Hop 2: relay_peer1 receives via observed link hint (NOT a trusted PeerId) and forwards unchanged to coord_peer
+    let hop1_msg = futures_poll_ready(t_relay.recv()).unwrap();
+    assert!(matches!(
+        hop1_msg.observed_source,
+        ObservedSourceRef::LinkLabel(_)
+    ));
+    futures_poll_ready(t_relay.send(coord_peer, &hop1_msg.payload)).unwrap();
 
-    // Coordinator receives from relay_peer1 and verifies originator signature of peer0!
-    let (hop2_from, received_bytes) = futures_poll_ready(t_coord.recv()).unwrap();
-    assert_eq!(hop2_from, peers[1].peer_id);
-    let decoded = BundledGossipDeliveryV1::from_bytes_bounded(
-        &received_bytes,
-        DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
-    )
-    .unwrap();
-    let mut gossip_replay = ReplayProtection::try_with_config(64, 120)
-        .unwrap()
-        .with_cohort_allowlist(CohortAllowlist::from_peers(cohort));
-    let verified_originator = decoded
-        .verify_for_recipient(coord_peer, &mut gossip_replay, 200)
-        .unwrap();
-    assert_eq!(verified_originator, peers[0].peer_id);
-
-    let decompressed_values =
-        serde_json::from_slice::<CompressedGradient>(&decoded.inner.encoded_payload)
-            .unwrap()
-            .decompress()
-            .unwrap();
-    let sub0 = PeerRoundSubmissionV1 {
-        run_id,
-        round_id: decoded.inner.round_id,
-        base_checkpoint_digest: coord.parent_digest(),
-        sender: verified_originator,
-        sequence: decoded.wrapper.delivery_seq,
-        timestamp_secs: decoded.wrapper.timestamp_secs as u64,
-        update_kind: UpdateKindV1::default(),
-        values: decompressed_values,
-        reported_examples: Some(decoded.inner.reported_examples),
-    };
+    // Coordinator receives over untrusted relay link, cryptographically derives peer0 from InnerUpdateV2,
+    // decompresses, validates Stage A/B, commits Stage C, and admits!
+    let hop2_msg = futures_poll_ready(t_coord.recv()).unwrap();
+    assert!(matches!(
+        hop2_msg.observed_source,
+        ObservedSourceRef::LinkLabel(_)
+    ));
     assert_eq!(
-        coord.submit_peer_update(sub0.clone(), 200).unwrap(),
+        coord
+            .submit_verified_delivery(&hop2_msg.payload, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 200)
+            .unwrap(),
         SubmissionDecision::Admitted {
             admitted_count: 1,
             min_quorum: 2
         }
     );
-    // Duplicate gossip arrival of the exact same payload -> DuplicateIdempotentAck!
+
+    // Exact wire packet replay MUST fail with ReplayError::Replay!
+    assert!(matches!(
+        coord.submit_verified_delivery(&hop2_msg.payload, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 200),
+        Err(RoundError::ReplayRejected(ReplayError::Replay {
+            seq: 1,
+            ..
+        }))
+    ));
+
+    // Identical round content re-sent by originator under fresh delivery_seq = 2 -> DuplicateIdempotentAck!
+    let inner2 = InnerUpdateV2 {
+        originator_public_key: *peers[0].keypair.public_key(),
+        swarm_instance_id: coord.swarm_instance_id(),
+        run_id: *run_id.as_bytes(),
+        round_id: 1,
+        contribution_id: 2,
+        base_checkpoint_digest: *coord.parent_digest().as_bytes(),
+        context_policy_digest: coord.context_policy_digest(),
+        payload_kind: PayloadKindV1::ModelDeltaV1,
+        compression_schema_version: COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1,
+        num_elements: 3,
+        reported_examples: 6,
+        encoded_payload,
+        originator_signature: Vec::new(),
+    };
+    let wire_bytes2 = BundledGossipDeliveryV2::new_signed(
+        &peers[0].auth,
+        inner2,
+        coord_peer,
+        session0,
+        1,
+        2,
+        200,
+    )
+    .to_bytes()
+    .unwrap();
+    futures_poll_ready(t_orig.send(peers[1].peer_id, &wire_bytes2)).unwrap();
+    let hop1_dup = futures_poll_ready(t_relay.recv()).unwrap();
+    futures_poll_ready(t_relay.send(coord_peer, &hop1_dup.payload)).unwrap();
+    let hop2_dup = futures_poll_ready(t_coord.recv()).unwrap();
     assert_eq!(
-        coord.submit_peer_update(sub0, 200).unwrap(),
+        coord
+            .submit_verified_delivery(&hop2_dup.payload, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 200)
+            .unwrap(),
         SubmissionDecision::DuplicateIdempotentAck
     );
+
+    // Equivocation under fresh delivery_seq = 3 revokes peer0's admitted vote!
+    let conflict_bytes = peers[0].build_dense_delivery(
+        &coord,
+        session0,
+        1,
+        3,
+        200,
+        1,
+        coord.parent_digest(),
+        &[-9.0, -9.0, -9.0],
+        6,
+    );
+    assert!(matches!(
+        coord.submit_verified_delivery(&conflict_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 200),
+        Err(RoundError::EquivocationRejected { .. })
+    ));
+    assert_eq!(coord.admitted_count(), 0);
 
     let _ = fs::remove_dir_all(&base);
 }

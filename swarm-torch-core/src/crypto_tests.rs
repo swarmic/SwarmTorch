@@ -401,3 +401,120 @@ fn gradient_validator_rejects_f32_norm_sq_overflow_without_nan_bypass() {
     };
     assert!(permissive.validate(&gradients).is_ok());
 }
+
+#[test]
+fn derive_session_id_v1_rejects_zero_nonce_and_matches_pinned_vector() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver = PeerId::new([0x44u8; 32]);
+    let sender = PeerId::new([0x55u8; 32]);
+    let epoch = 7u64;
+
+    assert_eq!(
+        derive_session_id_v1(
+            &swarm_id,
+            &run_id,
+            &policy_digest,
+            &receiver,
+            &sender,
+            epoch,
+            &[0u8; 32]
+        ),
+        Err(CryptoError::VerificationFailed)
+    );
+
+    let nonce = [0x66u8; 32];
+    let sid = derive_session_id_v1(
+        &swarm_id,
+        &run_id,
+        &policy_digest,
+        &receiver,
+        &sender,
+        epoch,
+        &nonce,
+    )
+    .expect("non-zero nonce must derive session id");
+
+    // Pinned SHA-256 preimage equivalence vector for cross-platform determinism (`ST-03`).
+    let expected = sha256_slices(&[
+        b"swarmtorch.session.id.v1",
+        &swarm_id,
+        &run_id,
+        &policy_digest,
+        receiver.as_bytes(),
+        sender.as_bytes(),
+        &7u64.to_le_bytes(),
+        &nonce,
+    ]);
+    assert_eq!(sid, expected);
+    assert_eq!(
+        sid,
+        [
+            0xbf, 0x97, 0xcd, 0xfc, 0x4c, 0xfa, 0x2d, 0x6c, 0x80, 0x11, 0x37, 0xea, 0xe4, 0xef,
+            0x3a, 0x3f, 0xcf, 0x12, 0xd9, 0x78, 0x28, 0x82, 0xec, 0x56, 0xbb, 0x86, 0xd1, 0x83,
+            0xf6, 0x33, 0x2a, 0x95,
+        ]
+    );
+}
+
+#[test]
+fn envelope_v2_and_handshake_v2_bind_run_policy_and_session_id() {
+    let sender = KeyPair::from_seed([0x21; 32]).unwrap();
+    let receiver = KeyPair::from_seed([0x22; 32]).unwrap();
+    let auth = MessageAuth::new(sender.clone());
+
+    let challenge = SessionHandshakeChallengeV2 {
+        swarm_instance_id: [0xA5; 16],
+        run_id: [0xB6; 16],
+        policy_digest: [0xC7; 32],
+        receiver_peer: receiver.peer_id(),
+        sender_peer: sender.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0x77; 32],
+        issued_at_secs: 1_700_000_000,
+    };
+    let session_id = challenge.derive_session_id().unwrap();
+    let hs_sig = auth.sign_session_handshake_v2(&challenge).unwrap();
+    assert_eq!(
+        MessageAuth::verify_session_handshake_v2(sender.public_key(), &challenge, &hs_sig),
+        Ok(session_id)
+    );
+
+    let mut bad_run = challenge;
+    bad_run.run_id[0] ^= 0x01;
+    assert_eq!(
+        MessageAuth::verify_session_handshake_v2(sender.public_key(), &bad_run, &hs_sig),
+        Err(CryptoError::VerificationFailed)
+    );
+
+    let ctx = EnvelopeContextV2 {
+        version: (0, 3),
+        swarm_instance_id: challenge.swarm_instance_id,
+        run_id: challenge.run_id,
+        session_epoch: challenge.requested_epoch,
+        session_id,
+        round_id: 4,
+        message_type: 1,
+        sequence: 12,
+        timestamp: 1_700_000_010,
+    };
+    let payload = b"v2 session-bound payload";
+    let sig_v2 = auth.sign_v2(&ctx, payload);
+    assert!(MessageAuth::verify_v2(sender.public_key(), &ctx, payload, &sig_v2).is_ok());
+
+    let mut wrong_session = ctx;
+    wrong_session.session_id[31] ^= 0x80;
+    assert_eq!(
+        MessageAuth::verify_v2(sender.public_key(), &wrong_session, payload, &sig_v2),
+        Err(CryptoError::VerificationFailed)
+    );
+
+    let mut wrong_run = ctx;
+    wrong_run.run_id[0] ^= 0x01;
+    assert_eq!(
+        MessageAuth::verify_v2(sender.public_key(), &wrong_run, payload, &sig_v2),
+        Err(CryptoError::VerificationFailed)
+    );
+}

@@ -7,6 +7,8 @@
 //!   named associated future types without `async-trait`.
 
 #[cfg(feature = "alloc")]
+use alloc::string::String;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 use core::future::Future;
@@ -140,7 +142,63 @@ pub struct BroadcastStats {
     pub failed: usize,
 }
 
-/// Asynchronous complete-message transport trait (`ADR-0022` §1.3).
+/// Unauthenticated observed transport-level source locator (`ST-06`).
+///
+/// Represents a network or link endpoint observed directly at the transport layer and
+/// MUST NEVER be treated as a verified canonical [`PeerId`]. Downstream protocol layers
+/// must authenticate every payload cryptographically (or via a sealed carrier proof)
+/// before attributing identity.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObservedSourceRef {
+    /// IPv4 socket endpoint `(octets, port)`.
+    Ipv4 {
+        /// IPv4 octets.
+        addr: [u8; 4],
+        /// UDP/TCP port.
+        port: u16,
+    },
+    /// IPv6 socket endpoint `(octets, port)`.
+    Ipv6 {
+        /// IPv6 octets.
+        addr: [u8; 16],
+        /// UDP/TCP port.
+        port: u16,
+    },
+    /// Named transport or hub link hint (e.g. mock queue, topic, or local link handle).
+    LinkLabel(String),
+    /// Transport backend did not expose an observable source locator.
+    Unspecified,
+}
+
+#[cfg(feature = "std")]
+impl From<std::net::SocketAddr> for ObservedSourceRef {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        match addr {
+            std::net::SocketAddr::V4(v4) => Self::Ipv4 {
+                addr: v4.ip().octets(),
+                port: v4.port(),
+            },
+            std::net::SocketAddr::V6(v6) => Self::Ipv6 {
+                addr: v6.ip().octets(),
+                port: v6.port(),
+            },
+        }
+    }
+}
+
+/// Complete message received by [`SwarmTransport::recv`] paired strictly with its
+/// unauthenticated [`ObservedSourceRef`] (`ST-06`).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedTransportMessage {
+    /// Observed transport source hint (unauthenticated; NEVER a trusted `PeerId`).
+    pub observed_source: ObservedSourceRef,
+    /// Raw wire payload bytes awaiting downstream cryptographic verification.
+    pub payload: Vec<u8>,
+}
+
+/// Asynchronous complete-message transport trait (`ADR-0022` §1.3, `ST-06`).
 ///
 /// Available whenever `alloc` is enabled (and unchanged when `std` is enabled),
 /// using Generic Associated Types instead of `async-trait`.
@@ -151,7 +209,7 @@ pub trait SwarmTransport: Send + Sync {
     where
         Self: 'a;
     /// Future returned by [`SwarmTransport::recv`].
-    type RecvFuture<'a>: Future<Output = Result<(PeerId, Vec<u8>)>> + Send + 'a
+    type RecvFuture<'a>: Future<Output = Result<ObservedTransportMessage>> + Send + 'a
     where
         Self: 'a;
     /// Future returned by [`SwarmTransport::broadcast`].

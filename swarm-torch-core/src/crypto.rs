@@ -15,8 +15,20 @@ pub const ENVELOPE_DOMAIN_TAG_V0: &[u8] = b"swarmtorch.envelope.v0";
 /// Domain separation tag for scoped v1 envelopes (`(0, 2)`).
 pub const ENVELOPE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.envelope.v1";
 
+/// Domain separation tag for session-bound v2 envelopes (`(0, 3)`, `ST-03`).
+pub const ENVELOPE_DOMAIN_TAG_V2: &[u8] = b"swarmtorch.envelope.v2";
+
+/// Domain separation tag for receiver-nonce-bound session identifiers (`ST-03`).
+pub const SESSION_ID_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.session.id.v1";
+
 /// Domain separation tag for receiver-challenged session recovery handshakes.
 pub const SESSION_HANDSHAKE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.session.handshake.v1";
+
+/// Domain separation tag for session-id-bound v2 recovery handshakes (`ST-03`).
+pub const SESSION_HANDSHAKE_DOMAIN_TAG_V2: &[u8] = b"swarmtorch.session.handshake.v2";
+
+/// Domain separation tag for attested transport link principal handshakes (`ST-08`).
+pub const LINK_ATTESTATION_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.link.attestation.v1";
 
 /// Domain separation tag for `ManifestSignatureV1` (`ADR-0023` §3.1, `W10-02`).
 pub const MANIFEST_SIGNATURE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.manifest.sig.v1";
@@ -27,8 +39,14 @@ pub const MANIFEST_ENTRIES_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.manifest.entries.
 /// Domain separation tag for canonical inner update digests (`ADR-0022` §3.1, `W10-03`).
 pub const INNER_UPDATE_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.update.v1";
 
+/// Domain separation tag for run- and policy-bound canonical inner update digests (`ST-01`, `ST-03`).
+pub const INNER_UPDATE_DOMAIN_TAG_V2: &[u8] = b"swarmtorch.update.v2";
+
 /// Domain separation tag for originator-signed gossip recipient wrappers (`ADR-0022` §3.2, `W10-03`).
 pub const RECIPIENT_WRAPPER_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.gossip.wrapper.v1";
+
+/// Domain separation tag for session-id-bound gossip recipient wrappers (`ST-03`).
+pub const RECIPIENT_WRAPPER_DOMAIN_TAG_V2: &[u8] = b"swarmtorch.gossip.wrapper.v2";
 
 /// Domain separation tag for canonical `SwarmTorchCheckpointV1` model schema hashes (`ADR-0024` §3, `W11-04`).
 pub const MODEL_SCHEMA_HASH_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.schema.v1";
@@ -40,6 +58,98 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+/// Derive a deterministic 256-bit receiver-bound `session_id` (`ST-03`).
+///
+/// Rejects an all-zero `receiver_nonce` with [`CryptoError::VerificationFailed`].
+pub fn derive_session_id_v1(
+    swarm_instance_id: &[u8; 16],
+    run_id: &[u8; 16],
+    policy_digest: &[u8; 32],
+    receiver_peer: &PeerId,
+    sender_peer: &PeerId,
+    session_epoch: u64,
+    receiver_nonce: &[u8; 32],
+) -> Result<[u8; 32], CryptoError> {
+    if *receiver_nonce == [0u8; 32] {
+        return Err(CryptoError::VerificationFailed);
+    }
+    Ok(sha256_slices(&[
+        SESSION_ID_DOMAIN_TAG_V1,
+        swarm_instance_id,
+        run_id,
+        policy_digest,
+        receiver_peer.as_bytes(),
+        sender_peer.as_bytes(),
+        &session_epoch.to_le_bytes(),
+        receiver_nonce,
+    ]))
+}
+
+/// Scoped and session-bound envelope v2 signing metadata (`(0, 3)`, `ST-03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeContextV2 {
+    /// Protocol version `(major, minor)`.
+    pub version: (u8, u8),
+    /// Swarm deployment / cohort instance identifier (16 bytes).
+    pub swarm_instance_id: [u8; 16],
+    /// Bound training/coordination run identifier (16 bytes).
+    pub run_id: [u8; 16],
+    /// Monotonically increasing sender session epoch.
+    pub session_epoch: u64,
+    /// Receiver-nonce-derived session identifier ([`derive_session_id_v1`]).
+    pub session_id: [u8; 32],
+    /// Training / coordination round identifier.
+    pub round_id: u64,
+    /// Message type discriminator byte.
+    pub message_type: u8,
+    /// Per-session monotonic sequence number.
+    pub sequence: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: u32,
+}
+
+/// Receiver-challenged v2 session recovery handshake statement (`ST-03`).
+///
+/// Binds `run_id`, `policy_digest`, and `receiver_nonce` so a fresh receiver process
+/// invalidates stale pre-crash messages even within the same wall-clock second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "alloc", derive(Serialize, Deserialize))]
+pub struct SessionHandshakeChallengeV2 {
+    /// Swarm deployment / cohort instance identifier.
+    pub swarm_instance_id: [u8; 16],
+    /// Bound training/coordination run identifier.
+    pub run_id: [u8; 16],
+    /// Context policy digest governing the session.
+    pub policy_digest: [u8; 32],
+    /// Receiver `PeerId` that issued `receiver_nonce`.
+    pub receiver_peer: PeerId,
+    /// Restarting sender `PeerId` establishing or advancing the session.
+    pub sender_peer: PeerId,
+    /// Target session epoch (`>= 1`, strictly greater than any active epoch for the sender).
+    pub requested_epoch: u64,
+    /// Initial sequence floor reserved for the new session.
+    pub initial_sequence: u64,
+    /// Receiver-generated 256-bit random session challenge nonce.
+    pub receiver_nonce: [u8; 32],
+    /// Challenge issue timestamp in Unix seconds.
+    pub issued_at_secs: u32,
+}
+
+impl SessionHandshakeChallengeV2 {
+    /// Derive the deterministic v2 session identifier bound to this challenge.
+    pub fn derive_session_id(&self) -> Result<[u8; 32], CryptoError> {
+        derive_session_id_v1(
+            &self.swarm_instance_id,
+            &self.run_id,
+            &self.policy_digest,
+            &self.receiver_peer,
+            &self.sender_peer,
+            self.requested_epoch,
+            &self.receiver_nonce,
+        )
+    }
 }
 
 /// Scoped envelope v1 signing metadata (`ADR-0021`, `W9-02`).
@@ -236,6 +346,49 @@ fn canonical_session_handshake_digest(
     hasher.finalize().into()
 }
 
+fn canonical_envelope_v2_digest(
+    public_key: &[u8; 32],
+    ctx: &EnvelopeContextV2,
+    payload: &[u8],
+) -> [u8; 32] {
+    let payload_hash = Sha256::digest(payload);
+    let mut hasher = Sha256::new();
+    hasher.update(ENVELOPE_DOMAIN_TAG_V2);
+    hasher.update([ctx.version.0, ctx.version.1]);
+    hasher.update(ctx.swarm_instance_id);
+    hasher.update(ctx.run_id);
+    hasher.update(ctx.session_epoch.to_le_bytes());
+    hasher.update(ctx.session_id);
+    hasher.update(ctx.round_id.to_le_bytes());
+    hasher.update(public_key);
+    hasher.update(ctx.sequence.to_le_bytes());
+    hasher.update(ctx.timestamp.to_le_bytes());
+    hasher.update([ctx.message_type]);
+    hasher.update(payload_hash);
+    hasher.finalize().into()
+}
+
+fn canonical_session_handshake_v2_digest(
+    public_key: &[u8; 32],
+    challenge: &SessionHandshakeChallengeV2,
+    session_id: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_HANDSHAKE_DOMAIN_TAG_V2);
+    hasher.update(challenge.swarm_instance_id);
+    hasher.update(challenge.run_id);
+    hasher.update(challenge.policy_digest);
+    hasher.update(challenge.receiver_peer.as_bytes());
+    hasher.update(challenge.sender_peer.as_bytes());
+    hasher.update(public_key);
+    hasher.update(challenge.requested_epoch.to_le_bytes());
+    hasher.update(challenge.initial_sequence.to_le_bytes());
+    hasher.update(challenge.receiver_nonce);
+    hasher.update(session_id);
+    hasher.update(challenge.issued_at_secs.to_le_bytes());
+    hasher.finalize().into()
+}
+
 /// Compute the canonical `ManifestSignatureV1` preimage digest (`ADR-0023` §3.1, `W10-02`):
 /// `"swarmtorch.manifest.sig.v1" || u32_le(schema_version) || run_id_raw_16_bytes || u64_le(signed_unix_nanos) || entries_hash`.
 pub fn canonical_manifest_sig_v1_digest(
@@ -382,6 +535,64 @@ impl MessageAuth {
         let canonical = canonical_session_handshake_digest(public_key, challenge);
         key.verify_strict(&canonical, &sig)
             .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Sign a session-id-bound v2 message envelope (`swarmtorch.envelope.v2`, `ST-03`).
+    pub fn sign_v2(&self, ctx: &EnvelopeContextV2, payload: &[u8]) -> Signature {
+        let canonical = canonical_envelope_v2_digest(&self.key_pair.public, ctx, payload);
+        let sig = self.key_pair.secret.sign(&canonical);
+        Signature(sig.to_bytes())
+    }
+
+    /// Verify a session-id-bound v2 message envelope (`swarmtorch.envelope.v2`, `ST-03`).
+    pub fn verify_v2(
+        public_key: &[u8; 32],
+        ctx: &EnvelopeContextV2,
+        payload: &[u8],
+        signature: &Signature,
+    ) -> Result<(), CryptoError> {
+        if *public_key == [0u8; 32] || ctx.session_id == [0u8; 32] {
+            return Err(CryptoError::InvalidPublicKey);
+        }
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_envelope_v2_digest(public_key, ctx, payload);
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
+    /// Sign a v2 session recovery handshake (`swarmtorch.session.handshake.v2`, `ST-03`).
+    pub fn sign_session_handshake_v2(
+        &self,
+        challenge: &SessionHandshakeChallengeV2,
+    ) -> Result<Signature, CryptoError> {
+        let session_id = challenge.derive_session_id()?;
+        let canonical =
+            canonical_session_handshake_v2_digest(&self.key_pair.public, challenge, &session_id);
+        let sig = self.key_pair.secret.sign(&canonical);
+        Ok(Signature(sig.to_bytes()))
+    }
+
+    /// Verify a v2 session recovery handshake (`swarmtorch.session.handshake.v2`, `ST-03`),
+    /// returning the derived deterministic `session_id`.
+    pub fn verify_session_handshake_v2(
+        public_key: &[u8; 32],
+        challenge: &SessionHandshakeChallengeV2,
+        signature: &Signature,
+    ) -> Result<[u8; 32], CryptoError> {
+        let derived_sender = PeerId::try_from_public_key_bytes(public_key)?;
+        if derived_sender != challenge.sender_peer || challenge.requested_epoch == 0 {
+            return Err(CryptoError::VerificationFailed);
+        }
+        let session_id = challenge.derive_session_id()?;
+        let key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| CryptoError::InvalidPublicKey)?;
+        let sig = signature.to_dalek()?;
+        let canonical = canonical_session_handshake_v2_digest(public_key, challenge, &session_id);
+        key.verify_strict(&canonical, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)?;
+        Ok(session_id)
     }
 
     /// Sign a `ManifestSignatureV1` preimage (`"swarmtorch.manifest.sig.v1"`, `ADR-0023` §3.1, `W10-02`).

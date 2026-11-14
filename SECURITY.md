@@ -25,18 +25,18 @@
 
 ---
 
-## Current Security Posture (Wave 11 / `v0.1.0` Release Candidate)
+## Current Security Posture (Wave 13 Phases `13-0` & `13A` Hardening)
 
 SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its implemented layers:
 
-- **Domain-Separated Message Authentication (`ADR-0008B`, `ADR-0021`, `W9-02`):**
-  - `MessageEnvelope` (`ProtocolVersion::V1_0`) binds protocol version (`1.0`), `message_type`, sender Ed25519 public key (`[u8; 32]`), `sequence`, `timestamp`, `round_id`, `swarm_id`, `session_nonce`, and `SHA-256(payload)` under domain tag `"swarmtorch.envelope.v1"` (`KeyPair::sign_with_domain` / `verify_with_domain`).
-- **Six-Stage Atomic Receive Pipeline & Low-MTU Chunk Reassembly (`ADR-0021`, `ADR-0022`, `W9-02`, `W11-03`):**
-  - `MessageEnvelope::decode_and_verify_payload` enforces `MAX_FRAME_BYTES = 65_536` *before* deserialization, validates version/key/timestamp bounds, checks cohort allowlist and sequence window read-only before Ed25519 signature verification, commits replay state only after signature verification succeeds, and decodes the inner payload last. Unauthenticated frames cannot mutate replay or peer state.
-  - `ChunkedFrameCodec` (`CRC-16/IBM-3740`) enforces bounded out-of-order reassembly (`MAX_CONCURRENT_REASSEMBLIES = 32`, `MAX_CHUNKS_PER_MESSAGE = 256`, conflict eviction, and lazy TTL sweep) before feeding reassembled frames into the 6-stage `MessageEnvelope` verifier across `TcpPacketTransport` and `UdpPacketTransport`.
-- **Safe `BTreeMap` Replay Protection, `CohortAllowlist`, & Restart Recovery (`ADR-0020` / `ADR-0021`, `W9-02`):**
-  - Replay state uses a 100% safe, deterministic dual-tree `BTreeMap` store (`entries_by_peer` + `expiry_index`) with bounded per-peer and total capacity (`max_tracked_peers`, `max_entries_per_peer`), eliminating `lru` from the dependency tree.
-  - Supports pinned cohort admission (`CohortAllowlist`) and explicit startup/restart recovery gating (`RecoveryRequired`) cleared via a fresh receiver-issued challenge handshake (`SessionHandshakeChallenge`, domain `"swarmtorch.handshake.v1"`).
+- **Domain-Separated Message Authentication & V2 Session Binding (`ADR-0008B`, `ADR-0020`, `ADR-0021`, `W9-02`, `13A-2`):**
+  - `MessageEnvelope` supports `ProtocolVersion::V1_0` and `ProtocolVersion::V0_3` (`(0, 3)`) with `InnerUpdateV2` / `RecipientWrapperV2` / `BundledGossipDeliveryV2` binding `swarm_id`, `run_id`, `round_id`, `session_id` (derived from 256-bit receiver nonce), compression schema version, sender Ed25519 verifying key (`[u8; 32]`), sequence, timestamp, and `SHA-256(payload)` under domain tag `"swarmtorch.envelope.v1"` (`KeyPair::sign_with_domain` / `verify_with_domain`).
+- **3-Stage Coordinator Admission, Non-Forged Transport Sources, & Bounded Reassembly (`ADR-0022`, `ADR-0023`, `13A-1`, `13A-3`):**
+  - `SwarmRoundCoordinator` fails closed on legacy unverified `PeerRoundSubmissionV1` ingress without state mutation and enforces 3-stage authentication (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) across synchronous, FedAsync, and LoRA paths.
+  - `SwarmTransport::recv` returns `ObservedTransportMessage { observed_source: ObservedSourceRef, payload }` (no sentinel `PeerId([0xFF; 32])` attribution), and `carrier::VerifiedLinkPrincipalV1` seals link-layer peer principals behind private fields.
+  - `ObservedSourceReassembler<E>` (`CRC-16/IBM-3740`) enforces pre-allocation bounds across payload, dimensioned `Vec<u64>` bitmaps, and per-transfer/source/tombstone overhead (`max_total_bytes`), contiguous `Vec<u8>` buffer storage, non-evicting quarantine tombstones, and $O(\log S)$ source quarantine escalation.
+- **Safe `BTreeMap` Replay Protection, Default `RequireSessionHandshake`, & `TimestampFloor` (`ADR-0020`, `W9-02`, `13A-2`):**
+  - Replay state uses a 100% safe, deterministic dual-tree `BTreeMap` store (`entries_by_peer` + `expiry_index` plus v2 session-scoped tables) with explicit `CohortAllowlist` admission and default `ReplayStartupPolicyV1::RequireSessionHandshake` gating cleared atomically via receiver-issued `SessionHandshakeChallengeV2` (`complete_recovery_handshake_v2` validates capacity before clearing pending challenges), plus monotonic `TimestampFloor` enforcement on coordinator resume.
 - **Byzantine Aggregation, Non-IID Bucketing, & Verifiable Sparse Co-Design (`ADR-0019`, `ADR-0020`, `ADR-0021`, `W9-01`, `W9-03`, `W11-01`, `W11-02`):**
   - All aggregators (`FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, `Bulyan` `BulyanProfile::IterativeKrumV1`, and stateful `CenteredClippingAggregator`) validate every coordinate of every update for `.is_finite()`, enforce `MAX_COHORT_SIZE = 1024`, sort via `total_cmp`, and widen sums/midpoints/distances to `f64` before narrowing to finite `f32`.
   - `SBucketingTransformer` deterministically shuffles client updates via `ChaCha8Rng` (`"swarmtorch.sbucket.v1"`) before robust aggregation, and `SharedSeedCoordinateVerifier` rejects out-of-policy sparse coordinate indices (`"swarmtorch.shared_seed_sparse.v1"`) before Byzantine distance calculation.

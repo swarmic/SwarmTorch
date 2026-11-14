@@ -383,8 +383,12 @@ impl MockNetworkHub {
         Ok(())
     }
 
-    /// Pop the next queued message addressed to `recipient`.
-    pub fn recv_for(&self, recipient: PeerId) -> crate::Result<(PeerId, Vec<u8>)> {
+    /// Pop the next queued message addressed to `recipient` with an unauthenticated observed
+    /// link source hint (`ObservedSourceRef`, never a trusted `PeerId`).
+    pub fn recv_for(
+        &self,
+        recipient: PeerId,
+    ) -> crate::Result<crate::traits::ObservedTransportMessage> {
         let mut guard = self
             .inner
             .lock()
@@ -397,7 +401,18 @@ impl MockNetworkHub {
             return Err(crate::Error::Timeout);
         };
         let (from, _, payload) = guard.messages.remove(pos).ok_or(crate::Error::Timeout)?;
-        Ok((from, payload))
+        let bytes = from.as_bytes();
+        let label = alloc::format!(
+            "mock-link:{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3]
+        );
+        Ok(crate::traits::ObservedTransportMessage {
+            observed_source: crate::traits::ObservedSourceRef::LinkLabel(label),
+            payload,
+        })
     }
 }
 
@@ -420,7 +435,8 @@ impl MockPeerTransport {
 #[cfg(feature = "std")]
 impl crate::traits::SwarmTransport for MockPeerTransport {
     type SendFuture<'a> = core::future::Ready<crate::Result<()>>;
-    type RecvFuture<'a> = core::future::Ready<crate::Result<(PeerId, Vec<u8>)>>;
+    type RecvFuture<'a> =
+        core::future::Ready<crate::Result<crate::traits::ObservedTransportMessage>>;
     type BroadcastFuture<'a> = core::future::Ready<crate::Result<crate::traits::BroadcastStats>>;
     type DiscoverFuture<'a> = core::future::Ready<crate::Result<Vec<PeerId>>>;
 

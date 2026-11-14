@@ -151,7 +151,6 @@ pub struct UdpGossipTransport {
     next_transfer_id: AtomicU32,
     start_instant: Instant,
     peers: RwLock<BTreeMap<PeerId, SocketAddr>>,
-    addr_to_peer: RwLock<BTreeMap<SocketAddr, PeerId>>,
     reassembler: Mutex<ObservedSourceReassembler<SocketAddr>>,
     inbox: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
 }
@@ -192,7 +191,6 @@ impl UdpGossipTransport {
             next_transfer_id: AtomicU32::new(1),
             start_instant: Instant::now(),
             peers: RwLock::new(BTreeMap::new()),
-            addr_to_peer: RwLock::new(BTreeMap::new()),
             reassembler: Mutex::new(reassembler),
             inbox: Mutex::new(VecDeque::new()),
         }))
@@ -222,7 +220,6 @@ impl UdpGossipTransport {
             next_transfer_id: AtomicU32::new(1),
             start_instant: Instant::now(),
             peers: RwLock::new(BTreeMap::new()),
-            addr_to_peer: RwLock::new(BTreeMap::new()),
             reassembler: Mutex::new(reassembler),
             inbox: Mutex::new(VecDeque::new()),
         }))
@@ -233,16 +230,13 @@ impl UdpGossipTransport {
         self.local_addr
     }
 
-    /// Register a peer's `SocketAddr` in the transport directory.
+    /// Register a peer's outbound `SocketAddr` in the transport directory (`PeerId` lookup is
+    /// strictly outbound; inbound identity always comes from authenticated envelope verification).
     pub fn register_peer(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {
         self.peers
             .write()
             .map_err(|_| Error::TransportUnavailable)?
             .insert(peer, addr);
-        self.addr_to_peer
-            .write()
-            .map_err(|_| Error::TransportUnavailable)?
-            .insert(addr, peer);
         Ok(())
     }
 
@@ -381,8 +375,13 @@ impl UdpGossipTransport {
 
 impl SwarmTransport for UdpGossipTransport {
     type SendFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<()>> + Send + 'a>>;
-    type RecvFuture<'a> =
-        Pin<Box<dyn core::future::Future<Output = Result<(PeerId, Vec<u8>)>> + Send + 'a>>;
+    type RecvFuture<'a> = Pin<
+        Box<
+            dyn core::future::Future<Output = Result<crate::traits::ObservedTransportMessage>>
+                + Send
+                + 'a,
+        >,
+    >;
     type BroadcastFuture<'a> =
         Pin<Box<dyn core::future::Future<Output = Result<BroadcastStats>> + Send + 'a>>;
     type DiscoverFuture<'a> =
@@ -403,13 +402,10 @@ impl SwarmTransport for UdpGossipTransport {
         Box::pin(async move {
             for _ in 0..200 {
                 if let Some((source_addr, payload)) = self.poll_reassembled_once()? {
-                    let peer = self
-                        .addr_to_peer
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&source_addr).copied())
-                        .unwrap_or_else(|| PeerId::new([0xFF; 32]));
-                    return Ok((peer, payload));
+                    return Ok(crate::traits::ObservedTransportMessage {
+                        observed_source: crate::traits::ObservedSourceRef::from(source_addr),
+                        payload,
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -469,7 +465,34 @@ mod tests {
     use super::*;
     use crate::protocol::MessageType;
     use swarm_torch_core::crypto::{KeyPair, MessageAuth};
-    use swarm_torch_core::replay::CohortAllowlist;
+    use swarm_torch_core::replay::{CohortAllowlist, ReplayStartupPolicyV1};
+
+    #[tokio::test]
+    async fn udp_gossip_transport_recv_returns_observed_source_without_sentinel_identity() {
+        let kp_a = KeyPair::from_seed([0x21; 32]).unwrap();
+        let kp_b = KeyPair::from_seed([0x22; 32]).unwrap();
+        let limits = ReassemblerLimits::default();
+        let hub = InMemoryUdpDatagramHub::new();
+        let addr_a: SocketAddr = "127.0.0.1:42101".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:42102".parse().unwrap();
+
+        let udp_a =
+            UdpGossipTransport::bind_in_memory(kp_a.peer_id(), addr_a, 1, limits, hub.clone())
+                .unwrap();
+        let udp_b =
+            UdpGossipTransport::bind_in_memory(kp_b.peer_id(), addr_b, 1, limits, hub).unwrap();
+
+        // Notice: udp_b intentionally does NOT register peer_a's IP:port in any socket map.
+        udp_a
+            .send_to_addr(addr_b, b"raw-unverified-payload")
+            .unwrap();
+        let msg = udp_b.recv().await.unwrap();
+        assert_eq!(
+            msg.observed_source,
+            crate::traits::ObservedSourceRef::from(addr_a)
+        );
+        assert_eq!(msg.payload, b"raw-unverified-payload");
+    }
 
     #[tokio::test]
     async fn udp_gossip_transport_fragments_and_reassembles_multi_chunk_signed_envelope() {
@@ -520,6 +543,7 @@ mod tests {
         let allowlist = CohortAllowlist::from_peers([peer_a, peer_b]);
         let mut replay = ReplayProtection::try_with_config(64, 60)
             .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
             .with_cohort_allowlist(allowlist);
 
         // Poll and verify through the MessageEnvelope gate on receiver B

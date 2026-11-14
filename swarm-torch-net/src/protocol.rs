@@ -8,15 +8,17 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "alloc")]
-use swarm_torch_core::crypto::{EnvelopeContextV1, MessageAuth};
+use swarm_torch_core::crypto::{EnvelopeContextV1, EnvelopeContextV2, MessageAuth};
 #[cfg(feature = "alloc")]
-use swarm_torch_core::replay::{ReplayProtection, ReplayRecordKey};
+use swarm_torch_core::replay::{
+    PreparedReplayAdmission, ReplayProtection, ReplayRecordKey, ReplayRecordKeyV2,
+};
 use swarm_torch_core::traits::PeerId;
 
 /// Default pre-deserialization wire frame bound (`1,048,576` bytes = 1 MiB).
 pub const DEFAULT_MAX_ENVELOPE_BYTES: usize = 1_048_576;
 
-/// Message envelope for all swarm communications (`ADR-0008`, `ADR-0021`, `W9-02`).
+/// Message envelope for all swarm communications (`ADR-0008`, `ADR-0021`, `W9-02`, `ST-03`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     /// Protocol version `(major, minor)`.
@@ -29,13 +31,19 @@ pub struct MessageEnvelope {
     pub sequence: u64,
     /// Unix timestamp (seconds, for expiry).
     pub timestamp: u32,
-    /// Scoped swarm deployment / cohort instance identifier (`VERSION_V1`).
+    /// Scoped swarm deployment / cohort instance identifier (`VERSION_V1`, `VERSION_V2`).
     #[serde(default)]
     pub swarm_instance_id: [u8; 16],
-    /// Monotonically increasing sender session epoch (`VERSION_V1`).
+    /// Bound training/coordination run identifier (`VERSION_V2`).
+    #[serde(default)]
+    pub run_id: [u8; 16],
+    /// Monotonically increasing sender session epoch (`VERSION_V1`, `VERSION_V2`).
     #[serde(default)]
     pub session_epoch: u64,
-    /// Training / coordination round identifier (`VERSION_V1`).
+    /// Receiver-nonce-derived session identifier (`VERSION_V2`).
+    #[serde(default)]
+    pub session_id: [u8; 32],
+    /// Training / coordination round identifier (`VERSION_V1`, `VERSION_V2`).
     #[serde(default)]
     pub round_id: u64,
     /// Payload bytes.
@@ -51,10 +59,13 @@ impl MessageEnvelope {
     pub const VERSION_V0: (u8, u8) = (0, 1);
     /// Scoped v1 envelope version (`swarmtorch.envelope.v1`).
     pub const VERSION_V1: (u8, u8) = (0, 2);
+    /// Receiver-session-bound v2 envelope version (`swarmtorch.envelope.v2`, `ST-03`).
+    pub const VERSION_V2: (u8, u8) = (0, 3);
     /// Current default protocol version for `new_with_public_key`.
     pub const CURRENT_VERSION: (u8, u8) = Self::VERSION_V0;
     /// Supported protocol versions.
-    pub const SUPPORTED_VERSIONS: &'static [(u8, u8)] = &[Self::VERSION_V0, Self::VERSION_V1];
+    pub const SUPPORTED_VERSIONS: &'static [(u8, u8)] =
+        &[Self::VERSION_V0, Self::VERSION_V1, Self::VERSION_V2];
 
     /// Create a new legacy v0 message envelope with explicit public key bytes.
     #[cfg(feature = "alloc")]
@@ -70,7 +81,9 @@ impl MessageEnvelope {
             sequence: 0,
             timestamp: 0,
             swarm_instance_id: [0u8; 16],
+            run_id: [0u8; 16],
             session_epoch: 0,
+            session_id: [0u8; 32],
             round_id: 0,
             payload,
             signature: None,
@@ -94,7 +107,38 @@ impl MessageEnvelope {
             sequence: 0,
             timestamp: 0,
             swarm_instance_id,
+            run_id: [0u8; 16],
             session_epoch,
+            session_id: [0u8; 32],
+            round_id,
+            payload,
+            signature: None,
+        }
+    }
+
+    /// Create a session-id-bound v2 message envelope (`VERSION_V2 = (0, 3)`, `swarmtorch.envelope.v2`, `ST-03`).
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v2(
+        sender_public_key: [u8; 32],
+        swarm_instance_id: [u8; 16],
+        run_id: [u8; 16],
+        session_epoch: u64,
+        session_id: [u8; 32],
+        round_id: u64,
+        message_type: MessageType,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION_V2,
+            message_type,
+            sender: sender_public_key,
+            sequence: 0,
+            timestamp: 0,
+            swarm_instance_id,
+            run_id,
+            session_epoch,
+            session_id,
             round_id,
             payload,
             signature: None,
@@ -157,9 +201,21 @@ impl MessageEnvelope {
         self
     }
 
-    /// Set the round identifier (`VERSION_V1`).
+    /// Set the round identifier (`VERSION_V1`, `VERSION_V2`).
     pub const fn with_round_id(mut self, round_id: u64) -> Self {
         self.round_id = round_id;
+        self
+    }
+
+    /// Set the bound training/coordination run identifier (`VERSION_V2`).
+    pub const fn with_run_id(mut self, run_id: [u8; 16]) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
+    /// Set the receiver-nonce-derived session identifier (`VERSION_V2`).
+    pub const fn with_session_id(mut self, session_id: [u8; 32]) -> Self {
+        self.session_id = session_id;
         self
     }
 
@@ -177,10 +233,29 @@ impl MessageEnvelope {
         }
     }
 
-    /// Sign this envelope using the appropriate domain-separated tag (`v0` or `v1`).
+    /// Construct the [`EnvelopeContextV2`] bound by `swarmtorch.envelope.v2` (`ST-03`).
+    #[cfg(feature = "alloc")]
+    pub const fn envelope_context_v2(&self) -> EnvelopeContextV2 {
+        EnvelopeContextV2 {
+            version: self.version,
+            swarm_instance_id: self.swarm_instance_id,
+            run_id: self.run_id,
+            session_epoch: self.session_epoch,
+            session_id: self.session_id,
+            round_id: self.round_id,
+            message_type: self.message_type as u8,
+            sequence: self.sequence,
+            timestamp: self.timestamp,
+        }
+    }
+
+    /// Sign this envelope using the appropriate domain-separated tag (`v0`, `v1`, or `v2`).
     #[cfg(feature = "alloc")]
     pub fn sign_with(mut self, auth: &MessageAuth) -> Self {
-        let sig = if self.version == Self::VERSION_V1 {
+        let sig = if self.version == Self::VERSION_V2 {
+            let ctx = self.envelope_context_v2();
+            auth.sign_v2(&ctx, &self.payload)
+        } else if self.version == Self::VERSION_V1 {
             let ctx = self.envelope_context_v1();
             auth.sign_v1(&ctx, &self.payload)
         } else {
@@ -229,34 +304,37 @@ impl MessageEnvelope {
         postcard::from_bytes(bytes).map_err(|_| VerifyError::MalformedEnvelope)
     }
 
-    /// Execute Stages 2–5 of the atomic receive pipeline (`ADR-0021`, `W9-02`):
-    /// - Stage 2: Stateless protocol version, timestamp window, and sender key validation.
-    /// - Stage 3: Cohort allowlist and session-epoch continuity gate (before crypto or state mutation).
-    /// - Stage 4: Domain-separated Ed25519 signature verification (`v0` or `v1`).
-    /// - Stage 5: Stateful replay window and expiry-indexed cache update.
+    /// Read-only Stages 2–5 preflight returning `(sender_peer, PreparedReplayAdmission)` with ZERO
+    /// state mutation to `replay_guard` (`ST-01`, `ST-03`).
     #[cfg(feature = "alloc")]
-    pub fn verify_authenticated(
+    pub fn verify_authenticated_prepared(
         &self,
-        replay_guard: &mut ReplayProtection,
+        replay_guard: &ReplayProtection,
         current_time: u32,
-    ) -> Result<(), VerifyError> {
-        // Stage 2a: Version check (before any state mutation).
+    ) -> Result<(PeerId, PreparedReplayAdmission), VerifyError> {
+        // Stage 2a: Version & profile discipline check (before any state mutation).
         if !self.is_version_supported() {
             return Err(VerifyError::UnsupportedVersion {
                 major: self.version.0,
                 minor: self.version.1,
             });
         }
-        // Reject unsigned v1 scope fields on legacy v0 envelopes.
         if self.version == Self::VERSION_V0
             && (self.swarm_instance_id != [0u8; 16]
+                || self.run_id != [0u8; 16]
                 || self.session_epoch != 0
+                || self.session_id != [0u8; 32]
                 || self.round_id != 0)
         {
             return Err(VerifyError::MalformedEnvelope);
         }
+        if self.version == Self::VERSION_V1
+            && (self.run_id != [0u8; 16] || self.session_id != [0u8; 32])
+        {
+            return Err(VerifyError::MalformedEnvelope);
+        }
 
-        // Stage 2b: Stateless timestamp expiry check.
+        // Stage 2b: Stateless timestamp expiry & restart floor check.
         replay_guard
             .check_timestamp_only(self.timestamp, current_time)
             .map_err(VerifyError::Replay)?;
@@ -266,17 +344,76 @@ impl MessageEnvelope {
             .sender_peer_id()
             .map_err(|_| VerifyError::InvalidSenderKey)?;
 
-        // Stage 3: Cohort allowlist and epoch continuity gate (before expensive crypto or state mutation).
+        // Stage 3: Cohort allowlist and epoch/session continuity gate (before crypto).
         replay_guard
             .check_peer_authorized(&sender_id)
             .map_err(VerifyError::Replay)?;
-        let record_key =
-            ReplayRecordKey::new(self.swarm_instance_id, sender_id, self.session_epoch);
-        replay_guard
-            .check_epoch_continuity(&record_key)
-            .map_err(VerifyError::Replay)?;
 
-        // Stage 4: Ed25519 signature verification.
+        if self.version == Self::VERSION_V2 {
+            let record_key_v2 = ReplayRecordKeyV2::new(
+                self.swarm_instance_id,
+                self.run_id,
+                sender_id,
+                self.session_epoch,
+                self.session_id,
+            );
+            replay_guard
+                .check_v2_session_continuity(&record_key_v2)
+                .map_err(VerifyError::Replay)?;
+
+            let signature = self.extract_signature()?;
+            let ctx = self.envelope_context_v2();
+            MessageAuth::verify_v2(&self.sender, &ctx, &self.payload, &signature)
+                .map_err(VerifyError::Crypto)?;
+
+            let prepared = replay_guard
+                .check_v2_admission_readonly(
+                    &record_key_v2,
+                    self.sequence,
+                    self.timestamp,
+                    current_time,
+                )
+                .map_err(VerifyError::Replay)?;
+            Ok((sender_id, prepared))
+        } else {
+            let record_key =
+                ReplayRecordKey::new(self.swarm_instance_id, sender_id, self.session_epoch);
+            replay_guard
+                .check_epoch_continuity(&record_key)
+                .map_err(VerifyError::Replay)?;
+
+            let signature = self.extract_signature()?;
+            if self.version == Self::VERSION_V1 {
+                let ctx = self.envelope_context_v1();
+                MessageAuth::verify_v1(&self.sender, &ctx, &self.payload, &signature)
+                    .map_err(VerifyError::Crypto)?;
+            } else {
+                MessageAuth::verify(
+                    &self.sender,
+                    self.version,
+                    self.message_type as u8,
+                    self.sequence,
+                    self.timestamp,
+                    &self.payload,
+                    &signature,
+                )
+                .map_err(VerifyError::Crypto)?;
+            }
+
+            let prepared = replay_guard
+                .check_v1_admission_readonly(
+                    &record_key,
+                    self.sequence,
+                    self.timestamp,
+                    current_time,
+                )
+                .map_err(VerifyError::Replay)?;
+            Ok((sender_id, prepared))
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    fn extract_signature(&self) -> Result<swarm_torch_core::crypto::Signature, VerifyError> {
         let sig_bytes = self
             .signature
             .as_ref()
@@ -291,31 +428,21 @@ impl MessageEnvelope {
 
         let mut sig_array = [0u8; 64];
         sig_array.copy_from_slice(sig_bytes);
-        let signature = swarm_torch_core::crypto::Signature::from_bytes(sig_array);
+        Ok(swarm_torch_core::crypto::Signature::from_bytes(sig_array))
+    }
 
-        if self.version == Self::VERSION_V1 {
-            let ctx = self.envelope_context_v1();
-            MessageAuth::verify_v1(&self.sender, &ctx, &self.payload, &signature)
-                .map_err(VerifyError::Crypto)?;
-        } else {
-            MessageAuth::verify(
-                &self.sender,
-                self.version,
-                self.message_type as u8,
-                self.sequence,
-                self.timestamp,
-                &self.payload,
-                &signature,
-            )
-            .map_err(VerifyError::Crypto)?;
-        }
-
-        // Stage 5: Stateful replay check and expiry-indexed cache update.
+    /// Execute Stages 2–5 of the atomic receive pipeline (`ADR-0021`, `W9-02`, `ST-03`).
+    #[cfg(feature = "alloc")]
+    pub fn verify_authenticated(
+        &self,
+        replay_guard: &mut ReplayProtection,
+        current_time: u32,
+    ) -> Result<(), VerifyError> {
+        let (_sender_id, prepared) =
+            self.verify_authenticated_prepared(replay_guard, current_time)?;
         replay_guard
-            .validate_sequence_scoped_at(&record_key, self.sequence, self.timestamp, current_time)
-            .map_err(VerifyError::Replay)?;
-
-        Ok(())
+            .commit_prepared_admission(prepared)
+            .map_err(VerifyError::Replay)
     }
 
     /// Execute the full 6-stage atomic receive pipeline, decoding the inner payload `T`

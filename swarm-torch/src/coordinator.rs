@@ -12,11 +12,13 @@ use std::io;
 use sha2::{Digest, Sha256};
 use swarm_torch_core::aggregation::{
     aggregate_with_bucketing_v1, apply_update_transforms, bucket_updates_v1, AggregationBudget,
-    BucketExecutionReport, BucketingConfig, CenteredClipping, CoordinateMedian, FedAvg,
-    PostBucketingRule, RobustAggregation, RobustAggregator, TrimmedMean,
+    BucketExecutionReport, BucketRemainderPolicy, BucketingConfig, CenteredClipping,
+    CoordinateMedian, FedAvg, PostBucketingRule, RobustAggregation, RobustAggregator, TrimmedMean,
 };
 #[cfg(feature = "robust-aggregation")]
-use swarm_torch_core::aggregation::{Bulyan, Krum};
+use swarm_torch_core::aggregation::{Bulyan, BulyanProfile, Krum};
+use swarm_torch_core::compression::CompressedGradient;
+use swarm_torch_core::crypto::{sha256_slices, SessionHandshakeChallengeV2, Signature};
 use swarm_torch_core::dataops::{
     AuthModeMarker, CacheDecisionV0, SourceDescriptorV0, TransformAuditV0, TrustClass,
 };
@@ -24,7 +26,9 @@ use swarm_torch_core::observe::{
     AttrMap, AttrValue, EventRecord, MetricRecord, RunEventEmitter, RunId, SpanId, SpanRecord,
     TraceId,
 };
-use swarm_torch_core::replay::{CohortAllowlist, ReplayError, ReplayProtection};
+use swarm_torch_core::replay::{
+    CohortAllowlist, PreparedReplayAdmission, ReplayError, ReplayProtection, ReplayRecordKeyV2,
+};
 use swarm_torch_core::run_graph::{
     node_def_hash_v1, node_id_from_key, AssetRefV1, CanonParams, ExecutionTrust, NodeV1, OpKind,
 };
@@ -32,6 +36,10 @@ use swarm_torch_core::traits::{
     FitnessFunction, GradientUpdate, PeerId, SwarmModel, SwarmOptimizer, UpdateTransform,
 };
 use swarm_torch_core::Error as CoreError;
+use swarm_torch_models::lora::LoraAdapterPairV1;
+use swarm_torch_net::gossip::{
+    BundledGossipDeliveryV2, GossipVerifyError, InnerUpdateV2, PayloadKindV1,
+};
 
 use crate::artifacts::{
     get_verified_checkpoint_model, pre_release_debit_dp_accountant, put_checkpoint_model,
@@ -208,7 +216,14 @@ impl RoundCoordinatorConfig {
     }
 }
 
-/// Authenticated peer submission for a training round (`ADR-0023` §1.3).
+/// Unverified round submission DTO kept only as a legacy compatibility boundary (`ST-01`).
+///
+/// [`SwarmRoundCoordinator`] rejects unauthenticated [`PeerRoundSubmissionV1`] inputs fail-closed;
+/// callers must deliver signed [`BundledGossipDeliveryV2`] payloads through the 3-stage pipeline
+/// (`prepare_verified_delivery` -> [`ExpectedRoundContextV1`] -> [`VerifiedRoundSubmissionV1`]).
+#[deprecated(
+    note = "unverified ingress DTO; use prepare_verified_delivery -> ExpectedRoundContextV1 -> VerifiedRoundSubmissionV1"
+)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PeerRoundSubmissionV1 {
     /// Run identifier this update is bound to.
@@ -231,6 +246,7 @@ pub struct PeerRoundSubmissionV1 {
     pub reported_examples: Option<u64>,
 }
 
+#[allow(deprecated)]
 impl PeerRoundSubmissionV1 {
     /// Compute the canonical SHA-256 digest of this submission's round-bound payload.
     pub fn canonical_payload_digest(&self) -> [u8; 32] {
@@ -256,7 +272,669 @@ impl PeerRoundSubmissionV1 {
     }
 }
 
-/// Outcome of [`SwarmRoundCoordinator::submit_peer_update`] (`ADR-0023` §1.3).
+/// Compression schema version `0`: raw contiguous little-endian `f32` coordinates (`num_elements * 4` bytes).
+pub const COMPRESSION_SCHEMA_DENSE_F32_LE_V1: u16 = 0;
+/// Compression schema version `1`: JSON-serialized [`CompressedGradient`] (`swarm-torch-core`).
+pub const COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1: u16 = 1;
+/// Compression schema version `2`: JSON-serialized [`LoraAdapterPairV1`] (`swarm-torch-models`).
+pub const COMPRESSION_SCHEMA_LORA_PAIR_V1: u16 = 2;
+
+const ROUND_SUBMISSION_DIGEST_DOMAIN_V2: &[u8] = b"swarmtorch.round.submission.v2";
+const CONTEXT_POLICY_DIGEST_DOMAIN_V1: &[u8] = b"swarmtorch.coordinator.policy.v1";
+
+/// Encode a dense `f32` slice into canonical little-endian bytes (`compression_schema_version = 0`).
+pub fn encode_dense_update_payload_v2(values: &[f32]) -> Result<Vec<u8>, RoundError> {
+    let mut out = Vec::with_capacity(values.len().saturating_mul(4));
+    for (idx, &v) in values.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(RoundError::NonFiniteInput {
+                sender: PeerId::new([0u8; 32]),
+                coord_index: idx,
+            });
+        }
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Encode a [`CompressedGradient`] for [`InnerUpdateV2`] (`compression_schema_version = 1`).
+pub fn encode_compressed_update_payload_v2(
+    compressed: &CompressedGradient,
+) -> Result<Vec<u8>, RoundError> {
+    compressed
+        .validate_shape_and_bounds(swarm_torch_core::compression::DEFAULT_MAX_COMPRESSION_ELEMENTS)
+        .map_err(|e| {
+            RoundError::InvalidWirePayload(format!("invalid compressed gradient: {e:?}"))
+        })?;
+    serde_json::to_vec(compressed).map_err(|e| {
+        RoundError::InvalidWirePayload(format!("failed to serialize compressed gradient: {e}"))
+    })
+}
+
+/// Encode a validated [`LoraAdapterPairV1`] for [`InnerUpdateV2`] (`compression_schema_version = 2`).
+pub fn encode_lora_update_payload_v2(pair: &LoraAdapterPairV1) -> Result<Vec<u8>, RoundError> {
+    let _ = LoraAdapterPairV1::try_new(
+        pair.descriptor.clone(),
+        pair.d_in,
+        pair.d_out,
+        pair.a_weights.clone(),
+        pair.b_weights.clone(),
+    )
+    .map_err(|e| RoundError::InvalidWirePayload(format!("invalid LoRA adapter pair: {e:?}")))?;
+    serde_json::to_vec(pair).map_err(|e| {
+        RoundError::InvalidWirePayload(format!("failed to serialize LoRA adapter pair: {e}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_dense_submission_digest_v2(
+    swarm_instance_id: &[u8; 16],
+    run_id: RunId,
+    round_id: u64,
+    base_checkpoint_digest: &CheckpointContentDigestV1,
+    context_policy_digest: &[u8; 32],
+    sender: PeerId,
+    payload_kind: PayloadKindV1,
+    values: &[f32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ROUND_SUBMISSION_DIGEST_DOMAIN_V2);
+    hasher.update(swarm_instance_id);
+    hasher.update(run_id.as_bytes());
+    hasher.update(round_id.to_le_bytes());
+    hasher.update(base_checkpoint_digest.as_bytes());
+    hasher.update(context_policy_digest);
+    hasher.update(sender.as_bytes());
+    hasher.update([payload_kind as u8]);
+    hasher.update((values.len() as u64).to_le_bytes());
+    for &v in values {
+        hasher.update(v.to_bits().to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn check_update_kind_compatible(
+    expected: UpdateKindV1,
+    kind: PayloadKindV1,
+) -> Result<(), RoundError> {
+    match (expected, kind) {
+        (UpdateKindV1::ModelDeltaV1 { .. }, PayloadKindV1::ModelDeltaV1)
+        | (UpdateKindV1::GradientV1, PayloadKindV1::GradientV1) => Ok(()),
+        (UpdateKindV1::ModelDeltaV1 { .. }, PayloadKindV1::GradientV1) => {
+            Err(RoundError::UpdateKindMismatch {
+                expected,
+                got: UpdateKindV1::GradientV1,
+            })
+        }
+        (UpdateKindV1::GradientV1, PayloadKindV1::ModelDeltaV1) => {
+            Err(RoundError::UpdateKindMismatch {
+                expected,
+                got: UpdateKindV1::ModelDeltaV1 {
+                    server_learning_rate: 1.0,
+                },
+            })
+        }
+        (_, PayloadKindV1::Ef21InnovationV1) => Err(RoundError::InvalidWirePayload(
+            "EF21 innovation payload is unsupported on dense/LoRA coordinator ingress".to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PreparedPayloadV2 {
+    Dense {
+        values: Vec<f32>,
+        canonical_payload_digest: [u8; 32],
+    },
+    Lora {
+        pair: LoraAdapterPairV1,
+    },
+}
+
+/// Stage A output: cryptographically authenticated, payload-decoded submission holding
+/// a read-only [`PreparedReplayAdmission`] proof (`ST-01`, `ST-03`).
+///
+/// Producing [`PreparedSubmissionV1`] performs zero mutation to coordinator or replay state.
+#[derive(Debug)]
+pub struct PreparedSubmissionV1 {
+    sender: PeerId,
+    swarm_instance_id: [u8; 16],
+    run_id: RunId,
+    round_id: u64,
+    base_checkpoint_digest: CheckpointContentDigestV1,
+    context_policy_digest: [u8; 32],
+    payload_kind: PayloadKindV1,
+    reported_examples: Option<u64>,
+    payload: PreparedPayloadV2,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl PreparedSubmissionV1 {
+    /// Authenticated sender `PeerId` derived from Ed25519 public key.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Swarm deployment/cohort instance identifier carried inside the signed inner update.
+    pub const fn swarm_instance_id(&self) -> [u8; 16] {
+        self.swarm_instance_id
+    }
+
+    /// Run identifier bound inside both the wrapper and inner update.
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Round identifier bound inside both the wrapper and inner update.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+
+    /// Parent checkpoint content digest bound inside the signed inner update.
+    pub const fn base_checkpoint_digest(&self) -> CheckpointContentDigestV1 {
+        self.base_checkpoint_digest
+    }
+
+    /// Context/aggregation policy digest bound inside the signed inner update.
+    pub const fn context_policy_digest(&self) -> [u8; 32] {
+        self.context_policy_digest
+    }
+
+    /// Payload kind discriminator bound inside the signed inner update.
+    pub const fn payload_kind(&self) -> PayloadKindV1 {
+        self.payload_kind
+    }
+
+    /// Advisory reported local example count (telemetry only).
+    pub const fn reported_examples(&self) -> Option<u64> {
+        self.reported_examples
+    }
+
+    /// Authenticated delivery sequence number.
+    pub fn sequence(&self) -> u64 {
+        self.replay_admission.sequence()
+    }
+
+    /// Authenticated delivery timestamp in Unix seconds.
+    pub fn timestamp_secs(&self) -> u32 {
+        self.replay_admission.timestamp()
+    }
+
+    /// Receiver-bound v2 session identifier validated during Stage A.
+    pub fn session_id(&self) -> Option<[u8; 32]> {
+        self.replay_admission.session_id()
+    }
+}
+
+/// Immutable coordinator context snapshot used in Stage B to validate [`PreparedSubmissionV1`]
+/// with zero mutation to coordinator or replay state (`ST-01`).
+#[derive(Debug, Clone)]
+pub struct ExpectedRoundContextV1 {
+    swarm_instance_id: [u8; 16],
+    coordinator_peer_id: PeerId,
+    run_id: RunId,
+    active_round_id: u64,
+    max_staleness: u64,
+    accepted_parent_digest: CheckpointContentDigestV1,
+    historical_digests_snapshot: BTreeMap<u64, CheckpointContentDigestV1>,
+    historical_anchor_rounds: BTreeSet<u64>,
+    expected_update_kind: UpdateKindV1,
+    expected_param_count: usize,
+    cohort_allowlist_snapshot: BTreeSet<PeerId>,
+    equivocated_snapshot: BTreeSet<PeerId>,
+    context_policy_digest: [u8; 32],
+    fedasync_policy: Option<swarm_torch_core::aggregation::FedAsyncStalenessDescriptorV1>,
+    coordinator_generation: u64,
+}
+
+impl ExpectedRoundContextV1 {
+    /// Expected swarm instance identifier.
+    pub const fn swarm_instance_id(&self) -> [u8; 16] {
+        self.swarm_instance_id
+    }
+
+    /// Coordinator local recipient `PeerId`.
+    pub const fn coordinator_peer_id(&self) -> PeerId {
+        self.coordinator_peer_id
+    }
+
+    /// Bound training/coordination run identifier.
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Active target round identifier when this snapshot was taken.
+    pub const fn active_round_id(&self) -> u64 {
+        self.active_round_id
+    }
+
+    /// Active checkpoint digest expected for `active_round_id`.
+    pub const fn accepted_parent_digest(&self) -> CheckpointContentDigestV1 {
+        self.accepted_parent_digest
+    }
+
+    /// Context/aggregation policy digest expected on signed v2 updates.
+    pub const fn context_policy_digest(&self) -> [u8; 32] {
+        self.context_policy_digest
+    }
+
+    /// Monotonic coordinator generation when this context was exported.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    fn validate_common_context(&self, prepared: &PreparedSubmissionV1) -> Result<(), RoundError> {
+        if prepared.swarm_instance_id != self.swarm_instance_id {
+            return Err(RoundError::SwarmInstanceMismatch {
+                expected: self.swarm_instance_id,
+                got: prepared.swarm_instance_id,
+            });
+        }
+        if prepared.run_id != self.run_id {
+            return Err(RoundError::RunIdMismatch {
+                expected: self.run_id,
+                got: prepared.run_id,
+            });
+        }
+        if prepared.context_policy_digest != self.context_policy_digest {
+            return Err(RoundError::ContextPolicyDigestMismatch {
+                expected: self.context_policy_digest,
+                got: prepared.context_policy_digest,
+            });
+        }
+        if !self.cohort_allowlist_snapshot.contains(&prepared.sender) {
+            return Err(RoundError::UnauthorizedPeer(prepared.sender));
+        }
+        if !prepared.replay_admission.is_v2() || prepared.replay_admission.session_id().is_none() {
+            return Err(RoundError::ReplayRejected(ReplayError::RecoveryRequired {
+                peer: prepared.sender,
+                current_epoch: 0,
+                requested_epoch: 1,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Stage B (synchronous/bounded-staleness round): validate `prepared` against this immutable
+    /// round context with zero state mutation (`ST-01`).
+    pub fn validate_sync_submission(
+        &self,
+        prepared: PreparedSubmissionV1,
+    ) -> Result<ValidatedRoundSubmissionV1, RoundError> {
+        self.validate_common_context(&prepared)?;
+
+        if prepared.round_id > self.active_round_id {
+            return Err(RoundError::FutureRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+            });
+        }
+        let staleness = self.active_round_id - prepared.round_id;
+        if staleness > self.max_staleness {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+                max_staleness: self.max_staleness,
+            });
+        }
+
+        let expected_base = if staleness == 0 {
+            self.accepted_parent_digest
+        } else {
+            let prev_round = prepared.round_id.saturating_sub(1);
+            self.historical_digests_snapshot
+                .get(&prev_round)
+                .copied()
+                .ok_or(RoundError::StaleAnchorEvicted {
+                    base_round: prev_round,
+                    current_round: self.active_round_id,
+                })?
+        };
+        if prepared.base_checkpoint_digest != expected_base {
+            return Err(RoundError::BaseCheckpointMismatch {
+                expected: expected_base,
+                got: prepared.base_checkpoint_digest,
+            });
+        }
+
+        check_update_kind_compatible(self.expected_update_kind, prepared.payload_kind)?;
+
+        if self.equivocated_snapshot.contains(&prepared.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: prepared.sender,
+                round_id: self.active_round_id,
+            });
+        }
+
+        let (values, canonical_payload_digest) = match prepared.payload {
+            PreparedPayloadV2::Dense {
+                values,
+                canonical_payload_digest,
+            } => (values, canonical_payload_digest),
+            PreparedPayloadV2::Lora { .. } => {
+                return Err(RoundError::InvalidWirePayload(
+                    "LoRA adapter payload must use validate_lora_submission".to_string(),
+                ));
+            }
+        };
+        if values.len() != self.expected_param_count {
+            return Err(RoundError::DimensionMismatch {
+                expected: self.expected_param_count,
+                got: values.len(),
+            });
+        }
+
+        Ok(ValidatedRoundSubmissionV1 {
+            coordinator_generation: self.coordinator_generation,
+            target_round_id: self.active_round_id,
+            sender: prepared.sender,
+            canonical_payload_digest,
+            values,
+            reported_examples: prepared.reported_examples,
+            replay_admission: prepared.replay_admission,
+        })
+    }
+
+    /// Stage B (`FedAsync`): validate a bounded-staleness asynchronous update against retained
+    /// historical anchors with zero state mutation (`ST-01`).
+    pub fn validate_fedasync_submission(
+        &self,
+        prepared: PreparedSubmissionV1,
+    ) -> Result<ValidatedFedAsyncSubmissionV1, RoundError> {
+        let policy = self
+            .fedasync_policy
+            .ok_or(RoundError::Aggregation(CoreError::InvalidThreshold))?;
+        self.validate_common_context(&prepared)?;
+
+        if !matches!(self.expected_update_kind, UpdateKindV1::ModelDeltaV1 { .. })
+            || prepared.payload_kind != PayloadKindV1::ModelDeltaV1
+        {
+            check_update_kind_compatible(self.expected_update_kind, prepared.payload_kind)?;
+            return Err(RoundError::UpdateKindMismatch {
+                expected: self.expected_update_kind,
+                got: UpdateKindV1::GradientV1,
+            });
+        }
+
+        let latest_committed = self.active_round_id.saturating_sub(1);
+        if prepared.round_id > latest_committed {
+            return Err(RoundError::FutureRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: latest_committed,
+            });
+        }
+        let staleness = latest_committed - prepared.round_id;
+        let max_stale = policy.max_staleness_rounds.min(self.max_staleness);
+        if staleness > max_stale {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: latest_committed,
+                max_staleness: max_stale,
+            });
+        }
+
+        let expected_base = self
+            .historical_digests_snapshot
+            .get(&prepared.round_id)
+            .copied()
+            .filter(|_| self.historical_anchor_rounds.contains(&prepared.round_id))
+            .ok_or(RoundError::StaleAnchorEvicted {
+                base_round: prepared.round_id,
+                current_round: latest_committed,
+            })?;
+        if prepared.base_checkpoint_digest != expected_base {
+            return Err(RoundError::BaseCheckpointMismatch {
+                expected: expected_base,
+                got: prepared.base_checkpoint_digest,
+            });
+        }
+
+        let values = match prepared.payload {
+            PreparedPayloadV2::Dense { values, .. } => values,
+            PreparedPayloadV2::Lora { .. } => {
+                return Err(RoundError::InvalidWirePayload(
+                    "LoRA adapter payload is unsupported in dense FedAsync step".to_string(),
+                ));
+            }
+        };
+        if values.len() != self.expected_param_count {
+            return Err(RoundError::DimensionMismatch {
+                expected: self.expected_param_count,
+                got: values.len(),
+            });
+        }
+
+        Ok(ValidatedFedAsyncSubmissionV1 {
+            coordinator_generation: self.coordinator_generation,
+            base_round_id: prepared.round_id,
+            sender: prepared.sender,
+            values,
+            replay_admission: prepared.replay_admission,
+        })
+    }
+
+    /// Stage B (LoRA/FLoRA cohort): validate a prepared LoRA adapter pair against the active round
+    /// context with zero state mutation (`ST-01`).
+    pub fn validate_lora_submission(
+        &self,
+        prepared: PreparedSubmissionV1,
+    ) -> Result<ValidatedLoraSubmissionV1, RoundError> {
+        self.validate_common_context(&prepared)?;
+
+        if prepared.round_id > self.active_round_id {
+            return Err(RoundError::FutureRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+            });
+        }
+        if prepared.round_id < self.active_round_id {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: prepared.round_id,
+                current_round: self.active_round_id,
+                max_staleness: 0,
+            });
+        }
+        if prepared.base_checkpoint_digest != self.accepted_parent_digest {
+            return Err(RoundError::BaseCheckpointMismatch {
+                expected: self.accepted_parent_digest,
+                got: prepared.base_checkpoint_digest,
+            });
+        }
+        if prepared.payload_kind != PayloadKindV1::ModelDeltaV1 {
+            return Err(RoundError::InvalidWirePayload(
+                "LoRA adapter submissions require PayloadKindV1::ModelDeltaV1".to_string(),
+            ));
+        }
+
+        let pair = match prepared.payload {
+            PreparedPayloadV2::Lora { pair, .. } => pair,
+            PreparedPayloadV2::Dense { .. } => {
+                return Err(RoundError::InvalidWirePayload(
+                    "dense vector payload cannot enter validate_lora_submission".to_string(),
+                ));
+            }
+        };
+
+        Ok(ValidatedLoraSubmissionV1 {
+            coordinator_generation: self.coordinator_generation,
+            round_id: prepared.round_id,
+            sender: prepared.sender,
+            pair,
+            replay_admission: prepared.replay_admission,
+        })
+    }
+}
+
+/// Stage B output for synchronous round admission (private fields, read-only before Stage C).
+#[derive(Debug)]
+pub struct ValidatedRoundSubmissionV1 {
+    coordinator_generation: u64,
+    target_round_id: u64,
+    sender: PeerId,
+    canonical_payload_digest: [u8; 32],
+    values: Vec<f32>,
+    reported_examples: Option<u64>,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl ValidatedRoundSubmissionV1 {
+    /// Coordinator generation stamped during Stage B validation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Target coordinator round identifier.
+    pub const fn target_round_id(&self) -> u64 {
+        self.target_round_id
+    }
+}
+
+/// Stage B output for `FedAsync` admission (private fields, read-only before Stage C).
+#[derive(Debug)]
+pub struct ValidatedFedAsyncSubmissionV1 {
+    coordinator_generation: u64,
+    base_round_id: u64,
+    sender: PeerId,
+    values: Vec<f32>,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl ValidatedFedAsyncSubmissionV1 {
+    /// Coordinator generation stamped during Stage B validation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Historical anchor base round identifier.
+    pub const fn base_round_id(&self) -> u64 {
+        self.base_round_id
+    }
+}
+
+/// Stage B output for LoRA cohort admission (private fields, read-only before Stage C).
+#[derive(Debug)]
+pub struct ValidatedLoraSubmissionV1 {
+    coordinator_generation: u64,
+    round_id: u64,
+    sender: PeerId,
+    pair: LoraAdapterPairV1,
+    replay_admission: PreparedReplayAdmission,
+}
+
+impl ValidatedLoraSubmissionV1 {
+    /// Coordinator generation stamped during Stage B validation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Target round identifier.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+}
+
+/// Stage C sealed token proving replay sequence consumption and round context verification (`ST-01`).
+#[derive(Debug)]
+pub struct VerifiedRoundSubmissionV1 {
+    coordinator_generation: u64,
+    round_id: u64,
+    sender: PeerId,
+    sequence: u64,
+    canonical_payload_digest: [u8; 32],
+    values: Vec<f32>,
+    reported_examples: Option<u64>,
+}
+
+impl VerifiedRoundSubmissionV1 {
+    /// Coordinator generation stamped when this token was committed.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Verified target round identifier.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+
+    /// Consumed replay sequence number.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// Stage C sealed token for a verified `FedAsync` update (`ST-01`).
+#[derive(Debug)]
+pub struct VerifiedFedAsyncSubmissionV1 {
+    coordinator_generation: u64,
+    base_round_id: u64,
+    sender: PeerId,
+    values: Vec<f32>,
+}
+
+impl VerifiedFedAsyncSubmissionV1 {
+    /// Coordinator generation stamped when this token was committed.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Historical anchor base round identifier.
+    pub const fn base_round_id(&self) -> u64 {
+        self.base_round_id
+    }
+}
+
+/// Stage C sealed token for a verified LoRA cohort contribution (`ST-01`).
+#[derive(Debug)]
+pub struct VerifiedLoraSubmissionV1 {
+    coordinator_generation: u64,
+    round_id: u64,
+    sender: PeerId,
+    pair: LoraAdapterPairV1,
+}
+
+impl VerifiedLoraSubmissionV1 {
+    /// Coordinator generation stamped when this token was committed.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Verified originator `PeerId`.
+    pub const fn sender(&self) -> PeerId {
+        self.sender
+    }
+
+    /// Target round identifier.
+    pub const fn round_id(&self) -> u64 {
+        self.round_id
+    }
+}
+
+/// Outcome of submitting an update to [`SwarmRoundCoordinator`] (`ADR-0023` §1.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionDecision {
     /// First valid submission from `sender` for the round; buffered for aggregation.
@@ -320,6 +998,27 @@ pub enum RoundError {
         base_round: u64,
         current_round: u64,
     },
+    /// Unverified or deprecated ingress path rejected fail-closed (`ST-01`).
+    UnverifiedSubmissionRejected,
+    /// Wire decoding or Ed25519 signature verification failed (`ST-01`, `ST-03`).
+    AuthenticationFailed(GossipVerifyError),
+    /// Wire payload `swarm_instance_id` did not match coordinator instance (`ST-01`).
+    SwarmInstanceMismatch {
+        expected: [u8; 16],
+        got: [u8; 16],
+    },
+    /// Wire payload `context_policy_digest` did not match active coordinator policy (`ST-01`).
+    ContextPolicyDigestMismatch {
+        expected: [u8; 32],
+        got: [u8; 32],
+    },
+    /// Sealed submission token belongs to a stale or mismatched coordinator generation (`ST-01`).
+    StaleCoordinatorGeneration {
+        expected: u64,
+        got: u64,
+    },
+    /// Wire payload compression/schema/LoRA decoding failed (`ST-01`).
+    InvalidWirePayload(String),
     Io(io::Error),
 }
 
@@ -386,12 +1085,42 @@ impl core::fmt::Display for RoundError {
                 f,
                 "stale base round {base_round} evicted from historical anchor window at round {current_round}"
             ),
+            Self::UnverifiedSubmissionRejected => write!(
+                f,
+                "unverified submission rejected: use authenticated BundledGossipDeliveryV2 3-stage pipeline"
+            ),
+            Self::AuthenticationFailed(e) => write!(
+                f,
+                "gossip authentication or wire envelope verification failed: {e:?}"
+            ),
+            Self::SwarmInstanceMismatch { expected, got } => write!(
+                f,
+                "swarm_instance_id mismatch: expected {expected:02x?}, got {got:02x?}"
+            ),
+            Self::ContextPolicyDigestMismatch { expected, got } => write!(
+                f,
+                "context_policy_digest mismatch: expected {expected:02x?}, got {got:02x?}"
+            ),
+            Self::StaleCoordinatorGeneration { expected, got } => write!(
+                f,
+                "stale coordinator_generation on verified submission: expected {expected}, got {got}"
+            ),
+            Self::InvalidWirePayload(msg) => write!(f, "invalid wire payload: {msg}"),
             Self::Io(e) => write!(f, "artifact/CAS I/O error: {e}"),
         }
     }
 }
 
 impl std::error::Error for RoundError {}
+
+impl From<GossipVerifyError> for RoundError {
+    fn from(e: GossipVerifyError) -> Self {
+        match e {
+            GossipVerifyError::Replay(replay_err) => Self::ReplayRejected(replay_err),
+            other => Self::AuthenticationFailed(other),
+        }
+    }
+}
 
 impl From<io::Error> for RoundError {
     fn from(e: io::Error) -> Self {
@@ -438,6 +1167,9 @@ pub struct RoundCommitSummaryV1 {
 /// Unified round coordinator state machine (`ADR-0023` §1, `W10-01`).
 pub struct SwarmRoundCoordinator<M: SwarmModel> {
     run_id: RunId,
+    swarm_instance_id: [u8; 16],
+    coordinator_peer_id: PeerId,
+    coordinator_generation: u64,
     config: RoundCoordinatorConfig,
     current_round: u64,
     model: M,
@@ -464,6 +1196,20 @@ pub struct SwarmRoundCoordinator<M: SwarmModel> {
     fedasync_clip_norm: Option<f32>,
     /// Bounded historical parameter anchor window (`round_id -> w_round`) for `FedAsync` drift compensation.
     historical_anchors: BTreeMap<u64, Vec<f32>>,
+}
+
+fn default_swarm_instance_id(run_id: RunId) -> [u8; 16] {
+    let digest = sha256_slices(&[b"swarmtorch.coordinator.instance.v1", run_id.as_bytes()]);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+fn default_coordinator_peer_id(run_id: RunId) -> PeerId {
+    PeerId::new(sha256_slices(&[
+        b"swarmtorch.coordinator.peer.v1",
+        run_id.as_bytes(),
+    ]))
 }
 
 impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
@@ -550,8 +1296,14 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         let mut historical_anchors = BTreeMap::new();
         historical_anchors.insert(0, initial_model.parameters().to_vec());
 
+        let swarm_instance_id = default_swarm_instance_id(run_id);
+        let coordinator_peer_id = default_coordinator_peer_id(run_id);
+
         Ok(Self {
             run_id,
+            swarm_instance_id,
+            coordinator_peer_id,
+            coordinator_generation: 0,
             config,
             current_round: 1,
             model: initial_model,
@@ -599,14 +1351,26 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         let replay = ReplayProtection::try_with_config(1024, config.max_clock_skew_secs)
             .expect("non-zero capacity")
             .with_cohort_allowlist(allowlist);
+        let floor_secs =
+            (resume_state.committed_unix_nanos / 1_000_000_000).min(u32::MAX as u64) as u32;
+        let replay = if floor_secs > 0 {
+            replay.with_timestamp_floor(floor_secs)
+        } else {
+            replay
+        };
 
         let mut historical_digests = BTreeMap::new();
         historical_digests.insert(resume_state.round_id, resume_state.content_digest);
         let mut historical_anchors = BTreeMap::new();
         historical_anchors.insert(resume_state.round_id, model.parameters().to_vec());
+        let swarm_instance_id = default_swarm_instance_id(resume_state.run_id);
+        let coordinator_peer_id = default_coordinator_peer_id(resume_state.run_id);
 
         Ok(Self {
             run_id: resume_state.run_id,
+            swarm_instance_id,
+            coordinator_peer_id,
+            coordinator_generation: 0,
             config,
             current_round: resume_state.round_id.saturating_add(1),
             model,
@@ -631,6 +1395,20 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     /// Configure conservative `$s$-Bucketing` pre-aggregation for subsequent rounds (`ADR-0019` §4, `W11-01`).
     pub fn set_bucketing(&mut self, bucketing: Option<BucketingConfig>) {
         self.bucketing = bucketing;
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+    }
+
+    /// Override the coordinator's [`swarm_instance_id`](Self::swarm_instance_id) and
+    /// [`coordinator_peer_id`](Self::coordinator_peer_id), bumping `coordinator_generation`.
+    pub fn with_coordinator_identity(
+        mut self,
+        swarm_instance_id: [u8; 16],
+        coordinator_peer_id: PeerId,
+    ) -> Self {
+        self.swarm_instance_id = swarm_instance_id;
+        self.coordinator_peer_id = coordinator_peer_id;
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        self
     }
 
     /// Borrow the `$s$-Bucketing` execution report from the most recently finalized round.
@@ -664,6 +1442,235 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         Ok(())
     }
 
+    /// Bound run identifier.
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Scoped swarm instance identifier expected on v2 deliveries and session handshakes.
+    pub const fn swarm_instance_id(&self) -> [u8; 16] {
+        self.swarm_instance_id
+    }
+
+    /// Local coordinator recipient [`PeerId`] expected as `intended_recipient` on v2 deliveries.
+    pub const fn coordinator_peer_id(&self) -> PeerId {
+        self.coordinator_peer_id
+    }
+
+    /// Monotonic coordinator generation incremented on every committed round or policy mutation.
+    pub const fn coordinator_generation(&self) -> u64 {
+        self.coordinator_generation
+    }
+
+    /// Number of active entries currently tracked by `ReplayProtection`.
+    pub fn replay_cache_size(&self) -> usize {
+        self.replay.cache_size()
+    }
+
+    /// Number of registered, pending v2 session recovery challenges.
+    pub fn replay_pending_challenge_count(&self) -> usize {
+        self.replay.pending_challenge_count()
+    }
+
+    /// Number of peers revoked for equivocation in `current_round`.
+    pub fn equivocated_count(&self) -> usize {
+        self.equivocated.len()
+    }
+
+    /// Deterministic SHA-256 context/aggregation policy digest bound into v2 updates & handshakes.
+    pub fn context_policy_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONTEXT_POLICY_DIGEST_DOMAIN_V1);
+        hasher.update(self.swarm_instance_id);
+        hasher.update(self.run_id.as_bytes());
+        hasher.update(self.coordinator_peer_id.as_bytes());
+        hasher.update((self.model.num_parameters() as u64).to_le_bytes());
+
+        match self.config.update_kind {
+            UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate,
+            } => {
+                hasher.update([1u8]);
+                hasher.update(server_learning_rate.to_bits().to_le_bytes());
+            }
+            UpdateKindV1::GradientV1 => hasher.update([2u8]),
+        }
+
+        match &self.config.aggregation {
+            RobustAggregation::FedAvg => hasher.update([1u8]),
+            RobustAggregation::Median => hasher.update([2u8]),
+            RobustAggregation::TrimmedMean { trim_ratio } => {
+                hasher.update([3u8]);
+                hasher.update(trim_ratio.to_bits().to_le_bytes());
+            }
+            #[cfg(feature = "robust-aggregation")]
+            RobustAggregation::Krum { num_byzantine } => {
+                hasher.update([4u8]);
+                hasher.update((*num_byzantine as u64).to_le_bytes());
+            }
+            #[cfg(feature = "robust-aggregation")]
+            RobustAggregation::MultiKrum {
+                num_byzantine,
+                num_selected,
+            } => {
+                hasher.update([5u8]);
+                hasher.update((*num_byzantine as u64).to_le_bytes());
+                hasher.update((*num_selected as u64).to_le_bytes());
+            }
+            #[cfg(feature = "robust-aggregation")]
+            RobustAggregation::Bulyan {
+                max_byzantine,
+                profile,
+            } => {
+                hasher.update([6u8]);
+                hasher.update((*max_byzantine as u64).to_le_bytes());
+                let p_tag: u8 = match profile {
+                    BulyanProfile::IterativeKrumV1 => 1,
+                };
+                hasher.update([p_tag]);
+            }
+            RobustAggregation::CenteredClipping {
+                tau,
+                max_iterations,
+            } => {
+                hasher.update([7u8]);
+                hasher.update(tau.to_bits().to_le_bytes());
+                hasher.update((*max_iterations as u64).to_le_bytes());
+            }
+        }
+
+        match &self.config.weighting_policy {
+            WeightingPolicyV1::EqualPeerVote => hasher.update([1u8]),
+            WeightingPolicyV1::RegistryCertified {
+                peer_weights,
+                max_weight_share,
+            } => {
+                hasher.update([2u8]);
+                hasher.update(max_weight_share.to_bits().to_le_bytes());
+                hasher.update((peer_weights.len() as u64).to_le_bytes());
+                for (peer, &weight) in peer_weights {
+                    hasher.update(peer.as_bytes());
+                    hasher.update(weight.to_le_bytes());
+                }
+            }
+        }
+
+        hasher.update((self.config.authorized_cohort.len() as u64).to_le_bytes());
+        for peer in &self.config.authorized_cohort {
+            hasher.update(peer.as_bytes());
+        }
+        hasher.update((self.config.min_quorum as u64).to_le_bytes());
+        hasher.update(self.config.max_staleness.to_le_bytes());
+        hasher.update(self.config.max_clock_skew_secs.to_le_bytes());
+
+        match self.fedasync_policy {
+            Some(p) => {
+                hasher.update([1u8]);
+                hasher.update(p.base_alpha.to_bits().to_le_bytes());
+                hasher.update(p.max_staleness_rounds.to_le_bytes());
+                hasher.update(p.polynomial_decay_exponent.to_bits().to_le_bytes());
+                hasher.update(self.fedasync_hinge_threshold.to_le_bytes());
+                match self.fedasync_clip_norm {
+                    Some(tau) => {
+                        hasher.update([1u8]);
+                        hasher.update(tau.to_bits().to_le_bytes());
+                    }
+                    None => hasher.update([0u8]),
+                }
+            }
+            None => hasher.update([0u8]),
+        }
+
+        match self.bucketing {
+            Some(b) => {
+                hasher.update([1u8]);
+                hasher.update((b.bucket_size as u64).to_le_bytes());
+                hasher.update((b.byzantine_count as u64).to_le_bytes());
+                hasher.update(b.round_seed);
+                let rem_tag: u8 = match b.remainder_policy {
+                    BucketRemainderPolicy::StrictExactMultiple => 1,
+                    BucketRemainderPolicy::DropRemainderDeterministic => 2,
+                };
+                hasher.update([rem_tag]);
+            }
+            None => hasher.update([0u8]),
+        }
+
+        hasher.finalize().into()
+    }
+
+    /// Export an immutable [`ExpectedRoundContextV1`] snapshot for Stage B validation (`ST-01`).
+    pub fn expected_round_context(&self) -> ExpectedRoundContextV1 {
+        ExpectedRoundContextV1 {
+            swarm_instance_id: self.swarm_instance_id,
+            coordinator_peer_id: self.coordinator_peer_id,
+            run_id: self.run_id,
+            active_round_id: self.current_round,
+            max_staleness: self.config.max_staleness,
+            accepted_parent_digest: self.parent_digest,
+            historical_digests_snapshot: self.historical_digests.clone(),
+            historical_anchor_rounds: self.historical_anchors.keys().copied().collect(),
+            expected_update_kind: self.config.update_kind,
+            expected_param_count: self.model.num_parameters(),
+            cohort_allowlist_snapshot: self.config.authorized_cohort.clone(),
+            equivocated_snapshot: self.equivocated.clone(),
+            context_policy_digest: self.context_policy_digest(),
+            fedasync_policy: self.fedasync_policy,
+            coordinator_generation: self.coordinator_generation,
+        }
+    }
+
+    /// Register a receiver-issued v2 session handshake challenge (`ST-03`).
+    pub fn register_session_challenge_v2(
+        &mut self,
+        challenge: SessionHandshakeChallengeV2,
+    ) -> Result<(), RoundError> {
+        if challenge.swarm_instance_id != self.swarm_instance_id {
+            return Err(RoundError::SwarmInstanceMismatch {
+                expected: self.swarm_instance_id,
+                got: challenge.swarm_instance_id,
+            });
+        }
+        let challenge_run_id = RunId::from_bytes(challenge.run_id);
+        if challenge_run_id != self.run_id {
+            return Err(RoundError::RunIdMismatch {
+                expected: self.run_id,
+                got: challenge_run_id,
+            });
+        }
+        if challenge.receiver_peer != self.coordinator_peer_id {
+            return Err(RoundError::UnauthorizedPeer(challenge.receiver_peer));
+        }
+        let expected_policy = self.context_policy_digest();
+        if challenge.policy_digest != expected_policy {
+            return Err(RoundError::ContextPolicyDigestMismatch {
+                expected: expected_policy,
+                got: challenge.policy_digest,
+            });
+        }
+        self.replay
+            .register_recovery_challenge_v2(challenge)
+            .map_err(RoundError::ReplayRejected)
+    }
+
+    /// Complete a receiver-bound v2 session handshake atomically (`ST-03`).
+    pub fn complete_session_handshake_v2(
+        &mut self,
+        sender_public_key: &[u8; 32],
+        signature: &Signature,
+        current_time: u32,
+    ) -> Result<ReplayRecordKeyV2, RoundError> {
+        self.replay
+            .complete_recovery_handshake_v2(
+                self.swarm_instance_id,
+                *self.run_id.as_bytes(),
+                sender_public_key,
+                signature,
+                current_time,
+            )
+            .map_err(RoundError::ReplayRejected)
+    }
+
     /// Current active round number (starts at `1` after genesis initialization).
     pub const fn current_round(&self) -> u64 {
         self.current_round
@@ -694,141 +1701,153 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.admitted.len() >= self.config.min_quorum
     }
 
-    /// Validate and admit a peer update for the current round (`ADR-0023` §1.3).
+    /// Legacy unverified round submission entrypoint — rejected fail-closed (`ST-01`).
     ///
-    /// Enforces:
-    /// 1. `run_id` binding.
-    /// 2. Future-round check BEFORE unsigned subtraction (`submission.round_id > self.current_round`).
-    /// 3. Bounded staleness check (`self.current_round - submission.round_id <= max_staleness`) and
-    ///    `base_checkpoint_digest` binding.
-    /// 4. `UpdateKindV1` compatibility check.
-    /// 5. Cohort allowlist check BEFORE any state mutation.
-    /// 6. Per-peer 1-vote-per-round equivocation vs. idempotent duplicate re-transmission check.
-    /// 7. `ReplayProtection` sequence & timestamp validation.
-    /// 8. Exact parameter dimension & finiteness validation.
+    /// Use [`Self::prepare_verified_delivery`] -> [`ExpectedRoundContextV1::validate_sync_submission`]
+    /// -> [`Self::commit_prepared_submission`] -> [`Self::submit_verified_update`] (or the
+    /// convenience [`Self::submit_verified_delivery`]).
+    #[deprecated(
+        note = "unverified ingress fails closed; use submit_verified_delivery or the 3-stage pipeline"
+    )]
+    #[allow(deprecated)]
     pub fn submit_peer_update(
         &mut self,
-        submission: PeerRoundSubmissionV1,
-        now_secs: u64,
+        _submission: PeerRoundSubmissionV1,
+        _now_secs: u64,
     ) -> Result<SubmissionDecision, RoundError> {
-        if submission.run_id != self.run_id {
-            return Err(RoundError::RunIdMismatch {
-                expected: self.run_id,
-                got: submission.run_id,
-            });
-        }
+        Err(RoundError::UnverifiedSubmissionRejected)
+    }
 
-        // Future-round check MUST precede any subtraction (`ADR-0023` §1.3).
-        if submission.round_id > self.current_round {
-            return Err(RoundError::FutureRoundRejected {
-                submission_round: submission.round_id,
-                current_round: self.current_round,
-            });
-        }
-        let staleness = self.current_round - submission.round_id;
-        if staleness > self.config.max_staleness {
-            return Err(RoundError::StaleRoundRejected {
-                submission_round: submission.round_id,
-                current_round: self.current_round,
-                max_staleness: self.config.max_staleness,
-            });
-        }
+    /// Stage A (`&self`, zero state mutation): bounded-deserialize and cryptographically verify a
+    /// signed [`BundledGossipDeliveryV2`] wire frame against `&self.replay` without consuming any
+    /// replay sequence state (`ST-01`, `ST-03`).
+    pub fn prepare_verified_delivery(
+        &self,
+        delivery_bytes: &[u8],
+        max_delivery_bytes: usize,
+        now_secs: u64,
+    ) -> Result<PreparedSubmissionV1, RoundError> {
+        let delivery =
+            BundledGossipDeliveryV2::from_bytes_bounded(delivery_bytes, max_delivery_bytes)?;
+        self.prepare_verified_delivery_struct(&delivery, now_secs)
+    }
 
-        let expected_base = if staleness == 0 {
-            self.parent_digest
-        } else {
-            let prev_round = submission.round_id.saturating_sub(1);
-            self.historical_digests
-                .get(&prev_round)
-                .copied()
-                .unwrap_or(self.parent_digest)
-        };
-        if submission.base_checkpoint_digest != expected_base {
-            return Err(RoundError::BaseCheckpointMismatch {
-                expected: expected_base,
-                got: submission.base_checkpoint_digest,
-            });
-        }
-
-        if submission.update_kind != self.config.update_kind {
-            return Err(RoundError::UpdateKindMismatch {
-                expected: self.config.update_kind,
-                got: submission.update_kind,
-            });
-        }
-
-        if !self.config.authorized_cohort.contains(&submission.sender) {
-            return Err(RoundError::UnauthorizedPeer(submission.sender));
-        }
-
-        if self.equivocated.contains(&submission.sender) {
-            return Err(RoundError::EquivocationRejected {
-                sender: submission.sender,
-                round_id: self.current_round,
-            });
-        }
-
-        let payload_digest = submission.canonical_payload_digest();
-        if let Some(existing) = self.admitted.get(&submission.sender) {
-            if existing.payload_digest == payload_digest {
-                return Ok(SubmissionDecision::DuplicateIdempotentAck);
-            } else {
-                // Conflicting payload from the same peer in the same round: revoke their earlier vote!
-                self.admitted.remove(&submission.sender);
-                self.equivocated.insert(submission.sender);
-                return Err(RoundError::EquivocationRejected {
-                    sender: submission.sender,
-                    round_id: self.current_round,
-                });
-            }
-        }
-
-        let expected_dim = self.model.num_parameters();
-        if submission.values.len() != expected_dim {
-            return Err(RoundError::DimensionMismatch {
-                expected: expected_dim,
-                got: submission.values.len(),
-            });
-        }
-        for (idx, &val) in submission.values.iter().enumerate() {
-            if !val.is_finite() {
-                return Err(RoundError::NonFiniteInput {
-                    sender: submission.sender,
-                    coord_index: idx,
-                });
-            }
-        }
-
-        let ts_u32 = u32::try_from(submission.timestamp_secs).map_err(|_| {
-            RoundError::ReplayRejected(ReplayError::Expired {
-                ts: u32::MAX,
-                now: u32::try_from(now_secs).unwrap_or(u32::MAX),
-                window: self.config.max_clock_skew_secs,
-            })
-        })?;
+    /// Stage A (`&self`, zero state mutation) over an already-deserialized
+    /// [`BundledGossipDeliveryV2`] (`ST-01`, `ST-03`).
+    pub fn prepare_verified_delivery_struct(
+        &self,
+        delivery: &BundledGossipDeliveryV2,
+        now_secs: u64,
+    ) -> Result<PreparedSubmissionV1, RoundError> {
         let now_u32 = u32::try_from(now_secs).map_err(|_| {
             RoundError::ReplayRejected(ReplayError::Expired {
-                ts: ts_u32,
+                ts: delivery.wrapper.timestamp_secs,
                 now: u32::MAX,
                 window: self.config.max_clock_skew_secs,
             })
         })?;
+        let (originator, replay_admission) = delivery.verify_for_recipient_v2_prepared(
+            self.coordinator_peer_id,
+            &self.replay,
+            now_u32,
+        )?;
+        let payload = decode_prepared_payload_v2(&delivery.inner, originator)?;
+        Ok(PreparedSubmissionV1 {
+            sender: originator,
+            swarm_instance_id: delivery.inner.swarm_instance_id,
+            run_id: RunId::from_bytes(delivery.inner.run_id),
+            round_id: delivery.inner.round_id,
+            base_checkpoint_digest: CheckpointContentDigestV1(
+                delivery.inner.base_checkpoint_digest,
+            ),
+            context_policy_digest: delivery.inner.context_policy_digest,
+            payload_kind: delivery.inner.payload_kind,
+            reported_examples: if delivery.inner.reported_examples == 0 {
+                None
+            } else {
+                Some(delivery.inner.reported_examples)
+            },
+            payload,
+            replay_admission,
+        })
+    }
+
+    /// Stage C (synchronous round): verify `coordinator_generation` still matches, commit the
+    /// prepared replay sequence atomically, and emit a sealed [`VerifiedRoundSubmissionV1`] (`ST-01`).
+    pub fn commit_prepared_submission(
+        &mut self,
+        validated: ValidatedRoundSubmissionV1,
+    ) -> Result<VerifiedRoundSubmissionV1, RoundError> {
+        if validated.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: validated.coordinator_generation,
+            });
+        }
+        let sequence = validated.replay_admission.sequence();
         self.replay
-            .validate(&submission.sender, submission.sequence, ts_u32, now_u32)
+            .commit_prepared_admission(validated.replay_admission)
             .map_err(RoundError::ReplayRejected)?;
+        Ok(VerifiedRoundSubmissionV1 {
+            coordinator_generation: validated.coordinator_generation,
+            round_id: validated.target_round_id,
+            sender: validated.sender,
+            sequence,
+            canonical_payload_digest: validated.canonical_payload_digest,
+            values: validated.values,
+            reported_examples: validated.reported_examples,
+        })
+    }
+
+    /// Admit a sealed [`VerifiedRoundSubmissionV1`] produced by Stage C (`ST-01`).
+    pub fn submit_verified_update(
+        &mut self,
+        verified: VerifiedRoundSubmissionV1,
+    ) -> Result<SubmissionDecision, RoundError> {
+        if verified.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: verified.coordinator_generation,
+            });
+        }
+        if verified.round_id != self.current_round {
+            return Err(RoundError::StaleRoundRejected {
+                submission_round: verified.round_id,
+                current_round: self.current_round,
+                max_staleness: self.config.max_staleness,
+            });
+        }
+        if self.equivocated.contains(&verified.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: verified.sender,
+                round_id: self.current_round,
+            });
+        }
+
+        if let Some(existing) = self.admitted.get(&verified.sender) {
+            if existing.payload_digest == verified.canonical_payload_digest {
+                return Ok(SubmissionDecision::DuplicateIdempotentAck);
+            }
+            self.admitted.remove(&verified.sender);
+            self.equivocated.insert(verified.sender);
+            return Err(RoundError::EquivocationRejected {
+                sender: verified.sender,
+                round_id: self.current_round,
+            });
+        }
 
         let grad_update = GradientUpdate {
-            sender: *submission.sender.as_bytes(),
-            sequence: submission.sequence,
-            gradients: submission.values,
+            sender: *verified.sender.as_bytes(),
+            sequence: verified.sequence,
+            gradients: verified.values,
             round_id: self.current_round,
         };
         self.admitted.insert(
-            submission.sender,
+            verified.sender,
             AdmittedPeerEntry {
-                payload_digest,
+                payload_digest: verified.canonical_payload_digest,
                 update: grad_update,
-                reported_examples: submission.reported_examples,
+                reported_examples: verified.reported_examples,
             },
         );
 
@@ -836,6 +1855,21 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             admitted_count: self.admitted.len(),
             min_quorum: self.config.min_quorum,
         })
+    }
+
+    /// Execute Stages A -> B -> C + admission atomically for a synchronous signed wire frame (`ST-01`).
+    pub fn submit_verified_delivery(
+        &mut self,
+        delivery_bytes: &[u8],
+        max_delivery_bytes: usize,
+        now_secs: u64,
+    ) -> Result<SubmissionDecision, RoundError> {
+        let prepared =
+            self.prepare_verified_delivery(delivery_bytes, max_delivery_bytes, now_secs)?;
+        let ctx = self.expected_round_context();
+        let validated = ctx.validate_sync_submission(prepared)?;
+        let verified = self.commit_prepared_submission(validated)?;
+        self.submit_verified_update(verified)
     }
 
     /// Finalize the current round, applying `transforms`, running the configured
@@ -1123,6 +2157,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.last_bucketing_report = bucketing_report;
         self.record_anchor_and_prune(self.current_round, self.model.parameters().to_vec());
         self.current_round = self.current_round.saturating_add(1);
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
         self.admitted.clear();
         self.equivocated.clear();
 
@@ -1341,6 +2376,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 CryptoErrorOrIo::Io(e) => RoundError::Io(e),
             })?;
         self.dp_accountant = Some(acc);
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
         Ok(())
     }
 
@@ -1371,6 +2407,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.fedasync_policy = Some(policy);
         self.fedasync_hinge_threshold = hinge_threshold_rounds;
         self.fedasync_clip_norm = clip_norm;
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
         Ok(())
     }
 
@@ -1379,12 +2416,37 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         self.historical_anchors.get(&round_id).map(|v| v.as_slice())
     }
 
-    /// Execute one bounded-staleness asynchronous (`FedAsync`) submission step against historical anchor
-    /// round `submission.round_id`, applying pre-drift $\ell_2$ clipping, exact server drift compensation,
-    /// and mandatory pre-release DP ledger debit BEFORE CAS checkpoint publication (`ADR-0023` §4.1-4.2, `W12-03`).
+    /// Legacy unverified `FedAsync` entrypoint — rejected fail-closed (`ST-01`).
+    ///
+    /// Use [`Self::prepare_verified_delivery`] -> [`ExpectedRoundContextV1::validate_fedasync_submission`]
+    /// -> [`Self::commit_prepared_fedasync_submission`] -> [`Self::step_fedasync_verified_submission`]
+    /// (or [`Self::step_fedasync_verified_delivery`]).
+    #[deprecated(
+        note = "unverified ingress fails closed; use step_fedasync_verified_delivery or the 3-stage pipeline"
+    )]
+    #[allow(deprecated)]
     pub fn step_fedasync_stale_submission(
         &mut self,
-        submission: PeerRoundSubmissionV1,
+        _submission: PeerRoundSubmissionV1,
+        _now_secs: u64,
+        _subsampling_rate_q: f64,
+        _session: &mut DataOpsSession,
+        _ts_unix_nanos: u64,
+    ) -> Result<
+        (
+            swarm_torch_core::aggregation::FedAsyncStaleMixOutcomeV1,
+            RoundCommitSummaryV1,
+        ),
+        RoundError,
+    > {
+        Err(RoundError::UnverifiedSubmissionRejected)
+    }
+
+    /// Stage A -> B -> C convenience execution for a signed [`BundledGossipDeliveryV2`] targeting `FedAsync` (`ST-01`).
+    pub fn step_fedasync_verified_delivery(
+        &mut self,
+        delivery_bytes: &[u8],
+        max_delivery_bytes: usize,
         now_secs: u64,
         subsampling_rate_q: f64,
         session: &mut DataOpsSession,
@@ -1396,58 +2458,82 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         ),
         RoundError,
     > {
+        let prepared =
+            self.prepare_verified_delivery(delivery_bytes, max_delivery_bytes, now_secs)?;
+        let ctx = self.expected_round_context();
+        let validated = ctx.validate_fedasync_submission(prepared)?;
+        let verified = self.commit_prepared_fedasync_submission(validated)?;
+        self.step_fedasync_verified_submission(verified, subsampling_rate_q, session, ts_unix_nanos)
+    }
+
+    /// Stage C (`FedAsync`): verify `coordinator_generation`, commit replay sequence atomically,
+    /// and emit a sealed [`VerifiedFedAsyncSubmissionV1`] (`ST-01`).
+    pub fn commit_prepared_fedasync_submission(
+        &mut self,
+        validated: ValidatedFedAsyncSubmissionV1,
+    ) -> Result<VerifiedFedAsyncSubmissionV1, RoundError> {
+        if validated.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: validated.coordinator_generation,
+            });
+        }
+        self.replay
+            .commit_prepared_admission(validated.replay_admission)
+            .map_err(RoundError::ReplayRejected)?;
+        Ok(VerifiedFedAsyncSubmissionV1 {
+            coordinator_generation: validated.coordinator_generation,
+            base_round_id: validated.base_round_id,
+            sender: validated.sender,
+            values: validated.values,
+        })
+    }
+
+    /// Execute one bounded-staleness asynchronous (`FedAsync`) step using a sealed
+    /// [`VerifiedFedAsyncSubmissionV1`] token (`ADR-0023` §4.1-4.2, `W12-03`, `ST-01`).
+    pub fn step_fedasync_verified_submission(
+        &mut self,
+        verified: VerifiedFedAsyncSubmissionV1,
+        subsampling_rate_q: f64,
+        session: &mut DataOpsSession,
+        ts_unix_nanos: u64,
+    ) -> Result<
+        (
+            swarm_torch_core::aggregation::FedAsyncStaleMixOutcomeV1,
+            RoundCommitSummaryV1,
+        ),
+        RoundError,
+    > {
+        if verified.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: verified.coordinator_generation,
+            });
+        }
         let policy = self
             .fedasync_policy
             .ok_or(RoundError::Aggregation(CoreError::InvalidThreshold))?;
-        if submission.run_id != self.run_id {
-            return Err(RoundError::RunIdMismatch {
-                expected: self.run_id,
-                got: submission.run_id,
-            });
-        }
-        if !matches!(submission.update_kind, UpdateKindV1::ModelDeltaV1 { .. }) {
-            return Err(RoundError::UpdateKindMismatch {
-                expected: self.config.update_kind,
-                got: submission.update_kind,
-            });
-        }
-
         let latest_committed = self.current_round.saturating_sub(1);
-        if submission.round_id > latest_committed {
+        if verified.base_round_id > latest_committed {
             return Err(RoundError::FutureRoundRejected {
-                submission_round: submission.round_id,
+                submission_round: verified.base_round_id,
                 current_round: latest_committed,
             });
         }
-        let staleness = latest_committed - submission.round_id;
+        let staleness = latest_committed - verified.base_round_id;
         let max_stale = policy.max_staleness_rounds.min(self.config.max_staleness);
         if staleness > max_stale {
             return Err(RoundError::StaleRoundRejected {
-                submission_round: submission.round_id,
+                submission_round: verified.base_round_id,
                 current_round: latest_committed,
                 max_staleness: max_stale,
             });
         }
-
-        let expected_base = self
-            .historical_digests
-            .get(&submission.round_id)
-            .copied()
-            .ok_or(RoundError::StaleAnchorEvicted {
-                base_round: submission.round_id,
-                current_round: latest_committed,
-            })?;
-        if submission.base_checkpoint_digest != expected_base {
-            return Err(RoundError::BaseCheckpointMismatch {
-                expected: expected_base,
-                got: submission.base_checkpoint_digest,
-            });
-        }
         let w_base = self
             .historical_anchors
-            .get(&submission.round_id)
+            .get(&verified.base_round_id)
             .ok_or(RoundError::StaleAnchorEvicted {
-                base_round: submission.round_id,
+                base_round: verified.base_round_id,
                 current_round: latest_committed,
             })?
             .clone();
@@ -1467,28 +2553,16 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             }
         }
 
-        let ts_u32 = u32::try_from(submission.timestamp_secs).map_err(|_| {
-            RoundError::ReplayRejected(ReplayError::Expired {
-                ts: u32::MAX,
-                now: u32::try_from(now_secs).unwrap_or(u32::MAX),
-                window: self.config.max_clock_skew_secs,
-            })
-        })?;
-        let now_u32 = u32::try_from(now_secs).unwrap_or(u32::MAX);
-        self.replay
-            .validate(&submission.sender, submission.sequence, ts_u32, now_u32)
-            .map_err(RoundError::ReplayRejected)?;
-
         let outcome = swarm_torch_core::aggregation::apply_fedasync_stale_delta_v1(
             &HingePolicy {
                 inner: policy,
                 hinge: self.fedasync_hinge_threshold,
             },
-            submission.round_id,
+            verified.base_round_id,
             latest_committed,
             self.model.parameters(),
             &w_base,
-            &submission.values,
+            &verified.values,
             self.fedasync_clip_norm,
         )
         .map_err(RoundError::Aggregation)?;
@@ -1580,7 +2654,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         write_round_resume_state(&run_dir, &resume_state)?;
 
         let mut frozen_raw_inputs = BTreeMap::new();
-        frozen_raw_inputs.insert(submission.sender, submission.values);
+        frozen_raw_inputs.insert(verified.sender, verified.values);
 
         self.model = candidate_model;
         self.parent_digest = content_digest;
@@ -1590,10 +2664,11 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             .insert(committed_round, content_digest);
         self.record_anchor_and_prune(committed_round, self.model.parameters().to_vec());
         self.current_round = committed_round.saturating_add(1);
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
 
         let summary = RoundCommitSummaryV1 {
             round_id: committed_round,
-            admitted_peers: vec![submission.sender],
+            admitted_peers: vec![verified.sender],
             equivocated_peers: Vec::new(),
             checkpoint_asset_key,
             recipe_key,
@@ -1606,12 +2681,57 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         Ok((outcome, summary))
     }
 
-    /// Coordinate a cohort of LoRA / heterogeneous-rank FLoRA factor updates under authorized cohort
-    /// gating, quorum checks, optional exact base-weight merge, and pre-release DP ledger debit (`ADR-0024` §4, `W12-01`).
+    /// Legacy unverified LoRA cohort aggregation entrypoint — rejected fail-closed (`ST-01`).
+    ///
+    /// Use [`Self::prepare_verified_delivery`] -> [`ExpectedRoundContextV1::validate_lora_submission`]
+    /// -> [`Self::commit_prepared_lora_submission`] -> [`Self::aggregate_lora_cohort_verified_round`].
+    #[deprecated(
+        note = "unverified LoRA ingress fails closed; use aggregate_lora_cohort_verified_round with VerifiedLoraSubmissionV1"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn aggregate_lora_cohort_round(
         &mut self,
-        submissions: &[(PeerId, swarm_torch_models::lora::LoraAdapterPairV1)],
+        _submissions: &[(PeerId, swarm_torch_models::lora::LoraAdapterPairV1)],
+        _mode: swarm_torch_models::lora::LoraAggregationModeV1,
+        _b_factor_aggregator: &dyn swarm_torch_core::aggregation::RobustAggregator,
+        _base_weights_to_merge: Option<&mut [f32]>,
+        _subsampling_rate_q: f64,
+        _session: &mut DataOpsSession,
+        _ts_unix_nanos: u64,
+    ) -> Result<swarm_torch_models::lora::LoraAggregationOutcomeV1, RoundError> {
+        Err(RoundError::UnverifiedSubmissionRejected)
+    }
+
+    /// Stage C (LoRA cohort): verify `coordinator_generation`, commit replay sequence atomically,
+    /// and emit a sealed [`VerifiedLoraSubmissionV1`] (`ST-01`).
+    pub fn commit_prepared_lora_submission(
+        &mut self,
+        validated: ValidatedLoraSubmissionV1,
+    ) -> Result<VerifiedLoraSubmissionV1, RoundError> {
+        if validated.coordinator_generation != self.coordinator_generation {
+            return Err(RoundError::StaleCoordinatorGeneration {
+                expected: self.coordinator_generation,
+                got: validated.coordinator_generation,
+            });
+        }
+        self.replay
+            .commit_prepared_admission(validated.replay_admission)
+            .map_err(RoundError::ReplayRejected)?;
+        Ok(VerifiedLoraSubmissionV1 {
+            coordinator_generation: validated.coordinator_generation,
+            round_id: validated.round_id,
+            sender: validated.sender,
+            pair: validated.pair,
+        })
+    }
+
+    /// Coordinate a cohort of cryptographically verified [`VerifiedLoraSubmissionV1`] tokens under
+    /// generation binding, authorized cohort gating, quorum checks, staged base-weight merge, and
+    /// pre-release DP ledger debit (`ADR-0024` §4, `W12-01`, `ST-01`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_lora_cohort_verified_round(
+        &mut self,
+        submissions: &[VerifiedLoraSubmissionV1],
         mode: swarm_torch_models::lora::LoraAggregationModeV1,
         b_factor_aggregator: &dyn swarm_torch_core::aggregation::RobustAggregator,
         base_weights_to_merge: Option<&mut [f32]>,
@@ -1620,29 +2740,41 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         ts_unix_nanos: u64,
     ) -> Result<swarm_torch_models::lora::LoraAggregationOutcomeV1, RoundError> {
         let mut seen_peers = BTreeSet::new();
-        for (peer, _) in submissions {
-            if !self.config.authorized_cohort.contains(peer) {
+        let mut pairs: Vec<(PeerId, LoraAdapterPairV1)> = Vec::with_capacity(submissions.len());
+        for sub in submissions {
+            if sub.coordinator_generation != self.coordinator_generation {
+                return Err(RoundError::StaleCoordinatorGeneration {
+                    expected: self.coordinator_generation,
+                    got: sub.coordinator_generation,
+                });
+            }
+            if sub.round_id != self.current_round {
+                return Err(RoundError::StaleRoundRejected {
+                    submission_round: sub.round_id,
+                    current_round: self.current_round,
+                    max_staleness: 0,
+                });
+            }
+            if !self.config.authorized_cohort.contains(&sub.sender) {
                 return Err(RoundError::ReplayRejected(ReplayError::UnauthorizedPeer {
-                    peer: *peer,
+                    peer: sub.sender,
                 }));
             }
-            if !seen_peers.insert(*peer) {
+            if !seen_peers.insert(sub.sender) {
                 return Err(RoundError::Aggregation(CoreError::InvalidGradient));
             }
+            pairs.push((sub.sender, sub.pair.clone()));
         }
-        if submissions.len() < self.config.min_quorum {
+        if pairs.len() < self.config.min_quorum {
             return Err(RoundError::InsufficientQuorum {
-                admitted: submissions.len(),
+                admitted: pairs.len(),
                 min_quorum: self.config.min_quorum,
             });
         }
 
-        let outcome = swarm_torch_models::lora::aggregate_lora_adapters_v1(
-            submissions,
-            mode,
-            b_factor_aggregator,
-        )
-        .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
+        let outcome =
+            swarm_torch_models::lora::aggregate_lora_adapters_v1(&pairs, mode, b_factor_aggregator)
+                .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
 
         // Prepare & validate the candidate base-weight merge in a staging copy BEFORE attempting
         // durable DP pre-debit, and commit the mutation to `base_weights_to_merge` ONLY AFTER the
@@ -1691,8 +2823,140 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         if let (Some(base_w), Some(staged)) = (base_weights_to_merge, staged_base_weights.take()) {
             base_w.copy_from_slice(&staged);
         }
+        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
 
         Ok(outcome)
+    }
+}
+
+fn decode_prepared_payload_v2(
+    inner: &InnerUpdateV2,
+    originator: PeerId,
+) -> Result<PreparedPayloadV2, RoundError> {
+    let expected_run = RunId::from_bytes(inner.run_id);
+    let expected_base = CheckpointContentDigestV1(inner.base_checkpoint_digest);
+    match inner.compression_schema_version {
+        COMPRESSION_SCHEMA_DENSE_F32_LE_V1 => {
+            let expected_bytes = (inner.num_elements as usize)
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    RoundError::InvalidWirePayload("num_elements byte length overflow".to_string())
+                })?;
+            if inner.encoded_payload.len() != expected_bytes {
+                return Err(RoundError::InvalidWirePayload(format!(
+                    "dense payload length mismatch: expected {expected_bytes}, got {}",
+                    inner.encoded_payload.len()
+                )));
+            }
+            let mut values = Vec::with_capacity(inner.num_elements as usize);
+            for (idx, chunk) in inner.encoded_payload.chunks_exact(4).enumerate() {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(chunk);
+                let val = f32::from_le_bytes(arr);
+                if !val.is_finite() {
+                    return Err(RoundError::NonFiniteInput {
+                        sender: originator,
+                        coord_index: idx,
+                    });
+                }
+                values.push(val);
+            }
+            let canonical_payload_digest = canonical_dense_submission_digest_v2(
+                &inner.swarm_instance_id,
+                expected_run,
+                inner.round_id,
+                &expected_base,
+                &inner.context_policy_digest,
+                originator,
+                inner.payload_kind,
+                &values,
+            );
+            Ok(PreparedPayloadV2::Dense {
+                values,
+                canonical_payload_digest,
+            })
+        }
+        COMPRESSION_SCHEMA_COMPRESSED_GRADIENT_V1 => {
+            let compressed: CompressedGradient = serde_json::from_slice(&inner.encoded_payload)
+                .map_err(|e| {
+                    RoundError::InvalidWirePayload(format!("invalid compressed gradient JSON: {e}"))
+                })?;
+            compressed
+                .validate_shape_and_bounds(inner.num_elements as usize)
+                .map_err(|e| {
+                    RoundError::InvalidWirePayload(format!(
+                        "compressed gradient bounds check failed: {e:?}"
+                    ))
+                })?;
+            if compressed.num_elements != inner.num_elements as usize {
+                return Err(RoundError::DimensionMismatch {
+                    expected: inner.num_elements as usize,
+                    got: compressed.num_elements,
+                });
+            }
+            let values = compressed
+                .decompress_with_limit(inner.num_elements as usize)
+                .map_err(|e| {
+                    RoundError::InvalidWirePayload(format!(
+                        "compressed gradient decompression failed: {e:?}"
+                    ))
+                })?;
+            if values.len() != inner.num_elements as usize {
+                return Err(RoundError::DimensionMismatch {
+                    expected: inner.num_elements as usize,
+                    got: values.len(),
+                });
+            }
+            for (idx, &val) in values.iter().enumerate() {
+                if !val.is_finite() {
+                    return Err(RoundError::NonFiniteInput {
+                        sender: originator,
+                        coord_index: idx,
+                    });
+                }
+            }
+            let canonical_payload_digest = canonical_dense_submission_digest_v2(
+                &inner.swarm_instance_id,
+                expected_run,
+                inner.round_id,
+                &expected_base,
+                &inner.context_policy_digest,
+                originator,
+                inner.payload_kind,
+                &values,
+            );
+            Ok(PreparedPayloadV2::Dense {
+                values,
+                canonical_payload_digest,
+            })
+        }
+        COMPRESSION_SCHEMA_LORA_PAIR_V1 => {
+            let decoded: LoraAdapterPairV1 = serde_json::from_slice(&inner.encoded_payload)
+                .map_err(|e| {
+                    RoundError::InvalidWirePayload(format!("invalid LoRA adapter JSON: {e}"))
+                })?;
+            let pair = LoraAdapterPairV1::try_new(
+                decoded.descriptor,
+                decoded.d_in,
+                decoded.d_out,
+                decoded.a_weights,
+                decoded.b_weights,
+            )
+            .map_err(|e| {
+                RoundError::InvalidWirePayload(format!("invalid LoRA adapter pair: {e:?}"))
+            })?;
+            let total_coords = pair.a_weights.len() + pair.b_weights.len();
+            if total_coords != inner.num_elements as usize {
+                return Err(RoundError::DimensionMismatch {
+                    expected: inner.num_elements as usize,
+                    got: total_coords,
+                });
+            }
+            Ok(PreparedPayloadV2::Lora { pair })
+        }
+        other => Err(RoundError::InvalidWirePayload(format!(
+            "unsupported compression_schema_version {other}"
+        ))),
     }
 }
 
@@ -1777,6 +3041,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use swarm_torch_net::gossip::DEFAULT_MAX_GOSSIP_DELIVERY_BYTES;
 
     use crate::artifacts::{ArtifactWriteProfile, LockAcquisitionPolicy};
     use swarm_torch_models::optim::SgdOptimizer;
@@ -1799,6 +3064,167 @@ mod tests {
         dir
     }
 
+    struct TestPeer {
+        auth: swarm_torch_core::crypto::MessageAuth,
+        peer_id: PeerId,
+    }
+
+    impl TestPeer {
+        fn new(seed: u8) -> Self {
+            let kp = swarm_torch_core::crypto::KeyPair::from_seed([seed; 32]).unwrap();
+            let peer_id = kp.peer_id();
+            Self {
+                auth: swarm_torch_core::crypto::MessageAuth::new(kp),
+                peer_id,
+            }
+        }
+
+        fn establish_session<M: SwarmModel + Clone>(
+            &self,
+            coord: &mut SwarmRoundCoordinator<M>,
+            epoch: u64,
+            nonce_seed: u8,
+            now_secs: u32,
+        ) -> [u8; 32] {
+            let challenge = SessionHandshakeChallengeV2 {
+                swarm_instance_id: coord.swarm_instance_id(),
+                run_id: *coord.run_id().as_bytes(),
+                policy_digest: coord.context_policy_digest(),
+                receiver_peer: coord.coordinator_peer_id(),
+                sender_peer: self.peer_id,
+                requested_epoch: epoch,
+                initial_sequence: 0,
+                receiver_nonce: [nonce_seed; 32],
+                issued_at_secs: now_secs,
+            };
+            let session_id = challenge.derive_session_id().unwrap();
+            coord.register_session_challenge_v2(challenge).unwrap();
+            let sig = self.auth.sign_session_handshake_v2(&challenge).unwrap();
+            coord
+                .complete_session_handshake_v2(self.auth.key_pair().public_key(), &sig, now_secs)
+                .unwrap();
+            session_id
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_dense_delivery<M: SwarmModel + Clone>(
+            &self,
+            coord: &SwarmRoundCoordinator<M>,
+            session_id: [u8; 32],
+            epoch: u64,
+            seq: u64,
+            ts_secs: u32,
+            round_id: u64,
+            base_digest: CheckpointContentDigestV1,
+            payload_kind: PayloadKindV1,
+            values: &[f32],
+            reported_examples: u64,
+        ) -> Vec<u8> {
+            let mut raw = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            let inner = InnerUpdateV2 {
+                originator_public_key: *self.auth.key_pair().public_key(),
+                swarm_instance_id: coord.swarm_instance_id(),
+                run_id: *coord.run_id().as_bytes(),
+                round_id,
+                contribution_id: seq,
+                base_checkpoint_digest: *base_digest.as_bytes(),
+                context_policy_digest: coord.context_policy_digest(),
+                payload_kind,
+                compression_schema_version: COMPRESSION_SCHEMA_DENSE_F32_LE_V1,
+                num_elements: values.len() as u32,
+                reported_examples,
+                encoded_payload: raw,
+                originator_signature: Vec::new(),
+            };
+            BundledGossipDeliveryV2::new_signed(
+                &self.auth,
+                inner,
+                coord.coordinator_peer_id(),
+                session_id,
+                epoch,
+                seq,
+                ts_secs,
+            )
+            .to_bytes()
+            .unwrap()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_lora_delivery<M: SwarmModel + Clone>(
+            &self,
+            coord: &SwarmRoundCoordinator<M>,
+            session_id: [u8; 32],
+            epoch: u64,
+            seq: u64,
+            ts_secs: u32,
+            round_id: u64,
+            base_digest: CheckpointContentDigestV1,
+            pair: &LoraAdapterPairV1,
+        ) -> Vec<u8> {
+            let encoded_payload = encode_lora_update_payload_v2(pair).unwrap();
+            let inner = InnerUpdateV2 {
+                originator_public_key: *self.auth.key_pair().public_key(),
+                swarm_instance_id: coord.swarm_instance_id(),
+                run_id: *coord.run_id().as_bytes(),
+                round_id,
+                contribution_id: seq,
+                base_checkpoint_digest: *base_digest.as_bytes(),
+                context_policy_digest: coord.context_policy_digest(),
+                payload_kind: PayloadKindV1::ModelDeltaV1,
+                compression_schema_version: COMPRESSION_SCHEMA_LORA_PAIR_V1,
+                num_elements: (pair.a_weights.len() + pair.b_weights.len()) as u32,
+                reported_examples: 0,
+                encoded_payload,
+                originator_signature: Vec::new(),
+            };
+            BundledGossipDeliveryV2::new_signed(
+                &self.auth,
+                inner,
+                coord.coordinator_peer_id(),
+                session_id,
+                epoch,
+                seq,
+                ts_secs,
+            )
+            .to_bytes()
+            .unwrap()
+        }
+    }
+
+    fn verify_lora_delivery<M: SwarmModel + Clone>(
+        coord: &mut SwarmRoundCoordinator<M>,
+        peer: &TestPeer,
+        session_id: [u8; 32],
+        epoch: u64,
+        seq: u64,
+        ts_secs: u32,
+        pair: &LoraAdapterPairV1,
+    ) -> Result<VerifiedLoraSubmissionV1, RoundError> {
+        let round_id = coord.current_round();
+        let base_digest = coord.parent_digest();
+        let bytes = peer.build_lora_delivery(
+            coord,
+            session_id,
+            epoch,
+            seq,
+            ts_secs,
+            round_id,
+            base_digest,
+            pair,
+        );
+        let prepared = coord.prepare_verified_delivery(
+            &bytes,
+            DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+            ts_secs as u64,
+        )?;
+        let ctx = coord.expected_round_context();
+        let validated = ctx.validate_lora_submission(prepared)?;
+        coord.commit_prepared_lora_submission(validated)
+    }
+
     fn peer(seed: u8) -> PeerId {
         let kp = swarm_torch_core::crypto::KeyPair::from_seed([seed; 32]).unwrap();
         PeerId::from_public_key(kp.public_key())
@@ -1819,9 +3245,9 @@ mod tests {
         )
         .unwrap();
 
-        let p1 = peer(1);
-        let p2 = peer(2);
-        let cohort: BTreeSet<PeerId> = [p1, p2].into_iter().collect();
+        let p1 = TestPeer::new(1);
+        let p2 = TestPeer::new(2);
+        let cohort: BTreeSet<PeerId> = [p1.peer_id, p2.peer_id].into_iter().collect();
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::default(),
             aggregation: RobustAggregation::FedAvg,
@@ -1834,20 +3260,25 @@ mod tests {
         let model = linear_model_2_1(&[1.0, 2.0, 0.5]);
         let mut coord =
             SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
+        let s1 = p1.establish_session(&mut coord, 1, 0xA1, 100);
 
-        // Submit future round u64::MAX -> must return FutureRoundRejected without underflow panic!
-        let future_sub = PeerRoundSubmissionV1 {
-            run_id,
-            round_id: u64::MAX,
-            base_checkpoint_digest: coord.parent_digest(),
-            sender: p1,
-            sequence: 1,
-            timestamp_secs: 100,
-            update_kind: UpdateKindV1::default(),
-            values: vec![0.1, 0.1, 0.1],
-            reported_examples: None,
-        };
-        let err = coord.submit_peer_update(future_sub, 100).unwrap_err();
+        // Submit future round u64::MAX -> must return FutureRoundRejected without underflow panic
+        // and WITHOUT consuming replay sequence 1!
+        let future_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            u64::MAX,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        let err = coord
+            .submit_verified_delivery(&future_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap_err();
         assert!(matches!(
             err,
             RoundError::FutureRoundRejected {
@@ -1855,21 +3286,48 @@ mod tests {
                 current_round: 1
             }
         ));
+        assert_eq!(coord.admitted_count(), 0);
 
         // Submit stale round 0 when max_staleness == 0 -> StaleRoundRejected!
-        let stale_sub = PeerRoundSubmissionV1 {
-            run_id,
-            round_id: 0,
-            base_checkpoint_digest: coord.parent_digest(),
-            sender: p1,
-            sequence: 1,
-            timestamp_secs: 100,
-            update_kind: UpdateKindV1::default(),
-            values: vec![0.1, 0.1, 0.1],
-            reported_examples: None,
-        };
-        let err = coord.submit_peer_update(stale_sub, 100).unwrap_err();
+        let stale_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            0,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        let err = coord
+            .submit_verified_delivery(&stale_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap_err();
         assert!(matches!(err, RoundError::StaleRoundRejected { .. }));
+
+        // Sequence 1 was NOT consumed by Stage A/B failures, so valid round 1 with seq=1 succeeds!
+        let valid_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord
+                .submit_verified_delivery(&valid_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap(),
+            SubmissionDecision::Admitted {
+                admitted_count: 1,
+                ..
+            }
+        ));
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1889,9 +3347,9 @@ mod tests {
         )
         .unwrap();
 
-        let p1 = peer(1);
-        let p2 = peer(2);
-        let cohort: BTreeSet<PeerId> = [p1, p2].into_iter().collect();
+        let p1 = TestPeer::new(1);
+        let p2 = TestPeer::new(2);
+        let cohort: BTreeSet<PeerId> = [p1.peer_id, p2.peer_id].into_iter().collect();
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::default(),
             aggregation: RobustAggregation::FedAvg,
@@ -1904,61 +3362,95 @@ mod tests {
         let model = linear_model_2_1(&[1.0, 2.0, 0.5]);
         let mut coord =
             SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
+        let s1 = p1.establish_session(&mut coord, 1, 0xB1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xB2, 100);
 
-        let sub1 = PeerRoundSubmissionV1 {
-            run_id,
-            round_id: 1,
-            base_checkpoint_digest: coord.parent_digest(),
-            sender: p1,
-            sequence: 1,
-            timestamp_secs: 100,
-            update_kind: UpdateKindV1::default(),
-            values: vec![0.2, 0.4, 0.6],
-            reported_examples: None,
-        };
+        let sub1_seq1 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.2, 0.4, 0.6],
+            0,
+        );
         assert_eq!(
-            coord.submit_peer_update(sub1.clone(), 100).unwrap(),
+            coord
+                .submit_verified_delivery(&sub1_seq1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap(),
             SubmissionDecision::Admitted {
                 admitted_count: 1,
                 min_quorum: 2
             }
         );
 
-        // Byte-identical re-transmission from p1 -> DuplicateIdempotentAck (still 1 vote!).
+        // Exact wire packet replay (seq = 1) must be rejected by ReplayProtection!
+        let replay_err = coord
+            .submit_verified_delivery(&sub1_seq1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap_err();
+        assert!(matches!(
+            replay_err,
+            RoundError::ReplayRejected(ReplayError::Replay { seq: 1, .. })
+        ));
+
+        // Identical round content re-sent under fresh seq=2 -> DuplicateIdempotentAck (still 1 vote!).
+        let sub1_seq2 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            2,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.2, 0.4, 0.6],
+            0,
+        );
         assert_eq!(
-            coord.submit_peer_update(sub1, 100).unwrap(),
+            coord
+                .submit_verified_delivery(&sub1_seq2, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap(),
             SubmissionDecision::DuplicateIdempotentAck
         );
         assert_eq!(coord.admitted_count(), 1);
 
         // Admit p2 so quorum (2) is reached.
-        let sub2 = PeerRoundSubmissionV1 {
-            run_id,
-            round_id: 1,
-            base_checkpoint_digest: coord.parent_digest(),
-            sender: p2,
-            sequence: 1,
-            timestamp_secs: 100,
-            update_kind: UpdateKindV1::default(),
-            values: vec![0.4, 0.2, 0.0],
-            reported_examples: None,
-        };
-        coord.submit_peer_update(sub2, 100).unwrap();
+        let sub2 = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.4, 0.2, 0.0],
+            0,
+        );
+        coord
+            .submit_verified_delivery(&sub2, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
         assert!(coord.has_quorum());
 
         // Now p1 equivocates by sending a different vector in round 1!
-        let conflicting_sub1 = PeerRoundSubmissionV1 {
-            run_id,
-            round_id: 1,
-            base_checkpoint_digest: coord.parent_digest(),
-            sender: p1,
-            sequence: 2,
-            timestamp_secs: 100,
-            update_kind: UpdateKindV1::default(),
-            values: vec![-9.0, -9.0, -9.0],
-            reported_examples: None,
-        };
-        let err = coord.submit_peer_update(conflicting_sub1, 100).unwrap_err();
+        let conflicting_sub1 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            3,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[-9.0, -9.0, -9.0],
+            0,
+        );
+        let err = coord
+            .submit_verified_delivery(&conflicting_sub1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap_err();
         assert!(matches!(err, RoundError::EquivocationRejected { .. }));
         assert_eq!(
             coord.admitted_count(),
@@ -2028,14 +3520,14 @@ mod tests {
         )
         .unwrap();
 
-        let p1 = peer(10);
-        let p2 = peer(20);
-        let cohort: BTreeSet<PeerId> = [p1, p2].into_iter().collect();
+        let p1 = TestPeer::new(10);
+        let p2 = TestPeer::new(20);
+        let cohort: BTreeSet<PeerId> = [p1.peer_id, p2.peer_id].into_iter().collect();
 
         // Reject RegistryCertified paired with TrimmedMean
         let mut bad_weights = BTreeMap::new();
-        bad_weights.insert(p1, 100);
-        bad_weights.insert(p2, 300);
+        bad_weights.insert(p1.peer_id, 100);
+        bad_weights.insert(p2.peer_id, 300);
         let bad_cfg = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::default(),
             aggregation: RobustAggregation::TrimmedMean { trim_ratio: 0.2 },
@@ -2072,41 +3564,41 @@ mod tests {
         let mut coord =
             SwarmRoundCoordinator::initialize(run_id, config.clone(), model, &mut session, 1_000)
                 .unwrap();
+        let s1 = p1.establish_session(&mut coord, 1, 0xC1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xC2, 100);
 
         // p1 sends raw delta [2.0, 2.0, 2.0] with spoofed reported_examples = 999_999
+        let sub1 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[2.0, 2.0, 2.0],
+            999_999,
+        );
         coord
-            .submit_peer_update(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: 1,
-                    base_checkpoint_digest: coord.parent_digest(),
-                    sender: p1,
-                    sequence: 1,
-                    timestamp_secs: 100,
-                    update_kind: config.update_kind,
-                    values: vec![2.0, 2.0, 2.0],
-                    reported_examples: Some(999_999),
-                },
-                100,
-            )
+            .submit_verified_delivery(&sub1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
             .unwrap();
 
         // p2 sends raw delta [0.2, 0.2, 0.2]
+        let sub2 = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.2, 0.2, 0.2],
+            300,
+        );
         coord
-            .submit_peer_update(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: 1,
-                    base_checkpoint_digest: coord.parent_digest(),
-                    sender: p2,
-                    sequence: 1,
-                    timestamp_secs: 100,
-                    update_kind: config.update_kind,
-                    values: vec![0.2, 0.2, 0.2],
-                    reported_examples: Some(300),
-                },
-                100,
-            )
+            .submit_verified_delivery(&sub2, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
             .unwrap();
 
         let clip = MutatingClipTransform;
@@ -2122,7 +3614,7 @@ mod tests {
             .unwrap();
 
         // Frozen raw input for p1 must still be [2.0, 2.0, 2.0] even though MutatingClipTransform clamped to 0.5!
-        assert_eq!(summary.frozen_raw_inputs[&p1], vec![2.0, 2.0, 2.0]);
+        assert_eq!(summary.frozen_raw_inputs[&p1.peer_id], vec![2.0, 2.0, 2.0]);
         assert_eq!(summary.weight_mismatch_warnings.len(), 1);
 
         // Certified weights: p1=100 (0.25) * 0.5 + p2=300 (0.75) * 0.2 = 0.125 + 0.15 = 0.275
@@ -2158,7 +3650,7 @@ mod tests {
         let resume_state = resume_state.expect("resume state must exist");
         assert_eq!(resume_state.round_id, 1);
 
-        let resumed_coord: SwarmRoundCoordinator<LinearModel> =
+        let mut resumed_coord: SwarmRoundCoordinator<LinearModel> =
             SwarmRoundCoordinator::from_resume_state(
                 config,
                 LinearModel::new(2, 1).unwrap(),
@@ -2171,6 +3663,45 @@ mod tests {
             resumed_coord.model().parameters(),
             coord.model().parameters()
         );
+
+        // Post-resume deliveries using pre-crash session s1 MUST fail closed with RecoveryRequired!
+        let stale_session_bytes = p1.build_dense_delivery(
+            &resumed_coord,
+            s1,
+            1,
+            2,
+            110,
+            2,
+            resumed_coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        let rec_err = resumed_coord
+            .submit_verified_delivery(&stale_session_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
+            .unwrap_err();
+        assert!(matches!(
+            rec_err,
+            RoundError::ReplayRejected(ReplayError::RecoveryRequired { .. })
+        ));
+
+        // Establishing a fresh session handshake at epoch=2 after restart admits Round 2!
+        let s1_r2 = p1.establish_session(&mut resumed_coord, 2, 0xD1, 110);
+        let r2_bytes = p1.build_dense_delivery(
+            &resumed_coord,
+            s1_r2,
+            2,
+            1,
+            110,
+            2,
+            resumed_coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(resumed_coord
+            .submit_verified_delivery(&r2_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
+            .is_ok());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2192,8 +3723,8 @@ mod tests {
         )
         .unwrap();
 
-        let peers: Vec<PeerId> = (1..=6u8).map(peer).collect();
-        let cohort: BTreeSet<PeerId> = peers.iter().copied().collect();
+        let peers: Vec<TestPeer> = (1..=6u8).map(TestPeer::new).collect();
+        let cohort: BTreeSet<PeerId> = peers.iter().map(|p| p.peer_id).collect();
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::ModelDeltaV1 {
                 server_learning_rate: 1.0,
@@ -2219,28 +3750,33 @@ mod tests {
         }));
         assert!(coord.cclip_center().is_none());
 
+        let sessions: Vec<[u8; 32]> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.establish_session(&mut coord, 1, 0x30 + i as u8, 100))
+            .collect();
+
         // Round 1: 5 honest peers submit [0.2, 0.2, 0.2], 1 Byzantine peer submits [100.0, 100.0, 100.0].
-        for (i, &p) in peers.iter().enumerate() {
+        for (i, p) in peers.iter().enumerate() {
             let vals = if i < 5 {
                 vec![0.2, 0.2, 0.2]
             } else {
                 vec![100.0, 100.0, 100.0]
             };
+            let bytes = p.build_dense_delivery(
+                &coord,
+                sessions[i],
+                1,
+                1,
+                100,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::ModelDeltaV1,
+                &vals,
+                0,
+            );
             coord
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id,
-                        round_id: 1,
-                        base_checkpoint_digest: coord.parent_digest(),
-                        sender: p,
-                        sequence: 1,
-                        timestamp_secs: 100,
-                        update_kind: UpdateKindV1::default(),
-                        values: vals,
-                        reported_examples: None,
-                    },
-                    100,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
                 .unwrap();
         }
         let _r1 = coord
@@ -2264,27 +3800,26 @@ mod tests {
         assert_eq!(b_rep.effective_byzantine_bound, 1);
 
         // Round 2 clips around center_r1!
-        for (i, &p) in peers.iter().enumerate() {
+        for (i, p) in peers.iter().enumerate() {
             let vals = if i < 5 {
                 vec![0.22, 0.22, 0.22]
             } else {
                 vec![-500.0, -500.0, -500.0]
             };
+            let bytes = p.build_dense_delivery(
+                &coord,
+                sessions[i],
+                1,
+                2,
+                110,
+                2,
+                coord.parent_digest(),
+                PayloadKindV1::ModelDeltaV1,
+                &vals,
+                0,
+            );
             coord
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id,
-                        round_id: 2,
-                        base_checkpoint_digest: coord.parent_digest(),
-                        sender: p,
-                        sequence: 2,
-                        timestamp_secs: 110,
-                        update_kind: UpdateKindV1::default(),
-                        values: vals,
-                        reported_examples: None,
-                    },
-                    110,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
                 .unwrap();
         }
         let _r2 = coord
@@ -2317,9 +3852,9 @@ mod tests {
         )
         .unwrap();
 
-        let p1 = peer(1);
-        let p2 = peer(2);
-        let cohort: BTreeSet<PeerId> = [p1, p2].into_iter().collect();
+        let p1 = TestPeer::new(1);
+        let p2 = TestPeer::new(2);
+        let cohort: BTreeSet<PeerId> = [p1.peer_id, p2.peer_id].into_iter().collect();
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::ModelDeltaV1 {
                 server_learning_rate: 1.0,
@@ -2348,26 +3883,25 @@ mod tests {
                 Some(1.0),
             )
             .unwrap();
+        let s1 = p1.establish_session(&mut coord, 1, 0xE1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xE2, 100);
 
         // Advance synchronous round 1: move weights to [2.0, 3.0, 1.5]
-        for p in [p1, p2] {
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let bytes = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                100,
+                1,
+                digest_r0,
+                PayloadKindV1::ModelDeltaV1,
+                &[1.0, 1.0, 1.0],
+                0,
+            );
             coord
-                .submit_peer_update(
-                    PeerRoundSubmissionV1 {
-                        run_id,
-                        round_id: 1,
-                        base_checkpoint_digest: digest_r0,
-                        sender: p,
-                        sequence: 1,
-                        timestamp_secs: 100,
-                        update_kind: UpdateKindV1::ModelDeltaV1 {
-                            server_learning_rate: 1.0,
-                        },
-                        values: vec![1.0, 1.0, 1.0],
-                        reported_examples: None,
-                    },
-                    100,
-                )
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
                 .unwrap();
         }
         let _r1 = coord
@@ -2383,21 +3917,22 @@ mod tests {
         // Now latest committed round is 1 (w_current = [2.0, 3.0, 1.5]). Round 0 anchor is still in window (max_staleness = 1).
         // Byzantine peer 2 submits stale update anchored at round 0 with giant norm [1000.0, 0.0, 0.0].
         // Pre-drift norm clipping MUST bound stale_delta to norm <= 1.0 BEFORE adding server drift (w_0 - w_1)!
+        let stale_p2 = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            2,
+            105,
+            0,
+            digest_r0,
+            PayloadKindV1::ModelDeltaV1,
+            &[1000.0, 0.0, 0.0],
+            0,
+        );
         let (outcome, _sum2) = coord
-            .step_fedasync_stale_submission(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: 0,
-                    base_checkpoint_digest: digest_r0,
-                    sender: p2,
-                    sequence: 2,
-                    timestamp_secs: 105,
-                    update_kind: UpdateKindV1::ModelDeltaV1 {
-                        server_learning_rate: 1.0,
-                    },
-                    values: vec![1000.0, 0.0, 0.0],
-                    reported_examples: None,
-                },
+            .step_fedasync_verified_delivery(
+                &stale_p2,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
                 105,
                 0.5,
                 &mut session,
@@ -2408,23 +3943,25 @@ mod tests {
         assert!((outcome.clipped_delta_l2_norm - 1.0).abs() < 1e-4);
         assert_eq!(outcome.staleness_rounds, 1);
 
-        // After advancing one more step, round 0 anchor was evicted (latest_committed = 2, cutoff = 1)
+        // After advancing one more step, round 0 anchor was evicted (latest_committed = 2, cutoff = 1).
+        // Attempting to reuse round 0 fails in Stage B WITHOUT consuming p1's replay sequence 2!
         assert!(coord.historical_anchor_weights(0).is_none());
+        let stale_p1 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            2,
+            106,
+            0,
+            digest_r0,
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
         let stale_err = coord
-            .step_fedasync_stale_submission(
-                PeerRoundSubmissionV1 {
-                    run_id,
-                    round_id: 0,
-                    base_checkpoint_digest: digest_r0,
-                    sender: p1,
-                    sequence: 3,
-                    timestamp_secs: 106,
-                    update_kind: UpdateKindV1::ModelDeltaV1 {
-                        server_learning_rate: 1.0,
-                    },
-                    values: vec![0.1, 0.1, 0.1],
-                    reported_examples: None,
-                },
+            .step_fedasync_verified_delivery(
+                &stale_p1,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
                 106,
                 0.5,
                 &mut session,
@@ -2432,6 +3969,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(stale_err, RoundError::StaleRoundRejected { .. }));
+
+        // Prove p1's sequence 2 was NOT consumed by the rejected stale FedAsync delivery:
+        let current_p1 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            2,
+            106,
+            3,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(coord
+            .submit_verified_delivery(&current_p1, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 106)
+            .is_ok());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2580,14 +4134,14 @@ mod tests {
         .unwrap();
         let run_dir = session.sink().bundle().run_dir().to_path_buf();
 
-        let p1 = peer(1);
-        let p2 = peer(2);
-        let p_intruder = peer(9);
+        let p1 = TestPeer::new(1);
+        let p2 = TestPeer::new(2);
+        let p_intruder = TestPeer::new(9);
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::default(),
             aggregation: RobustAggregation::FedAvg,
             weighting_policy: WeightingPolicyV1::EqualPeerVote,
-            authorized_cohort: [p1, p2].into_iter().collect(),
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
             min_quorum: 2,
             max_staleness: 0,
             max_clock_skew_secs: 60,
@@ -2616,6 +4170,8 @@ mod tests {
                 },
             )
             .unwrap();
+        let s1 = p1.establish_session(&mut coord, 1, 0xF1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xF2, 100);
 
         let pair1 = LoraAdapterPairV1::try_new(
             LoRaAdapterDescriptorV1 {
@@ -2646,19 +4202,11 @@ mod tests {
         )
         .unwrap();
 
-        // Intruder peer rejected before DP debit
+        // Intruder peer fails Stage A replay/allowlist check BEFORE DP debit or Stage C!
+        let intruder_err =
+            verify_lora_delivery(&mut coord, &p_intruder, [0x99; 32], 1, 1, 100, &pair2);
         assert!(matches!(
-            coord.aggregate_lora_cohort_round(
-                &[(p1, pair1.clone()), (p_intruder, pair2.clone())],
-                LoraAggregationModeV1::FloraStackingV1 {
-                    max_stacked_rank: 16
-                },
-                &FedAvg,
-                None,
-                1.0,
-                &mut session,
-                2_000,
-            ),
+            intruder_err,
             Err(RoundError::ReplayRejected(
                 ReplayError::UnauthorizedPeer { .. }
             ))
@@ -2666,10 +4214,12 @@ mod tests {
         assert_eq!(coord.dp_accountant().unwrap().committed_rounds(), 0);
 
         // Authorized heterogeneous-rank FLoRA aggregation merges exact base weight and debits DP ledger
+        let v1 = verify_lora_delivery(&mut coord, &p1, s1, 1, 1, 100, &pair1).unwrap();
+        let v2 = verify_lora_delivery(&mut coord, &p2, s2, 1, 1, 100, &pair2).unwrap();
         let mut base_w = vec![0.0f32; 4];
         let outcome = coord
-            .aggregate_lora_cohort_round(
-                &[(p1, pair1), (p2, pair2)],
+            .aggregate_lora_cohort_verified_round(
+                &[v1, v2],
                 LoraAggregationModeV1::FloraStackingV1 {
                     max_stacked_rank: 16,
                 },
@@ -2714,13 +4264,13 @@ mod tests {
         .unwrap();
         let run_dir = session.sink().bundle().run_dir().to_path_buf();
 
-        let p1 = peer(1);
-        let p2 = peer(2);
+        let p1 = TestPeer::new(1);
+        let p2 = TestPeer::new(2);
         let config = RoundCoordinatorConfig {
             update_kind: UpdateKindV1::default(),
             aggregation: RobustAggregation::FedAvg,
             weighting_policy: WeightingPolicyV1::EqualPeerVote,
-            authorized_cohort: [p1, p2].into_iter().collect(),
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
             min_quorum: 2,
             max_staleness: 0,
             max_clock_skew_secs: 60,
@@ -2775,6 +4325,8 @@ mod tests {
             .dp_accountant()
             .unwrap()
             .guarantees_differential_privacy());
+        let s1 = p1.establish_session(&mut coord, 1, 0xA1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xA2, 100);
 
         let pair1 = LoraAdapterPairV1::try_new(
             LoRaAdapterDescriptorV1 {
@@ -2806,9 +4358,11 @@ mod tests {
         .unwrap();
 
         // 1. Mismatched `base_weights_to_merge` length MUST fail BEFORE pre_release_dp_debit_if_enabled!
+        let v1_step1 = verify_lora_delivery(&mut coord, &p1, s1, 1, 1, 100, &pair1).unwrap();
+        let v2_step1 = verify_lora_delivery(&mut coord, &p2, s2, 1, 1, 100, &pair2).unwrap();
         let mut wrong_len_base = vec![1.25f32; 3];
-        let wrong_len_err = coord.aggregate_lora_cohort_round(
-            &[(p1, pair1.clone()), (p2, pair2.clone())],
+        let wrong_len_err = coord.aggregate_lora_cohort_verified_round(
+            &[v1_step1, v2_step1],
             LoraAggregationModeV1::FloraStackingV1 {
                 max_stacked_rank: 8,
             },
@@ -2826,10 +4380,12 @@ mod tests {
             .is_empty());
 
         // 2. First valid LoRA round consumes budget cleanly (committed_rounds = 1).
+        let v1_step2 = verify_lora_delivery(&mut coord, &p1, s1, 1, 2, 100, &pair1).unwrap();
+        let v2_step2 = verify_lora_delivery(&mut coord, &p2, s2, 1, 2, 100, &pair2).unwrap();
         let mut base_w = vec![0.5f32; 4];
         coord
-            .aggregate_lora_cohort_round(
-                &[(p1, pair1.clone()), (p2, pair2.clone())],
+            .aggregate_lora_cohort_verified_round(
+                &[v1_step2, v2_step2],
                 LoraAggregationModeV1::FloraStackingV1 {
                     max_stacked_rank: 8,
                 },
@@ -2846,9 +4402,12 @@ mod tests {
         // 3. Budget exhaustion on subsequent LoRA round MUST fail WITHOUT mutating `base_w`!
         let mut hit_budget_err = false;
         for step in 0..8u64 {
+            let seq = 3 + step;
+            let v1 = verify_lora_delivery(&mut coord, &p1, s1, 1, seq, 100, &pair1).unwrap();
+            let v2 = verify_lora_delivery(&mut coord, &p2, s2, 1, seq, 100, &pair2).unwrap();
             let mut candidate_w = after_first.clone();
-            match coord.aggregate_lora_cohort_round(
-                &[(p1, pair1.clone()), (p2, pair2.clone())],
+            match coord.aggregate_lora_cohort_verified_round(
+                &[v1, v2],
                 LoraAggregationModeV1::FloraStackingV1 {
                     max_stacked_rank: 8,
                 },
@@ -2871,6 +4430,525 @@ mod tests {
             }
         }
         assert!(hit_budget_err, "expected PrivacyBudget exhaustion error");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_ab_failures_leave_replay_coordinator_and_model_untouched() {
+        let base = temp_dir("st01_zero_mutation");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x44; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(11);
+        let p2 = TestPeer::new(12);
+        let intruder = TestPeer::new(99);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap();
+
+        // 0. Delivery BEFORE handshake MUST fail with RecoveryRequired without consuming state.
+        let pre_hs_delivery = p1.build_dense_delivery(
+            &coord,
+            [0x11; 32],
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord.submit_verified_delivery(
+                &pre_hs_delivery,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100
+            ),
+            Err(RoundError::ReplayRejected(
+                ReplayError::RecoveryRequired { .. }
+            ))
+        ));
+        assert_eq!(coord.replay_cache_size(), 0);
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x55, 100);
+        assert_eq!(coord.replay_cache_size(), 1);
+        let gen_before = coord.coordinator_generation();
+
+        // 1. Corrupt signature in Stage A -> AuthenticationFailed, ZERO state change
+        let valid_struct = BundledGossipDeliveryV2::new_signed(
+            &p1.auth,
+            InnerUpdateV2 {
+                originator_public_key: *p1.auth.key_pair().public_key(),
+                swarm_instance_id: coord.swarm_instance_id(),
+                run_id: *run_id.as_bytes(),
+                round_id: 1,
+                contribution_id: 1,
+                base_checkpoint_digest: *coord.parent_digest().as_bytes(),
+                context_policy_digest: coord.context_policy_digest(),
+                payload_kind: PayloadKindV1::ModelDeltaV1,
+                compression_schema_version: COMPRESSION_SCHEMA_DENSE_F32_LE_V1,
+                num_elements: 3,
+                reported_examples: 0,
+                encoded_payload: encode_dense_update_payload_v2(&[0.5, 0.5, 0.5]).unwrap(),
+                originator_signature: Vec::new(),
+            },
+            coord.coordinator_peer_id(),
+            s1,
+            1,
+            1,
+            100,
+        );
+        let mut bad_sig = valid_struct.clone();
+        bad_sig.inner.originator_signature[0] ^= 0xFF;
+        let bad_sig_bytes = bad_sig.to_bytes().unwrap();
+        assert!(matches!(
+            coord.submit_verified_delivery(&bad_sig_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100),
+            Err(RoundError::AuthenticationFailed(_))
+        ));
+
+        // 2. Wrong context_policy_digest (valid signature by p1, seq=1) -> fails Stage B WITHOUT consuming seq=1!
+        let mut wrong_policy_inner = valid_struct.inner.clone();
+        wrong_policy_inner.context_policy_digest[0] ^= 0xAA;
+        let wrong_policy_bytes = BundledGossipDeliveryV2::new_signed(
+            &p1.auth,
+            wrong_policy_inner,
+            coord.coordinator_peer_id(),
+            s1,
+            1,
+            1,
+            100,
+        )
+        .to_bytes()
+        .unwrap();
+        assert!(matches!(
+            coord.submit_verified_delivery(
+                &wrong_policy_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100
+            ),
+            Err(RoundError::ContextPolicyDigestMismatch { .. })
+        ));
+
+        // 3. Wrong base_checkpoint_digest -> BaseCheckpointMismatch, seq=1 still unused!
+        let wrong_base_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            CheckpointContentDigestV1([0x99; 32]),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord.submit_verified_delivery(
+                &wrong_base_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100
+            ),
+            Err(RoundError::BaseCheckpointMismatch { .. })
+        ));
+
+        // 4. Wrong parameter dimension -> DimensionMismatch, seq=1 still unused!
+        let wrong_dim_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord.submit_verified_delivery(
+                &wrong_dim_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100
+            ),
+            Err(RoundError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
+
+        // 5. Non-finite payload -> NonFiniteInput in Stage A, seq=1 still unused!
+        let nan_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, f32::NAN, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord.submit_verified_delivery(&nan_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100),
+            Err(RoundError::NonFiniteInput { coord_index: 1, .. })
+        ));
+
+        // 6. Unauthorized intruder -> UnauthorizedPeer, zero mutation
+        let intruder_bytes = intruder.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            coord.submit_verified_delivery(&intruder_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100),
+            Err(RoundError::ReplayRejected(
+                ReplayError::UnauthorizedPeer { .. }
+            ))
+        ));
+
+        assert_eq!(coord.admitted_count(), 0);
+        assert_eq!(coord.equivocated_count(), 0);
+        assert_eq!(coord.replay_cache_size(), 1);
+        assert_eq!(coord.coordinator_generation(), gen_before);
+
+        // Proof that seq=1 was NOT burned by any of errors 1..6: valid p1 submission with seq=1 succeeds!
+        let valid_bytes = valid_struct.to_bytes().unwrap();
+        assert!(coord
+            .submit_verified_delivery(&valid_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn stale_verified_submission_and_deprecated_entrypoints_fail_closed() {
+        use swarm_torch_core::aggregation::FedAvg;
+        use swarm_torch_models::lora::{LoraAdapterPairV1, LoraAggregationModeV1};
+        use swarm_torch_models::safetensors_v1::LoRaAdapterDescriptorV1;
+
+        let base = temp_dir("st01_stale_gen_and_legacy");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x55; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(21);
+        let p2 = TestPeer::new(22);
+        let p3 = TestPeer::new(23);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id, p3.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap();
+
+        // All 3 deprecated unverified entrypoints fail closed with UnverifiedSubmissionRejected
+        let legacy_sub = PeerRoundSubmissionV1 {
+            run_id,
+            round_id: 1,
+            base_checkpoint_digest: coord.parent_digest(),
+            sender: p1.peer_id,
+            sequence: 1,
+            timestamp_secs: 100,
+            update_kind: UpdateKindV1::default(),
+            values: vec![0.1, 0.1, 0.1],
+            reported_examples: None,
+        };
+        assert!(matches!(
+            coord.submit_peer_update(legacy_sub.clone(), 100),
+            Err(RoundError::UnverifiedSubmissionRejected)
+        ));
+        assert!(matches!(
+            coord.step_fedasync_stale_submission(legacy_sub, 100, 1.0, &mut session, 1_100),
+            Err(RoundError::UnverifiedSubmissionRejected)
+        ));
+        let dummy_pair = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q".to_string(),
+                tensor_a_name: "a".to_string(),
+                tensor_b_name: "b".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            1,
+            1,
+            vec![1.0],
+            vec![1.0],
+        )
+        .unwrap();
+        assert!(matches!(
+            coord.aggregate_lora_cohort_round(
+                &[(p1.peer_id, dummy_pair.clone()), (p2.peer_id, dummy_pair)],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 4
+                },
+                &FedAvg,
+                None,
+                1.0,
+                &mut session,
+                1_200,
+            ),
+            Err(RoundError::UnverifiedSubmissionRejected)
+        ));
+        assert_eq!(coord.admitted_count(), 0);
+
+        // Mint a VerifiedRoundSubmissionV1 for p3 at coordinator_generation=0, then finalize round 1 via p1 + p2.
+        let s1 = p1.establish_session(&mut coord, 1, 0x01, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x02, 100);
+        let s3 = p3.establish_session(&mut coord, 1, 0x03, 100);
+
+        let b3 = p3.build_dense_delivery(
+            &coord,
+            s3,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.5, 0.5, 0.5],
+            0,
+        );
+        let prep3 = coord
+            .prepare_verified_delivery(&b3, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        let val3 = coord
+            .expected_round_context()
+            .validate_sync_submission(prep3)
+            .unwrap();
+        let verified_p3_gen0 = coord.commit_prepared_submission(val3).unwrap();
+
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let bytes = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                100,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::ModelDeltaV1,
+                &[0.1, 0.1, 0.1],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        let _ = coord
+            .finalize_round::<SgdOptimizer<LinearModel>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(coord.coordinator_generation(), 1);
+
+        // Presenting the old VerifiedRoundSubmissionV1 (generation 0) to generation 1 MUST fail!
+        let stale_gen_err = coord.submit_verified_update(verified_p3_gen0).unwrap_err();
+        assert!(matches!(
+            stale_gen_err,
+            RoundError::StaleCoordinatorGeneration {
+                expected: 1,
+                got: 0
+            }
+        ));
+        assert_eq!(coord.admitted_count(), 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resumed_coordinator_enforces_fresh_v2_handshake_and_timestamp_floor() {
+        let base = temp_dir("st03_timestamp_floor");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0x67; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(31);
+        let p2 = TestPeer::new(32);
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let t_r1_secs = 1_700_000_010u64;
+        let t_r1_nanos = t_r1_secs * 1_000_000_000;
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            t_r1_nanos - 1_000_000_000,
+        )
+        .unwrap();
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x11, t_r1_secs as u32);
+        let s2 = p2.establish_session(&mut coord, 1, 0x22, t_r1_secs as u32);
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let bytes = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                t_r1_secs as u32,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::ModelDeltaV1,
+                &[0.1, 0.1, 0.1],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, t_r1_secs)
+                .unwrap();
+        }
+        let _ = coord
+            .finalize_round::<SgdOptimizer<LinearModel>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                t_r1_nanos,
+            )
+            .unwrap();
+
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let _ = session.commit_and_close(None).unwrap();
+        let (resumed_session, resume_state) = DataOpsSession::resume(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let resume_state = resume_state.unwrap();
+
+        let mut resumed: SwarmRoundCoordinator<LinearModel> =
+            SwarmRoundCoordinator::from_resume_state(
+                config,
+                LinearModel::new(2, 1).unwrap(),
+                &resume_state,
+                &resumed_session,
+            )
+            .unwrap();
+
+        // Pre-floor session challenge/handshake or delivery is rejected after resume!
+        let s1_r2 = p1.establish_session(&mut resumed, 2, 0x33, (t_r1_secs + 1) as u32);
+        let below_floor_bytes = p1.build_dense_delivery(
+            &resumed,
+            s1_r2,
+            2,
+            1,
+            (t_r1_secs - 1) as u32,
+            2,
+            resumed.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        let floor_err = resumed
+            .submit_verified_delivery(
+                &below_floor_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                t_r1_secs + 1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            floor_err,
+            RoundError::ReplayRejected(ReplayError::TimestampBelowFloor { .. })
+        ));
+
+        // Delivery at or above floor succeeds!
+        let at_floor_bytes = p1.build_dense_delivery(
+            &resumed,
+            s1_r2,
+            2,
+            1,
+            (t_r1_secs + 1) as u32,
+            2,
+            resumed.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(resumed
+            .submit_verified_delivery(
+                &at_floor_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                t_r1_secs + 1
+            )
+            .is_ok());
 
         let _ = fs::remove_dir_all(&base);
     }

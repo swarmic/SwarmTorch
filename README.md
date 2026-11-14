@@ -22,13 +22,14 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
 - [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 12 + Wave 13 Phase `13-0` Containment)
+## Implementation Reality (Wave 12 + Wave 13 `13-0` & `13A` Hardening)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
 - `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, and `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`).
 - **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-13 work, and `VerifiedMechanismProtected` fails closed.
 - **Wasm Sandbox Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1` and `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` isolation lands (`Phase 13D-1`).
-- **Active Wave 13 Hardening:** Core crates pass the baseline test suite while end-to-end cryptographic coordinator admission (`13A`), atomic durable commits + `fs4` locking (`13B`), evented I/O + Bulyan Stage 2 + two-phase `SharedSeedSparse` (`13C`), and live external SDK wiring (`13D`) are executed incrementally across Wave 13.
+- **End-to-End Authenticated Admission & Replay Recovery V2 (`13A`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) failing closed on legacy unverified `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` without sentinel `PeerId` attribution; and `ObservedSourceReassembler<E>` bounds full heap reservation with non-evicting tombstones.
+- **Remaining Active Wave 13 Hardening:** Atomic durable commits + `fs4` locking + `PhysicalStrict` runner + numerical atomicity (`13B`), evented async I/O + Bulyan Stage 2 + two-phase `SharedSeedSparse` (`13C`), and live external SDK + `wasmi` wiring (`13D`) proceed sequentially across Wave 13.
 
 ### Adapter & Capability Maturity Matrix
 

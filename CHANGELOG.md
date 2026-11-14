@@ -5,9 +5,22 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-14 (Wave 13 Phase `13-0` Containment & Governance)
+## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0` & `13A`)
 
-### Security
+### Security (`Phase 13A` — Auth Admission, Replay V2, & Bounded Reassembly)
+- **3-Stage Authenticated Coordinator Admission (`ST-01`):**
+  - Replaced unauthenticated `PeerRoundSubmissionV1` ingress (`#[deprecated]`, failing closed with `RoundError::UnverifiedSubmissionRejected` and zero state mutation) with a strict prepare -> validate -> commit pipeline in `swarm-torch::coordinator`: **Stage A** `prepare_verified_delivery` / `prepare_verified_delivery_struct` (`&self`, read-only Ed25519 + v2 replay preflight + `InnerUpdateV2` schema decode into `PreparedSubmissionV1`), **Stage B** `ExpectedRoundContextV1::validate_{sync,fedasync,lora}_submission` (read-only binding of `swarm_instance_id`, `context_policy_digest`, `run_id`, `round_id`, `base_checkpoint_digest`, update kind/dimension, allowlist, and active cohort epoch), and **Stage C** atomic replay commit & admission returning sealed private-field proof tokens (`VerifiedRoundSubmissionV1`, `VerifiedFedAsyncSubmissionV1`, `VerifiedLoraSubmissionV1`).
+  - Added public canonical update payload encoders `encode_{dense,compressed,lora}_update_payload_v2` matching compression schema versions `0`, `1`, and `2`.
+- **Receiver-Nonce `session_id` V2 Replay Recovery & Default Fail-Closed Restart (`ST-03`):**
+  - Defaulted `ReplayProtection` startup/recovery policy to `ReplayStartupPolicyV1::RequireSessionHandshake` (`ReplayProtection::try_with_config`) and wired `SwarmRoundCoordinator::from_resume_state` to enforce `RequireSessionHandshake` plus monotonic `TimestampFloor` (`committed_unix_nanos / 1e9`).
+  - Added `SessionHandshakeChallengeV2` with 256-bit `receiver_nonce` and deterministic domain-separated `session_id`, `ProtocolVersion::V0_3` (`(0, 3)`), `InnerUpdateV2`, `RecipientWrapperV2`, `BundledGossipDeliveryV2`, `BTreeMap` v2 replay tracking keyed by `(SwarmInstanceId, RunId, PeerId, SessionEpoch, SessionId)`, atomic `complete_recovery_handshake_v2` (capacity validated prior to mutating pending challenges), and read-only `check_v2_admission_readonly` + `commit_prepared_admission`.
+- **Non-Forged Transport Attribution & Sealed Carrier Proofs (`ST-06` Identity, `ST-08`):**
+  - Replaced `SwarmTransport::recv() -> (PeerId, Vec<u8>)` (and sentinel `PeerId([0xFF; 32])` fallbacks in `UdpGossipTransport` / `TcpTransport`) with `ObservedTransportMessage` carrying transport-observed `ObservedSourceRef` (`SocketAddr`, `MockNodeId`, `LinkLabel`, `Opaque`), preventing pre-auth sender forgery across all transports and multi-node simulations.
+  - Sealed `VerifiedLinkPrincipalV1` in `swarm-torch-net::carrier` (private fields constructible only via adapter minting / link validation paths, rejecting external raw `[u8; 32]` construction).
+- **Dimensioned Bitmaps, Non-Evicting Quarantines, & Full Heap Accounting in Reassembly (`ST-13`):**
+  - Re-architected `ObservedSourceReassembler<E>` (`swarm-torch-net::chunked`) with dynamically dimensioned `Vec<u64>` bitmaps (`ceil(total_chunks / 64)` words supporting `MAX_CHUNKS_PER_MESSAGE > 256` without silent modular wrap), contiguous `Vec<u8>` reassembly buffers (zero-copy move upon completion), non-evicting conflict quarantine tombstones paired with $O(\log S)$ source-level quarantine escalation (`SourceQuarantined`), and complete peak heap reservation accounting (`payload + bitmap + per-transfer + source/tombstone overhead`).
+
+### Security (`Phase 13-0` — Containment)
 - **Differential Privacy Accounting Containment (`ST-02`):**
   - Reclassified `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`swarm-torch::artifacts::dp_ledger`), and `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) as **`ExperimentalHypotheticalBudgetOnly`** (`guarantees_differential_privacy = false`).
   - Added fail-closed `VerifiedMechanismProtected` rejection across `RdpAccountantV1`, `dp_ledger.rs`, and `SwarmRoundCoordinator` (`supports_certified_differential_privacy() == false`, `RoundConfigError::UnsupportedCertifiedDifferentialPrivacy`), and staged `base_weights_to_merge` validation/application prior to pre-release DP debit in `SwarmRoundCoordinator::aggregate_lora_cohort_round`.

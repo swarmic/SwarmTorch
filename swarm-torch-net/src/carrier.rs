@@ -17,10 +17,12 @@
 use alloc::{format, string::String, vec::Vec};
 
 #[cfg(feature = "alloc")]
-use crate::gossip::BundledGossipDeliveryV1;
+use crate::gossip::{BundledGossipDeliveryV1, BundledGossipDeliveryV2};
 #[cfg(feature = "alloc")]
 use crate::protocol::{MessageEnvelope, DEFAULT_MAX_ENVELOPE_BYTES};
-use swarm_torch_core::crypto::CryptoError;
+use swarm_torch_core::crypto::{
+    sha256_slices, CryptoError, MessageAuth, Signature, LINK_ATTESTATION_DOMAIN_TAG_V1,
+};
 use swarm_torch_core::traits::PeerId;
 
 /// Canonical ALPN protocol identifier negotiated on QUIC / Iroh connections (`ADR-0022` §4).
@@ -56,38 +58,150 @@ pub enum LinkBindingPolicyV1 {
     StrictOneToOne,
 }
 
-/// Authenticated transport carrier descriptor (`ADR-0022` §4).
+/// Authenticated transport carrier descriptor (`ADR-0022` §4, `ST-08`).
+///
+/// Fields are private so unauthenticated callers cannot mint forged link principals without
+/// verifying a signed handshake attestation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedLinkPrincipalV1 {
     /// Raw 32-byte transport public key / Iroh `EndpointId` authenticated by TLS/QUIC.
-    pub endpoint_public_key: [u8; 32],
+    endpoint_public_key: [u8; 32],
     /// Canonical SwarmTorch `PeerId` derived from `endpoint_public_key` (`SHA-256`).
-    pub link_peer_id: PeerId,
+    link_peer_id: PeerId,
+}
+
+/// Signed QUIC/TLS link-handshake attestation binding an endpoint key, negotiated ALPN, and
+/// non-zero receiver challenge nonce (`ST-08`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkHandshakeAttestationV1<'a> {
+    /// Raw 32-byte Ed25519 endpoint public key authenticated by TLS/QUIC.
+    pub endpoint_public_key: [u8; 32],
+    /// Negotiated ALPN protocol bytes carried under the handshake attestation.
+    pub negotiated_alpn: &'a [u8],
+    /// Non-zero receiver challenge nonce preventing replay or unauthenticated minting.
+    pub receiver_nonce: [u8; 16],
+    /// Ed25519 signature over `link_attestation_digest` under `LINK_ATTESTATION_DOMAIN_TAG_V1`.
+    pub signature: Signature,
+}
+
+/// Compute the canonical SHA-256 attestation digest binding endpoint key, ALPN, and receiver nonce.
+pub fn link_attestation_digest(
+    endpoint_public_key: &[u8; 32],
+    negotiated_alpn: &[u8],
+    receiver_nonce: &[u8; 16],
+) -> [u8; 32] {
+    let alpn_len = (negotiated_alpn.len() as u64).to_le_bytes();
+    sha256_slices(&[
+        endpoint_public_key,
+        &alpn_len,
+        negotiated_alpn,
+        receiver_nonce,
+    ])
+}
+
+/// Sign a [`LinkHandshakeAttestationV1`] using the transport endpoint's [`MessageAuth`].
+///
+/// Fails with [`CarrierError::InvalidLinkAttestation`] if `receiver_nonce` is all-zero or
+/// `negotiated_alpn` is empty.
+pub fn sign_link_attestation<'a>(
+    auth: &MessageAuth,
+    negotiated_alpn: &'a [u8],
+    receiver_nonce: [u8; 16],
+) -> Result<LinkHandshakeAttestationV1<'a>, CarrierError> {
+    if receiver_nonce == [0u8; 16] || negotiated_alpn.is_empty() {
+        return Err(CarrierError::InvalidLinkAttestation);
+    }
+    let endpoint_public_key = *auth.key_pair().public_key();
+    let digest = link_attestation_digest(&endpoint_public_key, negotiated_alpn, &receiver_nonce);
+    let signature = auth.sign_prehashed_domain(LINK_ATTESTATION_DOMAIN_TAG_V1, &digest);
+    Ok(LinkHandshakeAttestationV1 {
+        endpoint_public_key,
+        negotiated_alpn,
+        receiver_nonce,
+        signature,
+    })
 }
 
 impl VerifiedLinkPrincipalV1 {
-    /// Construct and validate a transport link principal from raw 32-byte Ed25519 endpoint key bytes.
-    pub fn try_from_endpoint_key(endpoint_public_key: &[u8; 32]) -> Result<Self, CarrierError> {
-        let link_peer_id = PeerId::try_from_public_key_bytes(endpoint_public_key)
+    /// Raw 32-byte transport endpoint public key / Iroh `EndpointId`.
+    pub const fn endpoint_public_key(&self) -> &[u8; 32] {
+        &self.endpoint_public_key
+    }
+
+    /// Canonical SwarmTorch `PeerId` derived from `endpoint_public_key` (`SHA-256`).
+    pub const fn link_peer_id(&self) -> PeerId {
+        self.link_peer_id
+    }
+
+    /// Construct a [`VerifiedLinkPrincipalV1`] strictly after verifying a signed
+    /// [`LinkHandshakeAttestationV1`] against `expected_receiver_nonce` (`ST-08`).
+    pub fn from_link_attestation(
+        expected_receiver_nonce: &[u8; 16],
+        attestation: &LinkHandshakeAttestationV1<'_>,
+    ) -> Result<Self, CarrierError> {
+        let link_peer_id = PeerId::try_from_public_key_bytes(&attestation.endpoint_public_key)
             .map_err(|_| CarrierError::InvalidLinkPrincipalKey)?;
+        if *expected_receiver_nonce == [0u8; 16]
+            || attestation.receiver_nonce == [0u8; 16]
+            || attestation.receiver_nonce != *expected_receiver_nonce
+            || attestation.negotiated_alpn.is_empty()
+        {
+            return Err(CarrierError::InvalidLinkAttestation);
+        }
+        let digest = link_attestation_digest(
+            &attestation.endpoint_public_key,
+            attestation.negotiated_alpn,
+            &attestation.receiver_nonce,
+        );
+        MessageAuth::verify_prehashed_domain(
+            &attestation.endpoint_public_key,
+            LINK_ATTESTATION_DOMAIN_TAG_V1,
+            &digest,
+            &attestation.signature,
+        )
+        .map_err(|_| CarrierError::InvalidLinkAttestation)?;
         Ok(Self {
-            endpoint_public_key: *endpoint_public_key,
+            endpoint_public_key: attestation.endpoint_public_key,
             link_peer_id,
         })
     }
 }
 
-/// Carrier-verified peer admission outcome separating transport hop from cryptographic originator.
+/// Carrier-verified peer admission outcome separating transport hop from cryptographic originator (`ST-08`).
+///
+/// Fields are private so callers cannot construct bindings outside handshake policy checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedCarrierBindingV1 {
     /// Verified transport link principal (`EndpointId` / QUIC peer).
-    pub link_principal: VerifiedLinkPrincipalV1,
+    link_principal: VerifiedLinkPrincipalV1,
     /// Cryptographically authenticated message originator (`PeerId`).
-    pub originator_peer_id: PeerId,
+    originator_peer_id: PeerId,
     /// Applied binding policy.
-    pub policy: LinkBindingPolicyV1,
-    /// True if `link_principal.link_peer_id != originator_peer_id` (forwarded via relay).
-    pub relayed_via_intermediary: bool,
+    policy: LinkBindingPolicyV1,
+    /// True if `link_principal.link_peer_id() != originator_peer_id` (forwarded via relay).
+    relayed_via_intermediary: bool,
+}
+
+impl VerifiedCarrierBindingV1 {
+    /// Verified transport link principal (`EndpointId` / QUIC peer).
+    pub const fn link_principal(&self) -> VerifiedLinkPrincipalV1 {
+        self.link_principal
+    }
+
+    /// Cryptographically authenticated message originator (`PeerId`).
+    pub const fn originator_peer_id(&self) -> PeerId {
+        self.originator_peer_id
+    }
+
+    /// Applied link-binding policy.
+    pub const fn policy(&self) -> LinkBindingPolicyV1 {
+        self.policy
+    }
+
+    /// True if `link_principal.link_peer_id() != originator_peer_id` (forwarded via relay).
+    pub const fn relayed_via_intermediary(&self) -> bool {
+        self.relayed_via_intermediary
+    }
 }
 
 /// Errors returned by carrier handshake, framing, and topic binding verification (`ADR-0022` §4).
@@ -99,6 +213,8 @@ pub enum CarrierError {
     EarlyDataRejected,
     /// Link endpoint key was all-zero or failed Ed25519 point validation.
     InvalidLinkPrincipalKey,
+    /// Link handshake attestation failed nonce binding, ALPN non-emptiness, or signature verification.
+    InvalidLinkAttestation,
     /// `StrictOneToOne` policy rejected a frame whose originator differs from the link principal.
     StrictBindingMismatch {
         link_peer: PeerId,
@@ -130,6 +246,10 @@ impl core::fmt::Display for CarrierError {
             Self::InvalidLinkPrincipalKey => {
                 write!(f, "invalid or all-zero QUIC link principal public key")
             }
+            Self::InvalidLinkAttestation => write!(
+                f,
+                "invalid link handshake attestation (missing nonce, mismatch, or bad signature)"
+            ),
             Self::StrictBindingMismatch {
                 link_peer,
                 originator,
@@ -182,20 +302,39 @@ impl Default for QuicStreamHandshakePolicyV1 {
 }
 
 impl QuicStreamHandshakePolicyV1 {
-    /// Validate negotiated ALPN, 1-RTT handshake completion, and link key before accepting frames.
-    pub fn validate_connection(
+    /// Validate negotiated ALPN, 1-RTT handshake completion, and signed endpoint attestation
+    /// against `expected_receiver_nonce` before accepting frames (`ST-08`).
+    pub fn validate_attested_connection(
         &self,
-        negotiated_alpn: &[u8],
+        expected_receiver_nonce: &[u8; 16],
         handshake_stage: QuicHandshakeStageV1,
-        endpoint_public_key: &[u8; 32],
+        attestation: &LinkHandshakeAttestationV1<'_>,
     ) -> Result<VerifiedLinkPrincipalV1, CarrierError> {
-        if negotiated_alpn != self.expected_alpn {
+        if attestation.negotiated_alpn != self.expected_alpn {
             return Err(CarrierError::AlpnMismatch);
         }
         if handshake_stage != QuicHandshakeStageV1::OneRttComplete {
             return Err(CarrierError::EarlyDataRejected);
         }
-        VerifiedLinkPrincipalV1::try_from_endpoint_key(endpoint_public_key)
+        VerifiedLinkPrincipalV1::from_link_attestation(expected_receiver_nonce, attestation)
+    }
+
+    /// Enforce link-binding policy without minting a public binding proof (`ST-08`).
+    ///
+    /// Returns `Ok(true)` if forwarded via an intermediary (`link_peer != authenticated_originator`).
+    pub fn check_link_binding(
+        &self,
+        link_peer: PeerId,
+        authenticated_originator: PeerId,
+    ) -> Result<bool, CarrierError> {
+        let relayed = link_peer != authenticated_originator;
+        if matches!(self.binding_policy, LinkBindingPolicyV1::StrictOneToOne) && relayed {
+            return Err(CarrierError::StrictBindingMismatch {
+                link_peer,
+                originator: authenticated_originator,
+            });
+        }
+        Ok(relayed)
     }
 
     /// Bind an already-verified transport connection to an authenticated message originator `PeerId`.
@@ -204,13 +343,8 @@ impl QuicStreamHandshakePolicyV1 {
         link_principal: VerifiedLinkPrincipalV1,
         authenticated_originator: PeerId,
     ) -> Result<VerifiedCarrierBindingV1, CarrierError> {
-        let relayed = link_principal.link_peer_id != authenticated_originator;
-        if matches!(self.binding_policy, LinkBindingPolicyV1::StrictOneToOne) && relayed {
-            return Err(CarrierError::StrictBindingMismatch {
-                link_peer: link_principal.link_peer_id,
-                originator: authenticated_originator,
-            });
-        }
+        let relayed =
+            self.check_link_binding(link_principal.link_peer_id(), authenticated_originator)?;
         Ok(VerifiedCarrierBindingV1 {
             link_principal,
             originator_peer_id: authenticated_originator,
@@ -386,10 +520,32 @@ impl ZenohTopicContractV1 {
         })
     }
 
-    /// Enforce that the Zenoh topic key agrees with an envelope's scoped v1 `(swarm_instance_id, round_id, originator)`
+    fn verify_topic_match_fields(
+        &self,
+        inner_scope: [u8; 16],
+        wrapper_scope: [u8; 16],
+        inner_round: u64,
+        wrapper_round: u64,
+        sender_peer: PeerId,
+    ) -> Result<(), CarrierError> {
+        if inner_scope != self.swarm_instance_id
+            || inner_round != self.round_id
+            || sender_peer != self.originator_peer_id
+            || wrapper_scope != self.swarm_instance_id
+            || wrapper_round != self.round_id
+        {
+            return Err(CarrierError::TopicIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Enforce that the Zenoh topic key agrees with an envelope's scoped v1/v2 `(swarm_instance_id, round_id, originator)`
     /// before admitting it into downstream signature/replay verification.
     pub fn verify_matches_envelope(&self, envelope: &MessageEnvelope) -> Result<(), CarrierError> {
-        if envelope.version != MessageEnvelope::VERSION_V1 {
+        if !matches!(
+            envelope.version,
+            MessageEnvelope::VERSION_V1 | MessageEnvelope::VERSION_V2
+        ) {
             return Err(CarrierError::TopicIdentityMismatch);
         }
         let sender_peer = envelope.sender_peer_id()?;
@@ -408,15 +564,28 @@ impl ZenohTopicContractV1 {
         delivery: &BundledGossipDeliveryV1,
     ) -> Result<(), CarrierError> {
         let sender_peer = delivery.inner.originator_peer_id()?;
-        if delivery.inner.swarm_instance_id != self.swarm_instance_id
-            || delivery.inner.round_id != self.round_id
-            || sender_peer != self.originator_peer_id
-            || delivery.wrapper.swarm_instance_id != self.swarm_instance_id
-            || delivery.wrapper.round_id != self.round_id
-        {
-            return Err(CarrierError::TopicIdentityMismatch);
-        }
-        Ok(())
+        self.verify_topic_match_fields(
+            delivery.inner.swarm_instance_id,
+            delivery.wrapper.swarm_instance_id,
+            delivery.inner.round_id,
+            delivery.wrapper.round_id,
+            sender_peer,
+        )
+    }
+
+    /// Enforce that the Zenoh topic key agrees with a v2 gossip [`BundledGossipDeliveryV2`].
+    pub fn verify_matches_gossip_delivery_v2(
+        &self,
+        delivery: &BundledGossipDeliveryV2,
+    ) -> Result<(), CarrierError> {
+        let sender_peer = delivery.inner.originator_peer_id()?;
+        self.verify_topic_match_fields(
+            delivery.inner.swarm_instance_id,
+            delivery.wrapper.swarm_instance_id,
+            delivery.inner.round_id,
+            delivery.wrapper.round_id,
+            sender_peer,
+        )
     }
 }
 
@@ -470,24 +639,34 @@ fn hex_nibble_lower(b: u8) -> Result<u8, CarrierError> {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    use crate::gossip::{BundledGossipDeliveryV2, InnerUpdateV2, PayloadKindV1};
     use crate::protocol::MessageType;
     use alloc::vec;
     use swarm_torch_core::crypto::KeyPair;
 
     #[test]
-    fn quic_policy_rejects_early_data_alpn_mismatch_and_enforces_binding_modes() {
+    fn quic_policy_rejects_early_data_alpn_mismatch_bad_attestation_and_enforces_binding_modes() {
         let relay_kp = KeyPair::from_seed([0x11; 32]).unwrap();
         let origin_kp = KeyPair::from_seed([0x22; 32]).unwrap();
+        let relay_auth = MessageAuth::new(relay_kp.clone());
+        let expected_nonce = [0x9A; 16];
+        let valid_attestation =
+            sign_link_attestation(&relay_auth, ALPN_SWARMTORCH_DELIVERY_V1, expected_nonce)
+                .unwrap();
 
         let policy = QuicStreamHandshakePolicyV1::default();
 
         // Wrong ALPN rejected
+        let wrong_alpn = LinkHandshakeAttestationV1 {
+            negotiated_alpn: b"wrong/alpn",
+            ..valid_attestation
+        };
         assert_eq!(
             policy
-                .validate_connection(
-                    b"wrong/alpn",
+                .validate_attested_connection(
+                    &expected_nonce,
                     QuicHandshakeStageV1::OneRttComplete,
-                    relay_kp.public_key(),
+                    &wrong_alpn,
                 )
                 .unwrap_err(),
             CarrierError::AlpnMismatch
@@ -497,36 +676,84 @@ mod tests {
         for early in [QuicHandshakeStageV1::ZeroRtt, QuicHandshakeStageV1::HalfRtt] {
             assert_eq!(
                 policy
-                    .validate_connection(ALPN_SWARMTORCH_DELIVERY_V1, early, relay_kp.public_key(),)
+                    .validate_attested_connection(&expected_nonce, early, &valid_attestation)
                     .unwrap_err(),
                 CarrierError::EarlyDataRejected
             );
         }
 
         // All-zero link public key rejected
+        let zero_key_attestation = LinkHandshakeAttestationV1 {
+            endpoint_public_key: [0u8; 32],
+            ..valid_attestation
+        };
         assert_eq!(
             policy
-                .validate_connection(
-                    ALPN_SWARMTORCH_DELIVERY_V1,
+                .validate_attested_connection(
+                    &expected_nonce,
                     QuicHandshakeStageV1::OneRttComplete,
-                    &[0u8; 32],
+                    &zero_key_attestation,
                 )
                 .unwrap_err(),
             CarrierError::InvalidLinkPrincipalKey
         );
 
+        // Zero receiver nonce, mismatched receiver nonce, empty ALPN, and tampered signature fail
+        assert_eq!(
+            sign_link_attestation(&relay_auth, ALPN_SWARMTORCH_DELIVERY_V1, [0u8; 16]).unwrap_err(),
+            CarrierError::InvalidLinkAttestation
+        );
+        assert_eq!(
+            sign_link_attestation(&relay_auth, b"", expected_nonce).unwrap_err(),
+            CarrierError::InvalidLinkAttestation
+        );
+        let wrong_nonce = [0x7B; 16];
+        assert_eq!(
+            policy
+                .validate_attested_connection(
+                    &wrong_nonce,
+                    QuicHandshakeStageV1::OneRttComplete,
+                    &valid_attestation,
+                )
+                .unwrap_err(),
+            CarrierError::InvalidLinkAttestation
+        );
+        let mut forged_sig = *valid_attestation.signature.as_bytes();
+        forged_sig[0] ^= 0xFF;
+        let bad_sig_attestation = LinkHandshakeAttestationV1 {
+            signature: Signature::from_bytes(forged_sig),
+            ..valid_attestation
+        };
+        assert_eq!(
+            policy
+                .validate_attested_connection(
+                    &expected_nonce,
+                    QuicHandshakeStageV1::OneRttComplete,
+                    &bad_sig_attestation,
+                )
+                .unwrap_err(),
+            CarrierError::InvalidLinkAttestation
+        );
+
         // 1-RTT completes and allows relayed originator under DecoupledRelayAllowed
         let link = policy
-            .validate_connection(
-                ALPN_SWARMTORCH_DELIVERY_V1,
+            .validate_attested_connection(
+                &expected_nonce,
                 QuicHandshakeStageV1::OneRttComplete,
-                relay_kp.public_key(),
+                &valid_attestation,
             )
             .unwrap();
+        assert_eq!(link.endpoint_public_key(), relay_kp.public_key());
+        assert_eq!(link.link_peer_id(), relay_kp.peer_id());
+        assert!(policy
+            .check_link_binding(link.link_peer_id(), origin_kp.peer_id())
+            .unwrap());
+
         let relayed = policy.bind_originator(link, origin_kp.peer_id()).unwrap();
-        assert!(relayed.relayed_via_intermediary);
-        assert_eq!(relayed.originator_peer_id, origin_kp.peer_id());
-        assert_eq!(relayed.link_principal.link_peer_id, relay_kp.peer_id());
+        assert!(relayed.relayed_via_intermediary());
+        assert_eq!(relayed.originator_peer_id(), origin_kp.peer_id());
+        assert_eq!(relayed.link_principal().link_peer_id(), relay_kp.peer_id());
+        assert_eq!(relayed.policy(), LinkBindingPolicyV1::DecoupledRelayAllowed);
 
         // StrictOneToOne rejects relay forwarding, permits direct matching peer
         let strict_policy = QuicStreamHandshakePolicyV1 {
@@ -534,13 +761,17 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
+            strict_policy.check_link_binding(link.link_peer_id(), origin_kp.peer_id()),
+            Err(CarrierError::StrictBindingMismatch { .. })
+        ));
+        assert!(matches!(
             strict_policy.bind_originator(link, origin_kp.peer_id()),
             Err(CarrierError::StrictBindingMismatch { .. })
         ));
         let direct = strict_policy
             .bind_originator(link, relay_kp.peer_id())
             .unwrap();
-        assert!(!direct.relayed_via_intermediary);
+        assert!(!direct.relayed_via_intermediary());
     }
 
     #[test]
@@ -636,6 +867,55 @@ mod tests {
         assert_eq!(
             parsed
                 .verify_matches_envelope(&wrong_round_env)
+                .unwrap_err(),
+            CarrierError::TopicIdentityMismatch
+        );
+
+        // Verify v2 envelopes and v2 gossip deliveries bind to Zenoh topic identity
+        let good_env_v2 = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            [0xcd; 16],
+            1,
+            [0x12; 32],
+            42,
+            MessageType::GradientUpdate,
+            vec![1, 2, 3],
+        );
+        parsed.verify_matches_envelope(&good_env_v2).unwrap();
+
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let delivery_v2 = BundledGossipDeliveryV2::new_signed(
+            &origin_auth,
+            InnerUpdateV2 {
+                originator_public_key: *origin_kp.public_key(),
+                swarm_instance_id: scope,
+                run_id: [0xcd; 16],
+                round_id: 42,
+                contribution_id: 1,
+                base_checkpoint_digest: [0x33; 32],
+                context_policy_digest: [0x44; 32],
+                payload_kind: PayloadKindV1::ModelDeltaV1,
+                compression_schema_version: 0,
+                num_elements: 1,
+                reported_examples: 10,
+                encoded_payload: vec![1, 2, 3, 4],
+                originator_signature: Vec::new(),
+            },
+            other_kp.peer_id(),
+            [0x12; 32],
+            1,
+            1,
+            1_700_000_000,
+        );
+        parsed
+            .verify_matches_gossip_delivery_v2(&delivery_v2)
+            .unwrap();
+        let mut wrong_round_v2 = delivery_v2.clone();
+        wrong_round_v2.wrapper.round_id = 43;
+        assert_eq!(
+            parsed
+                .verify_matches_gossip_delivery_v2(&wrong_round_v2)
                 .unwrap_err(),
             CarrierError::TopicIdentityMismatch
         );

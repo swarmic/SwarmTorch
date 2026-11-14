@@ -1,11 +1,15 @@
 //! Integration tests for replay protection with message envelopes.
 
-use swarm_torch_core::crypto::{CryptoError, KeyPair, MessageAuth};
-use swarm_torch_core::replay::{ReplayError, ReplayProtection};
+use swarm_torch_core::crypto::{CryptoError, KeyPair, MessageAuth, SessionHandshakeChallengeV2};
+use swarm_torch_core::replay::{ReplayError, ReplayProtection, ReplayStartupPolicyV1};
 use swarm_torch_core::traits::PeerId;
 use swarm_torch_net::protocol::{
     AuthenticatedEnvelopeVerifier, MessageEnvelope, MessageType, VerifyError,
 };
+
+fn new_genesis_replay_guard() -> ReplayProtection {
+    ReplayProtection::new().with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+}
 
 fn signed_heartbeat(
     keypair: &KeyPair,
@@ -37,7 +41,7 @@ fn signed_heartbeat(
 fn envelope_verify_authenticated_golden_path() {
     let keypair = KeyPair::from_seed([1u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"test payload".to_vec());
@@ -50,7 +54,7 @@ fn envelope_verify_authenticated_golden_path() {
 fn envelope_verify_authenticated_rejects_replay() {
     let keypair = KeyPair::from_seed([2u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"test payload".to_vec());
@@ -67,7 +71,7 @@ fn envelope_verify_authenticated_rejects_replay() {
 fn envelope_verify_authenticated_rejects_expired() {
     let keypair = KeyPair::from_seed([3u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let old_ts = 900;
     let now = 1000;
 
@@ -81,7 +85,7 @@ fn envelope_verify_authenticated_rejects_expired() {
 #[test]
 fn envelope_verify_authenticated_signature_before_replay() {
     let keypair = KeyPair::from_seed([4u8; 32]).expect("non-zero seed");
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let envelope = MessageEnvelope::new_with_public_key(
@@ -102,7 +106,7 @@ fn envelope_verify_authenticated_signature_before_replay() {
 
 #[test]
 fn envelope_verify_authenticated_rejects_missing_signature() {
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
     let keypair = KeyPair::from_seed([5u8; 32]).expect("non-zero seed");
 
@@ -122,7 +126,7 @@ fn envelope_verify_authenticated_rejects_missing_signature() {
 
 #[test]
 fn envelope_verify_authenticated_rejects_wrong_signature_length() {
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
     let keypair = KeyPair::from_seed([6u8; 32]).expect("non-zero seed");
 
@@ -148,7 +152,7 @@ fn envelope_verify_authenticated_rejects_wrong_signature_length() {
 fn envelope_verify_authenticated_rejects_tampered_payload() {
     let keypair = KeyPair::from_seed([7u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let mut envelope = signed_heartbeat(&keypair, &auth, 1, now, b"original payload".to_vec());
@@ -164,7 +168,7 @@ fn envelope_verify_authenticated_rejects_tampered_payload() {
 fn envelope_verify_authenticated_monotonic_sequences() {
     let keypair = KeyPair::from_seed([8u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     for sequence in 1..=10 {
@@ -180,7 +184,7 @@ fn envelope_verify_authenticated_monotonic_sequences() {
 fn envelope_verify_authenticated_out_of_order_within_window() {
     let keypair = KeyPair::from_seed([9u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let make_envelope = |sequence: u64| {
@@ -219,7 +223,7 @@ fn envelope_verify_authenticated_multi_peer_isolation() {
     let keypair_b = KeyPair::from_seed([11u8; 32]).expect("non-zero seed");
     let auth_b = MessageAuth::new(keypair_b.clone());
 
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let envelope_a = signed_heartbeat(&keypair_a, &auth_a, 5, now, b"peer a".to_vec());
@@ -254,7 +258,7 @@ fn new_with_public_key_uses_raw_bytes() {
 fn verify_authenticated_rejects_hashed_peer_id() {
     let keypair = KeyPair::from_seed([14u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let hashed_sender = PeerId::from_public_key(keypair.public_key());
@@ -291,7 +295,7 @@ fn current_unix_secs_returns_valid_timestamp() {
 fn verify_authenticated_requires_unix_seconds_not_millis() {
     let keypair = KeyPair::from_seed([15u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now_secs = 1_700_000_000;
 
     let envelope_secs = signed_heartbeat(&keypair, &auth, 1, now_secs, b"seconds".to_vec());
@@ -315,7 +319,7 @@ fn verify_authenticated_requires_unix_seconds_not_millis() {
 
 #[test]
 fn verify_authenticated_rejects_unsupported_version() {
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let mut envelope = MessageEnvelope::new_with_public_key(
         [16u8; 32],
         MessageType::Heartbeat,
@@ -343,7 +347,7 @@ fn sender_peer_id_rejects_zero_sender() {
 
 #[test]
 fn verify_authenticated_rejects_zero_sender_key() {
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
     let envelope = MessageEnvelope::new_with_public_key(
         [0u8; 32],
@@ -364,7 +368,7 @@ fn verify_authenticated_rejects_zero_sender_key() {
 fn verify_error_source_chain_includes_crypto() {
     let keypair = KeyPair::from_seed([23u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     let envelope = MessageEnvelope::new_with_public_key(
@@ -399,7 +403,7 @@ fn authenticated_verifier_verify_and_unwrap_with_time() {
     let now = 1000;
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"wrapped".to_vec());
 
-    let mut verifier = AuthenticatedEnvelopeVerifier::new();
+    let mut verifier = AuthenticatedEnvelopeVerifier::with_replay_guard(new_genesis_replay_guard());
     let result = verifier.verify_and_unwrap_with_time(envelope.clone(), now);
 
     assert!(result.is_ok());
@@ -422,7 +426,7 @@ fn authenticated_verifier_verify_and_unwrap_with_time() {
 fn h02_verify_path_uses_canonical_peer_id_for_replay() {
     let keypair = KeyPair::from_seed([200u8; 32]).expect("non-zero seed");
     let auth = MessageAuth::new(keypair.clone());
-    let mut replay_guard = ReplayProtection::new();
+    let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
     // First message accepted
@@ -479,7 +483,7 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
     let unauthorized_auth = MessageAuth::new(unauthorized_kp.clone());
 
     let allowlist = CohortAllowlist::from_peers([sender_kp.peer_id()]);
-    let mut replay_guard = ReplayProtection::new().with_cohort_allowlist(allowlist);
+    let mut replay_guard = new_genesis_replay_guard().with_cohort_allowlist(allowlist);
     let now = 5000;
 
     // Stage 1: Oversized frame rejected before deserialization.
@@ -585,4 +589,129 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
     assert!(env_e2_unrecovered
         .verify_authenticated(&mut replay_guard, now)
         .is_ok());
+}
+
+#[test]
+fn v2_envelope_session_id_and_restart_recovery_integration() {
+    let swarm_id = [0x44u8; 16];
+    let run_id = [0x55u8; 16];
+    let policy_digest = [0x66u8; 32];
+    let sender_kp = KeyPair::from_seed([0x71u8; 32]).unwrap();
+    let sender_auth = MessageAuth::new(sender_kp.clone());
+    let receiver_kp = KeyPair::from_seed([0x72u8; 32]).unwrap();
+    let now = 1_700_005_000u32;
+
+    let mut guard = ReplayProtection::try_with_config(64, 60)
+        .unwrap()
+        .with_cohort_allowlist(swarm_torch_core::replay::CohortAllowlist::from_peers([
+            sender_kp.peer_id(),
+        ]));
+
+    // Unestablished peer fails closed on default RequireSessionHandshake policy.
+    let fake_v2 = MessageEnvelope::new_v2(
+        *sender_kp.public_key(),
+        swarm_id,
+        run_id,
+        1,
+        [0x88u8; 32],
+        10,
+        MessageType::Heartbeat,
+        b"payload".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .sign_with(&sender_auth);
+    assert_eq!(
+        fake_v2.verify_authenticated(&mut guard, now),
+        Err(VerifyError::Replay(ReplayError::RecoveryRequired {
+            peer: sender_kp.peer_id(),
+            current_epoch: 0,
+            requested_epoch: 1,
+        }))
+    );
+
+    // Unsigned v2 fields smuggled inside a v1 envelope fail MalformedEnvelope.
+    let mut smuggled_v1 = MessageEnvelope::new_v1(
+        *sender_kp.public_key(),
+        swarm_id,
+        1,
+        10,
+        MessageType::Heartbeat,
+        b"payload".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .sign_with(&sender_auth);
+    smuggled_v1.run_id = run_id;
+    assert_eq!(
+        smuggled_v1.verify_authenticated(&mut guard, now),
+        Err(VerifyError::MalformedEnvelope)
+    );
+
+    // Complete v2 recovery handshake -> session_id_1 admitted.
+    let ch1 = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: sender_kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0xA1u8; 32],
+        issued_at_secs: now,
+    };
+    guard.register_recovery_challenge_v2(ch1).unwrap();
+    let hs_sig_1 = sender_auth.sign_session_handshake_v2(&ch1).unwrap();
+    let active_1 = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &hs_sig_1, now)
+        .unwrap();
+
+    let env1 = MessageEnvelope::new_v2(
+        *sender_kp.public_key(),
+        swarm_id,
+        run_id,
+        1,
+        active_1.session_id,
+        10,
+        MessageType::Heartbeat,
+        b"v2-ok".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .sign_with(&sender_auth);
+    let wire1 = env1.serialize().unwrap();
+    let decoded1 = MessageEnvelope::deserialize_bounded(&wire1, 4096).unwrap();
+    assert!(decoded1.verify_authenticated(&mut guard, now).is_ok());
+
+    // Simulate process crash/restart in the SAME wall-clock second and establish a new nonce session.
+    let mut restarted = ReplayProtection::try_with_config(64, 60)
+        .unwrap()
+        .with_timestamp_floor(now)
+        .with_cohort_allowlist(swarm_torch_core::replay::CohortAllowlist::from_peers([
+            sender_kp.peer_id(),
+        ]));
+    let ch2 = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: sender_kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [0xB2u8; 32],
+        issued_at_secs: now,
+    };
+    restarted.register_recovery_challenge_v2(ch2).unwrap();
+    let hs_sig_2 = sender_auth.sign_session_handshake_v2(&ch2).unwrap();
+    let _active_2 = restarted
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &hs_sig_2, now)
+        .unwrap();
+
+    // Capturing & replaying pre-crash env1 in the same second MUST fail SessionIdMismatch!
+    assert_eq!(
+        decoded1.verify_authenticated(&mut restarted, now),
+        Err(VerifyError::Replay(ReplayError::SessionIdMismatch {
+            peer: sender_kp.peer_id(),
+        }))
+    );
 }

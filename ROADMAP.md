@@ -9,7 +9,7 @@ For a high-level project overview and usage guide, see [`README.md`](README.md).
 | `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Completed |
 | `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Completed |
 | `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Completed |
-| `v0.2.0` | Isolated Adapter Contracts, LoRA/FLoRA, `FedAsync` + Accounting Ledger, & Wasm/Columnar Surface (Wave 12 + Wave 13 `13-0` Containment) | Containment Hardened (Wave 13 Remediation In Progress) |
+| `v0.2.0` | Isolated Adapter Contracts, LoRA/FLoRA, `FedAsync` + Accounting Ledger, & Wasm/Columnar Surface (Wave 12 + Wave 13 `13-0` & `13A`) | Containment + Auth/Replay/Reassembly Hardened (Wave 13 `13B`–`13D` In Progress) |
 | `v0.3.0+` | End-to-End Cryptographic Admission, Atomic Commits, `wasmi` & Live Adapter SDKs (Wave 13 `13A`–`13D`), Certified `DpFedAvgV1` | Planned |
 
 ## Release Gates
@@ -59,7 +59,7 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-### Wave 12 & Wave 13 Phase `13-0` Containment (`v0.2.0` — Containment Hardened)
+### Wave 12 & Wave 13 Phases `13-0` & `13A` (`v0.2.0` — Containment + Auth/Replay Hardened)
 1. **Isolated Framework Bridges & LoRA / FLoRA Update Algebra (`W12-01`, `ADR-0024` §4):**
    - Adds `BackendTensorBridge` / `BackendModelHandleV1` and explicit `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models`, coordinated atomically on staged base weights in `SwarmRoundCoordinator::aggregate_lora_cohort_round`, plus **`Simulation verified`** contract bridges in `adapters/swarm-torch-backends` (live `burn`/`candle` SDKs scheduled for Phase `13D-4`).
 2. **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4, `ST-08`):**
@@ -72,6 +72,10 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
    - **Phase `13-0` Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1`, `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) pending isolated `wasmi` execution in `adapters/swarm-torch-wasm` (Phase `13D-1`); the subset VM remains strictly hidden for trusted local unit fixtures only.
 5. **Zero-Port Read-Only Strict MCP Inspector (`W12-05`, `ADR-0016`):**
    - Adds `McpInspectorServerV1` and the `swarm_torch_mcp` `stdio` JSON-RPC 2.0 binary (`swarm-torch::mcp_inspector`) plus `adapters/swarm-torch-mcp` (`Simulation verified`), requiring `TrustPolicy::Strict` signatures on every request and surfacing `guarantees_differential_privacy: false` + `accounting_classification` on DP-budget tool output.
+6. **Phase `13A` End-to-End Authenticated Admission, Receiver-Bound V2 Replay Recovery, & Bounded Reassembly (`ST-01`, `ST-03`, `ST-06`, `ST-08`, `ST-13`):**
+   - Enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) in `SwarmRoundCoordinator`, failing closed on legacy unverified `PeerRoundSubmissionV1` ingress without state mutation.
+   - Replaces sentinel `PeerId([0xFF; 32])` transport attribution with `ObservedSourceRef` + `ObservedTransportMessage`, seals cross-crate `VerifiedLinkPrincipalV1` carrier proofs, and adds receiver-nonce `session_id` v2 replay handshakes (`SessionHandshakeChallengeV2`, default `RequireSessionHandshake`, monotonic `TimestampFloor`).
+   - Re-architects `ObservedSourceReassembler<E>` with dimensioned `Vec<u64>` bitmaps, contiguous `Vec<u8>` assembly storage, non-evicting quarantine tombstones + $O(\log S)$ source quarantine escalation, and full peak heap accounting.
 
 ---
 
@@ -89,8 +93,8 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 | Top-level crate portability | `swarm-torch` is std-only (fail-fast without `std`) | `swarm-torch/src/lib.rs` |
 | Core & model portability | `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` pass unit tests under `--no-default-features` | `.github/workflows/rust.yml`, crate `src/lib.rs` |
 | Runtime abstraction | `SwarmClock` and `SwarmRuntime` split; `TokioRuntime` and 32-bit portable `MockRuntime` with deterministic task/timer scheduler implemented; `EmbassyRuntime` gated on `embassy` + `embassy-time-driver` | `swarm-torch-runtime/src/lib.rs` |
-| Transport layer | Allocation-free `PacketTransport`, GAT-based `SwarmTransport`, originator-signed `BundledGossipDeliveryV1`, and `MockNetworkHub` implemented; concrete TCP/UDP/BLE/LoRa backends planned | `swarm-torch-net/src/traits.rs`, `swarm-torch-net/src/gossip.rs`, `swarm-torch-net/src/mock.rs` |
-| Replay/auth security | `MessageEnvelope` v1.0 domain-separated Ed25519 signatures, 6-stage `decode_and_verify_payload`, safe `BTreeMap` replay store, `CohortAllowlist`, and `RecoveryRequired` challenge handshake implemented | `swarm-torch-core/src/replay.rs`, `swarm-torch-net/src/protocol.rs`, `swarm-torch-net/tests/replay_integration.rs` |
+| Transport layer | Allocation-free `PacketTransport`, GAT `SwarmTransport` (`ObservedSourceRef`), originator-signed `BundledGossipDeliveryV1`/`V2`, `TcpTransport`/`UdpGossipTransport`, and bounded `ObservedSourceReassembler` landed; evented socket I/O in `13C-1`, radio flags placeholder-only | `swarm-torch-net/src/{traits,gossip,chunked,tcp,udp}.rs` |
+| Replay/auth security | `MessageEnvelope` v1.0 & v0.3 (`V0_3`) domain-separated Ed25519 signatures, safe dual-tree `BTreeMap` replay store, `CohortAllowlist`, default `RequireSessionHandshake` (`SessionHandshakeChallengeV2` + `session_id`), `TimestampFloor`, and 3-stage `SwarmRoundCoordinator` admission | `swarm-torch-core/src/replay.rs`, `swarm-torch-net/src/protocol.rs`, `swarm-torch/src/coordinator.rs` |
 | Coordinator, CAS, & strict artifacts | `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `.bundle.lock`, `ManifestSignatureV1`, `TrustPolicy::Strict`, and 9 Draft 2020-12 JSON Schemas implemented | `swarm-torch/src/coordinator.rs`, `swarm-torch/src/artifacts/`, `schemas/v1/`, `swarm-torch/tests/federated_round_simulation.rs` |
 
 ### Baseline Command Set (must remain green)

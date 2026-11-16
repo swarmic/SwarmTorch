@@ -19,8 +19,9 @@ use swarm_torch_core::observe::RunId;
 use swarm_torch_core::traits::{OptimizerStateSnapshotV1, PeerId, SwarmModel};
 
 use super::io::{
-    atomic_write, decode_hex_exact, hex_lower, parse_json_slice, read_and_hash_bounded, read_json,
-    write_json_pretty_atomic, write_once_cas_blob, MAX_SINGLE_ARTIFACT_BYTES,
+    atomic_write, decode_hex_exact, hex_lower, open_regular_no_symlink, parse_json_slice,
+    read_and_hash_bounded, read_json, write_json_pretty_atomic, write_once_cas_blob,
+    MAX_SINGLE_ARTIFACT_BYTES,
 };
 
 /// Domain tag for deterministic checkpoint recipe keys (`ADR-0023` §2.2).
@@ -295,6 +296,8 @@ pub struct CoordinatorResumeStateV2 {
     pub bucketing: Option<BucketingConfig>,
     #[serde(default)]
     pub dp_profile: Option<swarm_torch_core::dp::DpMechanismProfileV1>,
+    #[serde(default)]
+    pub equivocated_peers: Vec<PeerId>,
     pub committed_unix_nanos: u64,
 }
 
@@ -325,6 +328,47 @@ pub fn put_checkpoint_model<M: SwarmModel>(
     Ok((digest, uri, bytes.len() as u64))
 }
 
+fn read_cas_blob_verified(
+    run_dir: &Path,
+    expected_digest: &CheckpointContentDigestV1,
+    expected_bytes: Option<u64>,
+    label: &str,
+) -> io::Result<Vec<u8>> {
+    let blob_path = run_dir
+        .join("blobs")
+        .join("sha256")
+        .join(expected_digest.to_hex());
+    let (_file, meta_len) = open_regular_no_symlink(&blob_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{label} CAS blob not found: {}", blob_path.display()),
+            )
+        } else {
+            e
+        }
+    })?;
+    if let Some(exp_bytes) = expected_bytes {
+        if meta_len != exp_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{label} CAS blob byte size mismatch: expected {exp_bytes}, got {meta_len}"
+                ),
+            ));
+        }
+    }
+    let (bytes, actual_sha) =
+        read_and_hash_bounded(&blob_path, meta_len, MAX_SINGLE_ARTIFACT_BYTES)?;
+    if &actual_sha != expected_digest.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} CAS blob SHA-256 mismatch for {expected_digest}"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Load and cryptographically verify a checkpoint model from `runs/<run_id>/blobs/sha256/<hex_digest>`
 /// into `template`.
 ///
@@ -336,28 +380,7 @@ pub fn get_verified_checkpoint_model<M: SwarmModel>(
     expected_digest: &CheckpointContentDigestV1,
     expected_param_count: usize,
 ) -> io::Result<M> {
-    let blob_path = run_dir
-        .join("blobs")
-        .join("sha256")
-        .join(expected_digest.to_hex());
-    if !blob_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("checkpoint CAS blob not found: {}", blob_path.display()),
-        ));
-    }
-    let meta_len = std::fs::metadata(&blob_path)?.len();
-    let (bytes, actual_sha) =
-        read_and_hash_bounded(&blob_path, meta_len, MAX_SINGLE_ARTIFACT_BYTES)?;
-    if &actual_sha != expected_digest.as_bytes() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "checkpoint CAS blob SHA-256 mismatch for {}",
-                expected_digest
-            ),
-        ));
-    }
+    let bytes = read_cas_blob_verified(run_dir, expected_digest, None, "checkpoint")?;
     let state = swarm_torch_models::ModelState::from_bytes(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     if state.version != 1 {
@@ -413,15 +436,19 @@ pub fn verify_cas_uri_exists(
     })?;
     let hex_str = hex_lower(&expected_sha);
     let blob_path = run_dir.join("blobs").join("sha256").join(&hex_str);
-    if !blob_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("CAS blob missing on disk: {}", blob_path.display()),
-        ));
-    }
+    let (_file, meta_len) = open_regular_no_symlink(&blob_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("CAS blob missing on disk: {}", blob_path.display()),
+            )
+        } else {
+            e
+        }
+    })?;
     let len = match expected_bytes {
         Some(b) => b,
-        None => std::fs::metadata(&blob_path)?.len(),
+        None => meta_len,
     };
     let (_, actual_sha) = read_and_hash_bounded(&blob_path, len, MAX_SINGLE_ARTIFACT_BYTES)?;
     if actual_sha != expected_sha {
@@ -443,8 +470,10 @@ pub fn write_round_resume_state(run_dir: &Path, state: &RoundResumeStateV1) -> i
 /// verifying that its referenced physical CAS blob exists and matches `state.content_digest`.
 pub fn read_verified_round_resume_state(run_dir: &Path) -> io::Result<Option<RoundResumeStateV1>> {
     let path = run_dir.join(ROUND_RESUME_STATE_REL_PATH);
-    if !path.exists() {
-        return Ok(None);
+    match open_regular_no_symlink(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     }
     let state: RoundResumeStateV1 = read_json(&path)?;
     if state.schema_version != ROUND_RESUME_STATE_SCHEMA_V1 {
@@ -504,35 +533,7 @@ pub(crate) fn get_verified_json_cas_blob<T: serde::de::DeserializeOwned>(
     expected_bytes: Option<u64>,
     label: &str,
 ) -> io::Result<T> {
-    let blob_path = run_dir
-        .join("blobs")
-        .join("sha256")
-        .join(expected_digest.to_hex());
-    if !blob_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{label} CAS blob not found: {}", blob_path.display()),
-        ));
-    }
-    let meta_len = std::fs::metadata(&blob_path)?.len();
-    if let Some(exp_bytes) = expected_bytes {
-        if meta_len != exp_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{label} CAS blob byte size mismatch: expected {exp_bytes}, got {meta_len}"
-                ),
-            ));
-        }
-    }
-    let (bytes, actual_sha) =
-        read_and_hash_bounded(&blob_path, meta_len, MAX_SINGLE_ARTIFACT_BYTES)?;
-    if &actual_sha != expected_digest.as_bytes() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} CAS blob SHA-256 mismatch for {expected_digest}"),
-        ));
-    }
+    let bytes = read_cas_blob_verified(run_dir, expected_digest, expected_bytes, label)?;
     parse_json_slice(&bytes)
 }
 
@@ -724,12 +725,16 @@ pub(crate) fn write_archived_generation_manifest_bytes(
 /// (`ST-04`), returning `NotFound` if absent.
 pub fn read_committed_head_v1(run_dir: &Path) -> io::Result<CommittedHeadV1> {
     let path = run_dir.join(COMMITTED_HEAD_REL_PATH);
-    if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("committed head pointer not found: {}", path.display()),
-        ));
-    }
+    let (_file, _len) = open_regular_no_symlink(&path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("committed head pointer not found: {}", path.display()),
+            )
+        } else {
+            e
+        }
+    })?;
     let head: CommittedHeadV1 = read_json(&path)?;
     if head.schema_version != COMMITTED_HEAD_SCHEMA_V1 {
         return Err(io::Error::new(
@@ -797,32 +802,7 @@ fn read_verified_safetensors_blob(
     run_dir: &Path,
     expected_digest: &CheckpointContentDigestV1,
 ) -> io::Result<Vec<u8>> {
-    let blob_path = run_dir
-        .join("blobs")
-        .join("sha256")
-        .join(expected_digest.to_hex());
-    if !blob_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "SafeTensors checkpoint CAS blob not found: {}",
-                blob_path.display()
-            ),
-        ));
-    }
-    let meta_len = std::fs::metadata(&blob_path)?.len();
-    let (bytes, actual_sha) =
-        read_and_hash_bounded(&blob_path, meta_len, MAX_SINGLE_ARTIFACT_BYTES)?;
-    if &actual_sha != expected_digest.as_bytes() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "SafeTensors checkpoint CAS blob SHA-256 mismatch for {}",
-                expected_digest
-            ),
-        ));
-    }
-    Ok(bytes)
+    read_cas_blob_verified(run_dir, expected_digest, None, "SafeTensors checkpoint")
 }
 
 /// Load and cryptographically verify a `SwarmTorchCheckpointV1` SafeTensors v1 checkpoint from

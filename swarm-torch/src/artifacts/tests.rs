@@ -3683,3 +3683,613 @@ fn st05_ndjson_durability_policy_and_sink_write_graph_unlocked() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn st15_session_cache_blocks_trust_laundering_invalidates_outputs_and_rejects_uppercase_hex() {
+    let base = temp_dir("st15_session_trust_and_hex");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0xC1; 16]);
+    let mut session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+
+    // Register an initial trusted input dataset:
+    let ingest = make_source_node("ingest/raw");
+    session
+        .register_source(
+            "dataset://ns/raw",
+            TrustClass::Trusted,
+            SourceDescriptorV0 {
+                uri: "http://trusted/raw".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                etag_or_version: None,
+            },
+            None,
+            &ingest,
+        )
+        .unwrap();
+
+    // Materialize a SandboxedExtension node -> output is Untrusted under sandbox profile:
+    let mut node = make_transform_node(
+        "transform/norm",
+        &["dataset://ns/raw"],
+        &["dataset://ns/clean"],
+        ExecutionTrust::SandboxedExtension,
+    );
+    let mat_outputs = vec![OutputSpec {
+        asset_key: "dataset://ns/clean".to_string(),
+        schema: None,
+        rows: Some(10),
+        bytes: Some(100),
+    }];
+    let core_outputs = vec![OutputSpecCore {
+        asset_key: "dataset://ns/clean".to_string(),
+        schema: None,
+    }];
+    session
+        .materialize_node_outputs(&node, &mat_outputs, 100, CacheDecisionV0::Miss, 1)
+        .unwrap();
+    assert_eq!(
+        session.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Hit
+    );
+
+    // Switching execution_trust to Core OR UnsafeExtension MUST NOT return a cache hit!
+    node.execution_trust = ExecutionTrust::Core;
+    assert_eq!(
+        session.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Miss
+    );
+    node.execution_trust = ExecutionTrust::UnsafeExtension;
+    assert_eq!(
+        session.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Miss
+    );
+
+    // Invalidating node outputs removes them cleanly and yields Miss:
+    node.execution_trust = ExecutionTrust::SandboxedExtension;
+    session.invalidate_node_outputs(&node).unwrap();
+    assert_eq!(
+        session.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Miss
+    );
+
+    // Uppercase hex must fail strict lowercase fingerprint parsing in CAS:
+    assert!(
+        super::cas::parse_cas_uri_digest(&format!("cas://sha256/{}", "A".repeat(64))).is_none()
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st15_verify_committed_head_rejects_tampered_idle_lineage_snapshot() {
+    use crate::coordinator::{
+        RoundCoordinatorConfig, SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
+    };
+    use swarm_torch_core::aggregation::RobustAggregation;
+    use swarm_torch_models::simple::LinearModel;
+
+    let base = temp_dir("st15_tampered_idle_lineage");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0xC2; 16]);
+
+    let mut session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+    let model = LinearModel::new(1, 1).unwrap();
+    let authorized_peer = swarm_torch_core::crypto::KeyPair::from_seed([0xC4; 32])
+        .unwrap()
+        .peer_id();
+    let config = RoundCoordinatorConfig {
+        update_kind: UpdateKindV1::ModelDeltaV1 {
+            server_learning_rate: 1.0,
+        },
+        aggregation: RobustAggregation::FedAvg,
+        weighting_policy: WeightingPolicyV1::EqualPeerVote,
+        authorized_cohort: [authorized_peer].into_iter().collect(),
+        min_quorum: 1,
+        max_staleness: 0,
+        max_clock_skew_secs: 60,
+    };
+    let _coord =
+        SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
+    drop(session);
+
+    // Modify `datasets/lineage.json` on an idle committed bundle (no uncommitted NDJSON tail):
+    let lineage_path = run_dir.join("datasets").join("lineage.json");
+    let mut bytes = fs::read(&lineage_path).unwrap();
+    bytes.push(b'\n');
+    fs::write(&lineage_path, &bytes).unwrap();
+
+    let bundle = RunArtifactBundle::open(&run_dir).unwrap();
+    let err = bundle
+        .verify_committed_head(&TrustPolicy::LegacyPermissive)
+        .expect_err(
+            "tampered datasets/lineage.json on idle bundle must fail verify_committed_head",
+        );
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st15_uppercase_hex_unbound_cas_reopened_cache_laundering_and_dp_head_fail_closed() {
+    use super::cas::{
+        read_committed_head_v1, CheckpointContentDigestV1, CheckpointRecipeKeyV1, CommittedHeadV1,
+        COMMITTED_HEAD_SCHEMA_V1,
+    };
+    use super::dp_ledger::{
+        parse_and_validate_dp_ledger_slice, pre_release_debit_dp_accountant,
+        reconstruct_dp_accountant_from_committed_head, DP_LEDGER_REL_PATH,
+    };
+    use swarm_torch_core::dp::{
+        DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+        PrivacyAccountingClassificationV1, RdpAccountantV1,
+    };
+
+    // 1. Canonical lowercase hex enforcement across CAS / committed_head / dp_ledger.
+    let upper = "AA".repeat(32);
+    assert!(CheckpointContentDigestV1::from_hex(&upper).is_err());
+    assert!(CheckpointRecipeKeyV1::from_hex(&upper).is_err());
+
+    let base = temp_dir("st15_adversarial_edge");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0xC5; 16]);
+    let mut session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+    let ingest = make_source_node("ingest/raw");
+    session
+        .register_source(
+            "dataset://ns/raw",
+            TrustClass::Trusted,
+            SourceDescriptorV0 {
+                uri: "http://trusted/raw".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                etag_or_version: None,
+            },
+            None,
+            &ingest,
+        )
+        .unwrap();
+
+    let mut node = make_transform_node(
+        "transform/ext",
+        &["dataset://ns/raw"],
+        &["dataset://ns/ext_out"],
+        ExecutionTrust::SandboxedExtension,
+    );
+    let mat_outputs = vec![OutputSpec {
+        asset_key: "dataset://ns/ext_out".to_string(),
+        schema: None,
+        rows: Some(4),
+        bytes: Some(32),
+    }];
+    let core_outputs = vec![OutputSpecCore {
+        asset_key: "dataset://ns/ext_out".to_string(),
+        schema: None,
+    }];
+
+    // 2. Atomic CAS binding validation rejects missing CAS blob without mutating registry!
+    let mut bad_bindings = std::collections::BTreeMap::new();
+    bad_bindings.insert(
+        "dataset://ns/ext_out".to_string(),
+        (
+            format!("cas://sha256/{}", "ab".repeat(32)),
+            "application/octet-stream".to_string(),
+        ),
+    );
+    assert!(session
+        .materialize_node_outputs_with_cas_bindings(
+            &node,
+            &mat_outputs,
+            &bad_bindings,
+            100,
+            CacheDecisionV0::Miss,
+            1,
+        )
+        .is_err());
+    assert!(session.fingerprint("dataset://ns/ext_out").is_none());
+
+    // Empty content_type binding also fails closed before mutation.
+    let blob_payload = b"verified-output-bytes";
+    let digest: [u8; 32] = {
+        use sha2::Digest;
+        sha2::Sha256::digest(blob_payload).into()
+    };
+    super::io::write_once_cas_blob(&run_dir, &digest, blob_payload).unwrap();
+    bad_bindings.insert(
+        "dataset://ns/ext_out".to_string(),
+        (
+            format!("cas://sha256/{}", hex_lower(&digest)),
+            String::new(),
+        ),
+    );
+    assert!(session
+        .materialize_node_outputs_with_cas_bindings(
+            &node,
+            &mat_outputs,
+            &bad_bindings,
+            100,
+            CacheDecisionV0::Miss,
+            1,
+        )
+        .is_err());
+    assert!(session.fingerprint("dataset://ns/ext_out").is_none());
+
+    // Valid atomic CAS binding succeeds, and survives DataOpsSession reopen while still blocking
+    // SandboxedExtension <-> UnsafeExtension <-> Core cache laundering!
+    let mut good_bindings = std::collections::BTreeMap::new();
+    good_bindings.insert(
+        "dataset://ns/ext_out".to_string(),
+        (
+            format!("cas://sha256/{}", hex_lower(&digest)),
+            "application/octet-stream".to_string(),
+        ),
+    );
+    session
+        .materialize_node_outputs_with_cas_bindings(
+            &node,
+            &mat_outputs,
+            &good_bindings,
+            100,
+            CacheDecisionV0::Miss,
+            1,
+        )
+        .unwrap();
+    drop(session);
+
+    let reopened = DataOpsSession::open(
+        &run_dir,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Hit
+    );
+    node.execution_trust = ExecutionTrust::UnsafeExtension;
+    assert_eq!(
+        reopened.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Miss
+    );
+    node.execution_trust = ExecutionTrust::Core;
+    assert_eq!(
+        reopened.verify_cache_hit(&node, &core_outputs).unwrap(),
+        CacheDecisionV0::Miss
+    );
+    drop(reopened);
+
+    // 3. committed_head.json rejects uppercase manifest_sha256.
+    let bad_head = CommittedHeadV1 {
+        schema_version: COMMITTED_HEAD_SCHEMA_V1,
+        run_id,
+        generation: 1,
+        round_id: 1,
+        manifest_sha256: "AA".repeat(32),
+        resume_state_cas_uri: format!("cas://sha256/{}", "bb".repeat(32)),
+        committed_unix_nanos: 1,
+    };
+    super::cas::write_committed_head_v1(&run_dir, &bad_head).unwrap();
+    assert_eq!(
+        read_committed_head_v1(&run_dir).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    // 4. reconstruct_dp_accountant_from_committed_head rejects unexpected tail when
+    // after_cas_crash_tail_allowed == false and rejects uppercase hex in dp/ledger.ndjson.
+    let dp_profile = DpMechanismProfileV1 {
+        unit: DpUnitV1::ClientLevel,
+        adjacency: DpAdjacencyV1::AddRemoveOne,
+        clipping_radius_tau: 1.0,
+        noise_multiplier: 1.5,
+        target_delta: 1e-5,
+        max_epsilon: 10.0,
+        conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+        classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+    };
+    let mut acc = RdpAccountantV1::new(dp_profile).unwrap();
+    pre_release_debit_dp_accountant(
+        &run_dir,
+        run_id,
+        1,
+        &"00".repeat(32),
+        &mut acc,
+        1.0,
+        0.5,
+        10,
+    )
+    .unwrap();
+    let bundle = RunArtifactBundle::open(&run_dir).unwrap();
+    let manifest_r1 = bundle
+        .finalize_signed_manifest(
+            &swarm_torch_core::crypto::KeyPair::from_seed([0xC6; 32]).unwrap(),
+        )
+        .unwrap();
+    pre_release_debit_dp_accountant(
+        &run_dir,
+        run_id,
+        2,
+        &"11".repeat(32),
+        &mut acc,
+        1.0,
+        0.5,
+        20,
+    )
+    .unwrap();
+    assert!(
+        reconstruct_dp_accountant_from_committed_head(&bundle, &manifest_r1, dp_profile, false)
+            .is_err(),
+        "uncommitted DP ledger tail must fail when after_cas_crash_tail_allowed == false"
+    );
+    let ledger_raw = fs::read_to_string(run_dir.join(DP_LEDGER_REL_PATH)).unwrap();
+    let upper_ledger = ledger_raw.replace(&"00".repeat(32), &"0A".repeat(32));
+    assert!(parse_and_validate_dp_ledger_slice(upper_ledger.as_bytes()).is_err());
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st15_verify_committed_head_rejects_newline_tail_snapshot_tamper_symlink_manifest_and_dangling_symlink(
+) {
+    use crate::coordinator::{
+        RoundCoordinatorConfig, SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
+    };
+    use swarm_torch_core::aggregation::RobustAggregation;
+    use swarm_torch_core::crypto::KeyPair;
+    use swarm_torch_models::simple::LinearModel;
+
+    let base = temp_dir("st15_head_tamper_and_symlink");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0xC7; 16]);
+    let signer = KeyPair::from_seed([0xC8; 32]).unwrap();
+    let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+
+    let mut session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+    let peer = KeyPair::from_seed([0xC9; 32]).unwrap().peer_id();
+    let cfg = RoundCoordinatorConfig {
+        update_kind: UpdateKindV1::ModelDeltaV1 {
+            server_learning_rate: 1.0,
+        },
+        aggregation: RobustAggregation::FedAvg,
+        weighting_policy: WeightingPolicyV1::EqualPeerVote,
+        authorized_cohort: [peer].into_iter().collect(),
+        min_quorum: 1,
+        max_staleness: 0,
+        max_clock_skew_secs: 60,
+    };
+    let _coord = SwarmRoundCoordinator::initialize(
+        run_id,
+        cfg,
+        LinearModel::new(1, 1).unwrap(),
+        &mut session,
+        1_000,
+    )
+    .unwrap();
+    drop(session);
+
+    let bundle = RunArtifactBundle::open(&run_dir).unwrap();
+    let signed_manifest = bundle.finalize_signed_manifest(&signer).unwrap();
+    let manifest_sha = {
+        use sha2::Digest;
+        hex_lower(&sha2::Sha256::digest(
+            serde_json::to_vec_pretty(&signed_manifest).unwrap(),
+        ))
+    };
+    let mut head = super::cas::read_committed_head_v1(&run_dir).unwrap();
+    head.manifest_sha256 = manifest_sha;
+    super::cas::write_committed_head_v1(&run_dir, &head).unwrap();
+
+    // 1. Appending `\n` to `datasets/materializations.ndjson` + tampering `datasets/lineage.json`
+    //    MUST NOT activate crash-recovery snapshot exemption -> fails with InvalidData!
+    let mat_path = run_dir.join("datasets").join("materializations.ndjson");
+    let orig_mat = fs::read(&mat_path).unwrap();
+    let mut nl_mat = orig_mat.clone();
+    nl_mat.push(b'\n');
+    fs::write(&mat_path, &nl_mat).unwrap();
+    let lin_path = run_dir.join("datasets").join("lineage.json");
+    let orig_lin = fs::read(&lin_path).unwrap();
+    let mut bad_lin = orig_lin.clone();
+    bad_lin.push(b'\n');
+    fs::write(&lin_path, &bad_lin).unwrap();
+
+    assert_eq!(
+        bundle
+            .verify_committed_head(&strict_policy)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    fs::write(&mat_path, &orig_mat).unwrap();
+    fs::write(&lin_path, &orig_lin).unwrap();
+
+    // 2. Replacing `manifest.json` with a symlink MUST fail closed with InvalidData (not crash-recover!).
+    let manifest_path = run_dir.join("manifest.json");
+    let orig_manifest_bytes = fs::read(&manifest_path).unwrap();
+    let outside_manifest = base.join("outside_manifest.json");
+    fs::write(&outside_manifest, &orig_manifest_bytes).unwrap();
+    fs::remove_file(&manifest_path).unwrap();
+    #[cfg(unix)]
+    let sym_ok = std::os::unix::fs::symlink(&outside_manifest, &manifest_path).is_ok();
+    #[cfg(windows)]
+    let sym_ok = std::os::windows::fs::symlink_file(&outside_manifest, &manifest_path).is_ok();
+    if sym_ok {
+        assert_eq!(
+            bundle
+                .verify_committed_head(&strict_policy)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let _ = fs::remove_file(&manifest_path);
+    }
+    fs::write(&manifest_path, &orig_manifest_bytes).unwrap();
+
+    // 3. Replacing a manifest-listed file with a dangling symlink returns InvalidData, not NotFound!
+    let dangling_target = base.join("does_not_exist_target.bin");
+    let link_path = run_dir.join("datasets").join("escape_dangling");
+    #[cfg(unix)]
+    let d_ok = std::os::unix::fs::symlink(&dangling_target, &link_path).is_ok();
+    #[cfg(windows)]
+    let d_ok = std::os::windows::fs::symlink_file(&dangling_target, &link_path).is_ok();
+    if d_ok {
+        let mut m_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        m_json["signature"] = serde_json::Value::Null;
+        let mut entries_arr = m_json["entries"].as_array().cloned().unwrap();
+        let mut extra = entries_arr[0].clone();
+        extra["path"] = serde_json::Value::String("datasets/escape_dangling".to_string());
+        extra["required"] = serde_json::Value::Bool(false);
+        entries_arr.push(extra);
+        m_json["entries"] = serde_json::Value::Array(entries_arr);
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&m_json).unwrap()).unwrap();
+        let err = bundle.validate_manifest().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "dangling symlink should return InvalidData, got {err:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn st15_bundle_create_rejects_dangling_symlink_and_verify_head_rejects_oversized_or_symlinked_archive(
+) {
+    use crate::coordinator::{
+        RoundCoordinatorConfig, SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
+    };
+    use swarm_torch_core::aggregation::RobustAggregation;
+    use swarm_torch_core::crypto::KeyPair;
+    use swarm_torch_models::simple::LinearModel;
+
+    let base = temp_dir("st15_dangling_create_and_oversized_manifest");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("runs")).unwrap();
+
+    let run_id = RunId::from_bytes([0xC9; 16]);
+    let symlink_run_dir = base.join("runs").join(run_id.to_string());
+    let missing_target = base.join("missing_bundle_target");
+
+    #[cfg(unix)]
+    let link_ok = std::os::unix::fs::symlink(&missing_target, &symlink_run_dir).is_ok();
+    #[cfg(windows)]
+    let link_ok = std::os::windows::fs::symlink_dir(&missing_target, &symlink_run_dir).is_ok();
+    if link_ok {
+        let err = RunArtifactBundle::create(&base, run_id).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "RunArtifactBundle::create must fail closed on dangling symlink, got {err:?}"
+        );
+        #[cfg(unix)]
+        let _ = fs::remove_file(&symlink_run_dir);
+        #[cfg(windows)]
+        let _ = fs::remove_dir(&symlink_run_dir);
+    }
+
+    // Now test oversized manifest.json and symlinked archived manifest in verify_committed_head.
+    let head_base = base.join("head_test");
+    fs::create_dir_all(&head_base).unwrap();
+    let signer = KeyPair::from_seed([0xCA; 32]).unwrap();
+    let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+    let mut session = DataOpsSession::create(
+        &head_base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+    let peer = KeyPair::from_seed([0xCB; 32]).unwrap().peer_id();
+    let cfg = RoundCoordinatorConfig {
+        update_kind: UpdateKindV1::ModelDeltaV1 {
+            server_learning_rate: 1.0,
+        },
+        aggregation: RobustAggregation::FedAvg,
+        weighting_policy: WeightingPolicyV1::EqualPeerVote,
+        authorized_cohort: [peer].into_iter().collect(),
+        min_quorum: 1,
+        max_staleness: 0,
+        max_clock_skew_secs: 60,
+    };
+    let _coord = SwarmRoundCoordinator::initialize(
+        run_id,
+        cfg,
+        LinearModel::new(1, 1).unwrap(),
+        &mut session,
+        1_000,
+    )
+    .unwrap();
+    drop(session);
+
+    let bundle = RunArtifactBundle::open(&run_dir).unwrap();
+    let signed_manifest = bundle.finalize_signed_manifest(&signer).unwrap();
+    let signed_bytes = serde_json::to_vec_pretty(&signed_manifest).unwrap();
+    let signed_sha = {
+        use sha2::Digest;
+        hex_lower(&sha2::Sha256::digest(&signed_bytes))
+    };
+    let mut head = super::cas::read_committed_head_v1(&run_dir).unwrap();
+    head.manifest_sha256 = signed_sha;
+    super::cas::write_committed_head_v1(&run_dir, &head).unwrap();
+    super::cas::write_archived_generation_manifest_bytes(&run_dir, head.generation, &signed_bytes)
+        .unwrap();
+
+    // 1. Oversized manifest.json (> MAX_MANIFEST_BYTES) MUST fail closed instead of unbounded streaming.
+    let manifest_path = run_dir.join("manifest.json");
+    let oversized = vec![b' '; (MAX_MANIFEST_BYTES as usize) + 1];
+    fs::write(&manifest_path, &oversized).unwrap();
+    let oversized_err = bundle.verify_committed_head(&strict_policy).unwrap_err();
+    assert_eq!(oversized_err.kind(), io::ErrorKind::InvalidData);
+
+    // 2. Missing manifest.json + symlinked archived generation manifest MUST fail closed with InvalidData.
+    fs::remove_file(&manifest_path).unwrap();
+    let archive_rel = super::cas::committed_manifest_archive_rel_path(head.generation);
+    let archive_path = run_dir.join(&archive_rel);
+    let outside_archive = base.join("outside_archive.json");
+    fs::write(&outside_archive, &signed_bytes).unwrap();
+    fs::remove_file(&archive_path).unwrap();
+    #[cfg(unix)]
+    let arch_sym_ok = std::os::unix::fs::symlink(&outside_archive, &archive_path).is_ok();
+    #[cfg(windows)]
+    let arch_sym_ok = std::os::windows::fs::symlink_file(&outside_archive, &archive_path).is_ok();
+    if arch_sym_ok {
+        let arch_err = bundle.verify_committed_head(&strict_policy).unwrap_err();
+        assert_eq!(arch_err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}

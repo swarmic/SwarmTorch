@@ -20,14 +20,87 @@ pub const MAX_NDJSON_LINES: usize = 250_000;
 
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) fn reject_if_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to follow symlink at {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn path_is_present_no_symlink(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to follow symlink at {}", path.display()),
+        )),
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn reject_existing_parent_symlink(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            reject_if_symlink(parent)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_path_or_parent_symlink(path: &Path) -> io::Result<()> {
+    reject_existing_parent_symlink(path)?;
+    reject_if_symlink(path)
+}
+
+pub(crate) fn open_regular_no_symlink(path: &Path) -> io::Result<(File, u64)> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to follow symlink at {}", path.display()),
+        ));
+    }
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected regular file at {}", path.display()),
+        ));
+    }
+    let file = File::open(path)?;
+    let opened_meta = file.metadata()?;
+    if !opened_meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("opened path {} is not a regular file", path.display()),
+        ));
+    }
+    Ok((file, opened_meta.len()))
+}
+
 pub(crate) fn ensure_file(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        return Ok(());
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("refusing symlink or non-regular file at {}", path.display()),
+                ));
+            }
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let f = File::create(path)?;
+    let f = OpenOptions::new().write(true).create_new(true).open(path)?;
     f.sync_all()?;
     sync_parent_dir(path)?;
     Ok(())
@@ -91,8 +164,7 @@ pub(crate) fn parse_ndjson_slice_bounded<T: serde::de::DeserializeOwned>(
 
 /// Read a file into memory enforcing a hard pre-allocation and streaming byte cap (`max_bytes`).
 pub(crate) fn read_bytes_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let meta_len = file.metadata()?.len();
+    let (file, meta_len) = open_regular_no_symlink(path)?;
     if meta_len > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -138,8 +210,7 @@ pub(crate) fn read_and_hash_bounded(
             ),
         ));
     }
-    let file = File::open(path)?;
-    let meta_len = file.metadata()?.len();
+    let (file, meta_len) = open_regular_no_symlink(path)?;
     if meta_len != expected_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -213,11 +284,13 @@ pub(crate) fn append_ndjson_with_policy<T: serde::Serialize>(
     record: &T,
     policy: DurabilityPolicyV1,
 ) -> io::Result<()> {
+    reject_existing_parent_symlink(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
+    reject_if_symlink(path)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(record).map_err(io::Error::other)?;
     let mut buf = line.into_bytes();
@@ -275,7 +348,7 @@ pub(crate) fn rel_path_string(path: &Path, base: &Path) -> io::Result<String> {
 }
 
 pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
-    let mut file = File::open(path)?;
+    let (mut file, _len) = open_regular_no_symlink(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -333,8 +406,11 @@ fn next_unique_staging_path(target_path: &Path) -> io::Result<PathBuf> {
 
 /// Write `bytes` to a unique staging file, check `sync_all()`, rename to `path`, and sync parent dir.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    reject_path_or_parent_symlink(path)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
     }
 
     let tmp_path = next_unique_staging_path(path)?;
@@ -512,7 +588,12 @@ pub(crate) fn decode_hex_exact<const N: usize>(s: &str) -> io::Result<[u8; N]> {
         let hi = match bytes[i * 2] {
             b'0'..=b'9' => bytes[i * 2] - b'0',
             b'a'..=b'f' => bytes[i * 2] - b'a' + 10,
-            b'A'..=b'F' => bytes[i * 2] - b'A' + 10,
+            b'A'..=b'F' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uppercase hex character rejected; canonical lowercase hex required",
+                ))
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -523,7 +604,12 @@ pub(crate) fn decode_hex_exact<const N: usize>(s: &str) -> io::Result<[u8; N]> {
         let lo = match bytes[i * 2 + 1] {
             b'0'..=b'9' => bytes[i * 2 + 1] - b'0',
             b'a'..=b'f' => bytes[i * 2 + 1] - b'a' + 10,
-            b'A'..=b'F' => bytes[i * 2 + 1] - b'A' + 10,
+            b'A'..=b'F' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uppercase hex character rejected; canonical lowercase hex required",
+                ))
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -534,4 +620,9 @@ pub(crate) fn decode_hex_exact<const N: usize>(s: &str) -> io::Result<[u8; N]> {
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
+}
+
+/// Strictly decode a canonical 64-character lowercase Ed25519 verifying key hex string (`ST-15A`).
+pub fn parse_ed25519_public_key_hex(hex: &str) -> Result<[u8; 32], String> {
+    decode_hex_exact::<32>(hex).map_err(|e| e.to_string())
 }

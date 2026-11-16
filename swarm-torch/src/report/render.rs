@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::fs;
 
 use swarm_torch_core::run_graph::{GraphV1, NodeId};
 
@@ -8,7 +7,10 @@ use super::model::{
     build_registry_trust_index, format_transform_names, format_unsafe_reasons,
     is_node_unsafe_with_index, Report,
 };
-use crate::artifacts::{hex_lower, TrustPolicy, VerificationStatus};
+use crate::artifacts::{
+    hex_lower, reject_path_or_parent_symlink, write_bytes_atomic_no_symlink, TrustPolicy,
+    VerificationStatus,
+};
 
 pub fn generate_report_html(
     run_dir: impl AsRef<std::path::Path>,
@@ -16,7 +18,7 @@ pub fn generate_report_html(
 ) -> std::io::Result<()> {
     let report = load_report(run_dir)?;
     let html = render_html(&report);
-    fs::write(out_path, html)
+    write_bytes_atomic_no_symlink(out_path.as_ref(), html.as_bytes())
 }
 
 /// Generate HTML report enforcing the caller-supplied [`TrustPolicy`] (`AR-14-02`).
@@ -27,7 +29,7 @@ pub fn generate_report_html_with_policy(
 ) -> std::io::Result<()> {
     let (report, _) = load_report_with_policy(run_dir, policy)?;
     let html = render_html(&report);
-    fs::write(out_path, html)
+    write_bytes_atomic_no_symlink(out_path.as_ref(), html.as_bytes())
 }
 
 /// Generate report with optional JSON output.
@@ -50,11 +52,18 @@ pub fn generate_report_with_policy(
 ) -> std::io::Result<()> {
     let (report, _) = load_report_with_policy(&run_dir, policy)?;
     let html = render_html(&report);
-    fs::write(&html_out, html)?;
+    let json_payload = match json_out.as_ref() {
+        Some(json_path) => {
+            reject_path_or_parent_symlink(json_path.as_ref())?;
+            Some(serde_json::to_string_pretty(&report).map_err(std::io::Error::other)?)
+        }
+        None => None,
+    };
+    reject_path_or_parent_symlink(html_out.as_ref())?;
+    write_bytes_atomic_no_symlink(html_out.as_ref(), html.as_bytes())?;
 
-    if let Some(json_path) = json_out {
-        let json = serde_json::to_string_pretty(&report).map_err(std::io::Error::other)?;
-        fs::write(json_path, json)?;
+    if let (Some(json_path), Some(json)) = (json_out, json_payload) {
+        write_bytes_atomic_no_symlink(json_path.as_ref(), json.as_bytes())?;
     }
 
     Ok(())

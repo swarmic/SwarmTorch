@@ -957,3 +957,217 @@ fn generate_report_with_policy_enforces_strict_signature_and_surfaces_dp_classif
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn load_report_rejects_invalid_graph_or_non_finite_metric_and_render_refuses_symlinks() {
+    use crate::artifacts::TrustPolicy;
+    use crate::report::{generate_report_html_with_policy, generate_report_with_policy};
+    use swarm_torch_core::run_graph::{GraphV1, MAX_NODE_KEY_LEN};
+
+    let base = temp_dir("report_validates_graph_and_metrics");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0x67; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    // 1a. Corrupt `graph.json` with an oversized node_key (`validate_node_v1` must reject).
+    let oversized_key_graph = GraphV1 {
+        schema_version: 1,
+        graph_id: Some("bad-node-key".to_string()),
+        nodes: vec![make_node(
+            &"k".repeat(MAX_NODE_KEY_LEN + 1),
+            ExecutionTrust::Core,
+            &[],
+        )],
+        edges: vec![],
+    };
+    fs::write(
+        bundle.run_dir().join("graph.json"),
+        serde_json::to_vec_pretty(&oversized_key_graph).unwrap(),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    let err = load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+        .expect_err("oversized graph node_key must fail report load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+    // 1b. Duplicate node_key in `graph.json` (`validate_graph_v1` must reject).
+    let dup_key_graph = GraphV1 {
+        schema_version: 1,
+        graph_id: Some("dup-node-key".to_string()),
+        nodes: vec![
+            make_node("dup/node", ExecutionTrust::Core, &[]),
+            make_node("dup/node", ExecutionTrust::Core, &[]),
+        ],
+        edges: vec![],
+    };
+    fs::write(
+        bundle.run_dir().join("graph.json"),
+        serde_json::to_vec_pretty(&dup_key_graph).unwrap(),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    let err = load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+        .expect_err("duplicate graph node_key must fail report load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+    // 2. Restore valid graph, then inject `schema_version: 99` metric -> must fail closed.
+    bundle.write_graph(&GraphV1::default()).unwrap();
+    fs::write(
+        bundle.run_dir().join("metrics.ndjson"),
+        format!(
+            "{{\"schema_version\":99,\"ts_unix_nanos\":1,\"trace_id\":\"{}\",\"span_id\":null,\"name\":\"loss\",\"value\":0.5,\"unit\":null,\"attrs\":{{}}}}\n",
+            "11".repeat(16)
+        ),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    let err = load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+        .expect_err("unsupported metric schema_version must fail report load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+    // 3. Valid empty metrics + report render refuses existing output symlink on HTML and JSON targets.
+    fs::write(bundle.run_dir().join("metrics.ndjson"), b"").unwrap();
+    bundle.finalize_manifest().unwrap();
+
+    let outside_target = base.join("outside_sink.txt");
+    fs::write(&outside_target, b"keep-me").unwrap();
+    let symlink_out = base.join("report_link.html");
+    let valid_html_out = base.join("valid_report.html");
+    #[cfg(unix)]
+    let link_created = std::os::unix::fs::symlink(&outside_target, &symlink_out).is_ok();
+    #[cfg(windows)]
+    let link_created = std::os::windows::fs::symlink_file(&outside_target, &symlink_out).is_ok();
+
+    if link_created {
+        let html_err = generate_report_html_with_policy(
+            bundle.run_dir(),
+            &symlink_out,
+            &TrustPolicy::LegacyPermissive,
+        )
+        .expect_err("generate_report_html_with_policy must refuse symlink output");
+        assert_eq!(html_err.kind(), std::io::ErrorKind::InvalidData);
+        let json_err = generate_report_with_policy(
+            bundle.run_dir(),
+            &valid_html_out,
+            Some(&symlink_out),
+            &TrustPolicy::LegacyPermissive,
+        )
+        .expect_err("generate_report_with_policy must refuse symlink JSON output");
+        assert_eq!(json_err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&outside_target).unwrap(), b"keep-me");
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn load_report_rejects_bad_span_event_schema_and_oversized_unit() {
+    use crate::artifacts::TrustPolicy;
+    use swarm_torch_core::observe::MAX_METRIC_UNIT_LEN;
+    use swarm_torch_core::run_graph::GraphV1;
+
+    let base = temp_dir("report_span_event_unit");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0x68; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    bundle.write_graph(&GraphV1::default()).unwrap();
+
+    // 1. Bad schema_version in spans.ndjson -> fail closed.
+    fs::write(
+        bundle.run_dir().join("spans.ndjson"),
+        format!(
+            "{{\"schema_version\":2,\"trace_id\":\"{}\",\"span_id\":\"{}\",\"parent_span_id\":null,\"name\":\"s\",\"start_unix_nanos\":1,\"end_unix_nanos\":2,\"attrs\":{{}}}}\n",
+            "11".repeat(16),
+            "22".repeat(8),
+        ),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    assert_eq!(
+        load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // 2. Restore empty spans.ndjson, inject bad schema_version in events.ndjson -> fail closed.
+    fs::write(bundle.run_dir().join("spans.ndjson"), b"").unwrap();
+    fs::write(
+        bundle.run_dir().join("events.ndjson"),
+        format!(
+            "{{\"schema_version\":0,\"ts_unix_nanos\":1,\"trace_id\":\"{}\",\"span_id\":null,\"name\":\"ev\",\"attrs\":{{}}}}\n",
+            "11".repeat(16),
+        ),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    assert_eq!(
+        load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // 3. Restore empty events.ndjson, inject oversized metric unit -> fail closed.
+    fs::write(bundle.run_dir().join("events.ndjson"), b"").unwrap();
+    fs::write(
+        bundle.run_dir().join("metrics.ndjson"),
+        format!(
+            "{{\"schema_version\":1,\"ts_unix_nanos\":1,\"trace_id\":\"{}\",\"span_id\":null,\"name\":\"loss\",\"value\":0.1,\"unit\":\"{}\",\"attrs\":{{}}}}\n",
+            "11".repeat(16),
+            "u".repeat(MAX_METRIC_UNIT_LEN + 1),
+        ),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    assert_eq!(
+        load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // 4. Spoofed graph.json schema_version or spoofed node_id MUST fail closed BEFORE normalization.
+    let bad_ver_graph = GraphV1 {
+        schema_version: 99,
+        ..GraphV1::default()
+    };
+    fs::write(bundle.run_dir().join("metrics.ndjson"), b"").unwrap();
+    fs::write(
+        bundle.run_dir().join("graph.json"),
+        serde_json::to_vec_pretty(&bad_ver_graph).unwrap(),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    assert_eq!(
+        load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    let mut bad_node = make_node("spoof/node", ExecutionTrust::Core, &[]);
+    bad_node.node_id = Some(TraceId::from_bytes([0xee; 16]));
+    let bad_id_graph = GraphV1 {
+        schema_version: 1,
+        graph_id: Some("spoofed-node-id".to_string()),
+        nodes: vec![bad_node],
+        edges: vec![],
+    };
+    fs::write(
+        bundle.run_dir().join("graph.json"),
+        serde_json::to_vec_pretty(&bad_id_graph).unwrap(),
+    )
+    .unwrap();
+    bundle.finalize_manifest().unwrap();
+    assert_eq!(
+        load_report_with_policy(bundle.run_dir(), &TrustPolicy::LegacyPermissive)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -34,25 +34,30 @@ pub use cas::{
     COORDINATOR_RESUME_STATE_SCHEMA_V2, HISTORICAL_ANCHORS_BLOB_SCHEMA_V1,
     ROUND_RESUME_STATE_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
 };
+#[allow(deprecated)]
+pub use dp_ledger::reconstruct_dp_accountant_from_ledger;
 pub use dp_ledger::{
     append_dp_release_record_durable, derive_dp_receipt_id, parse_and_validate_dp_ledger_slice,
-    pre_release_debit_dp_accountant, read_dp_ledger_entries, reconstruct_dp_accountant_from_ledger,
-    reconstruct_dp_accountant_from_verified_bundle, CryptoErrorOrIo, DpLedgerEntryV1,
-    DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1, EXPERIMENTAL_DP_CLASSIFICATION_V1,
+    pre_release_debit_dp_accountant, read_dp_ledger_entries,
+    reconstruct_dp_accountant_from_committed_head, reconstruct_dp_accountant_from_verified_bundle,
+    CryptoErrorOrIo, DpLedgerEntryV1, DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1,
+    EXPERIMENTAL_DP_CLASSIFICATION_V1,
 };
+pub(crate) use io::atomic_write as write_bytes_atomic_no_symlink;
 pub use io::{
-    DurabilityPolicyV1, MAX_MANIFEST_BYTES, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,
-    MAX_SINGLE_ARTIFACT_BYTES, MAX_TOTAL_BUNDLE_BYTES,
+    parse_ed25519_public_key_hex, DurabilityPolicyV1, MAX_MANIFEST_BYTES, MAX_NDJSON_LINES,
+    MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES, MAX_TOTAL_BUNDLE_BYTES,
 };
 pub use lock::{BundleLockError, BundleLockGuard, LockAcquisitionPolicy, BUNDLE_LOCK_FILE_NAME};
 pub use session::{DataOpsSession, OutputSpec, PredictError, SessionCommitReceiptV1};
+pub(crate) use session::{SnapshotPairCommitV1, SNAPSHOT_PAIR_SCHEMA_V1};
 pub use sink::{ArtifactWriteProfile, ManifestRefreshPolicy, RunArtifactSink, SnapshotProfile};
 
 #[cfg(test)]
 pub(crate) use io::read_json;
 pub(crate) use io::{
-    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, read_bytes_bounded,
-    write_once_cas_blob,
+    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, path_is_present_no_symlink,
+    read_bytes_bounded, reject_path_or_parent_symlink, write_once_cas_blob,
 };
 
 pub(crate) fn record_validation_error_to_io<E: core::fmt::Display>(e: E) -> std::io::Error {

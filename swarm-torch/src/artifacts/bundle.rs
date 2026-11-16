@@ -10,8 +10,8 @@ use swarm_torch_core::crypto::{
     MANIFEST_SIGNATURE_DOMAIN_TAG_V1,
 };
 use swarm_torch_core::dataops::{
-    DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV1,
-    MaterializationRecordV2,
+    DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
+    MaterializationRecordCompat, MaterializationRecordV1, MaterializationRecordV2,
 };
 use swarm_torch_core::observe::{
     validate_event_record, validate_metric_record, validate_span_record, EventRecord, MetricRecord,
@@ -27,12 +27,15 @@ use super::cas::{
 use super::dp_ledger::DP_LEDGER_REL_PATH;
 use super::io::{
     append_ndjson_with_policy, atomic_write, collect_files_recursive, decode_hex_exact,
-    ensure_file, hex_lower, parse_json_slice, read_and_hash_bounded, read_bytes_bounded, read_json,
-    rel_path_string, sha256_file, sync_parent_dir, write_json_pretty_atomic, DurabilityPolicyV1,
-    MAX_MANIFEST_BYTES, MAX_SINGLE_ARTIFACT_BYTES, MAX_TOTAL_BUNDLE_BYTES,
+    ensure_file, hex_lower, open_regular_no_symlink, parse_json_slice, parse_ndjson_slice_bounded,
+    path_is_present_no_symlink, read_and_hash_bounded, read_bytes_bounded, read_json,
+    reject_if_symlink, rel_path_string, sha256_file, sync_parent_dir, write_json_pretty_atomic,
+    DurabilityPolicyV1, MAX_MANIFEST_BYTES, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,
+    MAX_SINGLE_ARTIFACT_BYTES, MAX_TOTAL_BUNDLE_BYTES,
 };
 use super::lock::{BundleLockGuard, LockAcquisitionPolicy};
 use super::record_validation_error_to_io;
+use super::session::{SnapshotPairCommitV1, SNAPSHOT_PAIR_SCHEMA_V1};
 
 pub const SCHEMA_VERSION_V1: u32 = 1;
 
@@ -317,7 +320,7 @@ impl RunArtifactBundle {
         let run_id_hex = run_id.to_string();
         let run_dir = base.as_ref().join("runs").join(&run_id_hex);
 
-        if run_dir.exists() {
+        if path_is_present_no_symlink(&run_dir)? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "run artifact bundle already exists",
@@ -515,11 +518,12 @@ impl RunArtifactBundle {
     pub fn sync_required_v1(&self) -> io::Result<()> {
         for rel in required_paths_v1() {
             let path = self.run_dir.join(rel);
+            reject_if_symlink(&path)?;
             let f = fs::OpenOptions::new().write(true).open(&path)?;
             f.sync_all()?;
         }
         let dp_ledger_path = self.run_dir.join(DP_LEDGER_REL_PATH);
-        if dp_ledger_path.exists() {
+        if path_is_present_no_symlink(&dp_ledger_path)? {
             let f = fs::OpenOptions::new().write(true).open(&dp_ledger_path)?;
             f.sync_all()?;
             sync_parent_dir(&dp_ledger_path)?;
@@ -557,10 +561,10 @@ impl RunArtifactBundle {
     ) -> io::Result<(ManifestV1, Vec<u8>, String)> {
         let canonical_root = self.run_dir.canonicalize()?;
 
-        // Ensure baseline v1 required files exist and are synced before hashing.
+        // Ensure baseline v1 required files exist and are non-symlinks before hashing.
         for p in required_paths_v1() {
             let full = self.run_dir.join(p);
-            if !full.exists() {
+            if !path_is_present_no_symlink(&full)? {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("missing required bundle file: {p}"),
@@ -753,13 +757,12 @@ impl RunArtifactBundle {
             }
 
             let path = self.run_dir.join(&entry.path);
-            if !path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing file listed in manifest: {}", entry.path),
-                ));
-            }
-            ensure_path_within_bundle(&path, &canonical_root, &entry.path)?;
+            verify_bundle_entry_path(
+                &path,
+                &canonical_root,
+                &entry.path,
+                &format!("missing file listed in manifest: {}", entry.path),
+            )?;
 
             let (bytes, digest) =
                 read_and_hash_bounded(&path, entry.bytes, MAX_SINGLE_ARTIFACT_BYTES)?;
@@ -832,58 +835,74 @@ impl RunArtifactBundle {
             ));
         }
 
+        let canonical_root = self.run_dir.canonicalize()?;
         let manifest_path = self.run_dir.join("manifest.json");
-        let active_manifest_sha = sha256_file(&manifest_path).ok().map(|d| hex_lower(&d));
-        let (manifest, status) = if active_manifest_sha.as_deref()
-            == Some(head.manifest_sha256.as_str())
-        {
-            let manifest_bytes = read_bytes_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
-            let actual_sha = hex_lower(&Sha256::digest(&manifest_bytes));
-            if actual_sha != head.manifest_sha256 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "active manifest.json sha256 {} != committed_head.manifest_sha256 {}",
-                        actual_sha, head.manifest_sha256
-                    ),
-                ));
+        let active_manifest = match read_bytes_bounded(&manifest_path, MAX_MANIFEST_BYTES) {
+            Ok(bytes) => {
+                ensure_path_within_bundle(&manifest_path, &canonical_root, "manifest.json")?;
+                let sha = hex_lower(&Sha256::digest(&bytes));
+                Some((bytes, sha))
             }
-            let active: ManifestV1 = parse_json_slice(&manifest_bytes)?;
-            let status = self.verify_manifest_header_and_policy(&active, policy)?;
-            validate_manifest_entries_well_formed(&active)?;
-            (active, status)
-        } else {
-            // Crash-recovery path: a subsequent round may have updated manifest.json before
-            // committed_head.json advanced; verify the generation's archived manifest matching
-            // the pinned `head.manifest_sha256` hash and policy signature instead.
-            let archive_rel = super::cas::committed_manifest_archive_rel_path(head.generation);
-            let archive_path = self.run_dir.join(&archive_rel);
-            if !archive_path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "active manifest.json sha256 ({:?}) != committed_head.manifest_sha256 ({}) and archived manifest {} is missing",
-                        active_manifest_sha, head.manifest_sha256, archive_rel
-                    ),
-                ));
-            }
-            let archive_bytes = read_bytes_bounded(&archive_path, MAX_MANIFEST_BYTES)?;
-            let archive_sha = hex_lower(&Sha256::digest(&archive_bytes));
-            if archive_sha != head.manifest_sha256 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "archived manifest {} sha256 {} != committed_head.manifest_sha256 {}",
-                        archive_rel, archive_sha, head.manifest_sha256
-                    ),
-                ));
-            }
-            let archived: ManifestV1 = parse_json_slice(&archive_bytes)?;
-            let status = self.verify_manifest_header_and_policy(&archived, policy)?;
-            validate_manifest_entries_well_formed(&archived)?;
-            (archived, status)
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
         };
-        self.verify_manifest_entries_for_committed_head(&manifest)?;
+        let active_manifest_sha = active_manifest.as_ref().map(|(_, sha)| sha.clone());
+        let crash_recovery_manifest =
+            active_manifest_sha.as_deref() != Some(head.manifest_sha256.as_str());
+        let (manifest, status) = match active_manifest {
+            Some((manifest_bytes, actual_sha)) if !crash_recovery_manifest => {
+                if actual_sha != head.manifest_sha256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "active manifest.json sha256 {} != committed_head.manifest_sha256 {}",
+                            actual_sha, head.manifest_sha256
+                        ),
+                    ));
+                }
+                let active: ManifestV1 = parse_json_slice(&manifest_bytes)?;
+                let status = self.verify_manifest_header_and_policy(&active, policy)?;
+                validate_manifest_entries_well_formed(&active)?;
+                (active, status)
+            }
+            _ => {
+                // Crash-recovery path: a subsequent round may have updated manifest.json before
+                // committed_head.json advanced; verify the generation's archived manifest matching
+                // the pinned `head.manifest_sha256` hash and policy signature instead.
+                let archive_rel = super::cas::committed_manifest_archive_rel_path(head.generation);
+                let archive_path = self.run_dir.join(&archive_rel);
+                let archive_bytes =
+                    read_bytes_bounded(&archive_path, MAX_MANIFEST_BYTES).map_err(|e| {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "active manifest.json sha256 ({:?}) != committed_head.manifest_sha256 ({}) and archived manifest {} is missing",
+                                    active_manifest_sha, head.manifest_sha256, archive_rel
+                                ),
+                            )
+                        } else {
+                            e
+                        }
+                    })?;
+                ensure_path_within_bundle(&archive_path, &canonical_root, &archive_rel)?;
+                let archive_sha = hex_lower(&Sha256::digest(&archive_bytes));
+                if archive_sha != head.manifest_sha256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "archived manifest {} sha256 {} != committed_head.manifest_sha256 {}",
+                            archive_rel, archive_sha, head.manifest_sha256
+                        ),
+                    ));
+                }
+                let archived: ManifestV1 = parse_json_slice(&archive_bytes)?;
+                let status = self.verify_manifest_header_and_policy(&archived, policy)?;
+                validate_manifest_entries_well_formed(&archived)?;
+                (archived, status)
+            }
+        };
+        self.verify_manifest_entries_for_committed_head(&manifest, crash_recovery_manifest)?;
 
         let (resume_v2, resume_digest) =
             get_verified_coordinator_resume_state_v2(&self.run_dir, &head.resume_state_cas_uri)?;
@@ -938,10 +957,40 @@ impl RunArtifactBundle {
         Ok((head, manifest, status, resume_v2))
     }
 
-    fn verify_manifest_entries_for_committed_head(&self, manifest: &ManifestV1) -> io::Result<()> {
+    /// Read an append-only `.ndjson` manifest entry from disk, verify its committed byte prefix
+    /// `[..entry.bytes]` matches the SHA-256 recorded in `manifest`, and return
+    /// `Ok(Some((committed_prefix_len, full_file_bytes)))` (or `Ok(None)` if absent from `manifest`).
+    pub fn read_verified_ndjson_committed_prefix(
+        &self,
+        manifest: &ManifestV1,
+        rel_path: &str,
+    ) -> io::Result<Option<(usize, Vec<u8>)>> {
+        validate_manifest_path(rel_path)?;
+        let Some(entry) = manifest.entries.iter().find(|e| e.path == rel_path) else {
+            return Ok(None);
+        };
+        let canonical_root = self.run_dir.canonicalize()?;
+        let file_path = self.run_dir.join(&entry.path);
+        verify_bundle_entry_path(
+            &file_path,
+            &canonical_root,
+            &entry.path,
+            &format!("manifest entry file missing: {}", entry.path),
+        )?;
+        read_and_verify_ndjson_prefix_at(&file_path, entry).map(Some)
+    }
+
+    fn verify_manifest_entries_for_committed_head(
+        &self,
+        manifest: &ManifestV1,
+        crash_recovery_manifest: bool,
+    ) -> io::Result<()> {
         let canonical_root = self.run_dir.canonicalize()?;
         let mut total_bytes: u64 = 0;
+        let mut dataops_tail_grew = false;
 
+        // Pass 1: Bound total bundle size, reject symlinks/escapes, and verify every append-only
+        // `.ndjson` committed byte prefix `[..entry.bytes]` BEFORE validating snapshots.
         for entry in &manifest.entries {
             total_bytes = total_bytes.checked_add(entry.bytes).ok_or_else(|| {
                 io::Error::new(
@@ -959,47 +1008,59 @@ impl RunArtifactBundle {
             }
 
             let file_path = self.run_dir.join(&entry.path);
-            if !file_path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("manifest entry file missing: {}", entry.path),
-                ));
-            }
-            ensure_path_within_bundle(&file_path, &canonical_root, &entry.path)?;
+            verify_bundle_entry_path(
+                &file_path,
+                &canonical_root,
+                &entry.path,
+                &format!("manifest entry file missing: {}", entry.path),
+            )?;
 
             if entry.path.ends_with(".ndjson") {
-                // Append-only NDJSON logs may have grown if a subsequent round crashed after
-                // appending pre-release DP debits or telemetry before `committed_head.json`
-                // advanced; verify the committed prefix `[..entry.bytes]` matches `entry.sha256`.
+                let (prefix_len, full_bytes) = read_and_verify_ndjson_prefix_at(&file_path, entry)?;
+                let tail = &full_bytes[prefix_len..];
+                if !tail.is_empty() && validate_dataops_ndjson_tail_records(&entry.path, tail)? {
+                    dataops_tail_grew = true;
+                }
+            }
+        }
+
+        let allow_snapshot_drift = crash_recovery_manifest || dataops_tail_grew;
+        let mut recovery_registry_sha: Option<String> = None;
+        let mut recovery_lineage_sha: Option<String> = None;
+
+        // Pass 2: Verify exact size + SHA-256 on every non-append file (`run.json`, `graph.json`,
+        // `blobs/sha256/*`, `artifacts/*`, and DataOps snapshots unless crash recovery is active).
+        for entry in &manifest.entries {
+            if entry.path.ends_with(".ndjson") {
+                continue;
+            }
+            let file_path = self.run_dir.join(&entry.path);
+            if allow_snapshot_drift && is_crash_recovery_mutable_snapshot(&entry.path) {
                 let bytes = read_bytes_bounded(&file_path, MAX_SINGLE_ARTIFACT_BYTES)?;
-                if (bytes.len() as u64) < entry.bytes {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "append-only manifest entry {} was truncated below committed length ({} < {})",
-                            entry.path,
-                            bytes.len(),
-                            entry.bytes
-                        ),
-                    ));
+                match entry.path.as_str() {
+                    "datasets/registry.json" => {
+                        let reg: DatasetRegistryV1 = parse_json_slice(&bytes)?;
+                        if reg.schema_version != swarm_torch_core::dataops::DATAOPS_SCHEMA_V1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported schema_version in datasets/registry.json",
+                            ));
+                        }
+                        recovery_registry_sha = Some(hex_lower(&Sha256::digest(&bytes)));
+                    }
+                    "datasets/lineage.json" => {
+                        let lin: DatasetLineageV1 = parse_json_slice(&bytes)?;
+                        if lin.schema_version != swarm_torch_core::dataops::DATAOPS_SCHEMA_V1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported schema_version in datasets/lineage.json",
+                            ));
+                        }
+                        recovery_lineage_sha = Some(hex_lower(&Sha256::digest(&bytes)));
+                    }
+                    _ => {}
                 }
-                let prefix_len = usize::try_from(entry.bytes).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("manifest entry byte length overflow for {}", entry.path),
-                    )
-                })?;
-                let prefix_sha = hex_lower(&Sha256::digest(&bytes[..prefix_len]));
-                if prefix_sha != entry.sha256 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "sha256 mismatch for committed prefix of {}: expected {}, got {}",
-                            entry.path, entry.sha256, prefix_sha
-                        ),
-                    ));
-                }
-            } else if entry.path == "run.json" || entry.path.starts_with("blobs/sha256/") {
+            } else {
                 let (_bytes, actual_sha) =
                     read_and_hash_bounded(&file_path, entry.bytes, MAX_SINGLE_ARTIFACT_BYTES)?;
                 let actual_hex = hex_lower(&actual_sha);
@@ -1014,8 +1075,53 @@ impl RunArtifactBundle {
                 }
             }
         }
+
+        if allow_snapshot_drift {
+            let pair_path = self
+                .run_dir
+                .join("datasets")
+                .join("snapshot_pair_commit.json");
+            if path_is_present_no_symlink(&pair_path)? {
+                ensure_path_within_bundle(
+                    &pair_path,
+                    &canonical_root,
+                    "datasets/snapshot_pair_commit.json",
+                )?;
+                let marker_bytes = read_bytes_bounded(&pair_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+                let marker: SnapshotPairCommitV1 = parse_json_slice(&marker_bytes)?;
+                if marker.schema_version != SNAPSHOT_PAIR_SCHEMA_V1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsupported schema_version in datasets/snapshot_pair_commit.json",
+                    ));
+                }
+                if let Some(ref reg_sha) = recovery_registry_sha {
+                    if &marker.registry_sha256 != reg_sha {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "datasets/snapshot_pair_commit.json registry_sha256 disagrees with datasets/registry.json",
+                        ));
+                    }
+                }
+                if let Some(ref lin_sha) = recovery_lineage_sha {
+                    if &marker.lineage_sha256 != lin_sha {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "datasets/snapshot_pair_commit.json lineage_sha256 disagrees with datasets/lineage.json",
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+fn is_crash_recovery_mutable_snapshot(path: &str) -> bool {
+    matches!(
+        path,
+        "datasets/registry.json" | "datasets/lineage.json" | "datasets/snapshot_pair_commit.json"
+    )
 }
 
 fn validate_manifest_entries_well_formed(manifest: &ManifestV1) -> io::Result<()> {
@@ -1113,19 +1219,57 @@ fn is_required_path_v1(p: &str) -> bool {
     required_paths_v1().contains(&p)
 }
 
+const MAX_MANIFEST_PATH_LEN: usize = 1024;
+
 pub(crate) fn validate_manifest_path(path: &str) -> io::Result<()> {
-    if path.is_empty() {
+    if path.is_empty() || path.len() > MAX_MANIFEST_PATH_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "manifest path must be non-empty",
+            format!("manifest path length invalid: {} bytes", path.len()),
+        ));
+    }
+    if path.bytes().any(|b| b == b'\0' || b < 0x20 || b == 0x7F) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest path contains forbidden control byte: {path}"),
         ));
     }
 
+    let bytes = path.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     let parsed = Path::new(path);
-    if parsed.is_absolute() {
+    if parsed.is_absolute() || path.starts_with('/') || path.starts_with('\\') || has_drive_prefix {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("manifest path must be relative: {path}"),
+        ));
+    }
+
+    for segment in path.split(['/', '\\']) {
+        if segment == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest path must not contain '..': {path}"),
+            ));
+        }
+        if segment == "." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest path must not contain '.': {path}"),
+            ));
+        }
+        if segment.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest path contains empty or trailing separator: {path}"),
+            ));
+        }
+    }
+
+    if path.contains('\\') || path.contains(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest path contains forbidden characters (backslash or colon): {path}"),
         ));
     }
 
@@ -1170,6 +1314,94 @@ pub(crate) fn validate_manifest_path(path: &str) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn verify_bundle_entry_path(
+    path: &Path,
+    canonical_root: &Path,
+    rel: &str,
+    missing_msg: &str,
+) -> io::Result<()> {
+    match open_regular_no_symlink(path) {
+        Ok(_) => ensure_path_within_bundle(path, canonical_root, rel),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            missing_msg.to_string(),
+        )),
+        Err(e) => {
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                if meta.file_type().is_symlink() {
+                    ensure_path_within_bundle(path, canonical_root, rel).map_err(|ce| {
+                        if ce.kind() == io::ErrorKind::NotFound {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("refusing dangling symlink outside or inside bundle root (escapes bundle root): {rel}"),
+                            )
+                        } else {
+                            ce
+                        }
+                    })?;
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+fn read_and_verify_ndjson_prefix_at(
+    file_path: &Path,
+    entry: &ManifestEntryV1,
+) -> io::Result<(usize, Vec<u8>)> {
+    let bytes = read_bytes_bounded(file_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+    let prefix_len = usize::try_from(entry.bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest entry byte length overflow for {}", entry.path),
+        )
+    })?;
+    if bytes.len() < prefix_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "append-only manifest entry {} was truncated below committed length ({} < {})",
+                entry.path,
+                bytes.len(),
+                prefix_len
+            ),
+        ));
+    }
+    let prefix_sha = hex_lower(&Sha256::digest(&bytes[..prefix_len]));
+    if prefix_sha != entry.sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "sha256 mismatch for committed prefix of {}: expected {}, got {}",
+                entry.path, entry.sha256, prefix_sha
+            ),
+        ));
+    }
+    Ok((prefix_len, bytes))
+}
+
+fn validate_dataops_ndjson_tail_records(rel_path: &str, tail: &[u8]) -> io::Result<bool> {
+    match rel_path {
+        "datasets/materializations.ndjson" => {
+            let rows: Vec<MaterializationRecordCompat> =
+                parse_ndjson_slice_bounded(tail, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+            Ok(!rows.is_empty())
+        }
+        "datasets/registry_updates.ndjson" => {
+            let rows: Vec<DatasetEntryV1> =
+                parse_ndjson_slice_bounded(tail, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+            Ok(!rows.is_empty())
+        }
+        "datasets/lineage_edges.ndjson" => {
+            let rows: Vec<LineageEdgeV1> =
+                parse_ndjson_slice_bounded(tail, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+            Ok(!rows.is_empty())
+        }
+        _ => Ok(false),
+    }
 }
 
 fn ensure_path_within_bundle(path: &Path, canonical_root: &Path, rel: &str) -> io::Result<()> {

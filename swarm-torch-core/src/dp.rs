@@ -367,20 +367,23 @@ impl RdpAccountantV1 {
                 return Err(CryptoError::InvalidPrivacyParameter);
             }
         }
-        let (converted_eps, opt_alpha) =
-            if committed_rounds == 0 && cumulative_rdp_orders.iter().all(|&r| r == 0.0) {
-                (0.0, RDP_ALPHA_GRID_V1[0])
-            } else {
-                let (eps, alpha) = convert_rdp_to_approx_dp_v1(
-                    &cumulative_rdp_orders,
-                    profile.target_delta,
-                    profile.conversion_formula,
-                )?;
-                if eps > profile.max_epsilon {
-                    return Err(CryptoError::PrivacyBudgetExhausted);
-                }
-                (eps, alpha)
-            };
+        let all_zero = cumulative_rdp_orders.iter().all(|&r| r == 0.0);
+        if (committed_rounds == 0) != all_zero {
+            return Err(CryptoError::InvalidPrivacyParameter);
+        }
+        let (converted_eps, opt_alpha) = if committed_rounds == 0 && all_zero {
+            (0.0, RDP_ALPHA_GRID_V1[0])
+        } else {
+            let (eps, alpha) = convert_rdp_to_approx_dp_v1(
+                &cumulative_rdp_orders,
+                profile.target_delta,
+                profile.conversion_formula,
+            )?;
+            if eps > profile.max_epsilon {
+                return Err(CryptoError::PrivacyBudgetExhausted);
+            }
+            (eps, alpha)
+        };
         Ok(Self {
             profile,
             cumulative_rdp_orders,
@@ -499,8 +502,12 @@ impl PrivacyAccountantHook for RdpAccountantV1 {
     ) -> Result<(), CryptoError> {
         let (desc, next_orders, converted_eps) =
             self.preview_clipped_round(tau, subsampling_rate_q)?;
+        let next_rounds = self
+            .committed_rounds
+            .checked_add(1)
+            .ok_or(CryptoError::PrivacyBudgetExhausted)?;
         self.cumulative_rdp_orders = next_orders;
-        self.committed_rounds = self.committed_rounds.saturating_add(1);
+        self.committed_rounds = next_rounds;
         self.last_optimal_alpha = desc.alpha;
         self.last_converted_epsilon = converted_eps;
         Ok(())
@@ -615,5 +622,86 @@ mod tests {
                 .unwrap_err(),
             CryptoError::InvalidPrivacyParameter
         );
+    }
+
+    #[test]
+    fn restore_from_orders_rejects_inconsistent_round_count_and_handles_round_overflow() {
+        let profile = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 10.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+        let mut nonzero = [0.0; RDP_GRID_LEN];
+        nonzero[0] = 0.25;
+        assert_eq!(
+            RdpAccountantV1::restore_from_orders(profile, nonzero, 0).unwrap_err(),
+            CryptoError::InvalidPrivacyParameter
+        );
+        assert_eq!(
+            RdpAccountantV1::restore_from_orders(profile, [0.0; RDP_GRID_LEN], 1).unwrap_err(),
+            CryptoError::InvalidPrivacyParameter
+        );
+
+        let valid_sched = compute_round_rdp_schedule_v1(0.05, 1.5).unwrap();
+        let mut maxed = RdpAccountantV1::restore_from_orders(profile, valid_sched, u64::MAX)
+            .expect("finite schedule with non-zero count restores cleanly");
+        assert_eq!(
+            maxed.record_clipped_round(1.0, 0.05).unwrap_err(),
+            CryptoError::PrivacyBudgetExhausted
+        );
+        assert_eq!(maxed.committed_rounds(), u64::MAX);
+    }
+
+    #[test]
+    fn restore_from_orders_and_preview_reject_non_finite_negative_and_budget_exceeded() {
+        let profile = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 0.5,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+            let mut bad_orders = [0.0; RDP_GRID_LEN];
+            bad_orders[3] = bad;
+            assert_eq!(
+                RdpAccountantV1::restore_from_orders(profile, bad_orders, 1).unwrap_err(),
+                CryptoError::InvalidPrivacyParameter
+            );
+        }
+
+        // Restoring orders whose converted epsilon exceeds max_epsilon fails closed.
+        let high_sched = [1.0; RDP_GRID_LEN];
+        assert_eq!(
+            RdpAccountantV1::restore_from_orders(profile, high_sched, 1).unwrap_err(),
+            CryptoError::PrivacyBudgetExhausted
+        );
+
+        let mut acc = RdpAccountantV1::new(DpMechanismProfileV1 {
+            max_epsilon: 10.0,
+            ..profile
+        })
+        .unwrap();
+        for bad_tau in [f32::NAN, f32::INFINITY, 0.0, -0.5] {
+            assert_eq!(
+                acc.record_clipped_round(bad_tau, 0.5).unwrap_err(),
+                CryptoError::InvalidPrivacyParameter
+            );
+        }
+        for bad_q in [f64::NAN, f64::INFINITY, 0.0, -0.1, 1.01] {
+            assert_eq!(
+                acc.record_clipped_round(1.0, bad_q).unwrap_err(),
+                CryptoError::InvalidPrivacyParameter
+            );
+        }
+        assert_eq!(acc.committed_rounds(), 0);
     }
 }

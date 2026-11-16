@@ -5,86 +5,99 @@ use std::io;
 use std::path::PathBuf;
 use std::process;
 
+use swarm_torch::artifacts::parse_ed25519_public_key_hex;
 use swarm_torch::mcp_inspector::McpInspectorServerV1;
 
-fn parse_pubkey_hex(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected 64-character Ed25519 public key hex, got {} chars",
-            hex.len()
-        ));
-    }
-    let bytes = hex.as_bytes();
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        let hi = hex_nibble(bytes[i * 2])?;
-        let lo = hex_nibble(bytes[i * 2 + 1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
+#[derive(Debug, PartialEq, Eq)]
+struct McpCliConfig {
+    run_dir: PathBuf,
+    public_key: [u8; 32],
 }
 
-fn hex_nibble(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(format!("invalid hex byte 0x{b:02x}")),
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum McpCliParseError {
+    HelpRequested,
+    Invalid(String),
 }
 
-fn main() {
-    let mut args = env::args().skip(1);
+fn parse_mcp_cli_args(args: &[String]) -> Result<McpCliConfig, McpCliParseError> {
     let mut run_dir: Option<PathBuf> = None;
     let mut pubkey_hex: Option<String> = None;
+    let mut i = 0;
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+    while i < args.len() {
+        match args[i].as_str() {
             "--run-dir" => {
-                let Some(val) = args.next() else {
-                    eprintln!("error: --run-dir requires a path value");
-                    process::exit(2);
+                if run_dir.is_some() {
+                    return Err(McpCliParseError::Invalid(
+                        "--run-dir may only be specified once".to_string(),
+                    ));
+                }
+                let Some(val) = args.get(i + 1) else {
+                    return Err(McpCliParseError::Invalid(
+                        "--run-dir requires a path value".to_string(),
+                    ));
                 };
                 run_dir = Some(PathBuf::from(val));
+                i += 2;
             }
             "--public-key-hex" => {
-                let Some(val) = args.next() else {
-                    eprintln!("error: --public-key-hex requires a 64-char hex value");
-                    process::exit(2);
+                if pubkey_hex.is_some() {
+                    return Err(McpCliParseError::Invalid(
+                        "--public-key-hex may only be specified once".to_string(),
+                    ));
+                }
+                let Some(val) = args.get(i + 1) else {
+                    return Err(McpCliParseError::Invalid(
+                        "--public-key-hex requires a 64-char hex value".to_string(),
+                    ));
                 };
-                pubkey_hex = Some(val);
+                pubkey_hex = Some(val.clone());
+                i += 2;
             }
-            "--help" | "-h" => {
-                eprintln!(
-                    "Usage: swarm_torch_mcp --run-dir <path> --public-key-hex <64-hex-chars>"
-                );
-                return;
-            }
+            "--help" | "-h" => return Err(McpCliParseError::HelpRequested),
             other => {
-                eprintln!("error: unsupported argument '{other}'");
-                process::exit(2);
+                return Err(McpCliParseError::Invalid(format!(
+                    "unsupported argument '{other}'"
+                )));
             }
         }
     }
 
     let Some(run_dir) = run_dir else {
-        eprintln!("error: missing required --run-dir <path>");
-        process::exit(2);
+        return Err(McpCliParseError::Invalid(
+            "missing required --run-dir <path>".to_string(),
+        ));
     };
     let Some(pubkey_hex) = pubkey_hex else {
-        eprintln!("error: missing required --public-key-hex <64-hex-chars>");
-        process::exit(2);
+        return Err(McpCliParseError::Invalid(
+            "missing required --public-key-hex <64-hex-chars>".to_string(),
+        ));
     };
+    let public_key = parse_ed25519_public_key_hex(&pubkey_hex)
+        .map_err(|msg| McpCliParseError::Invalid(format!("invalid --public-key-hex: {msg}")))?;
 
-    let pubkey = match parse_pubkey_hex(&pubkey_hex) {
-        Ok(pk) => pk,
-        Err(msg) => {
-            eprintln!("error: invalid --public-key-hex: {msg}");
+    Ok(McpCliConfig {
+        run_dir,
+        public_key,
+    })
+}
+
+fn main() {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let cfg = match parse_mcp_cli_args(&raw_args) {
+        Ok(c) => c,
+        Err(McpCliParseError::HelpRequested) => {
+            eprintln!("Usage: swarm_torch_mcp --run-dir <path> --public-key-hex <64-hex-chars>");
+            return;
+        }
+        Err(McpCliParseError::Invalid(msg)) => {
+            eprintln!("error: {msg}");
             process::exit(2);
         }
     };
 
-    let server = match McpInspectorServerV1::strict_with_key(run_dir, pubkey) {
+    let server = match McpInspectorServerV1::strict_with_key(cfg.run_dir, cfg.public_key) {
         Ok(s) => s,
         Err(err) => {
             eprintln!("error: failed to initialize strict MCP inspector: {err}");
@@ -97,5 +110,77 @@ fn main() {
     if let Err(err) = server.serve_stdio(stdin.lock(), stdout.lock()) {
         eprintln!("error: MCP inspector stdio loop failed: {err}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_requires_strict_run_dir_and_valid_64_hex_pubkey() {
+        let valid_pk = "aa".repeat(32);
+        let parsed = parse_mcp_cli_args(&[
+            "--run-dir".to_string(),
+            "runs/r1".to_string(),
+            "--public-key-hex".to_string(),
+            valid_pk,
+        ])
+        .unwrap();
+        assert_eq!(parsed.run_dir, PathBuf::from("runs/r1"));
+        assert_eq!(parsed.public_key, [0xaa; 32]);
+
+        assert!(matches!(
+            parse_mcp_cli_args(&["--run-dir".to_string(), "runs/r1".to_string()]),
+            Err(McpCliParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&[
+                "--run-dir".to_string(),
+                "runs/r1".to_string(),
+                "--public-key-hex".to_string(),
+                "zzzz".to_string(),
+            ]),
+            Err(McpCliParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&["--help".to_string()]),
+            Err(McpCliParseError::HelpRequested)
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&[
+                "--run-dir".to_string(),
+                "r1".to_string(),
+                "--run-dir".to_string(),
+                "r2".to_string(),
+                "--public-key-hex".to_string(),
+                "aa".repeat(32),
+            ]),
+            Err(McpCliParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&[
+                "--run-dir".to_string(),
+                "r1".to_string(),
+                "--public-key-hex".to_string(),
+                "AA".repeat(32),
+            ]),
+            Err(McpCliParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&[
+                "--run-dir".to_string(),
+                "r1".to_string(),
+                "--public-key-hex".to_string(),
+                "aa".repeat(32),
+                "--public-key-hex".to_string(),
+                "bb".repeat(32),
+            ]),
+            Err(McpCliParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_mcp_cli_args(&["-h".to_string()]),
+            Err(McpCliParseError::HelpRequested)
+        ));
     }
 }

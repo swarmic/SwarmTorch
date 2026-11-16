@@ -165,8 +165,14 @@ impl RunArtifactSink {
     /// from cloned `Arc<RunArtifactSink>` handles and releasing any held `.bundle.lock`.
     pub fn seal(&self) -> io::Result<u64> {
         let mut state = self.guard_unsealed()?;
+        let next_gen = state.generation.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sink generation counter overflow",
+            )
+        })?;
         state.sealed = true;
-        state.generation = state.generation.saturating_add(1);
+        state.generation = next_gen;
         let _ = state.lock_guard.take();
         Ok(state.generation)
     }
@@ -212,7 +218,7 @@ impl RunArtifactSink {
         // generation manifest to the newly finalized (possibly signed) bundle manifest so subsequent
         // strict checkpoint resume stays consistent with `manifest.json` (`ST-04`).
         let head_path = self.bundle.run_dir().join(COMMITTED_HEAD_REL_PATH);
-        if head_path.exists() {
+        if super::path_is_present_no_symlink(&head_path)? {
             let mut head = read_committed_head_v1(self.bundle.run_dir())?;
             write_archived_generation_manifest_bytes(
                 self.bundle.run_dir(),
@@ -222,8 +228,14 @@ impl RunArtifactSink {
             head.manifest_sha256 = manifest_sha256;
             write_committed_head_v1(self.bundle.run_dir(), &head)?;
         }
+        let next_gen = state.generation.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sink generation counter overflow",
+            )
+        })?;
         state.sealed = true;
-        state.generation = state.generation.saturating_add(1);
+        state.generation = next_gen;
         let gen = state.generation;
         let _ = state.lock_guard.take();
         Ok((gen, manifest))
@@ -265,7 +277,9 @@ impl RunArtifactSink {
         &self,
         state: &mut std::sync::MutexGuard<'_, SinkState>,
     ) -> io::Result<()> {
-        state.write_count = state.write_count.saturating_add(1);
+        state.write_count = state.write_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sink write counter overflow")
+        })?;
 
         match self.profile.manifest_policy {
             ManifestRefreshPolicy::FinalOnly => Ok(()),
@@ -352,5 +366,67 @@ impl RunArtifactSink {
     pub fn validate_manifest(&self) -> io::Result<()> {
         let _g = self.guard_any()?;
         self.bundle.validate_manifest()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use swarm_torch_core::observe::{AttrMap, MetricRecord, RunId, TraceId};
+
+    #[test]
+    fn sink_seal_and_seal_and_finalize_fail_closed_on_generation_overflow_without_mutating_sealed()
+    {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "swarm_torch_sink_overflow_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let run_id = RunId::from_bytes([0xE4; 16]);
+        let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+        let sink = RunArtifactSink::new(bundle);
+
+        {
+            let mut state = sink.lock.lock().unwrap();
+            state.generation = u64::MAX;
+        }
+        let err_seal = sink.seal().unwrap_err();
+        assert_eq!(err_seal.kind(), io::ErrorKind::InvalidData);
+        assert!(!sink.is_sealed().unwrap());
+        assert_eq!(sink.generation().unwrap(), u64::MAX);
+
+        let err_finalize = sink.seal_and_finalize(None).unwrap_err();
+        assert_eq!(err_finalize.kind(), io::ErrorKind::InvalidData);
+        assert!(!sink.is_sealed().unwrap());
+        assert_eq!(sink.generation().unwrap(), u64::MAX);
+
+        {
+            let mut state = sink.lock.lock().unwrap();
+            state.generation = 1;
+            state.write_count = u64::MAX;
+        }
+        let err_write = sink
+            .append_metric(&MetricRecord {
+                schema_version: 1,
+                ts_unix_nanos: 1,
+                trace_id: TraceId::from_bytes([1u8; 16]),
+                span_id: None,
+                name: "loss".to_string(),
+                value: 0.1,
+                unit: None,
+                attrs: AttrMap::new(),
+            })
+            .unwrap_err();
+        assert_eq!(err_write.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

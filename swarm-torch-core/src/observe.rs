@@ -428,6 +428,10 @@ pub const MAX_ATTR_VALUE_STR_LEN: usize = 1024;
 #[cfg(feature = "alloc")]
 pub const MAX_METRIC_UNIT_LEN: usize = 64;
 
+/// Canonical schema version for span, event, and metric records.
+#[cfg(feature = "alloc")]
+pub const OBSERVE_SCHEMA_V1: u32 = 1;
+
 /// Validation error for span/event/metric records.
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,6 +441,9 @@ pub enum RecordValidationError {
     AttrKeyTooLong { key: String, len: usize },
     AttrValueTooLong { key: String, len: usize },
     MetricUnitTooLong { len: usize },
+    NonFiniteMetricValue,
+    NonFiniteAttrValue { key: String },
+    UnsupportedSchemaVersion { expected: u32, got: u32 },
 }
 
 #[cfg(feature = "alloc")]
@@ -459,12 +466,35 @@ impl fmt::Display for RecordValidationError {
             Self::MetricUnitTooLong { len } => {
                 write!(f, "metric unit length {len} exceeds maximum")
             }
+            Self::NonFiniteMetricValue => {
+                write!(f, "metric value must be finite (NaN/Inf rejected)")
+            }
+            Self::NonFiniteAttrValue { key } => {
+                write!(f, "attribute '{key}' float value must be finite")
+            }
+            Self::UnsupportedSchemaVersion { expected, got } => {
+                write!(
+                    f,
+                    "unsupported record schema_version {got} (expected {expected})"
+                )
+            }
         }
     }
 }
 
 #[cfg(all(feature = "alloc", feature = "std"))]
 impl std::error::Error for RecordValidationError {}
+
+#[cfg(feature = "alloc")]
+fn validate_schema_version(schema_version: u32) -> Result<(), RecordValidationError> {
+    if schema_version != OBSERVE_SCHEMA_V1 {
+        return Err(RecordValidationError::UnsupportedSchemaVersion {
+            expected: OBSERVE_SCHEMA_V1,
+            got: schema_version,
+        });
+    }
+    Ok(())
+}
 
 #[cfg(feature = "alloc")]
 fn validate_name_and_attrs(name: &str, attrs: &AttrMap) -> Result<(), RecordValidationError> {
@@ -481,13 +511,19 @@ fn validate_name_and_attrs(name: &str, attrs: &AttrMap) -> Result<(), RecordVali
                 len: key.len(),
             });
         }
-        if let AttrValue::Str(s) = value {
-            if s.len() > MAX_ATTR_VALUE_STR_LEN {
-                return Err(RecordValidationError::AttrValueTooLong {
-                    key: key.clone(),
-                    len: s.len(),
-                });
+        match value {
+            AttrValue::Str(s) => {
+                if s.len() > MAX_ATTR_VALUE_STR_LEN {
+                    return Err(RecordValidationError::AttrValueTooLong {
+                        key: key.clone(),
+                        len: s.len(),
+                    });
+                }
             }
+            AttrValue::F64(v) if !v.is_finite() => {
+                return Err(RecordValidationError::NonFiniteAttrValue { key: key.clone() });
+            }
+            AttrValue::Bool(_) | AttrValue::I64(_) | AttrValue::U64(_) | AttrValue::F64(_) => {}
         }
     }
     Ok(())
@@ -533,21 +569,27 @@ pub struct MetricRecord {
     pub attrs: AttrMap,
 }
 
-/// Validate a span record against size/count bounds (L-09).
+/// Validate a span record against size/count/schema bounds (L-09).
 #[cfg(feature = "alloc")]
 pub fn validate_span_record(r: &SpanRecord) -> Result<(), RecordValidationError> {
+    validate_schema_version(r.schema_version)?;
     validate_name_and_attrs(&r.name, &r.attrs)
 }
 
-/// Validate an event record against size/count bounds (L-09).
+/// Validate an event record against size/count/schema bounds (L-09).
 #[cfg(feature = "alloc")]
 pub fn validate_event_record(r: &EventRecord) -> Result<(), RecordValidationError> {
+    validate_schema_version(r.schema_version)?;
     validate_name_and_attrs(&r.name, &r.attrs)
 }
 
-/// Validate a metric record against size/count bounds (L-09).
+/// Validate a metric record against size/count/finiteness/schema bounds (L-09).
 #[cfg(feature = "alloc")]
 pub fn validate_metric_record(r: &MetricRecord) -> Result<(), RecordValidationError> {
+    validate_schema_version(r.schema_version)?;
+    if !r.value.is_finite() {
+        return Err(RecordValidationError::NonFiniteMetricValue);
+    }
     validate_name_and_attrs(&r.name, &r.attrs)?;
     if let Some(unit) = r.unit.as_ref() {
         if unit.len() > MAX_METRIC_UNIT_LEN {
@@ -703,6 +745,131 @@ mod tests {
             validate_metric_record(&metric),
             Err(RecordValidationError::MetricUnitTooLong {
                 len: MAX_METRIC_UNIT_LEN + 1
+            })
+        );
+    }
+
+    #[test]
+    fn validate_records_reject_non_finite_floats_and_unsupported_schema_versions() {
+        for bad_val in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let metric = MetricRecord {
+                schema_version: OBSERVE_SCHEMA_V1,
+                ts_unix_nanos: 1,
+                trace_id: TraceId::from_bytes([1u8; 16]),
+                span_id: None,
+                name: "loss".to_string(),
+                value: bad_val,
+                unit: None,
+                attrs: AttrMap::new(),
+            };
+            assert_eq!(
+                validate_metric_record(&metric),
+                Err(RecordValidationError::NonFiniteMetricValue)
+            );
+
+            let mut bad_attrs = AttrMap::new();
+            bad_attrs.insert("lr".to_string(), AttrValue::F64(bad_val));
+            let event = EventRecord {
+                schema_version: OBSERVE_SCHEMA_V1,
+                ts_unix_nanos: 1,
+                trace_id: TraceId::from_bytes([1u8; 16]),
+                span_id: None,
+                name: "step".to_string(),
+                attrs: bad_attrs,
+            };
+            assert!(matches!(
+                validate_event_record(&event),
+                Err(RecordValidationError::NonFiniteAttrValue { .. })
+            ));
+        }
+
+        let bad_span = SpanRecord {
+            schema_version: 2,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: SpanId::from_bytes([2u8; 8]),
+            parent_span_id: None,
+            name: "span".to_string(),
+            start_unix_nanos: 1,
+            end_unix_nanos: None,
+            attrs: AttrMap::new(),
+        };
+        assert_eq!(
+            validate_span_record(&bad_span),
+            Err(RecordValidationError::UnsupportedSchemaVersion {
+                expected: OBSERVE_SCHEMA_V1,
+                got: 2
+            })
+        );
+    }
+
+    #[test]
+    fn validate_records_reject_all_types_bad_schema_and_non_finite_attrs() {
+        for bad_val in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut bad_attrs = AttrMap::new();
+            bad_attrs.insert("lr".to_string(), AttrValue::F64(bad_val));
+
+            let span = SpanRecord {
+                schema_version: OBSERVE_SCHEMA_V1,
+                trace_id: TraceId::from_bytes([1u8; 16]),
+                span_id: SpanId::from_bytes([2u8; 8]),
+                parent_span_id: None,
+                name: "span".to_string(),
+                start_unix_nanos: 1,
+                end_unix_nanos: None,
+                attrs: bad_attrs.clone(),
+            };
+            assert!(matches!(
+                validate_span_record(&span),
+                Err(RecordValidationError::NonFiniteAttrValue { .. })
+            ));
+
+            let metric = MetricRecord {
+                schema_version: OBSERVE_SCHEMA_V1,
+                ts_unix_nanos: 1,
+                trace_id: TraceId::from_bytes([1u8; 16]),
+                span_id: None,
+                name: "loss".to_string(),
+                value: 1.0,
+                unit: None,
+                attrs: bad_attrs,
+            };
+            assert!(matches!(
+                validate_metric_record(&metric),
+                Err(RecordValidationError::NonFiniteAttrValue { .. })
+            ));
+        }
+
+        let bad_event = EventRecord {
+            schema_version: 0,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "step".to_string(),
+            attrs: AttrMap::new(),
+        };
+        assert_eq!(
+            validate_event_record(&bad_event),
+            Err(RecordValidationError::UnsupportedSchemaVersion {
+                expected: OBSERVE_SCHEMA_V1,
+                got: 0
+            })
+        );
+
+        let bad_metric = MetricRecord {
+            schema_version: 99,
+            ts_unix_nanos: 1,
+            trace_id: TraceId::from_bytes([1u8; 16]),
+            span_id: None,
+            name: "loss".to_string(),
+            value: 1.0,
+            unit: None,
+            attrs: AttrMap::new(),
+        };
+        assert_eq!(
+            validate_metric_record(&bad_metric),
+            Err(RecordValidationError::UnsupportedSchemaVersion {
+                expected: OBSERVE_SCHEMA_V1,
+                got: 99
             })
         );
     }

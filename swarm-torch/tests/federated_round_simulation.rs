@@ -580,7 +580,8 @@ fn scenario_4_and_5_gossip_relay_forwarding_classic_residual_and_equivocation_de
     model.load_parameters(&[0.5, -0.5, 0.1]).unwrap();
     let mut coord = SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000)
         .unwrap()
-        .with_coordinator_identity(*run_id.as_bytes(), coord_peer);
+        .with_coordinator_identity(*run_id.as_bytes(), coord_peer)
+        .unwrap();
     let session0 = peers[0].establish_session(&mut coord, 1, 0x44, 200);
 
     // Originator (peer0) compresses its local delta ONCE using ClassicResidualCompressor (TopK 2/3)

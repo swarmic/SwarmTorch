@@ -26,8 +26,9 @@ use super::cas::{
     RoundResumeStateV1,
 };
 use super::io::{
-    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, read_bytes_bounded, sha256_file,
-    write_json_pretty_atomic, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
+    decode_hex_exact, hex_lower, parse_json_slice, parse_ndjson_slice_bounded,
+    path_is_present_no_symlink, read_bytes_bounded, sha256_file, write_json_pretty_atomic,
+    MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
 };
 use super::lock::{BundleLockGuard, LockAcquisitionPolicy};
 use super::{ArtifactWriteProfile, RunArtifactBundle, RunArtifactSink, SnapshotProfile};
@@ -63,14 +64,14 @@ pub struct SessionCommitReceiptV1 {
     pub manifest: ManifestV1,
 }
 
-const SNAPSHOT_PAIR_SCHEMA_V1: u32 = 1;
+pub(crate) const SNAPSHOT_PAIR_SCHEMA_V1: u32 = 1;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct SnapshotPairCommitV1 {
-    schema_version: u32,
-    pair_seq: u64,
-    registry_sha256: String,
-    lineage_sha256: String,
+pub(crate) struct SnapshotPairCommitV1 {
+    pub(crate) schema_version: u32,
+    pub(crate) pair_seq: u64,
+    pub(crate) registry_sha256: String,
+    pub(crate) lineage_sha256: String,
 }
 
 /// DataOps session: manages registry/lineage with trust propagation, cross-process lock
@@ -94,6 +95,8 @@ pub struct DataOpsSession {
     pending_transform_audits: Vec<TransformAuditV0>,
     /// Latest recorded physical `(rows, bytes)` keyed by `(asset_key, fingerprint_v0)`.
     cached_output_metrics: BTreeMap<(String, String), (Option<u64>, Option<u64>)>,
+    /// Latest recorded canonical `cache_key_v0` (binds `execution_profile`) keyed by `(asset_key, fingerprint_v0)`.
+    cached_cache_keys: BTreeMap<(String, String), String>,
 }
 
 impl DataOpsSession {
@@ -115,6 +118,7 @@ impl DataOpsSession {
             dataops_write_count: 0,
             pending_transform_audits: Vec::new(),
             cached_output_metrics: BTreeMap::new(),
+            cached_cache_keys: BTreeMap::new(),
         }
     }
 
@@ -155,7 +159,7 @@ impl DataOpsSession {
         let reg_snap: DatasetRegistryV1 = parse_json_slice(&reg_snap_bytes)?;
 
         let reg_updates_path = datasets_dir.join("registry_updates.ndjson");
-        let reg_updates: Vec<DatasetEntryV1> = if reg_updates_path.exists() {
+        let reg_updates: Vec<DatasetEntryV1> = if path_is_present_no_symlink(&reg_updates_path)? {
             let bytes = read_bytes_bounded(&reg_updates_path, MAX_SINGLE_ARTIFACT_BYTES)?;
             parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?
         } else {
@@ -177,7 +181,7 @@ impl DataOpsSession {
         let lin_snap: DatasetLineageV1 = parse_json_slice(&lin_snap_bytes)?;
 
         let lin_updates_path = datasets_dir.join("lineage_edges.ndjson");
-        let lin_updates: Vec<LineageEdgeV1> = if lin_updates_path.exists() {
+        let lin_updates: Vec<LineageEdgeV1> = if path_is_present_no_symlink(&lin_updates_path)? {
             let bytes = read_bytes_bounded(&lin_updates_path, MAX_SINGLE_ARTIFACT_BYTES)?;
             parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?
         } else {
@@ -197,19 +201,26 @@ impl DataOpsSession {
         let mat_path = datasets_dir.join("materializations.ndjson");
         let mut max_seq = 0u64;
         let mut cached_output_metrics = BTreeMap::new();
-        if mat_path.exists() {
+        let mut cached_cache_keys = BTreeMap::new();
+        if path_is_present_no_symlink(&mat_path)? {
             let bytes = read_bytes_bounded(&mat_path, MAX_SINGLE_ARTIFACT_BYTES)?;
             let rows: Vec<MaterializationRecordCompat> =
                 parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let v2 = row.into_v2();
-                if v2.status == MaterializationStatusV0::Ok
-                    && (v2.rows.is_some() || v2.bytes.is_some())
-                {
-                    cached_output_metrics.insert(
-                        (v2.asset_key.clone(), v2.fingerprint_v0.clone()),
-                        (v2.rows, v2.bytes),
-                    );
+                if v2.status == MaterializationStatusV0::Ok {
+                    if v2.rows.is_some() || v2.bytes.is_some() {
+                        cached_output_metrics.insert(
+                            (v2.asset_key.clone(), v2.fingerprint_v0.clone()),
+                            (v2.rows, v2.bytes),
+                        );
+                    }
+                    if let Some(ref key) = v2.cache_key_v0 {
+                        cached_cache_keys.insert(
+                            (v2.asset_key.clone(), v2.fingerprint_v0.clone()),
+                            key.clone(),
+                        );
+                    }
                 }
                 let seq = if v2.record_seq == 0 {
                     (idx as u64) + 1
@@ -221,10 +232,15 @@ impl DataOpsSession {
         }
 
         let pair_marker_path = datasets_dir.join("snapshot_pair_commit.json");
-        let next_snapshot_pair_seq = if pair_marker_path.exists() {
+        let next_snapshot_pair_seq = if path_is_present_no_symlink(&pair_marker_path)? {
             let bytes = read_bytes_bounded(&pair_marker_path, MAX_SINGLE_ARTIFACT_BYTES)?;
             let marker: SnapshotPairCommitV1 = parse_json_slice(&bytes)?;
-            marker.pair_seq.saturating_add(1)
+            marker.pair_seq.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot_pair_commit pair_seq overflow",
+                )
+            })?
         } else {
             1
         };
@@ -232,16 +248,23 @@ impl DataOpsSession {
         let sink = Arc::new(RunArtifactSink::with_profile_and_lock(
             bundle, profile, lock_guard,
         ));
+        let next_record_seq = max_seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "materializations record_seq overflow",
+            )
+        })?;
         Ok(Self {
             sink,
             registry,
             lineage,
-            next_record_seq: max_seq.saturating_add(1),
+            next_record_seq,
             snapshot_profile,
             next_snapshot_pair_seq,
             dataops_write_count: 0,
             pending_transform_audits: Vec::new(),
             cached_output_metrics,
+            cached_cache_keys,
         })
     }
 
@@ -300,7 +323,7 @@ impl DataOpsSession {
     pub fn fingerprint_bytes(&self, asset_key: &str) -> Option<[u8; 32]> {
         self.registry
             .get(asset_key)
-            .and_then(|e| hex_to_bytes(&e.fingerprint_v0))
+            .and_then(|e| decode_hex_exact::<32>(&e.fingerprint_v0).ok())
     }
 
     /// Attach a verified physical CAS URI (`cas://sha256/<64_hex>`) to an already-materialized
@@ -389,6 +412,29 @@ impl DataOpsSession {
         cache_decision: impl Into<CacheDecisionV0>,
         duration_ms: u64,
     ) -> io::Result<()> {
+        let empty = BTreeMap::new();
+        self.materialize_node_outputs_with_cas_bindings(
+            node,
+            outputs,
+            &empty,
+            ts_unix_nanos,
+            cache_decision,
+            duration_ms,
+        )
+    }
+
+    /// Atomically validate and bind physical CAS URIs alongside node output materialization so
+    /// snapshots, `registry_updates.ndjson`, and manifests never observe intermediate unbound
+    /// outputs (`ST-10`).
+    pub fn materialize_node_outputs_with_cas_bindings(
+        &mut self,
+        node: &NodeV1,
+        outputs: &[OutputSpec],
+        cas_bindings: &BTreeMap<String, (String, String)>,
+        ts_unix_nanos: u64,
+        cache_decision: impl Into<CacheDecisionV0>,
+        duration_ms: u64,
+    ) -> io::Result<()> {
         // ── PRE-VALIDATION ──────────────────────────────────────────────
 
         let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -440,6 +486,17 @@ impl DataOpsSession {
             }
         }
 
+        let run_dir = self.sink.bundle().run_dir();
+        for (asset_key, (cas_uri, content_type)) in cas_bindings {
+            if content_type.is_empty() || !provided.contains(asset_key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid CAS binding for output asset {asset_key}"),
+                ));
+            }
+            verify_cas_uri_exists(run_dir, cas_uri, None)?;
+        }
+
         // ── SNAPSHOT INPUTS (pre-mutation) ───────────────────────────────
 
         let mut upstream_fps: Vec<[u8; 32]> = Vec::new();
@@ -456,7 +513,7 @@ impl DataOpsSession {
                     ),
                 )
             })?;
-            let fp_bytes = hex_to_bytes(&entry.fingerprint_v0).ok_or_else(|| {
+            let fp_bytes = decode_hex_exact::<32>(&entry.fingerprint_v0).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -545,7 +602,17 @@ impl DataOpsSession {
                 .registry
                 .get(&output.asset_key)
                 .filter(|existing| existing.fingerprint_v0 == fp_hex);
-            let preserved_source = existing_same_fp.and_then(|existing| existing.source.clone());
+            let preserved_source =
+                if let Some((cas_uri, content_type)) = cas_bindings.get(&output.asset_key) {
+                    Some(SourceDescriptorV0 {
+                        uri: cas_uri.clone(),
+                        content_type: content_type.clone(),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: None,
+                    })
+                } else {
+                    existing_same_fp.and_then(|existing| existing.source.clone())
+                };
             let preserved_schema = output
                 .schema
                 .clone()
@@ -616,7 +683,12 @@ impl DataOpsSession {
                 quality: None,
             };
             staged_materializations.push(mat);
-            next_record_seq = next_record_seq.saturating_add(1);
+            next_record_seq = next_record_seq.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "materializations record_seq overflow",
+                )
+            })?;
         }
 
         for entry in &staged_entries {
@@ -634,6 +706,12 @@ impl DataOpsSession {
                 self.cached_output_metrics.insert(
                     (mat.asset_key.clone(), mat.fingerprint_v0.clone()),
                     (mat.rows, mat.bytes),
+                );
+            }
+            if let Some(ref key) = mat.cache_key_v0 {
+                self.cached_cache_keys.insert(
+                    (mat.asset_key.clone(), mat.fingerprint_v0.clone()),
+                    key.clone(),
                 );
             }
         }
@@ -668,7 +746,9 @@ impl DataOpsSession {
     }
 
     fn record_dataops_mutation(&mut self) -> io::Result<()> {
-        self.dataops_write_count = self.dataops_write_count.saturating_add(1);
+        self.dataops_write_count = self.dataops_write_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "dataops write counter overflow")
+        })?;
         match self.snapshot_profile {
             SnapshotProfile::Strict => self.flush_snapshots(),
             SnapshotProfile::Streaming {
@@ -708,7 +788,13 @@ impl DataOpsSession {
             lineage_sha256,
         };
         write_json_pretty_atomic(&datasets_dir.join("snapshot_pair_commit.json"), &marker)?;
-        self.next_snapshot_pair_seq = self.next_snapshot_pair_seq.saturating_add(1);
+        self.next_snapshot_pair_seq =
+            self.next_snapshot_pair_seq.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot_pair_commit pair_seq overflow",
+                )
+            })?;
 
         if !matches!(
             self.sink.profile().manifest_policy,
@@ -866,7 +952,12 @@ impl DataOpsSession {
                 error_code: error_code.clone(),
                 quality: None,
             });
-            next_record_seq = next_record_seq.saturating_add(1);
+            next_record_seq = next_record_seq.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "materializations record_seq overflow",
+                )
+            })?;
         }
 
         for record in &staged {
@@ -927,8 +1018,8 @@ impl DataOpsSession {
                 .registry
                 .get(&input.asset_key)
                 .ok_or_else(|| PredictError::MissingInput(input.asset_key.clone()))?;
-            let fp_bytes = hex_to_bytes(&entry.fingerprint_v0)
-                .ok_or_else(|| PredictError::InvalidFingerprint(input.asset_key.clone()))?;
+            let fp_bytes = decode_hex_exact::<32>(&entry.fingerprint_v0)
+                .map_err(|_| PredictError::InvalidFingerprint(input.asset_key.clone()))?;
             upstream_fps.push(fp_bytes);
         }
 
@@ -969,17 +1060,38 @@ impl DataOpsSession {
         })
     }
 
+    /// Remove declared `node.outputs` from active registry/cache state when execution or admission
+    /// fails/denies a node, preventing downstream steps from consuming stale prior artifacts (`ST-10`).
+    pub fn invalidate_node_outputs(&mut self, node: &NodeV1) -> io::Result<()> {
+        let mut removed_any = false;
+        for out in &node.outputs {
+            if self.registry.remove(&out.asset_key).is_some() {
+                removed_any = true;
+            }
+            self.cached_output_metrics
+                .retain(|(asset, _), _| asset != &out.asset_key);
+            self.cached_cache_keys
+                .retain(|(asset, _), _| asset != &out.asset_key);
+        }
+        if removed_any {
+            self.record_dataops_mutation()?;
+        }
+        Ok(())
+    }
+
     /// Evaluate whether `node` can reuse all of its declared `outputs` from cache
     /// (`ADR-0023` §2.3, `W10-01`).
     ///
     /// - Respects [`CachePolicyV0::Bypass`] by returning [`CacheDecisionV0::Bypass`].
-    /// - Requires `node.outputs` to be non-empty and every predicted output to match the current
-    ///   registry entry's `fingerprint_v0`.
-    /// - Returns `Ok(CacheDecisionV0::Miss)` when no matching cached output is registered.
-    /// - When a recorded cache entry matches the predicted fingerprint and binds a
-    ///   `cas://sha256/...` or `blobs/sha256/...` URI, verifies that the physical CAS blob exists
-    ///   and its SHA-256 matches, returning `Err(io::Error)` on missing/corrupt CAS integrity failure
-    ///   instead of silently downgrading to `Miss`.
+    /// - Requires `node.outputs` to be non-empty, every predicted output to match the current
+    ///   registry entry's `fingerprint_v0`, AND the expected trust class / `execution_profile`
+    ///   derived from `node.execution_trust` and input trust (`ST-10`).
+    /// - Returns `Ok(CacheDecisionV0::Miss)` when no matching cached output is registered or when
+    ///   trust/execution profile changed.
+    /// - When a recorded cache entry matches and binds a `cas://sha256/...` or
+    ///   `blobs/sha256/...` URI, verifies that the physical CAS blob exists and its SHA-256
+    ///   matches, returning `Err(io::Error)` on missing/corrupt CAS integrity failure instead
+    ///   of silently downgrading to `Miss`.
     pub fn verify_cache_hit(
         &self,
         node: &NodeV1,
@@ -994,6 +1106,35 @@ impl DataOpsSession {
         let Ok(predicted) = self.predict(node, outputs) else {
             return Ok(CacheDecisionV0::Miss);
         };
+
+        let mut upstream_fps = Vec::with_capacity(node.inputs.len());
+        let mut any_untrusted_input = false;
+        for inp in &node.inputs {
+            let Some(entry) = self.registry.get(&inp.asset_key) else {
+                return Ok(CacheDecisionV0::Miss);
+            };
+            let Ok(fp_bytes) = decode_hex_exact::<32>(&entry.fingerprint_v0) else {
+                return Ok(CacheDecisionV0::Miss);
+            };
+            upstream_fps.push(fp_bytes);
+            if matches!(entry.trust, TrustClass::Untrusted) {
+                any_untrusted_input = true;
+            }
+        }
+        let expected_output_trust =
+            if any_untrusted_input || !matches!(node.execution_trust, ExecutionTrust::Core) {
+                TrustClass::Untrusted
+            } else {
+                TrustClass::Trusted
+            };
+        let execution_profile = match node.execution_trust {
+            ExecutionTrust::Core => "core",
+            ExecutionTrust::SandboxedExtension => "sandboxed_extension",
+            ExecutionTrust::UnsafeExtension => "unsafe_extension",
+        };
+        let expected_cache_key = cache_key_v0(node, &upstream_fps, execution_profile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
         let run_dir = self.sink.bundle().run_dir();
         for pred in &predicted {
             let Some(entry) = self.registry.get(&pred.asset_key) else {
@@ -1001,6 +1142,17 @@ impl DataOpsSession {
             };
             if entry.fingerprint_v0 != pred.fingerprint_v0 {
                 return Ok(CacheDecisionV0::Miss);
+            }
+            if entry.trust != expected_output_trust {
+                return Ok(CacheDecisionV0::Miss);
+            }
+            if let Some(prev_key) = self
+                .cached_cache_keys
+                .get(&(pred.asset_key.clone(), pred.fingerprint_v0.clone()))
+            {
+                if prev_key != &expected_cache_key {
+                    return Ok(CacheDecisionV0::Miss);
+                }
             }
             if let Some(ref src) = entry.source {
                 if parse_cas_uri_digest(&src.uri).is_some() {
@@ -1017,27 +1169,5 @@ impl DataOpsSession {
         asset_key: &str,
     ) -> Option<&mut DatasetEntryV1> {
         self.registry.get_mut(asset_key)
-    }
-}
-
-fn hex_to_bytes(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let high = hex_digit(chunk[0])?;
-        let low = hex_digit(chunk[1])?;
-        out[i] = (high << 4) | low;
-    }
-    Some(out)
-}
-
-fn hex_digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
     }
 }

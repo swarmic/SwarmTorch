@@ -5,15 +5,20 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use swarm_torch_core::dataops::{
     validate_source_descriptor_bounds, DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1,
-    LineageEdgeV1, MaterializationRecordCompat, MaterializationRecordV2,
+    LineageEdgeV1, MaterializationRecordCompat, MaterializationRecordV2, DATAOPS_SCHEMA_V1,
 };
-use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
-use swarm_torch_core::run_graph::GraphV1;
+use swarm_torch_core::observe::{
+    validate_event_record, validate_metric_record, validate_span_record, EventRecord, MetricRecord,
+    SpanRecord,
+};
+use swarm_torch_core::run_graph::{
+    node_id_from_key, validate_graph_v1, validate_node_v1, GraphV1, GRAPH_SCHEMA_V1,
+};
 
 use crate::artifacts::{
     hex_lower, parse_and_validate_dp_ledger_slice, parse_json_slice, parse_ndjson_slice_bounded,
-    RunArtifactBundle, TrustPolicy, VerifiedBundleV1, DP_LEDGER_REL_PATH, MAX_NDJSON_LINES,
-    MAX_NDJSON_LINE_BYTES,
+    RunArtifactBundle, SnapshotPairCommitV1, TrustPolicy, VerifiedBundleV1, DP_LEDGER_REL_PATH,
+    MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, SNAPSHOT_PAIR_SCHEMA_V1,
 };
 
 use super::model::Report;
@@ -28,16 +33,6 @@ pub enum LoadWarning {
     SourceDescriptorBoundsExceeded { asset_key: String, message: String },
     SnapshotPairMismatch { message: String },
 }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct SnapshotPairCommitV1 {
-    schema_version: u32,
-    pair_seq: u64,
-    registry_sha256: String,
-    lineage_sha256: String,
-}
-
-const SNAPSHOT_PAIR_SCHEMA_V1: u32 = 1;
 
 /// Load a report enforcing [`TrustPolicy::Strict`] (`ADR-0023` §3.1, `P2-10`, `W10-02`).
 ///
@@ -75,8 +70,35 @@ pub fn load_report_from_verified(
 ) -> io::Result<(Report, Vec<LoadWarning>)> {
     let mut warnings = Vec::new();
 
-    let mut graph: GraphV1 = parse_json_slice(verified.require_bytes("graph.json")?)?;
-    graph = graph
+    let raw_graph: GraphV1 = parse_json_slice(verified.require_bytes("graph.json")?)?;
+    if raw_graph.schema_version != GRAPH_SCHEMA_V1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported graph schema_version {} (expected {})",
+                raw_graph.schema_version, GRAPH_SCHEMA_V1
+            ),
+        ));
+    }
+    for node in &raw_graph.nodes {
+        if let Some(explicit_id) = node.node_id {
+            let expected_id = node_id_from_key(&node.node_key);
+            if explicit_id != expected_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "graph node '{}' has spoofed node_id {} (expected {})",
+                        node.node_key, explicit_id, expected_id
+                    ),
+                ));
+            }
+        }
+        validate_node_v1(node)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    validate_graph_v1(&raw_graph)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let graph = raw_graph
         .normalize()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -98,10 +120,29 @@ pub fn load_report_from_verified(
         warnings.push(LoadWarning::SnapshotPairMismatch { message });
         (DatasetRegistryV1::default(), DatasetLineageV1::default())
     } else {
-        (
-            parse_json_slice(verified.require_bytes("datasets/registry.json")?)?,
-            parse_json_slice(verified.require_bytes("datasets/lineage.json")?)?,
-        )
+        let reg: DatasetRegistryV1 =
+            parse_json_slice(verified.require_bytes("datasets/registry.json")?)?;
+        if reg.schema_version != DATAOPS_SCHEMA_V1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported registry schema_version {} (expected {})",
+                    reg.schema_version, DATAOPS_SCHEMA_V1
+                ),
+            ));
+        }
+        let lin: DatasetLineageV1 =
+            parse_json_slice(verified.require_bytes("datasets/lineage.json")?)?;
+        if lin.schema_version != DATAOPS_SCHEMA_V1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported lineage schema_version {} (expected {})",
+                    lin.schema_version, DATAOPS_SCHEMA_V1
+                ),
+            ));
+        }
+        (reg, lin)
     };
 
     let registry = apply_registry_updates(registry_snapshot, registry_updates);
@@ -124,16 +165,28 @@ pub fn load_report_from_verified(
         MAX_NDJSON_LINE_BYTES,
         MAX_NDJSON_LINES,
     )?;
+    for span in &spans {
+        validate_span_record(span)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    }
     let events: Vec<EventRecord> = parse_ndjson_slice_bounded(
         verified.require_bytes("events.ndjson")?,
         MAX_NDJSON_LINE_BYTES,
         MAX_NDJSON_LINES,
     )?;
+    for event in &events {
+        validate_event_record(event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    }
     let metrics: Vec<MetricRecord> = parse_ndjson_slice_bounded(
         verified.require_bytes("metrics.ndjson")?,
         MAX_NDJSON_LINE_BYTES,
         MAX_NDJSON_LINES,
     )?;
+    for metric in &metrics {
+        validate_metric_record(metric)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    }
     let materializations_raw: Vec<MaterializationRecordCompat> = parse_ndjson_slice_bounded(
         verified.require_bytes("datasets/materializations.ndjson")?,
         MAX_NDJSON_LINE_BYTES,

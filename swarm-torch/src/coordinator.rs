@@ -52,12 +52,14 @@ use swarm_torch_net::gossip::{
 use crate::artifacts::{
     get_verified_cclip_center_v1, get_verified_checkpoint_model,
     get_verified_historical_anchors_v1, get_verified_optimizer_state_snapshot_v1,
-    pre_release_debit_dp_accountant, put_cclip_center_v1, put_checkpoint_model,
-    put_coordinator_resume_state_v2, put_historical_anchors_v1, put_optimizer_state_snapshot_v1,
-    reconstruct_dp_accountant_from_ledger, write_committed_head_v1, write_round_resume_state,
-    CheckpointContentDigestV1, CheckpointRecipeKeyV1, CommittedHeadV1, CoordinatorResumeStateV2,
-    CryptoErrorOrIo, DataOpsSession, OutputSpec, RestoreModeV1, RoundResumeStateV1, TrustPolicy,
-    COMMITTED_HEAD_SCHEMA_V1, COORDINATOR_RESUME_STATE_SCHEMA_V2, ROUND_RESUME_STATE_SCHEMA_V1,
+    path_is_present_no_symlink, pre_release_debit_dp_accountant, put_cclip_center_v1,
+    put_checkpoint_model, put_coordinator_resume_state_v2, put_historical_anchors_v1,
+    put_optimizer_state_snapshot_v1, read_committed_head_v1,
+    reconstruct_dp_accountant_from_committed_head, write_committed_head_v1,
+    write_round_resume_state, CheckpointContentDigestV1, CheckpointRecipeKeyV1, CommittedHeadV1,
+    CoordinatorResumeStateV2, CryptoErrorOrIo, DataOpsSession, OutputSpec, RestoreModeV1,
+    RoundResumeStateV1, RunArtifactBundle, TrustPolicy, COMMITTED_HEAD_SCHEMA_V1,
+    COORDINATOR_RESUME_STATE_SCHEMA_V2, DP_LEDGER_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
 };
 
 /// Domain tag for canonical peer round submission digests (`ADR-0023` §1.3).
@@ -551,10 +553,18 @@ fn canonical_sparse_opening_digest_v2(
     hasher.update(msg.payload.k.to_le_bytes());
     hasher.update((msg.payload.values.len() as u64).to_le_bytes());
     for &v in &msg.payload.values {
-        let bits = if v == 0.0 { 0u32 } else { v.to_bits() };
-        hasher.update(bits.to_le_bytes());
+        hasher.update(f32_canonical_bits(v).to_le_bytes());
     }
     hasher.finalize().into()
+}
+
+#[inline]
+fn f32_canonical_bits(v: f32) -> u32 {
+    if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -579,7 +589,46 @@ fn canonical_dense_submission_digest_v2(
     hasher.update([payload_kind as u8]);
     hasher.update((values.len() as u64).to_le_bytes());
     for &v in values {
-        hasher.update(v.to_bits().to_le_bytes());
+        hasher.update(f32_canonical_bits(v).to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_lora_submission_digest_v2(
+    swarm_instance_id: &[u8; 16],
+    run_id: RunId,
+    round_id: u64,
+    base_checkpoint_digest: &CheckpointContentDigestV1,
+    context_policy_digest: &[u8; 32],
+    sender: PeerId,
+    pair: &LoraAdapterPairV1,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"swarmtorch.lora.submission.v1");
+    hasher.update(swarm_instance_id);
+    hasher.update(run_id.as_bytes());
+    hasher.update(round_id.to_le_bytes());
+    hasher.update(base_checkpoint_digest.as_bytes());
+    hasher.update(context_policy_digest);
+    hasher.update(sender.as_bytes());
+    for s in [
+        pair.descriptor.target_module.as_str(),
+        pair.descriptor.tensor_a_name.as_str(),
+        pair.descriptor.tensor_b_name.as_str(),
+    ] {
+        hasher.update((s.len() as u64).to_le_bytes());
+        hasher.update(s.as_bytes());
+    }
+    hasher.update(pair.descriptor.rank.to_le_bytes());
+    hasher.update(f32_canonical_bits(pair.descriptor.alpha).to_le_bytes());
+    hasher.update((pair.d_in as u64).to_le_bytes());
+    hasher.update((pair.d_out as u64).to_le_bytes());
+    for slice in [&pair.a_weights, &pair.b_weights] {
+        hasher.update((slice.len() as u64).to_le_bytes());
+        for &v in slice {
+            hasher.update(f32_canonical_bits(v).to_le_bytes());
+        }
     }
     hasher.finalize().into()
 }
@@ -625,6 +674,7 @@ enum PreparedPayloadV2 {
     },
     Lora {
         pair: LoraAdapterPairV1,
+        canonical_payload_digest: [u8; 32],
     },
     SparseCommitment {
         msg: SharedSeedCommitmentMessageV1,
@@ -780,6 +830,16 @@ impl ExpectedRoundContextV1 {
         self.coordinator_generation
     }
 
+    fn check_not_equivocated(&self, sender: PeerId) -> Result<(), RoundError> {
+        if self.equivocated_snapshot.contains(&sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender,
+                round_id: self.active_round_id,
+            });
+        }
+        Ok(())
+    }
+
     fn validate_common_context(&self, prepared: &PreparedSubmissionV1) -> Result<(), RoundError> {
         if prepared.swarm_instance_id != self.swarm_instance_id {
             return Err(RoundError::SwarmInstanceMismatch {
@@ -809,6 +869,7 @@ impl ExpectedRoundContextV1 {
                 requested_epoch: 1,
             }));
         }
+        self.check_not_equivocated(prepared.sender)?;
         Ok(())
     }
 
@@ -861,13 +922,6 @@ impl ExpectedRoundContextV1 {
         }
 
         check_update_kind_compatible(self.expected_update_kind, prepared.payload_kind)?;
-
-        if self.equivocated_snapshot.contains(&prepared.sender) {
-            return Err(RoundError::EquivocationRejected {
-                sender: prepared.sender,
-                round_id: self.active_round_id,
-            });
-        }
 
         let (values, canonical_payload_digest) = match prepared.payload {
             PreparedPayloadV2::Dense {
@@ -999,6 +1053,12 @@ impl ExpectedRoundContextV1 {
         prepared: PreparedSubmissionV1,
     ) -> Result<ValidatedLoraSubmissionV1, RoundError> {
         self.validate_common_context(&prepared)?;
+        if self.active_sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "LoRA submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
 
         if prepared.round_id > self.active_round_id {
             return Err(RoundError::FutureRoundRejected {
@@ -1025,8 +1085,11 @@ impl ExpectedRoundContextV1 {
             ));
         }
 
-        let pair = match prepared.payload {
-            PreparedPayloadV2::Lora { pair, .. } => pair,
+        let (pair, canonical_payload_digest) = match prepared.payload {
+            PreparedPayloadV2::Lora {
+                pair,
+                canonical_payload_digest,
+            } => (pair, canonical_payload_digest),
             PreparedPayloadV2::Dense { .. }
             | PreparedPayloadV2::SparseCommitment { .. }
             | PreparedPayloadV2::SparseOpening { .. } => {
@@ -1041,6 +1104,7 @@ impl ExpectedRoundContextV1 {
             coordinator_generation: self.coordinator_generation,
             round_id: prepared.round_id,
             sender: prepared.sender,
+            canonical_payload_digest,
             pair,
             replay_admission: prepared.replay_admission,
         })
@@ -1069,12 +1133,6 @@ impl ExpectedRoundContextV1 {
             return Err(RoundError::BaseCheckpointMismatch {
                 expected: self.accepted_parent_digest,
                 got: prepared.base_checkpoint_digest,
-            });
-        }
-        if self.equivocated_snapshot.contains(&prepared.sender) {
-            return Err(RoundError::EquivocationRejected {
-                sender: prepared.sender,
-                round_id: self.active_round_id,
             });
         }
 
@@ -1266,6 +1324,7 @@ pub struct ValidatedLoraSubmissionV1 {
     coordinator_generation: u64,
     round_id: u64,
     sender: PeerId,
+    canonical_payload_digest: [u8; 32],
     pair: LoraAdapterPairV1,
     replay_admission: PreparedReplayAdmission,
 }
@@ -1735,6 +1794,7 @@ pub struct SwarmRoundCoordinator<M: SwarmModel> {
     historical_digests: BTreeMap<u64, CheckpointContentDigestV1>,
     replay: ReplayProtection,
     admitted: BTreeMap<PeerId, AdmittedPeerEntry>,
+    lora_admitted_digests: BTreeMap<PeerId, [u8; 32]>,
     equivocated: BTreeSet<PeerId>,
     /// Persistent previous-round aggregate center $v^{(r-1)}$ for [`CenteredClipping`] (`ADR-0019` §4).
     cclip_center: Option<Vec<f32>>,
@@ -2043,6 +2103,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_clip_norm: None,
             bucketing: None,
             dp_profile: None,
+            equivocated_peers: Vec::new(),
             committed_unix_nanos: ts_unix_nanos,
         };
         let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
@@ -2090,6 +2151,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             historical_digests,
             replay,
             admitted: BTreeMap::new(),
+            lora_admitted_digests: BTreeMap::new(),
             equivocated: BTreeSet::new(),
             cclip_center: None,
             bucketing: None,
@@ -2120,7 +2182,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     ) -> Result<Self, RoundError> {
         config.validate()?;
         let run_dir = session.sink().bundle().run_dir();
-        let (_head, _manifest, _status, resume_v2) = session
+        let (_head, manifest, _status, resume_v2) = session
             .sink()
             .bundle()
             .verify_committed_head(trust_policy)?;
@@ -2129,6 +2191,18 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 expected: session.sink().bundle().run_id(),
                 got: resume_v2.run_id,
             });
+        }
+        let dp_ledger_in_manifest = manifest
+            .entries
+            .iter()
+            .any(|e| e.path == DP_LEDGER_REL_PATH);
+        if resume_v2.dp_profile.is_some()
+            || dp_ledger_in_manifest
+            || path_is_present_no_symlink(&run_dir.join(DP_LEDGER_REL_PATH))?
+        {
+            return Err(RoundError::ResumeStateMismatch(
+                "restore_weights_only cannot reset dp_accountant on a run with DP budget history; start a fresh run_id bundle or use resume_exact_training_state".to_string(),
+            ));
         }
         let model: M = get_verified_checkpoint_model(
             run_dir,
@@ -2142,6 +2216,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         historical_digests.insert(resume_v2.round_id, resume_v2.model_digest);
         let mut historical_anchors = BTreeMap::new();
         historical_anchors.insert(resume_v2.round_id, model.parameters().to_vec());
+        let restored_equivocated: BTreeSet<PeerId> =
+            resume_v2.equivocated_peers.iter().copied().collect();
 
         Ok(Self {
             run_id: resume_v2.run_id,
@@ -2157,7 +2233,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             historical_digests,
             replay,
             admitted: BTreeMap::new(),
-            equivocated: BTreeSet::new(),
+            lora_admitted_digests: BTreeMap::new(),
+            equivocated: restored_equivocated,
             cclip_center: None,
             bucketing: None,
             last_bucketing_report: None,
@@ -2192,7 +2269,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     ) -> Result<Self, RoundError> {
         config.validate()?;
         let run_dir = session.sink().bundle().run_dir();
-        let (_head, _manifest, _status, resume_v2) = session
+        let (_head, manifest, _status, resume_v2) = session
             .sink()
             .bundle()
             .verify_committed_head(trust_policy)?;
@@ -2297,18 +2374,34 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             )));
         }
 
-        // Reconstruct `dp_accountant` when `dp_profile` is committed in `CoordinatorResumeStateV2` (`AR-14-01`).
+        // Reconstruct `dp_accountant` pinned to verified committed-head manifest (`AR-14-01`).
+        let dp_ledger_in_manifest = manifest
+            .entries
+            .iter()
+            .any(|e| e.path == DP_LEDGER_REL_PATH);
         let restored_dp_accountant = match resume_v2.dp_profile {
             Some(profile) => {
-                let acc = reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(
-                    |err| match err {
-                        CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
-                        CryptoErrorOrIo::Io(e) => RoundError::Io(e),
-                    },
-                )?;
+                let acc = reconstruct_dp_accountant_from_committed_head(
+                    session.sink().bundle(),
+                    &manifest,
+                    profile,
+                    true,
+                )
+                .map_err(|err| match err {
+                    CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
+                    CryptoErrorOrIo::Io(e) => RoundError::Io(e),
+                })?;
                 Some(acc)
             }
-            None => None,
+            None => {
+                if dp_ledger_in_manifest {
+                    return Err(RoundError::ResumeStateMismatch(
+                        "dp/ledger.ndjson committed in manifest yet dp_profile missing in CoordinatorResumeStateV2"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
         };
 
         // Apply optimizer restore ONLY after all other CAS/manifest/config checks succeed.
@@ -2318,6 +2411,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         }
 
         let replay = Self::build_replay_protection(&config, resume_v2.replay_timestamp_floor_secs);
+        let restored_equivocated: BTreeSet<PeerId> =
+            resume_v2.equivocated_peers.iter().copied().collect();
 
         Ok(Self {
             run_id: resume_v2.run_id,
@@ -2333,7 +2428,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             historical_digests: resume_v2.historical_digests,
             replay,
             admitted: BTreeMap::new(),
-            equivocated: BTreeSet::new(),
+            lora_admitted_digests: BTreeMap::new(),
+            equivocated: restored_equivocated,
             cclip_center: restored_cclip_center,
             bucketing: resume_v2.bucketing,
             last_bucketing_report: None,
@@ -2373,97 +2469,24 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         }
     }
 
-    /// Legacy v1 coordinator resume helper (`ADR-0023` §2.2).
+    /// Legacy unauthenticated v1 coordinator resume helper — rejected fail-closed (`ST-04`).
     ///
-    /// Prefer [`Self::resume_exact_training_state`] or [`Self::restore_weights_only`] which
-    /// verify `checkpoints/committed_head.json`, optimizer state, `cclip_center`, and bounded
-    /// `historical_anchors` fail-closed (`ST-04`).
+    /// Use [`Self::resume_exact_training_state`] or [`Self::restore_weights_only`] which verify
+    /// `checkpoints/committed_head.json`, manifest signatures (`TrustPolicy`), `dp/ledger.ndjson`,
+    /// optimizer state, `cclip_center`, and `historical_anchors` (`ST-04`).
     #[deprecated(
-        note = "use resume_exact_training_state or restore_weights_only for authenticated transactional state recovery (ST-04)"
+        note = "unauthenticated v1 resume fails closed; use resume_exact_training_state or restore_weights_only (ST-04)"
     )]
     pub fn from_resume_state(
-        config: RoundCoordinatorConfig,
-        model_template: M,
-        resume_state: &RoundResumeStateV1,
-        session: &DataOpsSession,
+        _config: RoundCoordinatorConfig,
+        _model_template: M,
+        _resume_state: &RoundResumeStateV1,
+        _session: &DataOpsSession,
     ) -> Result<Self, RoundError> {
-        config.validate()?;
-        if matches!(config.update_kind, UpdateKindV1::GradientV1) {
-            return Err(RoundError::ResumeStateMismatch(
-                "from_resume_state cannot restore GradientV1 optimizer state; use resume_exact_training_state or restore_weights_only"
-                    .to_string(),
-            ));
-        }
-        if matches!(
-            config.aggregation,
-            RobustAggregation::CenteredClipping { .. }
-        ) && resume_state.round_id >= 1
-        {
-            return Err(RoundError::ResumeStateMismatch(
-                "from_resume_state cannot restore CenteredClipping center; use resume_exact_training_state or restore_weights_only"
-                    .to_string(),
-            ));
-        }
-        let next_round =
-            resume_state
-                .round_id
-                .checked_add(1)
-                .ok_or(RoundError::RoundIdOverflow {
-                    round_id: resume_state.round_id,
-                })?;
-        let run_dir = session.sink().bundle().run_dir();
-        if resume_state.run_id != session.sink().bundle().run_id() {
-            return Err(RoundError::RunIdMismatch {
-                expected: session.sink().bundle().run_id(),
-                got: resume_state.run_id,
-            });
-        }
-        let model: M = get_verified_checkpoint_model(
-            run_dir,
-            model_template,
-            &resume_state.content_digest,
-            resume_state.parameter_count,
-        )?;
-        let floor_secs =
-            (resume_state.committed_unix_nanos / 1_000_000_000).min(u32::MAX as u64) as u32;
-        let replay = Self::build_replay_protection(&config, floor_secs);
-
-        let mut historical_digests = BTreeMap::new();
-        historical_digests.insert(resume_state.round_id, resume_state.content_digest);
-        let mut historical_anchors = BTreeMap::new();
-        historical_anchors.insert(resume_state.round_id, model.parameters().to_vec());
-        let swarm_instance_id = default_swarm_instance_id(resume_state.run_id);
-        let coordinator_peer_id = default_coordinator_peer_id(resume_state.run_id);
-
-        Ok(Self {
-            run_id: resume_state.run_id,
-            swarm_instance_id,
-            coordinator_peer_id,
-            coordinator_generation: 0,
-            config,
-            current_round: next_round,
-            model,
-            parent_digest: resume_state.content_digest,
-            parent_recipe_key: resume_state.recipe_key,
-            parent_asset_key: resume_state.checkpoint_asset_key.clone(),
-            historical_digests,
-            replay,
-            admitted: BTreeMap::new(),
-            equivocated: BTreeSet::new(),
-            cclip_center: None,
-            bucketing: None,
-            last_bucketing_report: None,
-            sparse_round: None,
-            last_sparse_bandwidth_report: None,
-            dp_accountant: None,
-            fedasync_policy: None,
-            fedasync_hinge_threshold: 0,
-            fedasync_clip_norm: None,
-            historical_anchors,
-            manifest_signer: None,
-            #[cfg(test)]
-            fail_point: None,
-        })
+        Err(RoundError::ResumeStateMismatch(
+            "unauthenticated from_resume_state fails closed; use resume_exact_training_state or restore_weights_only"
+                .to_string(),
+        ))
     }
 
     /// Attach an Ed25519 manifest signing key so Step 3 signs every committed round manifest
@@ -2484,9 +2507,15 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     }
 
     /// Configure conservative `$s$-Bucketing` pre-aggregation for subsequent rounds (`ADR-0019` §4, `W11-01`).
-    pub fn set_bucketing(&mut self, bucketing: Option<BucketingConfig>) {
+    pub fn set_bucketing(&mut self, bucketing: Option<BucketingConfig>) -> Result<(), RoundError> {
+        let next_gen = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
         self.bucketing = bucketing;
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
+        self.coordinator_generation = next_gen;
+        Ok(())
     }
 
     /// Override the coordinator's [`swarm_instance_id`](Self::swarm_instance_id) and
@@ -2495,11 +2524,16 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         mut self,
         swarm_instance_id: [u8; 16],
         coordinator_peer_id: PeerId,
-    ) -> Self {
+    ) -> Result<Self, RoundError> {
+        let next_gen = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
         self.swarm_instance_id = swarm_instance_id;
         self.coordinator_peer_id = coordinator_peer_id;
-        self.coordinator_generation = self.coordinator_generation.saturating_add(1);
-        self
+        self.coordinator_generation = next_gen;
+        Ok(self)
     }
 
     /// Borrow the `$s$-Bucketing` execution report from the most recently finalized round.
@@ -2868,6 +2902,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                     .to_string(),
             ));
         }
+        if self.equivocated.contains(&validated.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: self.current_round,
+            });
+        }
         let sequence = validated.replay_admission.sequence();
         self.replay
             .commit_prepared_admission(validated.replay_admission)
@@ -2961,9 +3001,9 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 "two-phase SharedSeedSparse round is already active in current_round".to_string(),
             ));
         }
-        if !self.admitted.is_empty() {
+        if !self.admitted.is_empty() || !self.lora_admitted_digests.is_empty() {
             return Err(RoundError::InvalidWirePayload(
-                "cannot start SharedSeedSparse round after dense submissions were admitted"
+                "cannot start SharedSeedSparse round after dense or LoRA submissions were admitted"
                     .to_string(),
             ));
         }
@@ -2984,9 +3024,15 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             scaling,
             sampler_version: SHARED_SEED_SAMPLER_VERSION_V1,
         };
+        let next_generation = self.coordinator_generation.checked_add(1).ok_or(
+            RoundError::CoordinatorGenerationOverflow {
+                generation: self.coordinator_generation,
+            },
+        )?;
         let context_digest = context.context_digest().map_err(|e| {
             RoundError::InvalidWirePayload(format!("invalid SparseRoundContextV1: {e:?}"))
         })?;
+        self.coordinator_generation = next_generation;
         self.sparse_round = Some(ActiveSparseRoundV1 {
             context: context.clone(),
             context_digest,
@@ -3390,6 +3436,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         for (&coord_idx, &val) in expected_indices.iter().zip(aggregated_k.iter()) {
             aggregated_vec[coord_idx as usize] = val;
         }
+        // Preserve unsampled coordinates from any prior cclip_center instead of zeroing untouched entries.
+        let mut next_cclip_center_vec =
+            self.cclip_center.clone().unwrap_or_else(|| vec![0.0f32; d]);
+        for (&coord_idx, &val) in expected_indices.iter().zip(aggregated_k.iter()) {
+            next_cclip_center_vec[coord_idx as usize] = val;
+        }
 
         let (candidate_model, staged_optimizer, optimizer_snapshot, fitness_score) =
             stage_model_and_fitness_step(
@@ -3419,7 +3471,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             next_generation,
             candidate_model,
             optimizer_snapshot,
-            next_cclip_center: Some(aggregated_vec),
+            next_cclip_center: Some(next_cclip_center_vec),
             next_historical_anchors,
             next_historical_digests_without_new: self.historical_digests.clone(),
             next_bucketing_report: bucketing_report,
@@ -3514,6 +3566,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         O: SwarmOptimizer<Model = M> + Clone,
         F: FitnessFunction<Model = M>,
     {
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "finalize_round is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
         // Step 1: Pure in-memory preparation & validation (`ST-04`).
         if self.admitted.len() < self.config.min_quorum {
             return Err(RoundError::InsufficientQuorum {
@@ -3736,6 +3794,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_clip_norm: self.fedasync_clip_norm,
             bucketing: self.bucketing,
             dp_profile: self.dp_accountant.as_ref().map(|acc| *acc.profile()),
+            equivocated_peers: self.equivocated.iter().copied().collect(),
             committed_unix_nanos: plan.ts_unix_nanos,
         };
         let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
@@ -3747,7 +3806,15 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         for audit in &plan.staged_transform_audits {
             session.record_transform_applied(audit);
         }
-        if let Err(err) = session.materialize_node_outputs(
+        let mut cas_bindings = BTreeMap::new();
+        cas_bindings.insert(
+            plan.checkpoint_asset_key.clone(),
+            (
+                blob_uri.clone(),
+                "application/x-swarmtorch-model-v1".to_string(),
+            ),
+        );
+        if let Err(err) = session.materialize_node_outputs_with_cas_bindings(
             &round_node,
             &[OutputSpec {
                 asset_key: plan.checkpoint_asset_key.clone(),
@@ -3755,6 +3822,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 rows: plan.output_rows,
                 bytes: Some(blob_bytes),
             }],
+            &cas_bindings,
             plan.ts_unix_nanos,
             CacheDecisionV0::Miss,
             1,
@@ -3762,11 +3830,6 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             session.truncate_pending_transform_audits(prev_audit_len);
             return Err(RoundError::Io(err));
         }
-        session.bind_output_cas_uri(
-            &plan.checkpoint_asset_key,
-            &blob_uri,
-            "application/x-swarmtorch-model-v1",
-        )?;
 
         if plan.emit_standard_telemetry {
             let trace_id = TraceId::from_bytes(*self.run_id.as_bytes());
@@ -3890,7 +3953,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         }
         if plan.clear_round_admitted {
             self.admitted.clear();
-            self.equivocated.clear();
+            self.lora_admitted_digests.clear();
+            // `self.equivocated` persists across rounds and resumes for the entire `run_id` (`ST-01`).
         }
 
         Ok(RoundCommitSummaryV1 {
@@ -4043,7 +4107,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     ) -> Result<Option<crate::artifacts::DpLedgerEntryV1>, RoundError> {
         let run_dir = session.sink().bundle().run_dir().to_path_buf();
         let Some(acc) = self.dp_accountant.as_mut() else {
-            if run_dir.join(crate::artifacts::DP_LEDGER_REL_PATH).exists() {
+            if path_is_present_no_symlink(&run_dir.join(crate::artifacts::DP_LEDGER_REL_PATH))? {
                 return Err(RoundError::ResumeStateMismatch(
                     "dp/ledger.ndjson exists in bundle but dp_accountant is not configured"
                         .to_string(),
@@ -4102,6 +4166,17 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         run_dir: &std::path::Path,
         profile: swarm_torch_core::dp::DpMechanismProfileV1,
     ) -> Result<(), RoundError> {
+        self.configure_dp_accountant_with_policy(run_dir, profile, &TrustPolicy::LegacyPermissive)
+    }
+
+    /// Authenticate existing `dp/ledger.ndjson` against `checkpoints/committed_head.json` under
+    /// `trust_policy` and configure the active experimental Rényi DP budget accountant (`ST-02`, `AR-14-01`).
+    pub fn configure_dp_accountant_with_policy(
+        &mut self,
+        run_dir: &std::path::Path,
+        profile: swarm_torch_core::dp::DpMechanismProfileV1,
+        trust_policy: &TrustPolicy,
+    ) -> Result<(), RoundError> {
         if profile.classification
             != swarm_torch_core::dp::PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
             || !self.supports_certified_differential_privacy() && profile.guarantees_differential_privacy()
@@ -4110,6 +4185,33 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
             ));
         }
+        let expected_run_id = self.run_id;
+        let reconstruct = |profile: swarm_torch_core::dp::DpMechanismProfileV1| -> Result<
+            swarm_torch_core::dp::RdpAccountantV1,
+            RoundError,
+        > {
+            let head = read_committed_head_v1(run_dir)?;
+            if head.run_id != expected_run_id {
+                return Err(RoundError::RunIdMismatch {
+                    expected: expected_run_id,
+                    got: head.run_id,
+                });
+            }
+            let bundle = RunArtifactBundle::open(run_dir)?;
+            let (verified_head, manifest, _status, _resume) =
+                bundle.verify_committed_head(trust_policy)?;
+            if verified_head.run_id != expected_run_id {
+                return Err(RoundError::RunIdMismatch {
+                    expected: expected_run_id,
+                    got: verified_head.run_id,
+                });
+            }
+            reconstruct_dp_accountant_from_committed_head(&bundle, &manifest, profile, true)
+                .map_err(|err| match err {
+                    CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
+                    CryptoErrorOrIo::Io(e) => RoundError::Io(e),
+                })
+        };
         if let Some(existing) = self.dp_accountant.as_ref() {
             if existing.profile() != &profile {
                 return Err(RoundError::ResumeStateMismatch(
@@ -4117,13 +4219,13 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                         .to_string(),
                 ));
             }
-            let acc =
-                reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(
-                    |err| match err {
-                        CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
-                        CryptoErrorOrIo::Io(e) => RoundError::Io(e),
-                    },
-                )?;
+            let acc = reconstruct(profile)?;
+            if acc.committed_rounds() < existing.committed_rounds() {
+                return Err(RoundError::ResumeStateMismatch(
+                    "reconstructed dp_accountant has fewer committed_rounds than active coordinator state"
+                        .to_string(),
+                ));
+            }
             self.dp_accountant = Some(acc);
             return Ok(());
         }
@@ -4132,11 +4234,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 generation: self.coordinator_generation,
             },
         )?;
-        let acc =
-            reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(|err| match err {
-                CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
-                CryptoErrorOrIo::Io(e) => RoundError::Io(e),
-            })?;
+        let acc = reconstruct(profile)?;
         self.dp_accountant = Some(acc);
         self.coordinator_generation = next_generation;
         Ok(())
@@ -4256,6 +4354,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                     .to_string(),
             ));
         }
+        if self.equivocated.contains(&validated.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: self.current_round,
+            });
+        }
         self.replay
             .commit_prepared_admission(validated.replay_admission)
             .map_err(RoundError::ReplayRejected)?;
@@ -4286,6 +4390,18 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             return Err(RoundError::StaleCoordinatorGeneration {
                 expected: self.coordinator_generation,
                 got: verified.coordinator_generation,
+            });
+        }
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "FedAsync step is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
+        if self.equivocated.contains(&verified.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: verified.sender,
+                round_id: self.current_round,
             });
         }
         let policy = self
@@ -4371,6 +4487,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
         let node_key = format!("train/round_{committed_round}_fedasync");
 
+        let equivocated_peers: Vec<PeerId> = self.equivocated.iter().copied().collect();
+        let telemetry_equivocated_count = self.equivocated.len();
         let plan = StagedRoundCommit {
             committed_round,
             next_round,
@@ -4388,7 +4506,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             op_type: "fedasync_stale_step".to_string(),
             output_rows: Some(1),
             admitted_peers: vec![verified.sender],
-            equivocated_peers: Vec::new(),
+            equivocated_peers,
             frozen_raw_inputs,
             weight_mismatch_warnings: Vec::new(),
             fitness_score: None,
@@ -4396,10 +4514,10 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             dp_subsampling_q_override: Some(subsampling_rate_q),
             dp_explicit_tau: self.fedasync_clip_norm,
             emit_standard_telemetry: false,
-            clear_round_admitted: false,
+            clear_round_admitted: true,
             ts_unix_nanos,
             telemetry_admitted_count: 1,
-            telemetry_equivocated_count: 0,
+            telemetry_equivocated_count,
         };
 
         let summary = self.commit_round_plan_v1(plan, session)?;
@@ -4439,9 +4557,37 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 got: validated.coordinator_generation,
             });
         }
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "LoRA submission is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
+        if self.equivocated.contains(&validated.sender) {
+            return Err(RoundError::EquivocationRejected {
+                sender: validated.sender,
+                round_id: self.current_round,
+            });
+        }
+        if let Some(existing_digest) = self.lora_admitted_digests.get(&validated.sender) {
+            if existing_digest != &validated.canonical_payload_digest {
+                self.replay
+                    .commit_prepared_admission(validated.replay_admission)
+                    .map_err(RoundError::ReplayRejected)?;
+                self.lora_admitted_digests.remove(&validated.sender);
+                self.equivocated.insert(validated.sender);
+                return Err(RoundError::EquivocationRejected {
+                    sender: validated.sender,
+                    round_id: self.current_round,
+                });
+            }
+        }
         self.replay
             .commit_prepared_admission(validated.replay_admission)
             .map_err(RoundError::ReplayRejected)?;
+        self.lora_admitted_digests
+            .entry(validated.sender)
+            .or_insert(validated.canonical_payload_digest);
         Ok(VerifiedLoraSubmissionV1 {
             coordinator_generation: validated.coordinator_generation,
             round_id: validated.round_id,
@@ -4452,7 +4598,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
 
     /// Coordinate a cohort of cryptographically verified [`VerifiedLoraSubmissionV1`] tokens under
     /// generation binding, authorized cohort gating, quorum checks, staged base-weight merge, and
-    /// pre-release DP ledger debit (`ADR-0024` §4, `W12-01`, `ST-01`).
+    /// atomic transactional commit (`dp/ledger.ndjson` + CAS + `committed_head.json`, `ADR-0024` §4, `W12-01`, `ST-01`).
     #[allow(clippy::too_many_arguments)]
     pub fn aggregate_lora_cohort_verified_round(
         &mut self,
@@ -4464,6 +4610,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         session: &mut DataOpsSession,
         ts_unix_nanos: u64,
     ) -> Result<swarm_torch_models::lora::LoraAggregationOutcomeV1, RoundError> {
+        if self.sparse_round.is_some() {
+            return Err(RoundError::InvalidWirePayload(
+                "LoRA cohort aggregation is disallowed while a two-phase SharedSeedSparse round is active"
+                    .to_string(),
+            ));
+        }
         let mut seen_peers = BTreeSet::new();
         let mut pairs: Vec<(PeerId, LoraAdapterPairV1)> = Vec::with_capacity(submissions.len());
         for sub in submissions {
@@ -4485,6 +4637,12 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                     peer: sub.sender,
                 }));
             }
+            if self.equivocated.contains(&sub.sender) {
+                return Err(RoundError::EquivocationRejected {
+                    sender: sub.sender,
+                    round_id: self.current_round,
+                });
+            }
             if !seen_peers.insert(sub.sender) {
                 return Err(RoundError::Aggregation(CoreError::InvalidGradient));
             }
@@ -4502,9 +4660,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                 .map_err(|_| RoundError::Aggregation(CoreError::InvalidGradient))?;
 
         // Prepare & validate the candidate base-weight merge in a staging copy BEFORE attempting
-        // durable DP pre-debit, and commit the mutation to `base_weights_to_merge` ONLY AFTER the
-        // debit succeeds (`ST-02` failure atomicity).
-        let mut staged_base_weights = match base_weights_to_merge.as_deref() {
+        // transactional commit (DP debit + CAS + `committed_head.json`).
+        let staged_base_weights = match base_weights_to_merge.as_deref() {
             Some(base_w) => {
                 if base_w.iter().any(|v| v.is_nan()) {
                     return Err(RoundError::Aggregation(CoreError::NanDetected));
@@ -4536,25 +4693,71 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             None => None,
         };
 
+        let committed_round = self.current_round;
+        let next_round = committed_round
+            .checked_add(1)
+            .ok_or(RoundError::RoundIdOverflow {
+                round_id: committed_round,
+            })?;
         let next_generation = self.coordinator_generation.checked_add(1).ok_or(
             RoundError::CoordinatorGenerationOverflow {
                 generation: self.coordinator_generation,
             },
         )?;
+        let mut candidate_model = self.model.clone();
+        if let Some(ref staged) = staged_base_weights {
+            if staged.len() == candidate_model.num_parameters() {
+                candidate_model
+                    .load_parameters(staged)
+                    .map_err(RoundError::Aggregation)?;
+            }
+        }
+        let next_historical_anchors = self.compute_next_historical_anchors(
+            committed_round,
+            candidate_model.parameters().to_vec(),
+        );
+        let admitted_peers: Vec<PeerId> = pairs.iter().map(|(peer, _)| *peer).collect();
+        let equivocated_peers: Vec<PeerId> = self.equivocated.iter().copied().collect();
+        let telemetry_admitted_count = admitted_peers.len();
+        let telemetry_equivocated_count = equivocated_peers.len();
+        let checkpoint_asset_key = format!("checkpoint://round/{committed_round}");
+        let node_key = format!("train/round_{committed_round}_lora");
 
-        // Fail-closed DP debit before committing base-weight merge or releasing aggregated factors.
-        self.pre_release_dp_debit_if_enabled(
-            session,
-            self.current_round,
+        let plan = StagedRoundCommit {
+            committed_round,
+            next_round,
+            next_generation,
+            candidate_model,
+            optimizer_snapshot: None,
+            next_cclip_center: self.cclip_center.clone(),
+            next_historical_anchors,
+            next_historical_digests_without_new: self.historical_digests.clone(),
+            next_bucketing_report: self.last_bucketing_report.clone(),
+            next_sparse_bandwidth_report: self.last_sparse_bandwidth_report,
+            clear_sparse_round: false,
+            checkpoint_asset_key,
+            node_key,
+            op_type: "lora_cohort_aggregate".to_string(),
+            output_rows: Some(telemetry_admitted_count as u64),
+            admitted_peers,
+            equivocated_peers,
+            frozen_raw_inputs: BTreeMap::new(),
+            weight_mismatch_warnings: Vec::new(),
+            fitness_score: None,
+            staged_transform_audits: Vec::new(),
+            dp_subsampling_q_override: Some(subsampling_rate_q),
+            dp_explicit_tau: None,
+            emit_standard_telemetry: false,
+            clear_round_admitted: true,
             ts_unix_nanos,
-            None,
-            Some(subsampling_rate_q),
-        )?;
+            telemetry_admitted_count,
+            telemetry_equivocated_count,
+        };
 
-        if let (Some(base_w), Some(staged)) = (base_weights_to_merge, staged_base_weights.take()) {
+        let _summary = self.commit_round_plan_v1(plan, session)?;
+        if let (Some(base_w), Some(staged)) = (base_weights_to_merge, staged_base_weights) {
             base_w.copy_from_slice(&staged);
         }
-        self.coordinator_generation = next_generation;
 
         Ok(outcome)
     }
@@ -4797,7 +5000,19 @@ fn decode_prepared_payload_v2(
                     got: total_coords,
                 });
             }
-            Ok(PreparedPayloadV2::Lora { pair })
+            let canonical_payload_digest = canonical_lora_submission_digest_v2(
+                &inner.swarm_instance_id,
+                expected_run,
+                inner.round_id,
+                &expected_base,
+                &inner.context_policy_digest,
+                originator,
+                &pair,
+            );
+            Ok(PreparedPayloadV2::Lora {
+                pair,
+                canonical_payload_digest,
+            })
         }
         COMPRESSION_SCHEMA_SHARED_SEED_COMMITMENT_V1 => {
             if inner.payload_kind != PayloadKindV1::SharedSeedCommitmentV1 {
@@ -5566,12 +5781,21 @@ mod tests {
         assert_eq!(resume_state.round_id, 1);
 
         #[allow(deprecated)]
+        let legacy_res = SwarmRoundCoordinator::from_resume_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            &resume_state,
+            &resumed_session,
+        );
+        assert!(legacy_res.is_err());
+
         let mut resumed_coord: SwarmRoundCoordinator<LinearModel> =
-            SwarmRoundCoordinator::from_resume_state(
+            SwarmRoundCoordinator::resume_exact_training_state::<SgdOptimizer<LinearModel, 16>>(
                 config,
                 LinearModel::new(2, 1).unwrap(),
-                &resume_state,
+                None,
                 &resumed_session,
+                &TrustPolicy::LegacyPermissive,
             )
             .unwrap();
         assert_eq!(resumed_coord.current_round(), 2);
@@ -5658,12 +5882,14 @@ mod tests {
         let model = linear_model_2_1(&[1.0, 2.0, 0.5]);
         let mut coord =
             SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000).unwrap();
-        coord.set_bucketing(Some(BucketingConfig {
-            bucket_size: 2,
-            byzantine_count: 1,
-            round_seed: [0x99; 32],
-            remainder_policy: BucketRemainderPolicy::StrictExactMultiple,
-        }));
+        coord
+            .set_bucketing(Some(BucketingConfig {
+                bucket_size: 2,
+                byzantine_count: 1,
+                round_seed: [0x99; 32],
+                remainder_policy: BucketRemainderPolicy::StrictExactMultiple,
+            }))
+            .unwrap();
         assert!(coord.cclip_center().is_none());
 
         let sessions: Vec<[u8; 32]> = peers
@@ -5992,15 +6218,17 @@ mod tests {
         );
 
         // Recover coordinator from disk: spent budget from crashed attempt remains debited (non-refundable)!
-        let resume_state = crate::artifacts::read_verified_round_resume_state(&run_dir)
+        let _resume_state = crate::artifacts::read_verified_round_resume_state(&run_dir)
             .unwrap()
             .unwrap();
-        #[allow(deprecated)]
-        let mut recovered = SwarmRoundCoordinator::<LinearModel>::from_resume_state(
+        let mut recovered = SwarmRoundCoordinator::<LinearModel>::resume_exact_training_state::<
+            SgdOptimizer<LinearModel, 16>,
+        >(
             config,
             linear_model_2_1(&[0.0, 0.0, 0.0]),
-            &resume_state,
+            None,
             &session,
+            &TrustPolicy::LegacyPermissive,
         )
         .unwrap();
         recovered
@@ -6320,6 +6548,7 @@ mod tests {
         let mut hit_budget_err = false;
         for step in 0..8u64 {
             let seq = 3 + step;
+            let _ = coord.current_round();
             let v1 = verify_lora_delivery(&mut coord, &p1, s1, 1, seq, 100, &pair1).unwrap();
             let v2 = verify_lora_delivery(&mut coord, &p2, s2, 1, seq, 100, &pair2).unwrap();
             let mut candidate_w = after_first.clone();
@@ -6809,15 +7038,15 @@ mod tests {
             LockAcquisitionPolicy::FailFast,
         )
         .unwrap();
-        let resume_state = resume_state.unwrap();
+        let _resume_state = resume_state.unwrap();
 
-        #[allow(deprecated)]
         let mut resumed: SwarmRoundCoordinator<LinearModel> =
-            SwarmRoundCoordinator::from_resume_state(
+            SwarmRoundCoordinator::resume_exact_training_state::<SgdOptimizer<LinearModel, 16>>(
                 config,
                 LinearModel::new(2, 1).unwrap(),
-                &resume_state,
+                None,
                 &resumed_session,
+                &TrustPolicy::LegacyPermissive,
             )
             .unwrap();
 
@@ -8207,6 +8436,32 @@ mod tests {
         .unwrap();
         assert_eq!(restored.current_round(), 2);
         assert_eq!(restored.model().parameters(), coord.model().parameters());
+        assert_eq!(
+            restored.equivocated_count(),
+            1,
+            "Decision A9: equivocated_peers must persist across round commit and restart"
+        );
+        // After restart on the same run_id, the Round-1 equivocator (p3) remains barred in Round 2.
+        let mut restored = restored;
+        let s3_r2 = p3.establish_session(&mut restored, 2, 0x99, 120);
+        let r2_from_p3 = p3.build_dense_delivery(
+            &restored,
+            s3_r2,
+            2,
+            1,
+            120,
+            2,
+            restored.parent_digest(),
+            swarm_torch_net::gossip::PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            restored
+                .submit_verified_delivery(&r2_from_p3, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 120)
+                .unwrap_err(),
+            RoundError::EquivocationRejected { sender, round_id: 2 } if sender == p3.peer_id
+        ));
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -8400,5 +8655,1327 @@ mod tests {
         .is_err());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_restore_weights_only_blocks_dp_history_and_lora_commits_cas_head_with_persistent_equivocation(
+    ) {
+        use swarm_torch_core::aggregation::{
+            FedAsyncStalenessDescriptorV1, FedAvg, RobustAggregation,
+        };
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+        use swarm_torch_models::lora::{LoraAdapterPairV1, LoraAggregationModeV1};
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_models::safetensors_v1::LoRaAdapterDescriptorV1;
+        use swarm_torch_net::gossip::PayloadKindV1;
+
+        let base = temp_dir("st15_weights_only_dp_lora_equiv");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let signer = KeyPair::from_seed([0xD1; 32]).unwrap();
+        let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+
+        let p1 = TestPeer::new(61);
+        let p2 = TestPeer::new(62);
+        let p_bad = TestPeer::new(63);
+
+        // Part 1: Bundle with DP ledger history MUST block `restore_weights_only`!
+        let dp_run_id = RunId::from_bytes([0xD2; 16]);
+        let mut dp_sess = DataOpsSession::create(
+            base.join("dp_run"),
+            dp_run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let dp_run_dir = dp_sess.sink().bundle().run_dir().to_path_buf();
+        let dp_cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::GradientV1,
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut dp_coord = SwarmRoundCoordinator::initialize(
+            dp_run_id,
+            dp_cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut dp_sess,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+        dp_coord
+            .configure_dp_accountant(
+                &dp_run_dir,
+                DpMechanismProfileV1 {
+                    clipping_radius_tau: 1.0,
+                    noise_multiplier: 1.5,
+                    target_delta: 1e-5,
+                    max_epsilon: 10.0,
+                    unit: DpUnitV1::ClientLevel,
+                    adjacency: DpAdjacencyV1::AddRemoveOne,
+                    conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+                    classification:
+                        PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+                },
+            )
+            .unwrap();
+        let s1_dp = p1.establish_session(&mut dp_coord, 1, 0x01, 100);
+        let s2_dp = p2.establish_session(&mut dp_coord, 1, 0x02, 100);
+        for (peer, sid) in [(&p1, s1_dp), (&p2, s2_dp)] {
+            let b = peer.build_dense_delivery(
+                &dp_coord,
+                sid,
+                1,
+                1,
+                100,
+                1,
+                dp_coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.1, 0.1, 0.1],
+                0,
+            );
+            dp_coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        let mut opt_dp = SgdOptimizer::<LinearModel, 16>::new(0.1).unwrap();
+        dp_coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt_dp),
+                None,
+                &mut dp_sess,
+                2_000,
+            )
+            .unwrap();
+        drop(dp_sess);
+
+        let (dp_sess2, _) = DataOpsSession::resume(
+            &dp_run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let wo_res = SwarmRoundCoordinator::restore_weights_only(
+            dp_cfg,
+            LinearModel::new(2, 1).unwrap(),
+            &dp_sess2,
+            &strict_policy,
+        );
+        assert!(
+            matches!(wo_res, Err(RoundError::ResumeStateMismatch(_))),
+            "restore_weights_only must reject bundle with DP budget history"
+        );
+        drop(dp_sess2);
+
+        // Part 2: LoRA commits atomic CAS head, persists `equivocated_peers`, and bars equivocator across LoRA & FedAsync!
+        let lora_run_id = RunId::from_bytes([0xD3; 16]);
+        let mut lora_sess = DataOpsSession::create(
+            base.join("lora_run"),
+            lora_run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let lora_run_dir = lora_sess.sink().bundle().run_dir().to_path_buf();
+        let lora_cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id, p_bad.peer_id]
+                .into_iter()
+                .collect(),
+            min_quorum: 2,
+            max_staleness: 1,
+            max_clock_skew_secs: 60,
+        };
+        let mut lora_coord = SwarmRoundCoordinator::initialize(
+            lora_run_id,
+            lora_cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut lora_sess,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+
+        let s_bad = p_bad.establish_session(&mut lora_coord, 1, 0xB1, 100);
+        let pair1 = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+        )
+        .unwrap();
+        let pair2 = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![0.0, 1.0],
+            vec![0.0, 2.0],
+        )
+        .unwrap();
+
+        // Trigger equivocation from `p_bad` on Round 1 (two conflicting LoRA submissions):
+        verify_lora_delivery(&mut lora_coord, &p_bad, s_bad, 1, 1, 100, &pair1).unwrap();
+        assert!(matches!(
+            verify_lora_delivery(&mut lora_coord, &p_bad, s_bad, 1, 2, 100, &pair2).unwrap_err(),
+            RoundError::EquivocationRejected { sender, round_id: 1 } if sender == p_bad.peer_id
+        ));
+
+        let s1 = p1.establish_session(&mut lora_coord, 1, 0xB2, 100);
+        let s2 = p2.establish_session(&mut lora_coord, 1, 0xB3, 100);
+        let v1 = verify_lora_delivery(&mut lora_coord, &p1, s1, 1, 1, 100, &pair1).unwrap();
+        let v2 = verify_lora_delivery(&mut lora_coord, &p2, s2, 1, 1, 100, &pair2).unwrap();
+        let mut base_w = vec![0.5f32; 4];
+        lora_coord
+            .aggregate_lora_cohort_verified_round(
+                &[v1, v2],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 8,
+                },
+                &FedAvg,
+                Some(&mut base_w),
+                1.0,
+                &mut lora_sess,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(lora_coord.current_round(), 2);
+
+        // Resume strictly from the atomic CAS checkpoint written by `aggregate_lora_cohort_verified_round`:
+        drop(lora_sess);
+        let (mut lora_sess2, _) = DataOpsSession::resume(
+            &lora_run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut resumed_lora =
+            SwarmRoundCoordinator::resume_exact_training_state::<SgdOptimizer<LinearModel, 16>>(
+                lora_cfg,
+                LinearModel::new(2, 1).unwrap(),
+                None,
+                &lora_sess2,
+                &strict_policy,
+            )
+            .unwrap();
+        assert_eq!(resumed_lora.current_round(), 2);
+        assert_eq!(resumed_lora.equivocated_count(), 1);
+
+        // Resumed coordinator blocks `p_bad` in BOTH LoRA Stage B and FedAsync!
+        let s_bad_r2 = p_bad.establish_session(&mut resumed_lora, 2, 0xB4, 120);
+        let prepared_bad_lora = resumed_lora
+            .prepare_verified_delivery(
+                &p_bad.build_lora_delivery(
+                    &resumed_lora,
+                    s_bad_r2,
+                    2,
+                    1,
+                    120,
+                    2,
+                    resumed_lora.parent_digest(),
+                    &pair1,
+                ),
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                120,
+            )
+            .unwrap();
+        assert!(matches!(
+            resumed_lora
+                .expected_round_context()
+                .validate_lora_submission(prepared_bad_lora)
+                .unwrap_err(),
+            RoundError::EquivocationRejected { sender, round_id: 2 } if sender == p_bad.peer_id
+        ));
+
+        resumed_lora
+            .enable_fedasync(
+                FedAsyncStalenessDescriptorV1 {
+                    base_alpha: 0.4,
+                    max_staleness_rounds: 1,
+                    polynomial_decay_exponent: 0.5,
+                },
+                0,
+                None,
+            )
+            .unwrap();
+        let stale_anchor = *resumed_lora.historical_digests.get(&1).unwrap();
+        let bad_fedasync = p_bad.build_dense_delivery(
+            &resumed_lora,
+            s_bad_r2,
+            2,
+            2,
+            120,
+            1,
+            stale_anchor,
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        assert!(matches!(
+            resumed_lora
+                .step_fedasync_verified_delivery(
+                    &bad_fedasync,
+                    DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                    120,
+                    1.0,
+                    &mut lora_sess2,
+                    3_000,
+                )
+                .unwrap_err(),
+            RoundError::EquivocationRejected { sender, .. } if sender == p_bad.peer_id
+        ));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_sparse_begin_bumps_generation_and_preserves_unsampled_cclip_center() {
+        use swarm_torch_core::aggregation::RobustAggregation;
+        use swarm_torch_core::compression::SharedSeedResidualCompressor;
+        use swarm_torch_core::crypto::{KeyPair, MessageAuth};
+        use swarm_torch_models::optim::SgdOptimizer;
+
+        let base = temp_dir("st15_sparse_gen_and_cclip");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([0xD4; 16]);
+        let signer = KeyPair::from_seed([0xD5; 32]).unwrap();
+        let beacon_auth = MessageAuth::new(KeyPair::from_seed([0xD6; 32]).unwrap());
+
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+
+        let p1 = TestPeer::new(71);
+        let p2 = TestPeer::new(72);
+        let cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 10.0,
+                max_iterations: 2,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            cfg,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer);
+        // Seed an asymmetric non-zero prior cclip_center directly to verify sparse preservation.
+        let initial_center = vec![11.0f32, 22.0f32, 33.0f32];
+        coord.cclip_center = Some(initial_center.clone());
+
+        let gen_before_begin = coord.coordinator_generation;
+        let pre_begin_ctx = coord.expected_round_context();
+        let s1 = p1.establish_session(&mut coord, 1, 0xC1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xC2, 100);
+
+        let ctx = coord
+            .begin_sparse_round_v1(
+                1,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+                SparseBeaconPolicyV1::Ed25519TranscriptBeacon {
+                    beacon_public_key: *beacon_auth.key_pair().public_key(),
+                },
+            )
+            .unwrap();
+        assert_eq!(coord.coordinator_generation, gen_before_begin + 1);
+        let stale_gen_ctx = coord.expected_round_context();
+        coord.set_bucketing(None).unwrap();
+        assert_eq!(coord.coordinator_generation, gen_before_begin + 2);
+        let ctx_digest = ctx.context_digest().unwrap();
+
+        let c1 = SharedSeedResidualCompressor::new(3, 1).unwrap();
+        let c2 = SharedSeedResidualCompressor::new(3, 1).unwrap();
+        let (u1, comm1) = c1.prepare_pre_seed_vector(&[0.5, 0.5, 0.5]).unwrap();
+        let (u2, comm2) = c2.prepare_pre_seed_vector(&[0.5, 0.5, 0.5]).unwrap();
+
+        // Pre-`begin_sparse_round_v1` context lacks active sparse snapshot -> rejected!
+        // And post-begin context captured before a generation bump fails Stage C with StaleCoordinatorGeneration!
+        let comm1_bytes = build_sparse_commitment_delivery(
+            &p1,
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            &SharedSeedCommitmentMessageV1 {
+                context_digest: ctx_digest,
+                commitment: comm1,
+            },
+        );
+        let prepared1_pre = coord
+            .prepare_verified_delivery(&comm1_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        assert!(pre_begin_ctx
+            .validate_sparse_commitment_submission(prepared1_pre)
+            .is_err());
+
+        let prepared1_stale = coord
+            .prepare_verified_delivery(&comm1_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        let stale_gen_validated = stale_gen_ctx
+            .validate_sparse_commitment_submission(prepared1_stale)
+            .unwrap();
+        assert!(matches!(
+            coord.commit_sparse_commitment_submission(stale_gen_validated),
+            Err(RoundError::StaleCoordinatorGeneration { .. })
+        ));
+
+        // Fresh context succeeds cleanly for p1 & p2:
+        coord
+            .submit_sparse_commitment_delivery(&comm1_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        let comm2_bytes = build_sparse_commitment_delivery(
+            &p2,
+            &coord,
+            s2,
+            1,
+            1,
+            100,
+            &SharedSeedCommitmentMessageV1 {
+                context_digest: ctx_digest,
+                commitment: comm2,
+            },
+        );
+        coord
+            .submit_sparse_commitment_delivery(&comm2_bytes, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+
+        let root =
+            compute_commitments_root_v1(&ctx_digest, &[(p1.peer_id, comm1), (p2.peer_id, comm2)])
+                .unwrap();
+        let beacon_r = [0x88u8; 32];
+        let sig = SparseBeaconPolicyV1::sign_transcript_beacon(
+            &beacon_auth,
+            &ctx_digest,
+            &root,
+            &beacon_r,
+        );
+        let (_root_out, shared_seed) = coord
+            .finalize_sparse_commitments_with_beacon(&SparseBeaconRevealV1 {
+                beacon_r,
+                signature: Some(*sig.as_bytes()),
+            })
+            .unwrap();
+
+        let (pl1, op1) = comm1
+            .open_for_seed(
+                &u1,
+                1,
+                shared_seed,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+            )
+            .unwrap();
+        let sampled_idx =
+            swarm_torch_core::compression::sample_shared_indices_v1(3, 1, &shared_seed).unwrap()[0]
+                as usize;
+        let (pl2, op2) = comm2
+            .open_for_seed(
+                &u2,
+                1,
+                shared_seed,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+            )
+            .unwrap();
+        for (peer, sid, pl, op) in [(&p1, s1, pl1, op1), (&p2, s2, pl2, op2)] {
+            let wire = build_sparse_opening_delivery(
+                peer,
+                &coord,
+                sid,
+                1,
+                2,
+                100,
+                &SharedSeedOpeningMessageV1 {
+                    context_digest: ctx_digest,
+                    commitments_root: root,
+                    shared_round_seed: shared_seed,
+                    payload: pl,
+                    openings: op,
+                },
+            );
+            coord
+                .submit_sparse_opening_delivery(&wire, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+
+        coord
+            .finalize_sparse_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+
+        let next_center = coord.cclip_center.as_ref().unwrap();
+        for idx in 0..3 {
+            if idx != sampled_idx {
+                assert_eq!(
+                    next_center[idx], initial_center[idx],
+                    "unsampled cclip_center[{idx}] must stay untouched across sparse round"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_generation_overflow_lora_nonfinite_merge_and_missing_dp_profile_fail_closed() {
+        use swarm_torch_core::aggregation::{FedAvg, RobustAggregation};
+        use swarm_torch_core::compression::SharedSeedScalingProfile;
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+        use swarm_torch_models::lora::{LoraAdapterPairV1, LoraAggregationModeV1};
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_models::safetensors_v1::LoRaAdapterDescriptorV1;
+
+        let base = temp_dir("st15_gen_overflow_and_dp_mismatch");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([0xD7; 16]);
+        let signer = KeyPair::from_seed([0xD8; 32]).unwrap();
+
+        let p1 = TestPeer::new(81);
+        let p2 = TestPeer::new(82);
+        let cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+
+        // 1. LoRA base_weights_to_merge with NaN/Inf fails closed before round advances or mutates weights.
+        let s1 = p1.establish_session(&mut coord, 1, 0xE1, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0xE2, 100);
+        let pair = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![1.0, 0.0],
+            vec![0.5, 0.0],
+        )
+        .unwrap();
+        let v1 = verify_lora_delivery(&mut coord, &p1, s1, 1, 1, 100, &pair).unwrap();
+        let v2 = verify_lora_delivery(&mut coord, &p2, s2, 1, 1, 100, &pair).unwrap();
+        let mut nan_base = vec![f32::NAN, 1.0, 1.0, 1.0];
+        let err_nan = coord
+            .aggregate_lora_cohort_verified_round(
+                &[v1, v2],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 4,
+                },
+                &FedAvg,
+                Some(&mut nan_base),
+                1.0,
+                &mut session,
+                1_500,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err_nan,
+            RoundError::Aggregation(CoreError::NanDetected)
+        ));
+        assert_eq!(coord.current_round(), 1);
+        assert!(nan_base[0].is_nan());
+
+        // 2. Generation overflow guards on set_bucketing, begin_sparse_round_v1, configure_dp_accountant_with_policy,
+        //    and with_coordinator_identity must fail closed without mutating state.
+        coord.lora_admitted_digests.clear();
+        coord.coordinator_generation = u64::MAX;
+        assert!(matches!(
+            coord.set_bucketing(Some(BucketingConfig {
+                bucket_size: 2,
+                byzantine_count: 0,
+                round_seed: [0x11; 32],
+                remainder_policy: BucketRemainderPolicy::StrictExactMultiple,
+            })),
+            Err(RoundError::CoordinatorGenerationOverflow {
+                generation: u64::MAX
+            })
+        ));
+        assert!(coord.bucketing.is_none());
+
+        assert!(matches!(
+            coord.begin_sparse_round_v1(
+                1,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+                SparseBeaconPolicyV1::PrecommittedHashLock {
+                    commitment_digest: [0x22; 32]
+                },
+            ),
+            Err(RoundError::CoordinatorGenerationOverflow {
+                generation: u64::MAX
+            })
+        ));
+        assert!(coord.sparse_round.is_none());
+
+        assert!(matches!(
+            coord.configure_dp_accountant_with_policy(
+                &run_dir,
+                DpMechanismProfileV1 {
+                    unit: DpUnitV1::ClientLevel,
+                    adjacency: DpAdjacencyV1::AddRemoveOne,
+                    clipping_radius_tau: 1.0,
+                    noise_multiplier: 1.5,
+                    target_delta: 1e-5,
+                    max_epsilon: 10.0,
+                    conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+                    classification:
+                        PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+                },
+                &TrustPolicy::LegacyPermissive,
+            ),
+            Err(RoundError::CoordinatorGenerationOverflow {
+                generation: u64::MAX
+            })
+        ));
+        assert!(coord.dp_accountant().is_none());
+
+        assert!(matches!(
+            coord.with_coordinator_identity([0x33; 16], PeerId::new([0x44; 32])),
+            Err(RoundError::CoordinatorGenerationOverflow {
+                generation: u64::MAX
+            })
+        ));
+
+        // 3. Signed manifest committing dp/ledger.ndjson while CoordinatorResumeStateV2 omits dp_profile
+        //    MUST fail closed in resume_exact_training_state (`ResumeStateMismatch`).
+        let mismatch_base = base.join("mismatch_run");
+        fs::create_dir_all(&mismatch_base).unwrap();
+        let m_run_id = RunId::from_bytes([0xD9; 16]);
+        let mut m_sess = DataOpsSession::create(
+            &mismatch_base,
+            m_run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let m_run_dir = m_sess.sink().bundle().run_dir().to_path_buf();
+        let _m_coord = SwarmRoundCoordinator::initialize(
+            m_run_id,
+            cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut m_sess,
+            1_000,
+        )
+        .unwrap();
+        let dp_prof = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 10.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+        let mut acc = swarm_torch_core::dp::RdpAccountantV1::new(dp_prof).unwrap();
+        crate::artifacts::pre_release_debit_dp_accountant(
+            &m_run_dir,
+            m_run_id,
+            1,
+            &"00".repeat(32),
+            &mut acc,
+            1.0,
+            0.5,
+            1_100,
+        )
+        .unwrap();
+        drop(m_sess);
+
+        let m_bundle = RunArtifactBundle::open(&m_run_dir).unwrap();
+        let m_manifest = m_bundle.finalize_signed_manifest(&signer).unwrap();
+        let m_manifest_sha = {
+            use sha2::Digest;
+            crate::artifacts::hex_lower(&sha2::Sha256::digest(
+                serde_json::to_vec_pretty(&m_manifest).unwrap(),
+            ))
+        };
+        let mut m_head = crate::artifacts::read_committed_head_v1(&m_run_dir).unwrap();
+        m_head.manifest_sha256 = m_manifest_sha;
+        crate::artifacts::write_committed_head_v1(&m_run_dir, &m_head).unwrap();
+
+        let (m_sess2, _) = DataOpsSession::resume(
+            &m_run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let res = SwarmRoundCoordinator::resume_exact_training_state::<SgdOptimizer<LinearModel, 16>>(
+            cfg,
+            LinearModel::new(2, 1).unwrap(),
+            None,
+            &m_sess2,
+            &TrustPolicy::strict_with_key(*signer.public_key()),
+        );
+        assert!(
+            matches!(res, Err(RoundError::ResumeStateMismatch(_))),
+            "manifest listing dp/ledger.ndjson without dp_profile must fail closed"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_fedasync_clears_round_admitted_reports_equivocated_and_canonicalizes_neg_zero_while_dp_rejects_missing_head(
+    ) {
+        use swarm_torch_core::aggregation::{FedAsyncStalenessDescriptorV1, RobustAggregation};
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_net::gossip::PayloadKindV1;
+
+        let base = temp_dir("st15_fedasync_clear_negzero_dp_head");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let signer = KeyPair::from_seed([0xE1; 32]).unwrap();
+        let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+
+        let p1 = TestPeer::new(81);
+        let p2 = TestPeer::new(82);
+        let run_id = RunId::from_bytes([0xE2; 16]);
+        let mut sess = DataOpsSession::create(
+            base.join("run1"),
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = sess.sink().bundle().run_dir().to_path_buf();
+        let cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 1,
+            max_staleness: 2,
+            max_clock_skew_secs: 60,
+        };
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer);
+        coord
+            .enable_fedasync(
+                FedAsyncStalenessDescriptorV1 {
+                    base_alpha: 0.5,
+                    max_staleness_rounds: 2,
+                    polynomial_decay_exponent: 0.5,
+                },
+                0,
+                None,
+            )
+            .unwrap();
+
+        let s1 = p1.establish_session(&mut coord, 1, 0x11, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x12, 100);
+
+        // 1. Canonical `-0.0` vs `+0.0` in Dense delivery from p1 MUST treat duplicate as idempotent (not equivocation)!
+        let d_pos_zero = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.5, 0.0, -1.0],
+            0,
+        );
+        let d_neg_zero = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            2,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.5, -0.0, -1.0],
+            0,
+        );
+        coord
+            .submit_verified_delivery(&d_pos_zero, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        assert_eq!(
+            coord
+                .submit_verified_delivery(&d_neg_zero, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap(),
+            SubmissionDecision::DuplicateIdempotentAck
+        );
+
+        // 2. Make p2 equivocate in Round 1, then prove Stage C Dense also rejects p2 BEFORE consuming seq 3!
+        let p2_a = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            1,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        let p2_b = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            2,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[9.0, 9.0, 9.0],
+            0,
+        );
+        coord
+            .submit_verified_delivery(&p2_a, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        assert!(matches!(
+            coord
+                .submit_verified_delivery(&p2_b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap_err(),
+            RoundError::EquivocationRejected { sender, round_id: 1 } if sender == p2.peer_id
+        ));
+
+        let p2_stage_c = p2.build_dense_delivery(
+            &coord,
+            s2,
+            1,
+            3,
+            100,
+            1,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[0.2, 0.2, 0.2],
+            0,
+        );
+        let prep_p2 = coord
+            .prepare_verified_delivery(&p2_stage_c, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        assert!(matches!(
+            coord
+                .expected_round_context()
+                .validate_sync_submission(prep_p2),
+            Err(RoundError::EquivocationRejected { sender, round_id: 1 }) if sender == p2.peer_id
+        ));
+
+        // 3. Execute FedAsync step on anchor round 0 from honest p1 -> advances to Round 2,
+        //    reports p2 in `summary.equivocated_peers`, AND clears `admitted` so p1 can submit cleanly in Round 2!
+        let r0_anchor = *coord.historical_digests.get(&0).unwrap();
+        let fa_bytes = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            3,
+            100,
+            0,
+            r0_anchor,
+            PayloadKindV1::ModelDeltaV1,
+            &[0.2, 0.2, 0.2],
+            0,
+        );
+        let (_outcome, fa_summary) = coord
+            .step_fedasync_verified_delivery(
+                &fa_bytes,
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100,
+                1.0,
+                &mut sess,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(fa_summary.equivocated_peers, vec![p2.peer_id]);
+        assert_eq!(coord.current_round(), 2);
+
+        let p1_r2 = p1.build_dense_delivery(
+            &coord,
+            s1,
+            1,
+            4,
+            101,
+            2,
+            coord.parent_digest(),
+            PayloadKindV1::ModelDeltaV1,
+            &[-0.1, 0.3, 0.2],
+            0,
+        );
+        coord
+            .submit_verified_delivery(&p1_r2, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 101)
+            .unwrap();
+        coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut sess,
+                2_100,
+            )
+            .unwrap();
+
+        // 4. Deleting `checkpoints/committed_head.json` MUST make `configure_dp_accountant_with_policy` fail closed!
+        fs::remove_file(run_dir.join(crate::artifacts::COMMITTED_HEAD_REL_PATH)).unwrap();
+        let dp_prof = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 10.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+        assert!(coord
+            .configure_dp_accountant_with_policy(&run_dir, dp_prof, &strict_policy)
+            .is_err());
+        assert!(coord
+            .configure_dp_accountant_with_policy(
+                &run_dir,
+                dp_prof,
+                &TrustPolicy::Strict {
+                    trusted_public_keys: strict_policy_keys(&strict_policy),
+                    expected_run_id: Some(run_id),
+                    min_signed_unix_nanos: None,
+                },
+            )
+            .is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_configure_dp_accountant_rejects_missing_legacy_symlink_corrupt_head_and_wrong_run_id() {
+        use swarm_torch_core::aggregation::RobustAggregation;
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+
+        let base = temp_dir("st15_dp_head_fail_closed_all_modes");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let signer = KeyPair::from_seed([0xF1; 32]).unwrap();
+        let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+        let p1 = TestPeer::new(91);
+        let cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id].into_iter().collect(),
+            min_quorum: 1,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let dp_prof = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 10.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+
+        let run_a = RunId::from_bytes([0xF2; 16]);
+        let mut sess_a = DataOpsSession::create(
+            base.join("a"),
+            run_a,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir_a = sess_a.sink().bundle().run_dir().to_path_buf();
+        let mut coord_a = SwarmRoundCoordinator::initialize(
+            run_a,
+            cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_a,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+
+        // Create a second valid signed bundle for a different run_id (`run_b`).
+        let run_b = RunId::from_bytes([0xF3; 16]);
+        let mut sess_b = DataOpsSession::create(
+            base.join("b"),
+            run_b,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir_b = sess_b.sink().bundle().run_dir().to_path_buf();
+        let mut coord_b = SwarmRoundCoordinator::initialize(
+            run_b,
+            cfg,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_b,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+        let sb = p1.establish_session(&mut coord_b, 1, 0x77, 100);
+        let b_msg = p1.build_dense_delivery(
+            &coord_b,
+            sb,
+            1,
+            1,
+            100,
+            1,
+            coord_b.parent_digest(),
+            swarm_torch_net::gossip::PayloadKindV1::ModelDeltaV1,
+            &[0.1, 0.1, 0.1],
+            0,
+        );
+        coord_b
+            .submit_verified_delivery(&b_msg, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        coord_b
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                None,
+                None,
+                &mut sess_b,
+                2_000,
+            )
+            .unwrap();
+
+        // 1. Passing run_dir_b to coord_a MUST fail closed with RunIdMismatch!
+        assert!(matches!(
+            coord_a.configure_dp_accountant_with_policy(&run_dir_b, dp_prof, &strict_policy),
+            Err(RoundError::RunIdMismatch { expected, got }) if expected == run_a && got == run_b
+        ));
+
+        // 2. Corrupt committed_head.json MUST fail closed under both Strict and LegacyPermissive!
+        let head_path_a = run_dir_a.join(crate::artifacts::COMMITTED_HEAD_REL_PATH);
+        let orig_head = fs::read(&head_path_a).unwrap();
+        fs::write(&head_path_a, b"{not-valid-json").unwrap();
+        assert!(coord_a
+            .configure_dp_accountant_with_policy(&run_dir_a, dp_prof, &strict_policy)
+            .is_err());
+        assert!(coord_a
+            .configure_dp_accountant(&run_dir_a, dp_prof)
+            .is_err());
+
+        // 3. Symlinked committed_head.json MUST fail closed under both Strict and LegacyPermissive!
+        let outside_head = base.join("outside_head.json");
+        fs::write(&outside_head, &orig_head).unwrap();
+        fs::remove_file(&head_path_a).unwrap();
+        #[cfg(unix)]
+        let sym_ok = std::os::unix::fs::symlink(&outside_head, &head_path_a).is_ok();
+        #[cfg(windows)]
+        let sym_ok = std::os::windows::fs::symlink_file(&outside_head, &head_path_a).is_ok();
+        if sym_ok {
+            assert!(coord_a
+                .configure_dp_accountant_with_policy(&run_dir_a, dp_prof, &strict_policy)
+                .is_err());
+            assert!(coord_a
+                .configure_dp_accountant(&run_dir_a, dp_prof)
+                .is_err());
+            let _ = fs::remove_file(&head_path_a);
+        }
+
+        // 4. Missing committed_head.json MUST ALSO fail closed under LegacyPermissive (`configure_dp_accountant`)!
+        assert!(coord_a
+            .configure_dp_accountant(&run_dir_a, dp_prof)
+            .is_err());
+        assert!(coord_a.dp_accountant().is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_lora_and_sparse_opening_canonicalize_neg_zero_without_false_equivocation() {
+        use swarm_torch_core::aggregation::RobustAggregation;
+        use swarm_torch_core::compression::SharedSeedResidualCompressor;
+        use swarm_torch_models::lora::LoraAdapterPairV1;
+        use swarm_torch_models::safetensors_v1::LoRaAdapterDescriptorV1;
+
+        let base = temp_dir("st15_lora_sparse_neg_zero");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let p1 = TestPeer::new(92);
+        let p2 = TestPeer::new(93);
+        let cfg = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::ModelDeltaV1 {
+                server_learning_rate: 1.0,
+            },
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+
+        // 1. LoRA `-0.0` vs `+0.0` must produce identical `canonical_payload_digest` and idempotent admission.
+        let run_lora = RunId::from_bytes([0xF4; 16]);
+        let mut sess_lora = DataOpsSession::create(
+            base.join("lora"),
+            run_lora,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut coord_lora = SwarmRoundCoordinator::initialize(
+            run_lora,
+            cfg.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_lora,
+            1_000,
+        )
+        .unwrap();
+        let s1_lora = p1.establish_session(&mut coord_lora, 1, 0x01, 100);
+        let pair_pos = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![1.0, 0.0],
+            vec![0.5, 0.0],
+        )
+        .unwrap();
+        let pair_neg = LoraAdapterPairV1::try_new(
+            LoRaAdapterDescriptorV1 {
+                target_module: "q_proj".to_string(),
+                tensor_a_name: "q_proj.lora_A".to_string(),
+                tensor_b_name: "q_proj.lora_B".to_string(),
+                rank: 1,
+                alpha: 1.0,
+            },
+            2,
+            2,
+            vec![1.0, -0.0],
+            vec![0.5, -0.0],
+        )
+        .unwrap();
+        verify_lora_delivery(&mut coord_lora, &p1, s1_lora, 1, 1, 100, &pair_pos).unwrap();
+        verify_lora_delivery(&mut coord_lora, &p1, s1_lora, 1, 2, 100, &pair_neg).unwrap();
+        assert_eq!(coord_lora.equivocated_count(), 0);
+
+        // 2. SparseOpening `-0.0` vs `+0.0` must produce identical `canonical_payload_digest` and return `DuplicateIdempotentAck`.
+        let run_sp = RunId::from_bytes([0xF5; 16]);
+        let mut sess_sp = DataOpsSession::create(
+            base.join("sparse"),
+            run_sp,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut coord_sp = SwarmRoundCoordinator::initialize(
+            run_sp,
+            cfg,
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut sess_sp,
+            1_000,
+        )
+        .unwrap();
+        let s1 = p1.establish_session(&mut coord_sp, 1, 0x02, 100);
+        let s2 = p2.establish_session(&mut coord_sp, 1, 0x03, 100);
+        let beacon_r = [0x66u8; 32];
+        let ctx = coord_sp
+            .begin_sparse_round_v1(
+                2,
+                SharedSeedScalingProfile::ScaledUnbiasedV1,
+                SparseBeaconPolicyV1::PrecommittedHashLock {
+                    commitment_digest: SparseBeaconPolicyV1::precommit_digest(
+                        &coord_sp.swarm_instance_id(),
+                        run_sp,
+                        1,
+                        &beacon_r,
+                    ),
+                },
+            )
+            .unwrap();
+        let ctx_digest = ctx.context_digest().unwrap();
+        let c1 = SharedSeedResidualCompressor::new(3, 2).unwrap();
+        let c2 = SharedSeedResidualCompressor::new(3, 2).unwrap();
+        let (u1, comm1) = c1.prepare_pre_seed_vector(&[0.5, 0.0, 0.0]).unwrap();
+        let (_u2, comm2) = c2.prepare_pre_seed_vector(&[0.5, 0.0, 0.0]).unwrap();
+        coord_sp
+            .submit_sparse_commitment_delivery(
+                &build_sparse_commitment_delivery(
+                    &p1,
+                    &coord_sp,
+                    s1,
+                    1,
+                    1,
+                    100,
+                    &SharedSeedCommitmentMessageV1 {
+                        context_digest: ctx_digest,
+                        commitment: comm1,
+                    },
+                ),
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100,
+            )
+            .unwrap();
+        coord_sp
+            .submit_sparse_commitment_delivery(
+                &build_sparse_commitment_delivery(
+                    &p2,
+                    &coord_sp,
+                    s2,
+                    1,
+                    1,
+                    100,
+                    &SharedSeedCommitmentMessageV1 {
+                        context_digest: ctx_digest,
+                        commitment: comm2,
+                    },
+                ),
+                DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
+                100,
+            )
+            .unwrap();
+        let (root, seed) = coord_sp
+            .finalize_sparse_commitments_with_beacon(&SparseBeaconRevealV1 {
+                beacon_r,
+                signature: None,
+            })
+            .unwrap();
+        let (pl_pos, op_pos) = comm1
+            .open_for_seed(&u1, 2, seed, SharedSeedScalingProfile::ScaledUnbiasedV1)
+            .unwrap();
+        let mut pl_neg = pl_pos.clone();
+        for v in &mut pl_neg.values {
+            if *v == 0.0 {
+                *v = -0.0;
+            }
+        }
+        let msg_pos = SharedSeedOpeningMessageV1 {
+            context_digest: ctx_digest,
+            commitments_root: root,
+            shared_round_seed: seed,
+            payload: pl_pos,
+            openings: op_pos.clone(),
+        };
+        let msg_neg = SharedSeedOpeningMessageV1 {
+            context_digest: ctx_digest,
+            commitments_root: root,
+            shared_round_seed: seed,
+            payload: pl_neg,
+            openings: op_pos,
+        };
+        let w_pos = build_sparse_opening_delivery(&p1, &coord_sp, s1, 1, 2, 100, &msg_pos);
+        let w_neg = build_sparse_opening_delivery(&p1, &coord_sp, s1, 1, 3, 100, &msg_neg);
+        coord_sp
+            .submit_sparse_opening_delivery(&w_pos, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+            .unwrap();
+        assert_eq!(
+            coord_sp
+                .submit_sparse_opening_delivery(&w_neg, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap(),
+            SubmissionDecision::DuplicateIdempotentAck
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn strict_policy_keys(p: &TrustPolicy) -> Vec<[u8; 32]> {
+        match p {
+            TrustPolicy::Strict {
+                trusted_public_keys,
+                ..
+            } => trusted_public_keys.clone(),
+            TrustPolicy::LegacyPermissive => Vec::new(),
+        }
     }
 }

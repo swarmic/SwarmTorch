@@ -1,9 +1,10 @@
 //! Minimal native OpRunner (alpha.6, std-only).
 //!
-//! Implements three metadata-only ops:
-//! - `passthrough`: forwards inputs unchanged
-//! - `filter_rows`: filters rows (metadata-only; rows/bytes = None)
-//! - `union`: forwards input metadata for union-style stages; materialization computes outputs
+//! Implements core dataops operators (`passthrough`, `filter_rows`, `union`) plus
+//! policy-pinned `wasm_transform` dispatch over attached external executors:
+//! - Physical CAS execution (`RunnerExecutionModeV1::PhysicalStrict`): reads/writes verified CAS blobs
+//!   with real `rows`/`bytes` measurements.
+//! - Explicit test metadata mode (`RunnerExecutionModeV1::MetadataOnlyForTests`): metadata-only fallback.
 //!
 //! All ops emit a deterministic span:
 //! - `trace_id = run_id` (16 bytes → TraceId)
@@ -12,7 +13,7 @@
 //! **ADR-0018:** The runner boundary is separate from the scheduler.
 //! Policy enforcement must happen BEFORE calling `run()`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -30,9 +31,15 @@ use crate::artifacts::schema_check::{
     validate_json_bytes_against_schema, COLUMNAR_TABLE_SCHEMA_JSON,
 };
 use crate::artifacts::{
-    hex_lower, parse_cas_uri_digest, read_bytes_bounded, write_once_cas_blob, OutputSpec,
-    MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
+    cmp_json_numbers, hex_lower, parse_cas_uri_digest, parse_finite_json_number_str,
+    read_bytes_bounded, write_once_cas_blob, OutputSpec, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,
+    MAX_SINGLE_ARTIFACT_BYTES,
 };
+
+/// Maximum number of rows permitted in a validated [`ColumnarTableV1`] (`ST-15`).
+pub const MAX_COLUMNAR_ROWS: usize = MAX_NDJSON_LINES;
+/// Maximum number of columns permitted in a validated [`ColumnarTableV1`] (`ST-15`).
+pub const MAX_COLUMNAR_COLUMNS: usize = 4_096;
 use crate::wasm_sandbox::{
     resolve_and_preflight_wasm_node_v1, wasm_error_to_io, SandboxedExtensionPolicyV1,
     WasmExtensionExecutor, WasmSandboxError,
@@ -95,13 +102,23 @@ impl ColumnarTableV1 {
             content_digest_sha256: None,
         };
         table.validate()?;
-        let body_bytes = serde_json::to_vec(&(&table.columns, &table.rows))
+        table.content_digest_sha256 = Some(Self::compute_content_digest_sha256(
+            &table.columns,
+            &table.rows,
+        )?);
+        Ok(table)
+    }
+
+    fn compute_content_digest_sha256(
+        columns: &[ColumnSchemaV1],
+        rows: &[Vec<Value>],
+    ) -> io::Result<String> {
+        let body_bytes = serde_json::to_vec(&(columns, rows))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let digest = Sha256::digest(&body_bytes);
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&digest[..]);
-        table.content_digest_sha256 = Some(hex_lower(&arr));
-        Ok(table)
+        Ok(hex_lower(&arr))
     }
 
     /// Parse and validate a [`ColumnarTableV1`] from raw JSON bytes against `COLUMNAR_TABLE_SCHEMA_JSON`.
@@ -140,17 +157,42 @@ impl ColumnarTableV1 {
                 "invalid ColumnarTableV1 schema_version or table_format",
             ));
         }
+        if self.columns.len() > MAX_COLUMNAR_COLUMNS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ColumnarTableV1 column count {} exceeds MAX_COLUMNAR_COLUMNS ({MAX_COLUMNAR_COLUMNS})",
+                    self.columns.len()
+                ),
+            ));
+        }
+        if self.rows.len() > MAX_COLUMNAR_ROWS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ColumnarTableV1 row count {} exceeds MAX_COLUMNAR_ROWS ({MAX_COLUMNAR_ROWS})",
+                    self.rows.len()
+                ),
+            ));
+        }
         if self.row_count != self.rows.len() as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "ColumnarTableV1 row_count does not match rows.len()",
             ));
         }
+        let mut seen_columns = BTreeSet::new();
         for (col_idx, col) in self.columns.iter().enumerate() {
-            if col.name.is_empty() {
+            if col.name.is_empty() || col.name.chars().count() > 256 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("empty column name at index {col_idx}"),
+                    format!("invalid column name length at index {col_idx}"),
+                ));
+            }
+            if !seen_columns.insert(col.name.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("duplicate column name '{}'", col.name),
                 ));
             }
         }
@@ -194,6 +236,15 @@ impl ColumnarTableV1 {
                         ),
                     ));
                 }
+            }
+        }
+        if let Some(ref expected_digest) = self.content_digest_sha256 {
+            let actual_digest = Self::compute_content_digest_sha256(&self.columns, &self.rows)?;
+            if &actual_digest != expected_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ColumnarTableV1 content_digest_sha256 mismatch",
+                ));
             }
         }
         Ok(())
@@ -662,32 +713,52 @@ impl NativeOpRunner {
         Ok(parsed)
     }
 
-    fn physical_passthrough(
-        run_dir: &Path,
+    fn validate_declared_output_keys(
         node: &NodeV1,
-        inputs: &[AssetInstanceV1],
-        input_content_types: &BTreeMap<String, String>,
+        expected_len: usize,
+        op_name: &str,
+    ) -> io::Result<Vec<String>> {
+        if node.outputs.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{op_name} requires {expected_len} declared output(s), got {}",
+                    node.outputs.len()
+                ),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut keys = Vec::with_capacity(expected_len);
+        for out in &node.outputs {
+            if out.asset_key.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{op_name} declared output has empty asset_key"),
+                ));
+            }
+            if !seen.insert(out.asset_key.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{op_name} declared duplicate output asset_key '{}'",
+                        out.asset_key
+                    ),
+                ));
+            }
+            keys.push(out.asset_key.clone());
+        }
+        Ok(keys)
+    }
+
+    fn commit_staged_cas_outputs(
+        run_dir: &Path,
+        staged: Vec<(String, Vec<u8>, Option<u64>, ColumnarInputFormatV1)>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
-        let mut instances = Vec::with_capacity(inputs.len());
-        let mut output_specs = Vec::with_capacity(inputs.len());
+        let mut instances = Vec::with_capacity(staged.len());
+        let mut output_specs = Vec::with_capacity(staged.len());
         let mut output_content_types = BTreeMap::new();
-        for (idx, inp) in inputs.iter().enumerate() {
-            let fmt = Self::resolve_input_format(inp, input_content_types)?;
-            let raw = read_verified_cas_input(run_dir, inp)?;
-            let row_count = match fmt {
-                ColumnarInputFormatV1::ColumnarTableV1 => {
-                    let tbl = ColumnarTableV1::from_json_bytes_strict(&raw)?;
-                    Some(tbl.row_count)
-                }
-                ColumnarInputFormatV1::Ndjson => Some(Self::parse_ndjson_rows(&raw)?.len() as u64),
-                ColumnarInputFormatV1::OpaqueBinary => None,
-            };
-            let (hex, uri, byte_len) = write_cas_bytes(run_dir, &raw)?;
-            let out_key = node
-                .outputs
-                .get(idx)
-                .map(|o| o.asset_key.clone())
-                .unwrap_or_else(|| inp.asset_key.clone());
+        for (out_key, bytes, row_count, fmt) in staged {
+            let (hex, uri, byte_len) = write_cas_bytes(run_dir, &bytes)?;
             instances.push(AssetInstanceV1 {
                 asset_key: out_key.clone(),
                 fingerprint_v0: hex,
@@ -708,12 +779,37 @@ impl NativeOpRunner {
         })
     }
 
+    fn physical_passthrough(
+        run_dir: &Path,
+        node: &NodeV1,
+        inputs: &[AssetInstanceV1],
+        input_content_types: &BTreeMap<String, String>,
+    ) -> io::Result<PhysicalExecOutcomeV1> {
+        let out_keys = Self::validate_declared_output_keys(node, inputs.len(), "passthrough")?;
+        let mut staged = Vec::with_capacity(inputs.len());
+        for (inp, out_key) in inputs.iter().zip(out_keys) {
+            let fmt = Self::resolve_input_format(inp, input_content_types)?;
+            let raw = read_verified_cas_input(run_dir, inp)?;
+            let row_count = match fmt {
+                ColumnarInputFormatV1::ColumnarTableV1 => {
+                    let tbl = ColumnarTableV1::from_json_bytes_strict(&raw)?;
+                    Some(tbl.row_count)
+                }
+                ColumnarInputFormatV1::Ndjson => Some(Self::parse_ndjson_rows(&raw)?.len() as u64),
+                ColumnarInputFormatV1::OpaqueBinary => None,
+            };
+            staged.push((out_key, raw, row_count, fmt));
+        }
+        Self::commit_staged_cas_outputs(run_dir, staged)
+    }
+
     fn physical_filter_rows(
         run_dir: &Path,
         node: &NodeV1,
         inputs: &[AssetInstanceV1],
         input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
+        let out_keys = Self::validate_declared_output_keys(node, inputs.len(), "filter_rows")?;
         let col_name = canon_param_str(&node.params, "column");
         let raw_op = canon_param_str(&node.params, "op").unwrap_or("eq");
         let target_val = canon_param_str(&node.params, "value");
@@ -738,11 +834,8 @@ impl NativeOpRunner {
             }
         };
 
-        let mut instances = Vec::with_capacity(inputs.len());
-        let mut output_specs = Vec::with_capacity(inputs.len());
-        let mut output_content_types = BTreeMap::new();
-
-        for (idx, inp) in inputs.iter().enumerate() {
+        let mut staged = Vec::with_capacity(inputs.len());
+        for (inp, out_key) in inputs.iter().zip(out_keys) {
             let fmt = Self::resolve_input_format(inp, input_content_types)?;
             let raw = read_verified_cas_input(run_dir, inp)?;
             let (out_bytes, rows_kept) = match fmt {
@@ -802,31 +895,9 @@ impl NativeOpRunner {
                     ));
                 }
             };
-
-            let (hex, uri, byte_len) = write_cas_bytes(run_dir, &out_bytes)?;
-            let out_key = node
-                .outputs
-                .get(idx)
-                .map(|o| o.asset_key.clone())
-                .unwrap_or_else(|| inp.asset_key.clone());
-            instances.push(AssetInstanceV1 {
-                asset_key: out_key.clone(),
-                fingerprint_v0: hex,
-                uri: Some(uri),
-            });
-            output_specs.push(OutputSpec {
-                asset_key: out_key.clone(),
-                schema: None,
-                rows: Some(rows_kept),
-                bytes: Some(byte_len),
-            });
-            output_content_types.insert(out_key, fmt.content_type().to_string());
+            staged.push((out_key, out_bytes, Some(rows_kept), fmt));
         }
-        Ok(PhysicalExecOutcomeV1 {
-            instances,
-            output_specs,
-            output_content_types,
-        })
+        Self::commit_staged_cas_outputs(run_dir, staged)
     }
 
     fn physical_union(
@@ -841,6 +912,8 @@ impl NativeOpRunner {
                 "union requires at least one physical input",
             ));
         }
+        let mut out_keys = Self::validate_declared_output_keys(node, 1, "union")?;
+        let out_key = out_keys.remove(0);
 
         let first_fmt = Self::resolve_input_format(&inputs[0], input_content_types)?;
         if first_fmt == ColumnarInputFormatV1::OpaqueBinary {
@@ -906,28 +979,10 @@ impl NativeOpRunner {
             ColumnarInputFormatV1::OpaqueBinary => unreachable!(),
         };
 
-        let (hex, uri, byte_len) = write_cas_bytes(run_dir, &out_bytes)?;
-        let out_key = node
-            .outputs
-            .first()
-            .map(|o| o.asset_key.clone())
-            .unwrap_or_else(|| format!("asset://union/{hex}"));
-        let mut output_content_types = BTreeMap::new();
-        output_content_types.insert(out_key.clone(), first_fmt.content_type().to_string());
-        Ok(PhysicalExecOutcomeV1 {
-            instances: vec![AssetInstanceV1 {
-                asset_key: out_key.clone(),
-                fingerprint_v0: hex,
-                uri: Some(uri),
-            }],
-            output_specs: vec![OutputSpec {
-                asset_key: out_key,
-                schema: None,
-                rows: Some(total_rows),
-                bytes: Some(byte_len),
-            }],
-            output_content_types,
-        })
+        Self::commit_staged_cas_outputs(
+            run_dir,
+            vec![(out_key, out_bytes, Some(total_rows), first_fmt)],
+        )
     }
 
     /// Passthrough: returns inputs as-is, unchanged.
@@ -1036,15 +1091,8 @@ impl NativeOpRunner {
                 ),
             ));
         }
-        if node.outputs.len() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "wasm_transform supports at most 1 output asset, got {}",
-                    node.outputs.len()
-                ),
-            ));
-        }
+        let mut out_keys = Self::validate_declared_output_keys(node, 1, "wasm_transform")?;
+        let out_key = out_keys.remove(0);
 
         let (_declared_hash, export_name, wasm_bytes) =
             resolve_and_preflight_wasm_node_v1(policy, &node.params, registry)?;
@@ -1074,29 +1122,10 @@ impl NativeOpRunner {
             ColumnarInputFormatV1::OpaqueBinary => None,
         };
 
-        let (hex, uri, byte_len) = write_cas_bytes(run_dir, &receipt.output_bytes)?;
-        let out_key = node
-            .outputs
-            .first()
-            .map(|o| o.asset_key.clone())
-            .unwrap_or_else(|| inputs[0].asset_key.clone());
-        let mut output_content_types = BTreeMap::new();
-        output_content_types.insert(out_key.clone(), fmt.content_type().to_string());
-
-        Ok(PhysicalExecOutcomeV1 {
-            instances: vec![AssetInstanceV1 {
-                asset_key: out_key.clone(),
-                fingerprint_v0: hex,
-                uri: Some(uri),
-            }],
-            output_specs: vec![OutputSpec {
-                asset_key: out_key,
-                schema: None,
-                rows: rows_opt,
-                bytes: Some(byte_len),
-            }],
-            output_content_types,
-        })
+        Self::commit_staged_cas_outputs(
+            run_dir,
+            vec![(out_key, receipt.output_bytes, rows_opt, fmt)],
+        )
     }
 }
 
@@ -1169,21 +1198,22 @@ fn cell_matches_predicate(cell: &Value, op: &str, rhs_raw: &str) -> bool {
         }
         return false;
     }
-    if let Some(lhs_f) = cell.as_f64() {
-        if let Ok(rhs_f) = rhs_raw.parse::<f64>() {
-            if !lhs_f.is_finite() || !rhs_f.is_finite() {
-                return false;
-            }
-            return match op {
-                "eq" => (lhs_f - rhs_f).abs() <= 1e-12,
-                "ne" => (lhs_f - rhs_f).abs() > 1e-12,
-                "gt" => lhs_f > rhs_f,
-                "ge" => lhs_f >= rhs_f,
-                "lt" => lhs_f < rhs_f,
-                "le" => lhs_f <= rhs_f,
-                _ => false,
-            };
-        }
+    if let Value::Number(lhs_num) = cell {
+        let Some(rhs_num) = parse_finite_json_number_str(rhs_raw) else {
+            return false;
+        };
+        let Some(ord) = cmp_json_numbers(lhs_num, &rhs_num) else {
+            return false;
+        };
+        return match op {
+            "eq" => ord == std::cmp::Ordering::Equal,
+            "ne" => ord != std::cmp::Ordering::Equal,
+            "gt" => ord == std::cmp::Ordering::Greater,
+            "ge" => matches!(ord, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
+            "lt" => ord == std::cmp::Ordering::Less,
+            "le" => matches!(ord, std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
+            _ => false,
+        };
     }
     if let Some(lhs_s) = cell.as_str() {
         return match op {
@@ -1405,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_transform_fails_closed_until_wasmi_sandbox_integration() {
+    fn wasm_transform_fails_closed_when_executor_unattached() {
         let pid = std::process::id();
         let run_dir = std::env::temp_dir().join(format!("swarmtorch_native_wasm_deny_{pid}"));
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -1787,5 +1817,640 @@ mod tests {
         assert_eq!(err_oversized.kind(), io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn st15_columnar_bounds_duplicate_columns_digest_and_i64_predicates() {
+        use crate::wasm_sandbox::{
+            SandboxedExtensionPolicyV1, WasmExecutionReceiptV1, WasmExtensionExecutor,
+            WASM_MAGIC_AND_VERSION_V1,
+        };
+
+        // 1. Duplicate column names rejected cleanly.
+        let dup_cols = vec![
+            ColumnSchemaV1 {
+                name: "x".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            },
+            ColumnSchemaV1 {
+                name: "x".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            },
+        ];
+        assert_eq!(
+            ColumnarTableV1::try_new(dup_cols, vec![vec![Value::from(1), Value::from(2)]])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 2. Column name > 256 chars and rows.len() > MAX_COLUMNAR_ROWS rejected.
+        let long_name = vec![ColumnSchemaV1 {
+            name: "a".repeat(257),
+            dtype: ColumnDtypeV1::I64,
+            nullable: false,
+        }];
+        assert_eq!(
+            ColumnarTableV1::try_new(long_name, vec![])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let too_many = ColumnarTableV1 {
+            schema_version: 1,
+            table_format: "stcl-json-v1".to_string(),
+            row_count: (MAX_COLUMNAR_ROWS + 1) as u64,
+            columns: vec![ColumnSchemaV1 {
+                name: "id".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            rows: vec![vec![Value::from(1)]; MAX_COLUMNAR_ROWS + 1],
+            content_digest_sha256: None,
+        };
+        assert_eq!(
+            too_many.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 3. content_digest_sha256 verified against (columns, rows); cell tamper fails from_json_bytes_strict!
+        let mut valid_tbl = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "id".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![
+                vec![Value::from(9_007_199_254_740_992_i64)],
+                vec![Value::from(9_007_199_254_740_993_i64)],
+            ],
+        )
+        .unwrap();
+        let valid_bytes = valid_tbl.to_canonical_json_bytes().unwrap();
+        assert!(ColumnarTableV1::from_json_bytes_strict(&valid_bytes).is_ok());
+
+        valid_tbl.rows[0][0] = Value::from(9_007_199_254_740_994_i64);
+        let tampered_bytes = serde_json::to_vec(&valid_tbl).unwrap();
+        assert_eq!(
+            ColumnarTableV1::from_json_bytes_strict(&tampered_bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 4. Exact > 2^53 i64 / u64 / boundary float comparisons in cell_matches_predicate!
+        let big_even = Value::from(9_007_199_254_740_992_i64);
+        let big_odd = Value::from(9_007_199_254_740_993_i64);
+        assert!(cell_matches_predicate(&big_even, "eq", "9007199254740992"));
+        assert!(!cell_matches_predicate(&big_odd, "eq", "9007199254740992"));
+        assert!(cell_matches_predicate(&big_odd, "ne", "9007199254740992"));
+        assert!(cell_matches_predicate(&big_odd, "gt", "9007199254740992"));
+        assert!(!cell_matches_predicate(
+            &big_odd,
+            "eq",
+            "9007199254740992.0"
+        ));
+        assert!(cell_matches_predicate(&big_odd, "gt", "9007199254740992.0"));
+        assert!(cell_matches_predicate(
+            &Value::from(u64::MAX),
+            "gt",
+            "18446744073709551614"
+        ));
+        assert!(!cell_matches_predicate(
+            &Value::from(u64::MAX),
+            "eq",
+            "18446744073709551614"
+        ));
+        assert!(cell_matches_predicate(
+            &Value::from(i64::MAX),
+            "lt",
+            "9223372036854775808.0"
+        ));
+        assert!(cell_matches_predicate(
+            &Value::from(i64::MIN),
+            "gt",
+            "-9223372036854779904.0"
+        ));
+        assert!(cell_matches_predicate(
+            &Value::from(i64::MIN),
+            "eq",
+            "-9223372036854775808.0"
+        ));
+        assert!(!cell_matches_predicate(&big_odd, "eq", "NaN"));
+        assert!(!cell_matches_predicate(&big_odd, "gt", "inf"));
+
+        // 5. Output count enforcement before CAS writes across passthrough, filter_rows, union, wasm_transform!
+        let pid = std::process::id();
+        let run_dir = std::env::temp_dir().join(format!("swarmtorch_native_out_contract_{pid}"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let (hex_in, uri_in, _) = write_cas_bytes(&run_dir, &valid_bytes).unwrap();
+        let inp = AssetInstanceV1 {
+            asset_key: "dataset://ns/raw".to_string(),
+            fingerprint_v0: hex_in.clone(),
+            uri: Some(uri_in),
+        };
+        let mut cts = BTreeMap::new();
+        cts.insert(
+            "dataset://ns/raw".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let runner = NativeOpRunner::new();
+
+        for op in ["passthrough", "filter_rows", "union"] {
+            let mut node = test_node(op);
+            node.outputs = vec![];
+            let err_empty = runner
+                .run_in_session_with_content_types(
+                    &ctx,
+                    &run_dir,
+                    &node,
+                    std::slice::from_ref(&inp),
+                    &emitter,
+                    None,
+                    &cts,
+                )
+                .unwrap_err();
+            assert_eq!(err_empty.kind(), io::ErrorKind::InvalidInput);
+
+            node.outputs = vec![
+                AssetRefV1 {
+                    asset_key: "dataset://ns/o1".to_string(),
+                    fingerprint: None,
+                },
+                AssetRefV1 {
+                    asset_key: "dataset://ns/o2".to_string(),
+                    fingerprint: None,
+                },
+            ];
+            let err_two = runner
+                .run_in_session_with_content_types(
+                    &ctx,
+                    &run_dir,
+                    &node,
+                    std::slice::from_ref(&inp),
+                    &emitter,
+                    None,
+                    &cts,
+                )
+                .unwrap_err();
+            assert_eq!(err_two.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        // Exact filter_rows execution with 1 declared output filters 2^53+1 cleanly!
+        let mut filter_node = test_node("filter_rows");
+        filter_node
+            .params
+            .insert("column".to_string(), CanonValue::Str("id".to_string()));
+        filter_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("eq".to_string()));
+        filter_node.params.insert(
+            "value".to_string(),
+            CanonValue::Str("9007199254740993".to_string()),
+        );
+        filter_node.outputs = vec![AssetRefV1 {
+            asset_key: "dataset://ns/filtered".to_string(),
+            fingerprint: None,
+        }];
+        let out = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &filter_node,
+                std::slice::from_ref(&inp),
+                &emitter,
+                None,
+                &cts,
+            )
+            .unwrap();
+        let kept = ColumnarTableV1::from_json_bytes_strict(
+            &read_verified_cas_input(&run_dir, &out.instances[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.rows.len(), 1);
+        assert_eq!(kept.rows[0][0].as_i64(), Some(9_007_199_254_740_993_i64));
+
+        // wasm_transform rejects 0 declared outputs up front (before writing any CAS output)!
+        struct EchoWasm;
+        impl WasmExtensionExecutor for EchoWasm {
+            fn execute_byte_transform(
+                &self,
+                policy: &SandboxedExtensionPolicyV1,
+                wasm_bytes: &[u8],
+                _export_name: &str,
+                input_payload: &[u8],
+            ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
+                Ok(WasmExecutionReceiptV1 {
+                    module_sha256: SandboxedExtensionPolicyV1::sha256_module(wasm_bytes),
+                    fuel_consumed: policy.limits.max_fuel.min(10),
+                    peak_memory_bytes: 65_536,
+                    return_code: 0,
+                    output_bytes: input_payload.to_vec(),
+                })
+            }
+            fn execute_scalar_i32(
+                &self,
+                _policy: &SandboxedExtensionPolicyV1,
+                _wasm_bytes: &[u8],
+                _export_name: &str,
+                _arg: i32,
+            ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+                unreachable!()
+            }
+        }
+        let mut wasm = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        wasm.extend_from_slice(&[1, 7, 1, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
+        wasm.extend_from_slice(&[3, 2, 1, 0]);
+        wasm.extend_from_slice(&[5, 4, 1, 0x01, 1, 1]);
+        wasm.extend_from_slice(&[7, 13, 1, 9]);
+        wasm.extend_from_slice(b"transform");
+        wasm.extend_from_slice(&[0x00, 0x00]);
+        wasm.extend_from_slice(&[10, 6, 1, 4, 0, 0x41, 0, 0x0b]);
+        let wasm_hash = SandboxedExtensionPolicyV1::sha256_module(&wasm);
+        let wasm_policy = SandboxedExtensionPolicyV1::with_allowed_hash(wasm_hash);
+        let mut wasm_reg = BTreeMap::new();
+        wasm_reg.insert(wasm_hash, wasm);
+        let wasm_runner = NativeOpRunner::new().with_wasm_executor(Arc::new(EchoWasm));
+        let mut wasm_node = test_node("wasm_transform");
+        wasm_node.execution_trust = ExecutionTrust::SandboxedExtension;
+        wasm_node.params.insert(
+            "module_sha256".to_string(),
+            CanonValue::Str(hex_lower(&wasm_hash)),
+        );
+        wasm_node.params.insert(
+            "export".to_string(),
+            CanonValue::Str("transform".to_string()),
+        );
+        wasm_node.outputs = vec![];
+        let err_wasm_zero_out = wasm_runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &wasm_node,
+                std::slice::from_ref(&inp),
+                &emitter,
+                Some((&wasm_policy, &wasm_reg)),
+                &cts,
+            )
+            .unwrap_err();
+        assert_eq!(err_wasm_zero_out.kind(), io::ErrorKind::InvalidInput);
+        let _ = hex_in;
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn st15_multi_input_duplicate_outputs_and_partial_failure_write_zero_orphan_cas_blobs() {
+        use crate::artifacts::{DataOpsSession, RunArtifactBundle, RunArtifactSink};
+        use crate::scheduler::execute_graph_sequential;
+        use swarm_torch_core::dataops::{AuthModeMarker, SourceDescriptorV0, TrustClass};
+        use swarm_torch_core::execution::PermissivePolicy;
+        use swarm_torch_core::run_graph::GraphV1;
+
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("swarmtorch_native_no_orphans_{pid}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let tbl_a = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "k".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![vec![Value::from(1)]],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+        let tbl_b = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "k".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![vec![Value::from(2)]],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+
+        let (hex_a, uri_a, _) = write_cas_bytes(&base, &tbl_a).unwrap();
+        let (hex_b, uri_b, _) = write_cas_bytes(&base, &tbl_b).unwrap();
+        let in_a = AssetInstanceV1 {
+            asset_key: "dataset://ns/a".to_string(),
+            fingerprint_v0: hex_a.clone(),
+            uri: Some(uri_a.clone()),
+        };
+        let in_b = AssetInstanceV1 {
+            asset_key: "dataset://ns/b".to_string(),
+            fingerprint_v0: hex_b.clone(),
+            uri: Some(uri_b.clone()),
+        };
+        let mut cts = BTreeMap::new();
+        cts.insert(
+            "dataset://ns/a".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        cts.insert(
+            "dataset://ns/b".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        let blob_count = |dir: &Path| -> usize {
+            std::fs::read_dir(dir.join("blobs").join("sha256"))
+                .map(|it| it.count())
+                .unwrap_or(0)
+        };
+
+        let ctx = test_ctx();
+        let emitter = TestEmitter::new();
+        let runner = NativeOpRunner::new();
+
+        // 1. Duplicate and empty declared node.outputs rejected for passthrough & filter_rows before writing CAS!
+        for op in ["passthrough", "filter_rows"] {
+            let mut dup_node = test_node(op);
+            dup_node.inputs = vec![
+                AssetRefV1 {
+                    asset_key: "dataset://ns/a".to_string(),
+                    fingerprint: None,
+                },
+                AssetRefV1 {
+                    asset_key: "dataset://ns/b".to_string(),
+                    fingerprint: None,
+                },
+            ];
+            dup_node.outputs = vec![
+                AssetRefV1 {
+                    asset_key: "dataset://ns/dup".to_string(),
+                    fingerprint: None,
+                },
+                AssetRefV1 {
+                    asset_key: "dataset://ns/dup".to_string(),
+                    fingerprint: None,
+                },
+            ];
+            // Write distinct content under a custom payload so output digests would differ from input if written:
+            let tbl_c = ColumnarTableV1::try_new(
+                vec![ColumnSchemaV1 {
+                    name: "k".to_string(),
+                    dtype: ColumnDtypeV1::I64,
+                    nullable: false,
+                }],
+                vec![vec![Value::from(1)], vec![Value::from(2)]],
+            )
+            .unwrap()
+            .to_canonical_json_bytes()
+            .unwrap();
+            let (hex_c, uri_c, _) = write_cas_bytes(&base, &tbl_c).unwrap();
+            let in_c = AssetInstanceV1 {
+                asset_key: "dataset://ns/b".to_string(),
+                fingerprint_v0: hex_c,
+                uri: Some(uri_c),
+            };
+            let before = blob_count(&base);
+            if op == "filter_rows" {
+                dup_node
+                    .params
+                    .insert("column".to_string(), CanonValue::Str("k".to_string()));
+                dup_node
+                    .params
+                    .insert("op".to_string(), CanonValue::Str("eq".to_string()));
+                dup_node
+                    .params
+                    .insert("value".to_string(), CanonValue::Str("1".to_string()));
+            }
+            let err_dup = runner
+                .run_in_session_with_content_types(
+                    &ctx,
+                    &base,
+                    &dup_node,
+                    &[in_a.clone(), in_c.clone()],
+                    &emitter,
+                    None,
+                    &cts,
+                )
+                .unwrap_err();
+            assert_eq!(err_dup.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(blob_count(&base), before, "{op} dup leaked CAS blobs");
+
+            let mut empty_out_node = dup_node.clone();
+            empty_out_node.outputs[1].asset_key.clear();
+            let err_empty = runner
+                .run_in_session_with_content_types(
+                    &ctx,
+                    &base,
+                    &empty_out_node,
+                    &[in_a.clone(), in_c],
+                    &emitter,
+                    None,
+                    &cts,
+                )
+                .unwrap_err();
+            assert_eq!(err_empty.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(blob_count(&base), before, "{op} empty key leaked CAS blobs");
+        }
+
+        // 2. Partial failure on inputs[1] (`filter_rows` missing column on second input,
+        //    `passthrough` missing content_type on second input) writes ZERO CAS blobs for inputs[0]!
+        let bad_filter_ndjson = br#"{"other":99}
+"#;
+        let (hex_nd, uri_nd, _) = write_cas_bytes(&base, bad_filter_ndjson).unwrap();
+        let in_nd = AssetInstanceV1 {
+            asset_key: "dataset://ns/bad_nd".to_string(),
+            fingerprint_v0: hex_nd,
+            uri: Some(uri_nd),
+        };
+        let mut cts_partial = cts.clone();
+        cts_partial.insert(
+            "dataset://ns/bad_nd".to_string(),
+            CONTENT_TYPE_NDJSON.to_string(),
+        );
+        let mut filter_partial = test_node("filter_rows");
+        filter_partial.inputs = vec![
+            AssetRefV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint: None,
+            },
+            AssetRefV1 {
+                asset_key: "dataset://ns/bad_nd".to_string(),
+                fingerprint: None,
+            },
+        ];
+        filter_partial.outputs = vec![
+            AssetRefV1 {
+                asset_key: "dataset://ns/out_a".to_string(),
+                fingerprint: None,
+            },
+            AssetRefV1 {
+                asset_key: "dataset://ns/out_b".to_string(),
+                fingerprint: None,
+            },
+        ];
+        // Use missing-column ColumnarTableV1 on inputs[1] so filter_rows fails on second input
+        let missing_col_tbl = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "other".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![vec![Value::from(9)]],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+        let (hex_mcol, uri_mcol, _) = write_cas_bytes(&base, &missing_col_tbl).unwrap();
+        let in_mcol = AssetInstanceV1 {
+            asset_key: "dataset://ns/mcol".to_string(),
+            fingerprint_v0: hex_mcol,
+            uri: Some(uri_mcol),
+        };
+        cts_partial.insert(
+            "dataset://ns/mcol".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        filter_partial
+            .params
+            .insert("column".to_string(), CanonValue::Str("k".to_string()));
+        filter_partial
+            .params
+            .insert("op".to_string(), CanonValue::Str("eq".to_string()));
+        filter_partial
+            .params
+            .insert("value".to_string(), CanonValue::Str("999".to_string()));
+        // Note: input[0] would produce filtered (0 rows -> NEW CAS digest!), input[1] fails column lookup -> zero blobs!
+        let before_filter = blob_count(&base);
+        let err_partial_filter = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &base,
+                &filter_partial,
+                &[in_a.clone(), in_mcol],
+                &emitter,
+                None,
+                &cts_partial,
+            )
+            .unwrap_err();
+        assert_eq!(err_partial_filter.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(blob_count(&base), before_filter);
+
+        // passthrough with unknown/corrupt second input writes zero blobs
+        let mut pt_partial = test_node("passthrough");
+        pt_partial.outputs = filter_partial.outputs.clone();
+        let mut cts_missing_b = BTreeMap::new();
+        cts_missing_b.insert(
+            "dataset://ns/a".to_string(),
+            CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+        );
+        let before_pt = blob_count(&base);
+        let err_pt = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &base,
+                &pt_partial,
+                &[in_a, in_nd],
+                &emitter,
+                None,
+                &cts_missing_b,
+            )
+            .unwrap_err();
+        assert_eq!(err_pt.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(blob_count(&base), before_pt);
+        let _ = in_b;
+
+        // 3. Scheduler integration check: duplicate node.outputs fails node cleanly with zero extra CAS blobs!
+        let sched_dir = base.join("sched");
+        let run_id = RunId::from_bytes([0xE9; 16]);
+        let bundle = RunArtifactBundle::create(&sched_dir, run_id).unwrap();
+        let mut session = DataOpsSession::new(Arc::new(RunArtifactSink::new(bundle)));
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        write_once_cas_blob(&run_dir, &parse_cas_uri_digest(&uri_a).unwrap(), &tbl_a).unwrap();
+        let (hex_sched_b, uri_sched_b, _) = write_cas_bytes(&run_dir, &tbl_b).unwrap();
+        let _ = hex_sched_b;
+        let ingest = test_node("ingest");
+        session
+            .register_source(
+                "dataset://ns/a",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: uri_a,
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: AuthModeMarker::None,
+                    etag_or_version: None,
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+        session
+            .register_source(
+                "dataset://ns/b",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: uri_sched_b,
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: AuthModeMarker::None,
+                    etag_or_version: None,
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+        let blobs_before_sched = blob_count(&run_dir);
+        let mut sched_bad = test_node("filter_rows");
+        sched_bad.node_key = "node/dup_out".to_string();
+        sched_bad.inputs = vec![
+            AssetRefV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint: None,
+            },
+            AssetRefV1 {
+                asset_key: "dataset://ns/b".to_string(),
+                fingerprint: None,
+            },
+        ];
+        sched_bad.outputs = vec![
+            AssetRefV1 {
+                asset_key: "dataset://ns/dup_out".to_string(),
+                fingerprint: None,
+            },
+            AssetRefV1 {
+                asset_key: "dataset://ns/dup_out".to_string(),
+                fingerprint: None,
+            },
+        ];
+        sched_bad
+            .params
+            .insert("column".to_string(), CanonValue::Str("k".to_string()));
+        sched_bad
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        sched_bad
+            .params
+            .insert("value".to_string(), CanonValue::Str("2".to_string()));
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("dup-out-sched".to_string()),
+            nodes: vec![sched_bad],
+            edges: vec![],
+        };
+        let r = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &PermissivePolicy,
+            run_id,
+            ctx.clock_nanos,
+        )
+        .unwrap();
+        assert_eq!(r.failed_nodes, vec!["node/dup_out"]);
+        assert_eq!(blob_count(&run_dir), blobs_before_sched);
+        let _ = (hex_a, hex_b);
+        drop(session);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

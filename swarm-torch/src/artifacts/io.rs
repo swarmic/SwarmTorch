@@ -626,3 +626,118 @@ pub(crate) fn decode_hex_exact<const N: usize>(s: &str) -> io::Result<[u8; N]> {
 pub fn parse_ed25519_public_key_hex(hex: &str) -> Result<[u8; 32], String> {
     decode_hex_exact::<32>(hex).map_err(|e| e.to_string())
 }
+
+fn cmp_i64_f64(lhs: i64, rhs: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if !rhs.is_finite() {
+        return None;
+    }
+    if rhs < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    if rhs >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    let trunc_i = rhs.trunc() as i64;
+    let frac = rhs.fract();
+    Some(match lhs.cmp(&trunc_i) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Greater => Ordering::Greater,
+        Ordering::Equal => {
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+    })
+}
+
+fn cmp_u64_f64(lhs: u64, rhs: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if !rhs.is_finite() {
+        return None;
+    }
+    if rhs < 0.0 {
+        return Some(Ordering::Greater);
+    }
+    if rhs >= 18_446_744_073_709_551_616.0 {
+        return Some(Ordering::Less);
+    }
+    let trunc_u = rhs.trunc() as u64;
+    let frac = rhs.fract();
+    Some(match lhs.cmp(&trunc_u) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Greater => Ordering::Greater,
+        Ordering::Equal => {
+            if frac > 0.0 {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        }
+    })
+}
+
+/// Lossless comparison across JSON numbers (`i64`, `u64`, and finite `f64`), preserving exact
+/// integer ordering above `2^53`. Returns `None` on non-finite floats.
+pub(crate) fn cmp_json_numbers(
+    lhs: &serde_json::Number,
+    rhs: &serde_json::Number,
+) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if let (Some(a), Some(b)) = (lhs.as_i64(), rhs.as_i64()) {
+        return Some(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (lhs.as_u64(), rhs.as_u64()) {
+        return Some(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (lhs.as_i64(), rhs.as_u64()) {
+        return Some(if a < 0 {
+            Ordering::Less
+        } else {
+            (a as u64).cmp(&b)
+        });
+    }
+    if let (Some(a), Some(b)) = (lhs.as_u64(), rhs.as_i64()) {
+        return Some(if b < 0 {
+            Ordering::Greater
+        } else {
+            a.cmp(&(b as u64))
+        });
+    }
+    if let (Some(a), Some(bf)) = (lhs.as_i64(), rhs.as_f64()) {
+        return cmp_i64_f64(a, bf);
+    }
+    if let (Some(af), Some(b)) = (lhs.as_f64(), rhs.as_i64()) {
+        return cmp_i64_f64(b, af).map(Ordering::reverse);
+    }
+    if let (Some(a), Some(bf)) = (lhs.as_u64(), rhs.as_f64()) {
+        return cmp_u64_f64(a, bf);
+    }
+    if let (Some(af), Some(b)) = (lhs.as_f64(), rhs.as_u64()) {
+        return cmp_u64_f64(b, af).map(Ordering::reverse);
+    }
+    let af = lhs.as_f64()?;
+    let bf = rhs.as_f64()?;
+    if !af.is_finite() || !bf.is_finite() {
+        return None;
+    }
+    af.partial_cmp(&bf)
+}
+
+pub(crate) fn parse_finite_json_number_str(raw: &str) -> Option<serde_json::Number> {
+    if let Ok(i) = raw.parse::<i64>() {
+        return Some(serde_json::Number::from(i));
+    }
+    if let Ok(u) = raw.parse::<u64>() {
+        return Some(serde_json::Number::from(u));
+    }
+    let f = raw.parse::<f64>().ok()?;
+    if !f.is_finite() {
+        return None;
+    }
+    serde_json::Number::from_f64(f)
+}

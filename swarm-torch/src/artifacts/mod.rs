@@ -56,8 +56,9 @@ pub use sink::{ArtifactWriteProfile, ManifestRefreshPolicy, RunArtifactSink, Sna
 #[cfg(test)]
 pub(crate) use io::read_json;
 pub(crate) use io::{
-    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, path_is_present_no_symlink,
-    read_bytes_bounded, reject_path_or_parent_symlink, write_once_cas_blob,
+    cmp_json_numbers, hex_lower, parse_finite_json_number_str, parse_json_slice,
+    parse_ndjson_slice_bounded, path_is_present_no_symlink, read_bytes_bounded,
+    reject_path_or_parent_symlink, write_once_cas_blob,
 };
 
 pub(crate) fn record_validation_error_to_io<E: core::fmt::Display>(e: E) -> std::io::Error {

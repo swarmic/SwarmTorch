@@ -19,7 +19,7 @@ use swarm_torch_core::run_graph::{
 };
 
 use crate::artifacts::{parse_cas_uri_digest, DataOpsSession, OutputSpec};
-use crate::native_runner::{ExecutionContext, NativeOpRunner, CONTENT_TYPE_OCTET_STREAM};
+use crate::native_runner::{ExecutionContext, NativeOpRunner, RunnerExecutionModeV1};
 
 #[derive(Debug)]
 pub enum SchedulerError {
@@ -74,23 +74,25 @@ impl From<GraphValidationError> for SchedulerError {
     }
 }
 
-/// Execution isolation profile for graph node runners (`ADR-0023` §3, Wave 12 `W12-04` stub).
+/// Execution isolation profile for graph node runners (`ADR-0023` §3, `ADR-0025`, `ST-09`).
 ///
-/// In Wave 11 (`v0.1.0`), `execute_graph_sequential` executes `ExecutionTrust::Core` nodes via
-/// [`RunnerIsolationProfile::InProcessTrusted`]. Wave 12 (`W12-04`) will wire
-/// [`RunnerIsolationProfile::ExternalSandboxedStub`] to OS-level subprocess/Wasm isolation for
-/// `ExecutionTrust::SandboxedExtension` and `ExecutionTrust::UntrustedExternal` nodes.
+/// - [`RunnerIsolationProfile::InProcessTrusted`] executes `ExecutionTrust::Core` nodes in-process.
+/// - [`RunnerIsolationProfile::WasmSandboxedV1`] executes `ExecutionTrust::SandboxedExtension`
+///   `wasm_transform` nodes strictly through a configured external `WasmExtensionExecutor`
+///   (such as `adapters/swarm-torch-wasm` `wasmi`, currently scoped to `raw_mem0_v0`) and
+///   fails closed if none is attached.
+/// - [`RunnerIsolationProfile::ExternalSandboxedStub`] remains a fail-closed placeholder stub for
+///   future OS-level external subprocess isolation of `UnsafeExtension` nodes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum RunnerIsolationProfile {
     /// Execute trusted core operators in-process (`ExecutionTrust::Core`).
     #[default]
     InProcessTrusted,
-    /// Scheduled profile for future isolated `wasmi` extension execution (`ExecutionTrust::SandboxedExtension`).
-    ///
-    /// **Fails closed (`UnsupportedUntrustedWasmSandbox`) in `13-0`** until the external
-    /// `adapters/swarm-torch-wasm` (`wasmi`) integration lands (`ST-09`).
+    /// Fail-closed isolated `wasmi` extension execution (`ExecutionTrust::SandboxedExtension`),
+    /// delegating exclusively to the attached [`crate::wasm_sandbox::WasmExtensionExecutor`]
+    /// (`adapters/swarm-torch-wasm`, currently scoped to `raw_mem0_v0`).
     WasmSandboxedV1(crate::wasm_sandbox::SandboxedExtensionPolicyV1),
-    /// Legacy placeholder stub for external process isolation.
+    /// Placeholder stub for external process isolation (always denied fail-closed).
     ExternalSandboxedStub {
         /// Maximum wall-clock execution time in milliseconds.
         timeout_ms: u64,
@@ -290,16 +292,16 @@ pub fn execute_graph_with_isolation(
             PolicyDecision::Allowed => {}
             PolicyDecision::Denied { reason } => {
                 let error_code = format!("policy_denied:{reason}");
-                session.record_node_error(&node, started, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
+                record_failed_scheduler_node(
+                    session,
                     trace_id,
+                    &node,
                     started,
+                    0,
                     "scheduler/node_denied",
-                    &node.node_key,
-                    Some(&error_code),
+                    error_code,
+                    &mut report.failed_nodes,
                 )?;
-                report.failed_nodes.push(node.node_key.clone());
                 continue;
             }
         }
@@ -316,6 +318,7 @@ pub fn execute_graph_with_isolation(
         }
         if let Some(asset_key) = missing_input {
             let error_code = format!("missing_input:{asset_key}");
+            session.invalidate_node_outputs(&node)?;
             session.record_node_skipped(&node, started, error_code.clone())?;
             emit_scheduler_event(
                 session.sink().as_ref(),
@@ -329,40 +332,182 @@ pub fn execute_graph_with_isolation(
             continue;
         }
 
-        let core_specs: Vec<OutputSpecCore> = node
-            .outputs
-            .iter()
-            .map(|output| OutputSpecCore {
+        // Fail-closed isolation enforcement BEFORE cache-hit evaluation so a previously cached
+        // extension node cannot bypass stricter runtime isolation constraints.
+        let wasm_arg = match (&node.execution_trust, isolation) {
+            (_, RunnerIsolationProfile::ExternalSandboxedStub { .. }) => {
+                record_failed_scheduler_node(
+                    session,
+                    trace_id,
+                    &node,
+                    started,
+                    0,
+                    "scheduler/node_denied",
+                    "isolation_denied:ExternalSandboxedStub has no permitted host executor"
+                        .to_string(),
+                    &mut report.failed_nodes,
+                )?;
+                continue;
+            }
+            (swarm_torch_core::run_graph::ExecutionTrust::Core, _) => {
+                if node.op_type == "wasm_transform" {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        started,
+                        0,
+                        "scheduler/node_denied",
+                        "isolation_denied:wasm_transform requires SandboxedExtension trust"
+                            .to_string(),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                }
+                None
+            }
+            (
+                swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension,
+                RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
+            ) => {
+                if node.op_type != "wasm_transform" {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        started,
+                        0,
+                        "scheduler/node_denied",
+                        format!(
+                            "isolation_denied:SandboxedExtension only permits op_type 'wasm_transform', got '{}'",
+                            node.op_type
+                        ),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                }
+                if runner.wasm_executor().is_none() {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        started,
+                        0,
+                        "scheduler/node_denied",
+                        format!(
+                            "isolation_denied:{}",
+                            crate::wasm_sandbox::WasmSandboxError::UnsupportedUntrustedWasmSandbox
+                        ),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                }
+                let Some(registry) = wasm_registry.filter(|reg| !reg.is_empty()) else {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        started,
+                        0,
+                        "scheduler/node_denied",
+                        "isolation_denied:SandboxedExtension requires non-empty wasm_registry"
+                            .to_string(),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                };
+                if let Err(error) = crate::wasm_sandbox::resolve_and_preflight_wasm_node_v1(
+                    wasm_policy,
+                    &node.params,
+                    registry,
+                ) {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        started,
+                        0,
+                        "scheduler/node_denied",
+                        format!("isolation_denied:{error}"),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                }
+                Some((wasm_policy, registry))
+            }
+            (swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension, _) => {
+                record_failed_scheduler_node(
+                    session,
+                    trace_id,
+                    &node,
+                    started,
+                    0,
+                    "scheduler/node_denied",
+                    "isolation_denied:SandboxedExtension requires RunnerIsolationProfile::WasmSandboxedV1"
+                        .to_string(),
+                    &mut report.failed_nodes,
+                )?;
+                continue;
+            }
+            (swarm_torch_core::run_graph::ExecutionTrust::UnsafeExtension, _) => {
+                record_failed_scheduler_node(
+                    session,
+                    trace_id,
+                    &node,
+                    started,
+                    0,
+                    "scheduler/node_denied",
+                    "isolation_denied:UnsafeExtension has no permitted host executor".to_string(),
+                    &mut report.failed_nodes,
+                )?;
+                continue;
+            }
+        };
+        let execution_profile_override = wasm_arg.map(|(wasm_policy, _)| {
+            format!(
+                "sandboxed_extension:{}",
+                wasm_policy.policy_fingerprint_hex()
+            )
+        });
+
+        let mut core_specs: Vec<OutputSpecCore> = Vec::with_capacity(node.outputs.len());
+        let mut output_specs: Vec<OutputSpec> = Vec::with_capacity(node.outputs.len());
+        for output in &node.outputs {
+            let cached_schema = session
+                .cached_output_spec(&output.asset_key)
+                .and_then(|c| c.schema);
+            core_specs.push(OutputSpecCore {
                 asset_key: output.asset_key.clone(),
-                schema: None,
-            })
-            .collect();
-        let mut output_specs: Vec<OutputSpec> = node
-            .outputs
-            .iter()
-            .map(|output| OutputSpec {
+                schema: cached_schema,
+            });
+            // Keep fresh-execution output_specs schema unset until cache hit or runner outcome.
+            output_specs.push(OutputSpec {
                 asset_key: output.asset_key.clone(),
                 schema: None,
                 rows: None,
                 bytes: None,
-            })
-            .collect();
+            });
+        }
 
-        let cache_decision = match session.verify_cache_hit(&node, &core_specs) {
+        let cache_decision = match session.verify_cache_hit_with_profile(
+            &node,
+            &core_specs,
+            execution_profile_override.as_deref(),
+        ) {
             Ok(decision) => decision,
             Err(error) => {
                 let finished = (clock_nanos)();
                 let error_code = format!("cache_integrity_error:{error}");
-                session.record_node_error(&node, finished, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
+                record_failed_scheduler_node(
+                    session,
                     trace_id,
+                    &node,
                     finished,
+                    0,
                     "scheduler/node_failed",
-                    &node.node_key,
-                    Some(&error_code),
+                    error_code,
+                    &mut report.failed_nodes,
                 )?;
-                report.failed_nodes.push(node.node_key.clone());
                 continue;
             }
         };
@@ -381,24 +526,27 @@ pub fn execute_graph_with_isolation(
                 }
             }
             let finished = (clock_nanos)();
-            if let Err(error) = session.materialize_node_outputs(
+            let empty_cas = BTreeMap::new();
+            if let Err(error) = session.materialize_node_outputs_with_cas_bindings_and_profile(
                 &node,
                 &output_specs,
+                &empty_cas,
                 finished,
                 CacheDecisionV0::Hit,
                 0,
+                execution_profile_override.as_deref(),
             ) {
                 let error_code = format!("materialization_error:{error}");
-                session.record_node_error(&node, finished, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
+                record_failed_scheduler_node(
+                    session,
                     trace_id,
+                    &node,
                     finished,
+                    0,
                     "scheduler/node_failed",
-                    &node.node_key,
-                    Some(&error_code),
+                    error_code,
+                    &mut report.failed_nodes,
                 )?;
-                report.failed_nodes.push(node.node_key.clone());
                 continue;
             }
 
@@ -431,115 +579,6 @@ pub fn execute_graph_with_isolation(
             continue;
         }
 
-        // Fail-closed isolation enforcement before invoking runner
-        let wasm_arg = match (&node.execution_trust, isolation) {
-            (swarm_torch_core::run_graph::ExecutionTrust::Core, _) => {
-                if node.op_type == "wasm_transform" {
-                    let error_code =
-                        "isolation_denied:wasm_transform requires SandboxedExtension trust"
-                            .to_string();
-                    session.record_node_error(&node, started, 0, error_code.clone())?;
-                    emit_scheduler_event(
-                        session.sink().as_ref(),
-                        trace_id,
-                        started,
-                        "scheduler/node_denied",
-                        &node.node_key,
-                        Some(&error_code),
-                    )?;
-                    report.failed_nodes.push(node.node_key.clone());
-                    continue;
-                }
-                None
-            }
-            (
-                swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension,
-                RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
-            ) => {
-                if node.op_type != "wasm_transform" {
-                    let error_code = format!(
-                        "isolation_denied:SandboxedExtension only permits op_type 'wasm_transform', got '{}'",
-                        node.op_type
-                    );
-                    session.record_node_error(&node, started, 0, error_code.clone())?;
-                    emit_scheduler_event(
-                        session.sink().as_ref(),
-                        trace_id,
-                        started,
-                        "scheduler/node_denied",
-                        &node.node_key,
-                        Some(&error_code),
-                    )?;
-                    report.failed_nodes.push(node.node_key.clone());
-                    continue;
-                }
-                if runner.wasm_executor().is_none() {
-                    let error_code =
-                        "isolation_denied:UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until an isolated WasmExtensionExecutor is configured"
-                            .to_string();
-                    session.record_node_error(&node, started, 0, error_code.clone())?;
-                    emit_scheduler_event(
-                        session.sink().as_ref(),
-                        trace_id,
-                        started,
-                        "scheduler/node_denied",
-                        &node.node_key,
-                        Some(&error_code),
-                    )?;
-                    report.failed_nodes.push(node.node_key.clone());
-                    continue;
-                }
-                let Some(registry) = wasm_registry else {
-                    let error_code =
-                        "isolation_denied:SandboxedExtension requires non-empty wasm_registry"
-                            .to_string();
-                    session.record_node_error(&node, started, 0, error_code.clone())?;
-                    emit_scheduler_event(
-                        session.sink().as_ref(),
-                        trace_id,
-                        started,
-                        "scheduler/node_denied",
-                        &node.node_key,
-                        Some(&error_code),
-                    )?;
-                    report.failed_nodes.push(node.node_key.clone());
-                    continue;
-                };
-                Some((wasm_policy, registry))
-            }
-            (swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension, _) => {
-                let error_code =
-                    "isolation_denied:SandboxedExtension requires RunnerIsolationProfile::WasmSandboxedV1"
-                        .to_string();
-                session.record_node_error(&node, started, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
-                    trace_id,
-                    started,
-                    "scheduler/node_denied",
-                    &node.node_key,
-                    Some(&error_code),
-                )?;
-                report.failed_nodes.push(node.node_key.clone());
-                continue;
-            }
-            (swarm_torch_core::run_graph::ExecutionTrust::UnsafeExtension, _) => {
-                let error_code =
-                    "isolation_denied:UnsafeExtension has no permitted host executor".to_string();
-                session.record_node_error(&node, started, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
-                    trace_id,
-                    started,
-                    "scheduler/node_denied",
-                    &node.node_key,
-                    Some(&error_code),
-                )?;
-                report.failed_nodes.push(node.node_key.clone());
-                continue;
-            }
-        };
-
         let mut input_content_types = BTreeMap::new();
         for input in &node.inputs {
             if let Some(ct) = session.asset_content_type(&input.asset_key) {
@@ -561,17 +600,16 @@ pub fn execute_graph_with_isolation(
         let exec_outcome = match runner_result {
             Ok(outcome) => outcome,
             Err(error) => {
-                let error_code = format!("runner_error:{error}");
-                session.record_node_error(&node, finished, duration_ms, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
+                record_failed_scheduler_node(
+                    session,
                     trace_id,
+                    &node,
                     finished,
+                    duration_ms,
                     "scheduler/node_failed",
-                    &node.node_key,
-                    Some(&error_code),
+                    format!("runner_error:{error}"),
+                    &mut report.failed_nodes,
                 )?;
-                report.failed_nodes.push(node.node_key.clone());
                 continue;
             }
         };
@@ -580,6 +618,9 @@ pub fn execute_graph_with_isolation(
                 .iter_mut()
                 .find(|s| s.asset_key == phys_spec.asset_key)
             {
+                if phys_spec.schema.is_some() {
+                    target_spec.schema = phys_spec.schema.clone();
+                }
                 if phys_spec.rows.is_some() {
                     target_spec.rows = phys_spec.rows;
                 }
@@ -589,46 +630,55 @@ pub fn execute_graph_with_isolation(
             }
         }
         let runner_instances = exec_outcome.instances;
+        let output_content_types = exec_outcome.output_content_types;
+        let physical_cas_required = runner.mode() == RunnerExecutionModeV1::PhysicalStrict
+            || node.op_type == "wasm_transform"
+            || (!inputs.is_empty()
+                && inputs
+                    .iter()
+                    .all(|i| i.uri.as_deref().and_then(parse_cas_uri_digest).is_some()));
+        let cas_bindings = if physical_cas_required {
+            match build_physical_cas_bindings(&node, &runner_instances, &output_content_types) {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    record_failed_scheduler_node(
+                        session,
+                        trace_id,
+                        &node,
+                        finished,
+                        duration_ms,
+                        "scheduler/node_failed",
+                        format!("materialization_error:{error}"),
+                        &mut report.failed_nodes,
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
 
-        let materialize = session.materialize_node_outputs(
+        let materialize = session.materialize_node_outputs_with_cas_bindings_and_profile(
             &node,
             &output_specs,
+            &cas_bindings,
             finished,
             cache_decision,
             duration_ms,
+            execution_profile_override.as_deref(),
         );
         if let Err(error) = materialize {
-            let error_code = format!("materialization_error:{error}");
-            session.record_node_error(&node, finished, duration_ms, error_code.clone())?;
-            emit_scheduler_event(
-                session.sink().as_ref(),
+            record_failed_scheduler_node(
+                session,
                 trace_id,
+                &node,
                 finished,
+                duration_ms,
                 "scheduler/node_failed",
-                &node.node_key,
-                Some(&error_code),
+                format!("materialization_error:{error}"),
+                &mut report.failed_nodes,
             )?;
-            report.failed_nodes.push(node.node_key.clone());
             continue;
-        }
-
-        // Preserve verified CAS URI + canonical content_type returned by the runner on declared outputs.
-        let output_content_types = exec_outcome.output_content_types;
-        for instance in &runner_instances {
-            if let Some(ref uri) = instance.uri {
-                if parse_cas_uri_digest(uri).is_some()
-                    && node
-                        .outputs
-                        .iter()
-                        .any(|declared| declared.asset_key == instance.asset_key)
-                {
-                    let out_ct = output_content_types
-                        .get(&instance.asset_key)
-                        .map(String::as_str)
-                        .unwrap_or(CONTENT_TYPE_OCTET_STREAM);
-                    session.bind_output_cas_uri(&instance.asset_key, uri, out_ct)?;
-                }
-            }
         }
         report
             .runner_outputs
@@ -646,6 +696,120 @@ pub fn execute_graph_with_isolation(
     }
 
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_failed_scheduler_node(
+    session: &mut DataOpsSession,
+    trace_id: TraceId,
+    node: &NodeV1,
+    ts_unix_nanos: u64,
+    duration_ms: u64,
+    event_name: &str,
+    error_code: String,
+    failed_nodes: &mut Vec<String>,
+) -> io::Result<()> {
+    session.invalidate_node_outputs(node)?;
+    session.record_node_error(node, ts_unix_nanos, duration_ms, error_code.clone())?;
+    emit_scheduler_event(
+        session.sink().as_ref(),
+        trace_id,
+        ts_unix_nanos,
+        event_name,
+        &node.node_key,
+        Some(&error_code),
+    )?;
+    failed_nodes.push(node.node_key.clone());
+    Ok(())
+}
+
+fn build_physical_cas_bindings(
+    node: &NodeV1,
+    runner_instances: &[AssetInstanceV1],
+    output_content_types: &BTreeMap<String, String>,
+) -> io::Result<BTreeMap<String, (String, String)>> {
+    let mut declared = BTreeSet::new();
+    for out in &node.outputs {
+        if !declared.insert(out.asset_key.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "duplicate declared output asset_key '{}' in node '{}'",
+                    out.asset_key, node.node_key
+                ),
+            ));
+        }
+    }
+
+    let mut cas_bindings = BTreeMap::new();
+    for instance in runner_instances {
+        if !declared.contains(instance.asset_key.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "runner emitted undeclared output asset_key '{}' for node '{}'",
+                    instance.asset_key, node.node_key
+                ),
+            ));
+        }
+        let uri = instance.uri.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "physical runner output '{}' missing CAS URI",
+                    instance.asset_key
+                ),
+            )
+        })?;
+        if !uri.starts_with("cas://sha256/") || parse_cas_uri_digest(uri).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "physical runner output '{}' has invalid CAS URI '{uri}'",
+                    instance.asset_key
+                ),
+            ));
+        }
+        let content_type = output_content_types
+            .get(&instance.asset_key)
+            .filter(|ct| !ct.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "physical runner output '{}' missing content_type",
+                        instance.asset_key
+                    ),
+                )
+            })?;
+        if cas_bindings
+            .insert(instance.asset_key.clone(), (uri.to_string(), content_type))
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runner emitted duplicate output asset_key '{}' for node '{}'",
+                    instance.asset_key, node.node_key
+                ),
+            ));
+        }
+    }
+
+    if cas_bindings.len() != declared.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "physical runner produced {} CAS outputs for node '{}' declaring {} outputs",
+                cas_bindings.len(),
+                node.node_key,
+                declared.len()
+            ),
+        ));
+    }
+
+    Ok(cas_bindings)
 }
 
 fn emit_scheduler_event(
@@ -1401,7 +1565,7 @@ mod tests {
         .unwrap();
         assert_eq!(r_denied.failed_nodes, vec!["node/wasm_op"]);
 
-        // 2. Under WasmSandboxedV1 in Phase 13-0, untrusted Wasm MUST also fail closed cleanly!
+        // 2. Under WasmSandboxedV1 without an attached WasmExtensionExecutor, untrusted Wasm MUST fail closed cleanly!
         let wasm_policy = SandboxedExtensionPolicyV1::with_allowed_hash(hash);
         let mut registry = BTreeMap::new();
         registry.insert(hash, wasm);
@@ -1678,6 +1842,1068 @@ mod tests {
         assert_eq!(nd_mat.rows, Some(1));
 
         drop(reopened);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_scheduler_invalidates_stale_outputs_on_failure_and_binds_cas_atomically() {
+        use sha2::{Digest, Sha256};
+        use swarm_torch_core::execution::ExecutionPolicy;
+        use swarm_torch_core::run_graph::{CanonValue, EdgeV1};
+
+        use crate::artifacts::{hex_lower, parse_cas_uri_digest, write_once_cas_blob};
+        use crate::native_runner::{ColumnDtypeV1, ColumnSchemaV1, ColumnarTableV1};
+
+        struct CustomPolicy {
+            deny_produce: bool,
+        }
+        impl ExecutionPolicy for CustomPolicy {
+            fn allow(
+                &self,
+                node: &NodeV1,
+                _registry: &swarm_torch_core::dataops::DatasetRegistryV1,
+            ) -> PolicyDecision {
+                if self.deny_produce && node.node_key == "node/produce" {
+                    PolicyDecision::Denied {
+                        reason: "policy_revoked".to_string(),
+                    }
+                } else {
+                    PolicyDecision::Allowed
+                }
+            }
+        }
+
+        let (base, mut session) = create_session("st15_sched_invalidation_atomic_cas");
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        let tbl = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "score".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![
+                vec![serde_json::Value::from(10)],
+                vec![serde_json::Value::from(3)],
+            ],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+        let raw_sha: [u8; 32] = Sha256::digest(&tbl).into();
+        write_once_cas_blob(&run_dir, &raw_sha, &tbl).unwrap();
+        let ingest = make_node("ingest/raw", "ingest", &[], &[], ExecutionTrust::Core);
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&raw_sha)),
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: Some("v1".to_string()),
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let mut produce = make_node(
+            "node/produce",
+            "filter_rows",
+            &["dataset://ns/raw"],
+            &["dataset://ns/prod_out"],
+            ExecutionTrust::Core,
+        );
+        produce
+            .params
+            .insert("column".to_string(), CanonValue::Str("score".to_string()));
+        produce
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        produce
+            .params
+            .insert("value".to_string(), CanonValue::Str("5".to_string()));
+        let downstream = make_node(
+            "node/downstream",
+            "passthrough",
+            &["dataset://ns/prod_out"],
+            &["dataset://ns/final"],
+            ExecutionTrust::Core,
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("st15b1".to_string()),
+            nodes: vec![produce.clone(), downstream.clone()],
+            edges: vec![EdgeV1 {
+                from_node_id: node_id_from_key(&produce.node_key),
+                to_node_id: node_id_from_key(&downstream.node_key),
+                asset_key: None,
+            }],
+        };
+
+        let runner = NativeOpRunner::new();
+
+        // 1. Valid execution binds CAS URI atomically with the first registry snapshot/update.
+        let r1 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &CustomPolicy {
+                deny_produce: false,
+            },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r1.failed_nodes.is_empty(), "{:?}", r1.failed_nodes);
+        assert!(session.fingerprint("dataset://ns/prod_out").is_some());
+        assert!(session.fingerprint("dataset://ns/final").is_some());
+
+        let prod_entry = session
+            .registry_snapshot()
+            .datasets
+            .into_iter()
+            .find(|d| d.asset_key == "dataset://ns/prod_out")
+            .unwrap();
+        let prod_cas_uri = prod_entry
+            .source
+            .as_ref()
+            .expect("bound CAS source")
+            .uri
+            .clone();
+        assert!(prod_cas_uri.starts_with("cas://sha256/"));
+        assert_eq!(
+            session.asset_content_type("dataset://ns/prod_out"),
+            Some(CONTENT_TYPE_COLUMNAR_JSON_V1)
+        );
+        let reg_updates =
+            fs::read_to_string(run_dir.join("datasets/registry_updates.ndjson")).unwrap();
+        let prod_update_lines: Vec<&str> = reg_updates
+            .lines()
+            .filter(|line| line.contains("\"dataset://ns/prod_out\""))
+            .collect();
+        assert_eq!(
+            prod_update_lines.len(),
+            1,
+            "atomic materialization must emit a single already-CAS-bound registry_updates row: {prod_update_lines:?}"
+        );
+        assert!(
+            prod_update_lines[0].contains(&prod_cas_uri),
+            "registry update row must carry CAS URI atomically"
+        );
+
+        // 2. Policy denial invalidates stale `dataset://ns/prod_out` and skips/invalidates `dataset://ns/final`.
+        let r2 = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &CustomPolicy { deny_produce: true },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r2.failed_nodes, vec!["node/produce"]);
+        assert_eq!(r2.skipped_nodes, vec!["node/downstream"]);
+        assert!(session.fingerprint("dataset://ns/prod_out").is_none());
+        assert!(session
+            .resolve_asset_instance("dataset://ns/prod_out")
+            .is_none());
+        assert!(session.fingerprint("dataset://ns/final").is_none());
+
+        // 3. Re-populate cleanly, then trigger a runner error -> invalidates stale outputs before continuing.
+        let r3_ok = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &CustomPolicy {
+                deny_produce: false,
+            },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r3_ok.failed_nodes.is_empty());
+        assert!(session.fingerprint("dataset://ns/prod_out").is_some());
+        assert!(session.fingerprint("dataset://ns/final").is_some());
+
+        let mut broken_produce = produce.clone();
+        broken_produce.params.insert(
+            "column".to_string(),
+            CanonValue::Str("missing_col".to_string()),
+        );
+        broken_produce.cache_policy = Some(CachePolicyV0::Bypass);
+        let broken_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("st15b1-broken".to_string()),
+            nodes: vec![broken_produce.clone(), downstream.clone()],
+            edges: vec![EdgeV1 {
+                from_node_id: node_id_from_key(&broken_produce.node_key),
+                to_node_id: node_id_from_key(&downstream.node_key),
+                asset_key: None,
+            }],
+        };
+        let r4_fail = execute_graph_sequential(
+            &broken_graph,
+            &mut session,
+            &runner,
+            &CustomPolicy {
+                deny_produce: false,
+            },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r4_fail.failed_nodes, vec!["node/produce"]);
+        assert_eq!(r4_fail.skipped_nodes, vec!["node/downstream"]);
+        assert!(session.fingerprint("dataset://ns/prod_out").is_none());
+        assert!(session.fingerprint("dataset://ns/final").is_none());
+
+        // 4. Re-populate cleanly, then corrupt/delete cached CAS blob -> verify_cache_hit error invalidates stale outputs!
+        let r5_ok = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &CustomPolicy {
+                deny_produce: false,
+            },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(r5_ok.failed_nodes.is_empty());
+        let prod_entry2 = session
+            .registry_snapshot()
+            .datasets
+            .into_iter()
+            .find(|d| d.asset_key == "dataset://ns/prod_out")
+            .unwrap();
+        let prod_digest = parse_cas_uri_digest(&prod_entry2.source.unwrap().uri).unwrap();
+        let blob_path = run_dir
+            .join("blobs")
+            .join("sha256")
+            .join(hex_lower(&prod_digest));
+        fs::remove_file(blob_path).unwrap();
+
+        let r6_cache_err = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &runner,
+            &CustomPolicy {
+                deny_produce: false,
+            },
+            RunId::from_bytes([0xE5; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r6_cache_err.failed_nodes, vec!["node/produce"]);
+        assert_eq!(r6_cache_err.skipped_nodes, vec!["node/downstream"]);
+        assert!(session.fingerprint("dataset://ns/prod_out").is_none());
+        assert!(session.fingerprint("dataset://ns/final").is_none());
+
+        drop(session);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_isolation_runs_before_cache_hit_and_external_stub_fails_closed() {
+        use sha2::{Digest, Sha256};
+        use swarm_torch_core::run_graph::CanonValue;
+
+        use crate::artifacts::{hex_lower, write_once_cas_blob};
+        use crate::native_runner::CONTENT_TYPE_OCTET_STREAM;
+        use crate::wasm_sandbox::{
+            SandboxedExtensionPolicyV1, WasmExecutionReceiptV1, WasmExtensionExecutor,
+            WasmSandboxError, WASM_MAGIC_AND_VERSION_V1,
+        };
+
+        struct StubWasmExecutor;
+        impl WasmExtensionExecutor for StubWasmExecutor {
+            fn execute_byte_transform(
+                &self,
+                policy: &SandboxedExtensionPolicyV1,
+                wasm_bytes: &[u8],
+                _export_name: &str,
+                input_payload: &[u8],
+            ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
+                Ok(WasmExecutionReceiptV1 {
+                    module_sha256: SandboxedExtensionPolicyV1::sha256_module(wasm_bytes),
+                    fuel_consumed: policy.limits.max_fuel.min(100),
+                    peak_memory_bytes: 65_536,
+                    return_code: 0,
+                    output_bytes: input_payload.to_vec(),
+                })
+            }
+
+            fn execute_scalar_i32(
+                &self,
+                _policy: &SandboxedExtensionPolicyV1,
+                _wasm_bytes: &[u8],
+                _export_name: &str,
+                _arg: i32,
+            ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+                unreachable!()
+            }
+        }
+
+        // Valid minimal module: (i32, i32) -> i32 export "transform" returning 0
+        let mut wasm = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        wasm.extend_from_slice(&[1, 7, 1, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
+        wasm.extend_from_slice(&[3, 2, 1, 0]);
+        wasm.extend_from_slice(&[5, 4, 1, 0x01, 1, 1]);
+        wasm.extend_from_slice(&[7, 13, 1, 9]);
+        wasm.extend_from_slice(b"transform");
+        wasm.extend_from_slice(&[0x00, 0x00]);
+        wasm.extend_from_slice(&[10, 6, 1, 4, 0, 0x41, 0, 0x0b]);
+
+        let hash = SandboxedExtensionPolicyV1::sha256_module(&wasm);
+        let hex_hash = hex_lower(&hash);
+        let mut registry = BTreeMap::new();
+        registry.insert(hash, wasm);
+        let wasm_policy = SandboxedExtensionPolicyV1::with_allowed_hash(hash);
+
+        let (base, mut session) = create_session("st15_isolation_before_cache");
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let payload = b"wasm-cas-in";
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        write_once_cas_blob(&run_dir, &digest, payload).unwrap();
+        let ingest = make_node("ingest/wasm", "ingest", &[], &[], ExecutionTrust::Core);
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&digest)),
+                    content_type: CONTENT_TYPE_OCTET_STREAM.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: None,
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let mut wasm_node = make_node(
+            "node/wasm_op",
+            "wasm_transform",
+            &["dataset://ns/raw"],
+            &["dataset://ns/wasm_out"],
+            ExecutionTrust::SandboxedExtension,
+        );
+        wasm_node
+            .params
+            .insert("module_sha256".to_string(), CanonValue::Str(hex_hash));
+        wasm_node.params.insert(
+            "export".to_string(),
+            CanonValue::Str("transform".to_string()),
+        );
+        let wasm_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("wasm-cache-check".to_string()),
+            nodes: vec![wasm_node],
+            edges: vec![],
+        };
+
+        let attached_runner = NativeOpRunner::new().with_wasm_executor(Arc::new(StubWasmExecutor));
+        let r_ok = execute_graph_with_isolation(
+            &wasm_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy.clone()),
+            Some(&registry),
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_ok.executed_nodes, vec!["node/wasm_op"]);
+        assert!(session.fingerprint("dataset://ns/wasm_out").is_some());
+
+        // Cached entry exists, yet running under InProcessTrusted MUST deny (NOT cache hit!) and invalidate output.
+        let r_inproc_denied = execute_graph_sequential(
+            &wasm_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_inproc_denied.failed_nodes, vec!["node/wasm_op"]);
+        assert!(r_inproc_denied.cached_nodes.is_empty());
+        assert!(session.fingerprint("dataset://ns/wasm_out").is_none());
+
+        // Re-populate cleanly, then deny under WasmSandboxedV1 without executor and without registry.
+        execute_graph_with_isolation(
+            &wasm_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy.clone()),
+            Some(&registry),
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert!(session.fingerprint("dataset://ns/wasm_out").is_some());
+
+        let r_no_exec = execute_graph_with_isolation(
+            &wasm_graph,
+            &mut session,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy.clone()),
+            Some(&registry),
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_no_exec.failed_nodes, vec!["node/wasm_op"]);
+        assert!(r_no_exec.cached_nodes.is_empty());
+        assert!(session.fingerprint("dataset://ns/wasm_out").is_none());
+
+        execute_graph_with_isolation(
+            &wasm_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy.clone()),
+            Some(&registry),
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        let r_no_reg = execute_graph_with_isolation(
+            &wasm_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
+            None,
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_no_reg.failed_nodes, vec!["node/wasm_op"]);
+        assert!(r_no_reg.cached_nodes.is_empty());
+        assert!(session.fingerprint("dataset://ns/wasm_out").is_none());
+
+        // ExternalSandboxedStub MUST fail closed even for ExecutionTrust::Core nodes.
+        let core_node = make_node(
+            "node/core_stub",
+            "passthrough",
+            &["dataset://ns/raw"],
+            &["dataset://ns/core_out"],
+            ExecutionTrust::Core,
+        );
+        let core_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("stub-fail-closed".to_string()),
+            nodes: vec![core_node],
+            edges: vec![],
+        };
+        let r_stub = execute_graph_with_isolation(
+            &core_graph,
+            &mut session,
+            &attached_runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::ExternalSandboxedStub {
+                timeout_ms: 1000,
+                max_memory_bytes: 1_048_576,
+            },
+            None,
+            RunId::from_bytes([0xE6; 16]),
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_stub.failed_nodes, vec!["node/core_stub"]);
+        assert!(r_stub.executed_nodes.is_empty());
+
+        drop(session);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_schema_cache_hit_and_cas_bijection_and_reopen_invalidation() {
+        use sha2::{Digest, Sha256};
+        use swarm_torch_core::dataops::SchemaDescriptorV0;
+        use swarm_torch_core::run_graph::CanonValue;
+
+        use crate::artifacts::{
+            hex_lower, write_once_cas_blob, ArtifactWriteProfile, LockAcquisitionPolicy,
+            SnapshotProfile,
+        };
+
+        // Verify schema-bearing OutputSpec hits scheduler cache on matching run and does not leak onto Miss,
+        // and verify mismatched node.outputs fails closed + invalidation survives reopen/Streaming + load_report.
+        let base = temp_dir("st15_schema_bijection_reopen");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let streaming_profile = ArtifactWriteProfile {
+            snapshot_profile: SnapshotProfile::streaming(8),
+            ..ArtifactWriteProfile::default()
+        };
+        let run_id = RunId::from_bytes([0xE7; 16]);
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            streaming_profile,
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        let tbl = ColumnarTableV1::try_new(
+            vec![ColumnSchemaV1 {
+                name: "x".to_string(),
+                dtype: ColumnDtypeV1::I64,
+                nullable: false,
+            }],
+            vec![vec![serde_json::Value::from(7)]],
+        )
+        .unwrap()
+        .to_canonical_json_bytes()
+        .unwrap();
+        let sha: [u8; 32] = Sha256::digest(&tbl).into();
+        write_once_cas_blob(&run_dir, &sha, &tbl).unwrap();
+        let in_uri = format!("cas://sha256/{}", hex_lower(&sha));
+        let ingest = make_node("ingest/x", "ingest", &[], &[], ExecutionTrust::Core);
+        session
+            .register_source(
+                "dataset://ns/in",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: in_uri.clone(),
+                    content_type: CONTENT_TYPE_COLUMNAR_JSON_V1.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: None,
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let mut filter_node = make_node(
+            "node/filter",
+            "filter_rows",
+            &["dataset://ns/in"],
+            &["dataset://ns/out"],
+            ExecutionTrust::Core,
+        );
+        filter_node
+            .params
+            .insert("column".to_string(), CanonValue::Str("x".to_string()));
+        filter_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("eq".to_string()));
+        filter_node
+            .params
+            .insert("value".to_string(), CanonValue::Str("7".to_string()));
+
+        // Seed schema-bearing cached output directly, then execute matching node via scheduler -> Cache Hit!
+        let mut seed_cas = BTreeMap::new();
+        seed_cas.insert(
+            "dataset://ns/out".to_string(),
+            (in_uri, CONTENT_TYPE_COLUMNAR_JSON_V1.to_string()),
+        );
+        let schema_a = SchemaDescriptorV0 {
+            format: "stcl-columns-v1".to_string(),
+            canonical: r#"[{"name":"x","dtype":"i64","nullable":false}]"#.to_string(),
+        };
+        session
+            .materialize_node_outputs_with_cas_bindings(
+                &filter_node,
+                &[OutputSpec {
+                    asset_key: "dataset://ns/out".to_string(),
+                    schema: Some(schema_a.clone()),
+                    rows: Some(1),
+                    bytes: Some(tbl.len() as u64),
+                }],
+                &seed_cas,
+                100,
+                swarm_torch_core::dataops::CacheDecisionV0::Miss,
+                1,
+            )
+            .unwrap();
+
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("schema-cache".to_string()),
+            nodes: vec![filter_node.clone()],
+            edges: vec![],
+        };
+        let r_hit = execute_graph_sequential(
+            &graph,
+            &mut session,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_hit.cached_nodes, vec!["node/filter"]);
+        assert_eq!(
+            session
+                .cached_output_spec("dataset://ns/out")
+                .unwrap()
+                .schema,
+            Some(schema_a)
+        );
+
+        // Parameter change causes Miss -> fresh NativeOpRunner execution does not inherit stale schema_a.
+        let mut miss_node = filter_node.clone();
+        miss_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("ge".to_string()));
+        let miss_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("schema-miss".to_string()),
+            nodes: vec![miss_node],
+            edges: vec![],
+        };
+        let r_miss = execute_graph_sequential(
+            &miss_graph,
+            &mut session,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert!(r_miss.cached_nodes.is_empty());
+        assert_eq!(r_miss.executed_nodes, vec!["node/filter"]);
+        assert_eq!(
+            session
+                .cached_output_spec("dataset://ns/out")
+                .unwrap()
+                .schema,
+            None
+        );
+
+        // Output cardinality mismatch (2 declared outputs for 1-input passthrough) MUST fail closed
+        // BEFORE mutating registry AND invalidate prior `dataset://ns/out` even under Streaming!
+        let bad_cardinality_node = make_node(
+            "node/bad_card",
+            "passthrough",
+            &["dataset://ns/in"],
+            &["dataset://ns/out", "dataset://ns/extra_unbound"],
+            ExecutionTrust::Core,
+        );
+        let bad_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("bad-card".to_string()),
+            nodes: vec![bad_cardinality_node],
+            edges: vec![],
+        };
+        let r_bad = execute_graph_sequential(
+            &bad_graph,
+            &mut session,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_bad.failed_nodes, vec!["node/bad_card"]);
+        assert!(session.fingerprint("dataset://ns/out").is_none());
+        assert!(session.fingerprint("dataset://ns/extra_unbound").is_none());
+
+        // Drop session WITHOUT finalize(), reopen via DataOpsSession::open -> invalidated output MUST stay gone!
+        drop(session);
+        let mut reopened =
+            DataOpsSession::open(&run_dir, streaming_profile, LockAcquisitionPolicy::FailFast)
+                .unwrap();
+        assert!(reopened.fingerprint("dataset://ns/out").is_none());
+        assert!(reopened.cached_output_spec("dataset://ns/out").is_none());
+        let r_reopened = execute_graph_sequential(
+            &miss_graph,
+            &mut reopened,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert!(r_reopened.cached_nodes.is_empty());
+        assert_eq!(r_reopened.executed_nodes, vec!["node/filter"]);
+
+        // Now fail again + finalize -> load_report MUST NOT see invalidated asset in registry!
+        let r_bad_after = execute_graph_sequential(
+            &bad_graph,
+            &mut reopened,
+            &NativeOpRunner::new(),
+            &PermissivePolicy,
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_bad_after.failed_nodes, vec!["node/bad_card"]);
+        reopened.finalize().unwrap();
+        let report = load_report(&run_dir).unwrap();
+        assert!(
+            !report
+                .registry
+                .datasets
+                .iter()
+                .any(|d| d.asset_key == "dataset://ns/out"),
+            "load_report must not resurrect invalidated outputs: {:?}",
+            report.registry.datasets
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn st15_wasm_policy_cache_isolation_and_cas_bindings_edge_cases_and_manifest_schema() {
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicUsize;
+        use swarm_torch_core::run_graph::CanonValue;
+
+        use crate::artifacts::schema_check::validate_verified_bundle_schemas;
+        use crate::artifacts::{
+            hex_lower, write_once_cas_blob, ArtifactWriteProfile, LockAcquisitionPolicy,
+            ManifestRefreshPolicy, SnapshotProfile,
+        };
+        use crate::native_runner::CONTENT_TYPE_OCTET_STREAM;
+        use crate::wasm_sandbox::{
+            SandboxedExtensionPolicyV1, WasmExecutionReceiptV1, WasmExtensionExecutor,
+            WasmSandboxError, WASM_MAGIC_AND_VERSION_V1,
+        };
+
+        struct CountingWasmExecutor {
+            calls: AtomicUsize,
+        }
+        impl WasmExtensionExecutor for CountingWasmExecutor {
+            fn execute_byte_transform(
+                &self,
+                policy: &SandboxedExtensionPolicyV1,
+                wasm_bytes: &[u8],
+                _export_name: &str,
+                input_payload: &[u8],
+            ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(WasmExecutionReceiptV1 {
+                    module_sha256: SandboxedExtensionPolicyV1::sha256_module(wasm_bytes),
+                    fuel_consumed: policy.limits.max_fuel.min(50),
+                    peak_memory_bytes: 65_536,
+                    return_code: 0,
+                    output_bytes: input_payload.to_vec(),
+                })
+            }
+
+            fn execute_scalar_i32(
+                &self,
+                _policy: &SandboxedExtensionPolicyV1,
+                _wasm_bytes: &[u8],
+                _export_name: &str,
+                _arg: i32,
+            ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+                unreachable!()
+            }
+        }
+
+        // Direct unit coverage for build_physical_cas_bindings edge cases
+        let mut node_ok = make_node(
+            "node/cas",
+            "passthrough",
+            &[],
+            &["dataset://ns/a"],
+            ExecutionTrust::Core,
+        );
+        let valid_uri = format!("cas://sha256/{}", "ab".repeat(32));
+        let mut ok_cts = BTreeMap::new();
+        ok_cts.insert(
+            "dataset://ns/a".to_string(),
+            CONTENT_TYPE_OCTET_STREAM.to_string(),
+        );
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(valid_uri.clone()),
+            }],
+            &ok_cts
+        )
+        .is_ok());
+
+        // Rejects non-cas prefix (`blobs/sha256/...`), uppercase hex, undeclared key, duplicate key, missing content-type, duplicate declared output
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(format!("blobs/sha256/{}", "ab".repeat(32))),
+            }],
+            &ok_cts
+        )
+        .is_err());
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "AB".repeat(32),
+                uri: Some(format!("cas://sha256/{}", "AB".repeat(32))),
+            }],
+            &ok_cts
+        )
+        .is_err());
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/extra".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(valid_uri.clone()),
+            }],
+            &ok_cts
+        )
+        .is_err());
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(valid_uri.clone()),
+            }],
+            &BTreeMap::new()
+        )
+        .is_err());
+        let dup_node = make_node(
+            "node/dup_out",
+            "passthrough",
+            &[],
+            &["dataset://ns/a", "dataset://ns/a"],
+            ExecutionTrust::Core,
+        );
+        assert!(build_physical_cas_bindings(
+            &dup_node,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(valid_uri),
+            }],
+            &ok_cts
+        )
+        .is_err());
+        node_ok.outputs.push(AssetRefV1 {
+            asset_key: "dataset://ns/b".to_string(),
+            fingerprint: None,
+        });
+        assert!(build_physical_cas_bindings(
+            &node_ok,
+            &[AssetInstanceV1 {
+                asset_key: "dataset://ns/a".to_string(),
+                fingerprint_v0: "ab".repeat(32),
+                uri: Some(format!("cas://sha256/{}", "ab".repeat(32))),
+            }],
+            &ok_cts
+        )
+        .is_err());
+
+        // Wasm cache policy/registry bypass checks + ManifestRefreshPolicy::Always schema checks
+        let mut wasm = WASM_MAGIC_AND_VERSION_V1.to_vec();
+        wasm.extend_from_slice(&[1, 7, 1, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
+        wasm.extend_from_slice(&[3, 2, 1, 0]);
+        wasm.extend_from_slice(&[5, 4, 1, 0x01, 1, 1]);
+        wasm.extend_from_slice(&[7, 13, 1, 9]);
+        wasm.extend_from_slice(b"transform");
+        wasm.extend_from_slice(&[0x00, 0x00]);
+        wasm.extend_from_slice(&[10, 6, 1, 4, 0, 0x41, 0, 0x0b]);
+        let hash = SandboxedExtensionPolicyV1::sha256_module(&wasm);
+        let hex_hash = hex_lower(&hash);
+        let mut registry = BTreeMap::new();
+        registry.insert(hash, wasm);
+        let mut policy = SandboxedExtensionPolicyV1::with_allowed_hash(hash);
+        policy.allowed_exports.insert("transform".to_string());
+
+        let base = temp_dir("st15_wasm_policy_cache_and_schema");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([0xE8; 16]);
+        let profile_always = ArtifactWriteProfile {
+            snapshot_profile: SnapshotProfile::Strict,
+            manifest_policy: ManifestRefreshPolicy::Always,
+        };
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            profile_always,
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let payload = b"raw-wasm-data";
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        write_once_cas_blob(&run_dir, &digest, payload).unwrap();
+        let ingest = make_node("ingest/wasm", "ingest", &[], &[], ExecutionTrust::Core);
+        session
+            .register_source(
+                "dataset://ns/raw",
+                TrustClass::Trusted,
+                SourceDescriptorV0 {
+                    uri: format!("cas://sha256/{}", hex_lower(&digest)),
+                    content_type: CONTENT_TYPE_OCTET_STREAM.to_string(),
+                    auth_mode: swarm_torch_core::dataops::AuthModeMarker::None,
+                    etag_or_version: None,
+                },
+                None,
+                &ingest,
+            )
+            .unwrap();
+
+        let mut wasm_node = make_node(
+            "node/wasm",
+            "wasm_transform",
+            &["dataset://ns/raw"],
+            &["dataset://ns/wout"],
+            ExecutionTrust::SandboxedExtension,
+        );
+        wasm_node
+            .params
+            .insert("module_sha256".to_string(), CanonValue::Str(hex_hash));
+        wasm_node.params.insert(
+            "export".to_string(),
+            CanonValue::Str("transform".to_string()),
+        );
+        let graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("wasm-policy-cache".to_string()),
+            nodes: vec![wasm_node],
+            edges: vec![],
+        };
+
+        let executor = Arc::new(CountingWasmExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let runner = NativeOpRunner::new().with_wasm_executor(executor.clone());
+        let populate = |session: &mut DataOpsSession, pol: &SandboxedExtensionPolicyV1| {
+            execute_graph_with_isolation(
+                &graph,
+                session,
+                &runner,
+                &PermissivePolicy,
+                &RunnerIsolationProfile::WasmSandboxedV1(pol.clone()),
+                Some(&registry),
+                run_id,
+                test_clock,
+            )
+            .unwrap()
+        };
+
+        // 1. Initial run executes once cleanly and caches.
+        let r1 = populate(&mut session, &policy);
+        assert_eq!(r1.executed_nodes, vec!["node/wasm"]);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let r1_hit = populate(&mut session, &policy);
+        assert_eq!(r1_hit.cached_nodes, vec!["node/wasm"]);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+        // 2. Tightening store limits (max_fuel: 100_000 -> 500) MUST NOT hit cache; forces re-execution!
+        let mut tighter_policy = policy.clone();
+        tighter_policy.limits.max_fuel = 500;
+        let r_tighter = populate(&mut session, &tighter_policy);
+        assert!(r_tighter.cached_nodes.is_empty());
+        assert_eq!(r_tighter.executed_nodes, vec!["node/wasm"]);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+
+        // 3. Empty Some(&BTreeMap::new()) MUST deny + invalidate cached output instead of hitting cache!
+        let r_empty_reg = execute_graph_with_isolation(
+            &graph,
+            &mut session,
+            &runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::WasmSandboxedV1(tighter_policy.clone()),
+            Some(&BTreeMap::new()),
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_empty_reg.failed_nodes, vec!["node/wasm"]);
+        assert!(r_empty_reg.cached_nodes.is_empty());
+        assert!(session.fingerprint("dataset://ns/wout").is_none());
+
+        // 4. Revoked allowed_module_hashes MUST deny + invalidate!
+        assert_eq!(
+            populate(&mut session, &policy).executed_nodes,
+            vec!["node/wasm"]
+        );
+        let mut revoked_hash_pol = policy.clone();
+        revoked_hash_pol.allowed_module_hashes.clear();
+        let r_revoked_hash = populate(&mut session, &revoked_hash_pol);
+        assert_eq!(r_revoked_hash.failed_nodes, vec!["node/wasm"]);
+        assert!(session.fingerprint("dataset://ns/wout").is_none());
+
+        // 5. Revoked allowed_exports MUST deny + invalidate!
+        assert_eq!(
+            populate(&mut session, &policy).executed_nodes,
+            vec!["node/wasm"]
+        );
+        let mut revoked_exp_pol = policy.clone();
+        revoked_exp_pol.allowed_exports.clear();
+        revoked_exp_pol
+            .allowed_exports
+            .insert("other_export".to_string());
+        let r_revoked_exp = populate(&mut session, &revoked_exp_pol);
+        assert_eq!(r_revoked_exp.failed_nodes, vec!["node/wasm"]);
+        assert!(session.fingerprint("dataset://ns/wout").is_none());
+
+        // 6. max_fuel == 0 MUST deny + invalidate!
+        assert_eq!(
+            populate(&mut session, &policy).executed_nodes,
+            vec!["node/wasm"]
+        );
+        let mut zero_fuel_pol = policy.clone();
+        zero_fuel_pol.limits.max_fuel = 0;
+        let r_zero_fuel = populate(&mut session, &zero_fuel_pol);
+        assert_eq!(r_zero_fuel.failed_nodes, vec!["node/wasm"]);
+        assert!(session.fingerprint("dataset://ns/wout").is_none());
+
+        // 7. ExternalSandboxedStub MUST deny & invalidate previously cached output AND leave manifest + v1 schemas valid!
+        assert_eq!(
+            populate(&mut session, &policy).executed_nodes,
+            vec!["node/wasm"]
+        );
+        let r_stub_inv = execute_graph_with_isolation(
+            &graph,
+            &mut session,
+            &runner,
+            &PermissivePolicy,
+            &RunnerIsolationProfile::ExternalSandboxedStub {
+                timeout_ms: 1000,
+                max_memory_bytes: 1_048_576,
+            },
+            Some(&registry),
+            run_id,
+            test_clock,
+        )
+        .unwrap();
+        assert_eq!(r_stub_inv.failed_nodes, vec!["node/wasm"]);
+        assert!(session.fingerprint("dataset://ns/wout").is_none());
+
+        // Also invalidate `dataset://ns/raw` so `registry_updates.ndjson` becomes 0 bytes, and validate manifest + all v1 schemas!
+        session
+            .invalidate_node_outputs(&make_node(
+                "ingest/wasm",
+                "ingest",
+                &[],
+                &["dataset://ns/raw"],
+                ExecutionTrust::Core,
+            ))
+            .unwrap();
+        assert_eq!(
+            fs::read(run_dir.join("datasets/registry_updates.ndjson"))
+                .unwrap()
+                .len(),
+            0
+        );
+        session.sink().bundle().validate_manifest().unwrap();
+        let verified = session
+            .sink()
+            .bundle()
+            .verify_and_load(&crate::artifacts::TrustPolicy::LegacyPermissive)
+            .unwrap();
+        validate_verified_bundle_schemas(&verified).unwrap();
+
         let _ = fs::remove_dir_all(&base);
     }
 }

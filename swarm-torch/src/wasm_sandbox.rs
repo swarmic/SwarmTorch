@@ -1,12 +1,13 @@
-//! Experimental fallback WebAssembly (`MVP`) test-fixture VM (`ADR-0018`, `W12-04`, `ST-09`).
+//! Fail-closed experimental WebAssembly (`MVP`) test-fixture VM (`ADR-0018`, `ADR-0025`, `W12-04`, `ST-09`).
 //!
-//! > **Security Notice (`ST-09` Fail-Closed Containment):** Production untrusted WebAssembly execution
-//! > via `WasmSandboxRunnerV1::execute_byte_transform`, `WasmSandboxRunnerV1::execute_scalar_i32`,
-//! > `Scheduler` (`RunnerIsolationProfile::WasmSandboxedV1`), and `NativeOpRunner` **fails closed**
-//! > with `WasmSandboxError::UnsupportedUntrustedWasmSandbox` until the isolated `wasmi` adapter
-//! > (`adapters/swarm-torch-wasm`) is connected in `13D-1`. The subset interpreter below is kept
-//! > exclusively behind `#[doc(hidden)]` `WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only`
-//! > for internal unit tests.
+//! > **Security Notice (`ST-09` Fail-Closed Containment):** `WasmSandboxRunnerV1::execute_byte_transform`
+//! > and `WasmSandboxRunnerV1::execute_scalar_i32` fail closed unconditionally with
+//! > `WasmSandboxError::UnsupportedUntrustedWasmSandbox`. Production `Scheduler`
+//! > (`RunnerIsolationProfile::WasmSandboxedV1`) and `NativeOpRunner` also fail closed with
+//! > `WasmSandboxError::UnsupportedUntrustedWasmSandbox` unless an external [`crate::wasm_sandbox::WasmExtensionExecutor`]
+//! > (such as `adapters/swarm-torch-wasm`, currently scoped to `raw_mem0_v0`) is explicitly attached
+//! > via `NativeOpRunner::with_wasm_executor`. The internal subset interpreter below is kept exclusively
+//! > behind `#[doc(hidden)]` `WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only` for unit tests.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -28,7 +29,7 @@ pub const DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION: usize = 4_096;
 /// Errors raised during pre-parse verification, static validation, or sandboxed Wasm execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasmSandboxError {
-    /// Untrusted Wasm sandbox execution is disabled until the external `wasmi` adapter lands (`ST-09`).
+    /// Fail-closed error returned when untrusted Wasm execution has no attached [`WasmExtensionExecutor`] (`ST-09`).
     UnsupportedUntrustedWasmSandbox,
     /// Module digest was not present in [`SandboxedExtensionPolicyV1::allowed_module_hashes`].
     UntrustedModuleHash { actual: [u8; 32] },
@@ -80,7 +81,7 @@ impl fmt::Display for WasmSandboxError {
         match self {
             Self::UnsupportedUntrustedWasmSandbox => write!(
                 f,
-                "UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until the isolated wasmi adapter is integrated"
+                "UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution requires an attached external WasmExtensionExecutor"
             ),
             Self::UntrustedModuleHash { actual } => {
                 write!(
@@ -210,6 +211,31 @@ impl SandboxedExtensionPolicyV1 {
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest[..]);
         out
+    }
+
+    /// Compute a canonical domain-separated SHA-256 hex digest binding all allowlists and store
+    /// limits so cached `SandboxedExtension` outputs cannot replay across tightened policies.
+    pub fn policy_fingerprint_hex(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"swarmtorch.wasm.policy.v1");
+        hasher.update((self.allowed_module_hashes.len() as u64).to_be_bytes());
+        for hash in &self.allowed_module_hashes {
+            hasher.update(hash);
+        }
+        hasher.update((self.allowed_exports.len() as u64).to_be_bytes());
+        for export in &self.allowed_exports {
+            hasher.update((export.len() as u64).to_be_bytes());
+            hasher.update(export.as_bytes());
+        }
+        hasher.update((self.limits.max_module_bytes as u64).to_be_bytes());
+        hasher.update(self.limits.max_memory_pages.to_be_bytes());
+        hasher.update(self.limits.max_table_elements.to_be_bytes());
+        hasher.update(self.limits.max_memories.to_be_bytes());
+        hasher.update(self.limits.max_tables.to_be_bytes());
+        hasher.update(self.limits.max_fuel.to_be_bytes());
+        hasher.update([u8::from(self.limits.trap_on_grow_failure)]);
+        hasher.update(self.limits.timeout_ms.to_be_bytes());
+        crate::artifacts::hex_lower(&hasher.finalize())
     }
 }
 
@@ -376,6 +402,87 @@ pub fn preflight_wasm_extension_v1(
         });
     }
     Ok(actual)
+}
+
+pub(crate) fn wasm_error_to_io(err: WasmSandboxError) -> std::io::Error {
+    use std::io;
+    let kind = match &err {
+        WasmSandboxError::UnsupportedUntrustedWasmSandbox => io::ErrorKind::Unsupported,
+        WasmSandboxError::UntrustedModuleHash { .. }
+        | WasmSandboxError::ForbiddenImport { .. }
+        | WasmSandboxError::ExportNotAllowed(_) => io::ErrorKind::PermissionDenied,
+        WasmSandboxError::ExecutionTimeout { .. } => io::ErrorKind::TimedOut,
+        WasmSandboxError::ModuleTooLarge { .. }
+        | WasmSandboxError::InvalidWasmHeader
+        | WasmSandboxError::MalformedSectionOrLeb128
+        | WasmSandboxError::MultipleMemoriesForbidden
+        | WasmSandboxError::MultipleTablesForbidden
+        | WasmSandboxError::MemoryLimitExceeded { .. }
+        | WasmSandboxError::TableLimitExceeded { .. }
+        | WasmSandboxError::ExportSignatureMismatch(_)
+        | WasmSandboxError::OutOfBoundsMemoryAccess { .. } => io::ErrorKind::InvalidInput,
+        WasmSandboxError::OutOfFuel { .. }
+        | WasmSandboxError::MemoryGrowTrap { .. }
+        | WasmSandboxError::ExecutionTrap(_) => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, err.to_string())
+}
+
+/// Shared fail-closed resolver & preflight check for `wasm_transform` nodes across scheduler admission
+/// and physical execution (`ADR-0018`, `ST-09`).
+pub(crate) fn resolve_and_preflight_wasm_node_v1<'a, 'b>(
+    policy: &SandboxedExtensionPolicyV1,
+    params: &'a swarm_torch_core::run_graph::CanonParams,
+    registry: &'b std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+) -> std::io::Result<([u8; 32], &'a str, &'b [u8])> {
+    use std::io;
+    use swarm_torch_core::run_graph::CanonValue;
+
+    if registry.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "wasm_transform requires a non-empty wasm_registry",
+        ));
+    }
+    let module_hex = match params.get("module_sha256") {
+        Some(CanonValue::Str(s)) => s.as_str(),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wasm_transform requires string parameter 'module_sha256'",
+            ));
+        }
+    };
+    let declared_hash = parse_sha256_hex_v1(module_hex).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("wasm_transform invalid 64-hex lowercase module_sha256 '{module_hex}'"),
+        )
+    })?;
+    let export_name = match params.get("export") {
+        Some(CanonValue::Str(s)) if !s.is_empty() => s.as_str(),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wasm_transform requires non-empty string parameter 'export'",
+            ));
+        }
+    };
+    let wasm_bytes = registry.get(&declared_hash).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("wasm_transform module '{module_hex}' not present in wasm_registry"),
+        )
+    })?;
+    let verified_hash =
+        preflight_wasm_extension_v1(policy, wasm_bytes, export_name).map_err(wasm_error_to_io)?;
+    if verified_hash != declared_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wasm_registry entry bytes do not match declared module_sha256 key",
+        ));
+    }
+    Ok((declared_hash, export_name, wasm_bytes.as_slice()))
 }
 
 #[cfg(test)]
@@ -1787,7 +1894,7 @@ mod tests {
         sec2.push(0x00);
         push_section(&mut with_wasi, 2, &sec2);
 
-        // Production entrypoints MUST fail closed even for pinned modules until wasmi lands (`ST-09`).
+        // Static WasmSandboxRunnerV1 entrypoints MUST fail closed unconditionally even for pinned modules (`ST-09`).
         let pinned = SandboxedExtensionPolicyV1::with_allowed_hash(
             SandboxedExtensionPolicyV1::sha256_module(&with_wasi),
         );

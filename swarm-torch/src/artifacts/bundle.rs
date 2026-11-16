@@ -494,6 +494,25 @@ impl RunArtifactBundle {
         )
     }
 
+    /// Atomically replace `datasets/registry_updates.ndjson` with the current active entries
+    /// (for example after `invalidate_node_outputs` removes stale outputs so crash-recovery or
+    /// `load_report` replay cannot resurrect invalidated assets).
+    pub fn rewrite_registry_updates(&self, entries: &[DatasetEntryV1]) -> io::Result<()> {
+        let mut buf = Vec::new();
+        for entry in entries {
+            let line = serde_json::to_vec(entry).map_err(io::Error::other)?;
+            buf.extend_from_slice(&line);
+            buf.push(b'\n');
+        }
+        atomic_write(
+            &self
+                .run_dir
+                .join("datasets")
+                .join("registry_updates.ndjson"),
+            &buf,
+        )
+    }
+
     pub fn append_lineage_edge_update(&self, edge: &LineageEdgeV1) -> io::Result<()> {
         append_ndjson_with_policy(
             &self.run_dir.join("datasets").join("lineage_edges.ndjson"),

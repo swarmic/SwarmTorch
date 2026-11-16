@@ -221,6 +221,9 @@ impl DataOpsSession {
                             key.clone(),
                         );
                     }
+                } else {
+                    cached_output_metrics.retain(|(asset, _), _| asset != &v2.asset_key);
+                    cached_cache_keys.retain(|(asset, _), _| asset != &v2.asset_key);
                 }
                 let seq = if v2.record_seq == 0 {
                     (idx as u64) + 1
@@ -435,6 +438,28 @@ impl DataOpsSession {
         cache_decision: impl Into<CacheDecisionV0>,
         duration_ms: u64,
     ) -> io::Result<()> {
+        self.materialize_node_outputs_with_cas_bindings_and_profile(
+            node,
+            outputs,
+            cas_bindings,
+            ts_unix_nanos,
+            cache_decision,
+            duration_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_node_outputs_with_cas_bindings_and_profile(
+        &mut self,
+        node: &NodeV1,
+        outputs: &[OutputSpec],
+        cas_bindings: &BTreeMap<String, (String, String)>,
+        ts_unix_nanos: u64,
+        cache_decision: impl Into<CacheDecisionV0>,
+        duration_ms: u64,
+        execution_profile_override: Option<&str>,
+    ) -> io::Result<()> {
         // ── PRE-VALIDATION ──────────────────────────────────────────────
 
         let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -554,11 +579,8 @@ impl DataOpsSession {
             TrustClass::Trusted
         };
         let cache_decision = cache_decision.into();
-        let execution_profile = match node.execution_trust {
-            ExecutionTrust::Core => "core",
-            ExecutionTrust::SandboxedExtension => "sandboxed_extension",
-            ExecutionTrust::UnsafeExtension => "unsafe_extension",
-        };
+        let execution_profile = execution_profile_override
+            .unwrap_or_else(|| default_execution_profile(node.execution_trust));
         let cache_key = cache_key_v0(node, &upstream_fps, execution_profile)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -1060,8 +1082,9 @@ impl DataOpsSession {
         })
     }
 
-    /// Remove declared `node.outputs` from active registry/cache state when execution or admission
-    /// fails/denies a node, preventing downstream steps from consuming stale prior artifacts (`ST-10`).
+    /// Remove declared `node.outputs` from active registry/cache state and synchronize on-disk
+    /// snapshots + `registry_updates.ndjson` when execution or admission fails/denies a node,
+    /// preventing downstream steps or reopened sessions from consuming stale prior artifacts (`ST-10`).
     pub fn invalidate_node_outputs(&mut self, node: &NodeV1) -> io::Result<()> {
         let mut removed_any = false;
         for out in &node.outputs {
@@ -1074,7 +1097,15 @@ impl DataOpsSession {
                 .retain(|(asset, _), _| asset != &out.asset_key);
         }
         if removed_any {
-            self.record_dataops_mutation()?;
+            self.dataops_write_count =
+                self.dataops_write_count.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "dataops write counter overflow")
+                })?;
+            let entries: Vec<DatasetEntryV1> = self.registry.values().cloned().collect();
+            self.sink.rewrite_registry_updates(&entries)?;
+            // Destructive invalidation must flush snapshots immediately even under Streaming profile
+            // so `registry.json` and `registry_updates.ndjson` remain consistent on disk.
+            self.flush_snapshots()?;
         }
         Ok(())
     }
@@ -1096,6 +1127,15 @@ impl DataOpsSession {
         &self,
         node: &NodeV1,
         outputs: &[OutputSpecCore],
+    ) -> io::Result<CacheDecisionV0> {
+        self.verify_cache_hit_with_profile(node, outputs, None)
+    }
+
+    pub(crate) fn verify_cache_hit_with_profile(
+        &self,
+        node: &NodeV1,
+        outputs: &[OutputSpecCore],
+        execution_profile_override: Option<&str>,
     ) -> io::Result<CacheDecisionV0> {
         if matches!(node.cache_policy, Some(CachePolicyV0::Bypass)) {
             return Ok(CacheDecisionV0::Bypass);
@@ -1127,11 +1167,8 @@ impl DataOpsSession {
             } else {
                 TrustClass::Trusted
             };
-        let execution_profile = match node.execution_trust {
-            ExecutionTrust::Core => "core",
-            ExecutionTrust::SandboxedExtension => "sandboxed_extension",
-            ExecutionTrust::UnsafeExtension => "unsafe_extension",
-        };
+        let execution_profile = execution_profile_override
+            .unwrap_or_else(|| default_execution_profile(node.execution_trust));
         let expected_cache_key = cache_key_v0(node, &upstream_fps, execution_profile)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -1169,5 +1206,13 @@ impl DataOpsSession {
         asset_key: &str,
     ) -> Option<&mut DatasetEntryV1> {
         self.registry.get_mut(asset_key)
+    }
+}
+
+fn default_execution_profile(trust: ExecutionTrust) -> &'static str {
+    match trust {
+        ExecutionTrust::Core => "core",
+        ExecutionTrust::SandboxedExtension => "sandboxed_extension",
+        ExecutionTrust::UnsafeExtension => "unsafe_extension",
     }
 }

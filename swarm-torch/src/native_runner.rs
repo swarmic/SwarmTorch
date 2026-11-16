@@ -34,7 +34,7 @@ use crate::artifacts::{
     MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
 };
 use crate::wasm_sandbox::{
-    parse_sha256_hex_v1, preflight_wasm_extension_v1, SandboxedExtensionPolicyV1,
+    resolve_and_preflight_wasm_node_v1, wasm_error_to_io, SandboxedExtensionPolicyV1,
     WasmExtensionExecutor, WasmSandboxError,
 };
 
@@ -1046,41 +1046,8 @@ impl NativeOpRunner {
             ));
         }
 
-        let module_hex = canon_param_str(&node.params, "module_sha256").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "wasm_transform requires string parameter 'module_sha256'",
-            )
-        })?;
-        let declared_hash = parse_sha256_hex_v1(module_hex).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("wasm_transform invalid 64-hex lowercase module_sha256 '{module_hex}'"),
-            )
-        })?;
-        let export_name = canon_param_str(&node.params, "export")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "wasm_transform requires non-empty string parameter 'export'",
-                )
-            })?;
-
-        let wasm_bytes = registry.get(&declared_hash).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("wasm_transform module '{module_hex}' not present in wasm_registry"),
-            )
-        })?;
-        let verified_hash = preflight_wasm_extension_v1(policy, wasm_bytes, export_name)
-            .map_err(wasm_error_to_io)?;
-        if verified_hash != declared_hash {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wasm_registry entry bytes do not match declared module_sha256 key",
-            ));
-        }
+        let (_declared_hash, export_name, wasm_bytes) =
+            resolve_and_preflight_wasm_node_v1(policy, &node.params, registry)?;
 
         let fmt = Self::resolve_input_format(&inputs[0], input_content_types)?;
         let raw_input = read_verified_cas_input(run_dir, &inputs[0])?;
@@ -1131,29 +1098,6 @@ impl NativeOpRunner {
             output_content_types,
         })
     }
-}
-
-fn wasm_error_to_io(err: WasmSandboxError) -> io::Error {
-    let kind = match &err {
-        WasmSandboxError::UnsupportedUntrustedWasmSandbox => io::ErrorKind::Unsupported,
-        WasmSandboxError::UntrustedModuleHash { .. }
-        | WasmSandboxError::ForbiddenImport { .. }
-        | WasmSandboxError::ExportNotAllowed(_) => io::ErrorKind::PermissionDenied,
-        WasmSandboxError::ExecutionTimeout { .. } => io::ErrorKind::TimedOut,
-        WasmSandboxError::ModuleTooLarge { .. }
-        | WasmSandboxError::InvalidWasmHeader
-        | WasmSandboxError::MalformedSectionOrLeb128
-        | WasmSandboxError::MultipleMemoriesForbidden
-        | WasmSandboxError::MultipleTablesForbidden
-        | WasmSandboxError::MemoryLimitExceeded { .. }
-        | WasmSandboxError::TableLimitExceeded { .. }
-        | WasmSandboxError::ExportSignatureMismatch(_)
-        | WasmSandboxError::OutOfBoundsMemoryAccess { .. } => io::ErrorKind::InvalidInput,
-        WasmSandboxError::OutOfFuel { .. }
-        | WasmSandboxError::MemoryGrowTrap { .. }
-        | WasmSandboxError::ExecutionTrap(_) => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, err.to_string())
 }
 
 fn write_cas_bytes(run_dir: &Path, bytes: &[u8]) -> io::Result<(String, String, u64)> {

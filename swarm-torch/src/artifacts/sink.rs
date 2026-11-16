@@ -340,6 +340,12 @@ impl RunArtifactSink {
         self.post_write_maybe_refresh_manifest(&mut state)
     }
 
+    pub fn rewrite_registry_updates(&self, entries: &[DatasetEntryV1]) -> io::Result<()> {
+        let mut state = self.guard_unsealed()?;
+        self.bundle.rewrite_registry_updates(entries)?;
+        self.post_write_maybe_refresh_manifest(&mut state)
+    }
+
     pub fn append_lineage_edge_update(&self, edge: &LineageEdgeV1) -> io::Result<()> {
         let mut state = self.guard_unsealed()?;
         self.bundle.append_lineage_edge_update(edge)?;

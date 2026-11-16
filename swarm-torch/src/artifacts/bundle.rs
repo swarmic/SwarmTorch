@@ -837,8 +837,21 @@ impl RunArtifactBundle {
         let (manifest, status) = if active_manifest_sha.as_deref()
             == Some(head.manifest_sha256.as_str())
         {
-            let verified = self.verify_and_load(policy)?;
-            (verified.manifest, verified.status)
+            let manifest_bytes = read_bytes_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+            let actual_sha = hex_lower(&Sha256::digest(&manifest_bytes));
+            if actual_sha != head.manifest_sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active manifest.json sha256 {} != committed_head.manifest_sha256 {}",
+                        actual_sha, head.manifest_sha256
+                    ),
+                ));
+            }
+            let active: ManifestV1 = parse_json_slice(&manifest_bytes)?;
+            let status = self.verify_manifest_header_and_policy(&active, policy)?;
+            validate_manifest_entries_well_formed(&active)?;
+            (active, status)
         } else {
             // Crash-recovery path: a subsequent round may have updated manifest.json before
             // committed_head.json advanced; verify the generation's archived manifest matching
@@ -870,6 +883,7 @@ impl RunArtifactBundle {
             validate_manifest_entries_well_formed(&archived)?;
             (archived, status)
         };
+        self.verify_manifest_entries_for_committed_head(&manifest)?;
 
         let (resume_v2, resume_digest) =
             get_verified_coordinator_resume_state_v2(&self.run_dir, &head.resume_state_cas_uri)?;
@@ -922,6 +936,85 @@ impl RunArtifactBundle {
         let _ = COMMITTED_HEAD_REL_PATH;
 
         Ok((head, manifest, status, resume_v2))
+    }
+
+    fn verify_manifest_entries_for_committed_head(&self, manifest: &ManifestV1) -> io::Result<()> {
+        let canonical_root = self.run_dir.canonicalize()?;
+        let mut total_bytes: u64 = 0;
+
+        for entry in &manifest.entries {
+            total_bytes = total_bytes.checked_add(entry.bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "total bundle byte size overflow",
+                )
+            })?;
+            if total_bytes > MAX_TOTAL_BUNDLE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "total bundle bytes {total_bytes} exceed maximum {MAX_TOTAL_BUNDLE_BYTES}"
+                    ),
+                ));
+            }
+
+            let file_path = self.run_dir.join(&entry.path);
+            if !file_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("manifest entry file missing: {}", entry.path),
+                ));
+            }
+            ensure_path_within_bundle(&file_path, &canonical_root, &entry.path)?;
+
+            if entry.path.ends_with(".ndjson") {
+                // Append-only NDJSON logs may have grown if a subsequent round crashed after
+                // appending pre-release DP debits or telemetry before `committed_head.json`
+                // advanced; verify the committed prefix `[..entry.bytes]` matches `entry.sha256`.
+                let bytes = read_bytes_bounded(&file_path, MAX_SINGLE_ARTIFACT_BYTES)?;
+                if (bytes.len() as u64) < entry.bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "append-only manifest entry {} was truncated below committed length ({} < {})",
+                            entry.path,
+                            bytes.len(),
+                            entry.bytes
+                        ),
+                    ));
+                }
+                let prefix_len = usize::try_from(entry.bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("manifest entry byte length overflow for {}", entry.path),
+                    )
+                })?;
+                let prefix_sha = hex_lower(&Sha256::digest(&bytes[..prefix_len]));
+                if prefix_sha != entry.sha256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "sha256 mismatch for committed prefix of {}: expected {}, got {}",
+                            entry.path, entry.sha256, prefix_sha
+                        ),
+                    ));
+                }
+            } else if entry.path == "run.json" || entry.path.starts_with("blobs/sha256/") {
+                let (_bytes, actual_sha) =
+                    read_and_hash_bounded(&file_path, entry.bytes, MAX_SINGLE_ARTIFACT_BYTES)?;
+                let actual_hex = hex_lower(&actual_sha);
+                if actual_hex != entry.sha256 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "sha256 mismatch for {}: expected {}, got {}",
+                            entry.path, entry.sha256, actual_hex
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

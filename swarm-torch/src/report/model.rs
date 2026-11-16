@@ -12,6 +12,9 @@ use swarm_torch_core::run_graph::{ExecutionTrust, GraphV1, NodeV1};
 pub struct Report {
     #[serde(serialize_with = "serialize_path")]
     pub run_dir: PathBuf,
+    pub verification_status: crate::artifacts::VerificationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dp_accounting_classification: Option<String>,
     pub graph: GraphV1,
     pub registry: DatasetRegistryV1,
     pub lineage: DatasetLineageV1,

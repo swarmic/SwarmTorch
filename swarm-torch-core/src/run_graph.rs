@@ -550,6 +550,9 @@ impl GraphV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::string::ToString;
+    use alloc::vec;
 
     #[test]
     fn node_id_is_stable_for_key() {

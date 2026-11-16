@@ -29,6 +29,9 @@ use crate::{Error, Result};
 /// Default maximum message size accepted by [`TcpTransport`] (`1 MiB`).
 pub const DEFAULT_TCP_MAX_MESSAGE_BYTES: usize = 1_048_576;
 
+/// Default maximum concurrent inbound TCP connections retained by [`TcpTransport`] (`AR-14-09`).
+pub const DEFAULT_MAX_ACTIVE_TCP_CONNECTIONS: usize = 256;
+
 /// Explicit cancellation-safe frame reader state machine (`F-06`, `W11-03`).
 ///
 /// Storing [`TcpFrameReaderState`] inside the per-connection state guarantees that if a non-blocking
@@ -63,6 +66,11 @@ impl TcpFrameReaderState {
     /// Whether the stream has been poisoned by a malformed length header or EOF mid-frame.
     pub const fn is_poisoned(&self) -> bool {
         matches!(self.phase, FrameReadPhase::Poisoned)
+    }
+
+    /// Whether the reader is currently between frames with zero buffered partial bytes (`AR-14-09`).
+    pub const fn is_idle(&self) -> bool {
+        matches!(self.phase, FrameReadPhase::ReadingLength { filled: 0, .. })
     }
 
     /// Attempt to advance the frame reader from any `std::io::Read` source.
@@ -333,6 +341,7 @@ pub struct TcpTransport {
     local_peer: PeerId,
     local_addr: SocketAddr,
     max_message_bytes: usize,
+    max_active_connections: usize,
     backend: TcpBackend,
     peers: RwLock<BTreeMap<PeerId, SocketAddr>>,
     connections: Mutex<Vec<ActiveConnection>>,
@@ -345,6 +354,7 @@ impl core::fmt::Debug for TcpTransport {
             .field("local_peer", &self.local_peer)
             .field("local_addr", &self.local_addr)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_active_connections", &self.max_active_connections)
             .finish()
     }
 }
@@ -355,6 +365,21 @@ impl TcpTransport {
         local_peer: PeerId,
         bind_addr: SocketAddr,
         max_message_bytes: usize,
+    ) -> Result<Arc<Self>> {
+        Self::bind_with_limits(
+            local_peer,
+            bind_addr,
+            max_message_bytes,
+            DEFAULT_MAX_ACTIVE_TCP_CONNECTIONS,
+        )
+    }
+
+    /// Bind a new [`TcpTransport`] to `bind_addr` with explicit message and connection caps (`AR-14-09`).
+    pub fn bind_with_limits(
+        local_peer: PeerId,
+        bind_addr: SocketAddr,
+        max_message_bytes: usize,
+        max_active_connections: usize,
     ) -> Result<Arc<Self>> {
         if max_message_bytes == 0 || max_message_bytes > u32::MAX as usize {
             return Err(Error::InvalidMessage);
@@ -369,6 +394,7 @@ impl TcpTransport {
             local_peer,
             local_addr,
             max_message_bytes,
+            max_active_connections: max_active_connections.max(1),
             backend: TcpBackend::OsSocket(Mutex::new(OsTcpListenerSlot::Std(listener))),
             peers: RwLock::new(BTreeMap::new()),
             connections: Mutex::new(Vec::new()),
@@ -394,6 +420,7 @@ impl TcpTransport {
             local_peer,
             local_addr: virtual_addr,
             max_message_bytes,
+            max_active_connections: DEFAULT_MAX_ACTIVE_TCP_CONNECTIONS,
             backend: TcpBackend::InMemory {
                 hub,
                 reader_state: Mutex::new(TcpFrameReaderState::new(max_message_bytes)),
@@ -402,6 +429,27 @@ impl TcpTransport {
             connections: Mutex::new(Vec::new()),
             inbox: Mutex::new(VecDeque::new()),
         }))
+    }
+
+    /// Configured maximum concurrent active inbound connections (`AR-14-09`).
+    pub const fn max_active_connections(&self) -> usize {
+        self.max_active_connections
+    }
+
+    fn push_bounded_connection(
+        conns: &mut Vec<ActiveConnection>,
+        incoming: ActiveConnection,
+        max_active_connections: usize,
+    ) {
+        if conns.len() >= max_active_connections {
+            if let Some(idle_idx) = conns.iter().position(|c| c.reader_state.is_idle()) {
+                conns.remove(idle_idx);
+            } else {
+                // All slots are actively mid-frame; drop the new connection to bound memory.
+                return;
+            }
+        }
+        conns.push(incoming);
     }
 
     /// Bound local socket address.
@@ -575,11 +623,15 @@ impl TcpTransport {
             return Poll::Ready(Err(Error::TransportUnavailable));
         };
         for (stream, remote_addr) in accepted {
-            conns.push(ActiveConnection {
-                stream,
-                reader_state: TcpFrameReaderState::new(self.max_message_bytes),
-                remote_addr,
-            });
+            Self::push_bounded_connection(
+                &mut conns,
+                ActiveConnection {
+                    stream,
+                    reader_state: TcpFrameReaderState::new(self.max_message_bytes),
+                    remote_addr,
+                },
+                self.max_active_connections,
+            );
         }
 
         let mut idx = 0;
@@ -738,11 +790,15 @@ impl TcpTransport {
                     .lock()
                     .map_err(|_| Error::TransportUnavailable)?;
                 for (stream, remote_addr) in accepted {
-                    conns.push(ActiveConnection {
-                        stream,
-                        reader_state: TcpFrameReaderState::new(self.max_message_bytes),
-                        remote_addr,
-                    });
+                    Self::push_bounded_connection(
+                        &mut conns,
+                        ActiveConnection {
+                            stream,
+                            reader_state: TcpFrameReaderState::new(self.max_message_bytes),
+                            remote_addr,
+                        },
+                        self.max_active_connections,
+                    );
                 }
 
                 let mut idx = 0;
@@ -880,7 +936,7 @@ impl SwarmTransport for TcpTransport {
                 failed: 0,
             };
             for peer in peers {
-                match self.send_sync(peer, msg) {
+                match self.send(peer, msg).await {
                     Ok(()) => stats.confirmed += 1,
                     Err(_) => stats.failed += 1,
                 }
@@ -1096,5 +1152,44 @@ mod tests {
         let (first, second) = rx_task.await.unwrap();
         assert_eq!(first.payload, b"first-async-tcp");
         assert_eq!(second.payload, b"split-tcp-payload");
+    }
+
+    #[test]
+    fn tcp_transport_enforces_max_active_connections_cap_against_idle_sockets() {
+        let p_rx = PeerId::new([0x31u8; 32]);
+        let Ok(rx) = TcpTransport::bind_with_limits(p_rx, "127.0.0.1:0".parse().unwrap(), 4096, 2)
+        else {
+            return;
+        };
+        assert_eq!(rx.max_active_connections(), 2);
+
+        // Open 4 idle TCP sockets without sending any frame bytes, then send a valid frame on a 5th socket:
+        let mut idle_clients = Vec::new();
+        for _ in 0..4 {
+            if let Ok(s) = TcpStream::connect(rx.local_addr()) {
+                idle_clients.push(s);
+            }
+        }
+        let _ = rx.poll_recv_once();
+        assert!(rx.connections.lock().unwrap().len() <= 2);
+
+        let p_tx = PeerId::new([0x32u8; 32]);
+        let Ok(tx) = TcpTransport::bind(p_tx, "127.0.0.1:0".parse().unwrap(), 4096) else {
+            return;
+        };
+        tx.register_peer(p_rx, rx.local_addr()).unwrap();
+        tx.send_sync(p_rx, b"bounded-tcp-ok").unwrap();
+
+        let mut received = None;
+        for _ in 0..20 {
+            if let Ok(Some(msg)) = rx.poll_recv_once() {
+                received = Some(msg.payload);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(received.as_deref(), Some(&b"bounded-tcp-ok"[..]));
+        assert!(rx.connections.lock().unwrap().len() <= 2);
+        drop(idle_clients);
     }
 }

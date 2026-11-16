@@ -2042,6 +2042,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_hinge_threshold: 0,
             fedasync_clip_norm: None,
             bucketing: None,
+            dp_profile: None,
             committed_unix_nanos: ts_unix_nanos,
         };
         let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
@@ -2296,6 +2297,20 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             )));
         }
 
+        // Reconstruct `dp_accountant` when `dp_profile` is committed in `CoordinatorResumeStateV2` (`AR-14-01`).
+        let restored_dp_accountant = match resume_v2.dp_profile {
+            Some(profile) => {
+                let acc = reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(
+                    |err| match err {
+                        CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
+                        CryptoErrorOrIo::Io(e) => RoundError::Io(e),
+                    },
+                )?;
+                Some(acc)
+            }
+            None => None,
+        };
+
         // Apply optimizer restore ONLY after all other CAS/manifest/config checks succeed.
         if let (Some(opt), Some(ref snapshot)) = (optimizer, loaded_opt_snapshot) {
             opt.restore_state(snapshot)
@@ -2324,7 +2339,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             last_bucketing_report: None,
             sparse_round: None,
             last_sparse_bandwidth_report: None,
-            dp_accountant: None,
+            dp_accountant: restored_dp_accountant,
             fedasync_policy: resume_v2.fedasync_policy,
             fedasync_hinge_threshold: resume_v2.fedasync_hinge_threshold,
             fedasync_clip_norm: resume_v2.fedasync_clip_norm,
@@ -3720,6 +3735,7 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             fedasync_hinge_threshold: self.fedasync_hinge_threshold,
             fedasync_clip_norm: self.fedasync_clip_norm,
             bucketing: self.bucketing,
+            dp_profile: self.dp_accountant.as_ref().map(|acc| *acc.profile()),
             committed_unix_nanos: plan.ts_unix_nanos,
         };
         let (_resume_v2_digest, resume_v2_uri, _resume_v2_bytes) =
@@ -4025,7 +4041,14 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         explicit_tau: Option<f32>,
         subsampling_q_override: Option<f64>,
     ) -> Result<Option<crate::artifacts::DpLedgerEntryV1>, RoundError> {
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
         let Some(acc) = self.dp_accountant.as_mut() else {
+            if run_dir.join(crate::artifacts::DP_LEDGER_REL_PATH).exists() {
+                return Err(RoundError::ResumeStateMismatch(
+                    "dp/ledger.ndjson exists in bundle but dp_accountant is not configured"
+                        .to_string(),
+                ));
+            }
             return Ok(None);
         };
         if acc.guarantees_differential_privacy() {
@@ -4041,7 +4064,6 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             let total = self.config.authorized_cohort.len().max(1) as f64;
             (self.admitted.len().max(1) as f64 / total).clamp(0.0, 1.0)
         });
-        let run_dir = session.sink().bundle().run_dir().to_path_buf();
         let (_, entry) = pre_release_debit_dp_accountant(
             &run_dir,
             self.run_id,
@@ -4087,6 +4109,23 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
             return Err(RoundError::Config(
                 RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
             ));
+        }
+        if let Some(existing) = self.dp_accountant.as_ref() {
+            if existing.profile() != &profile {
+                return Err(RoundError::ResumeStateMismatch(
+                    "configured DpMechanismProfileV1 disagrees with restored dp_accountant profile"
+                        .to_string(),
+                ));
+            }
+            let acc =
+                reconstruct_dp_accountant_from_ledger(run_dir, profile).map_err(
+                    |err| match err {
+                        CryptoErrorOrIo::Crypto(c) => RoundError::PrivacyBudget(c),
+                        CryptoErrorOrIo::Io(e) => RoundError::Io(e),
+                    },
+                )?;
+            self.dp_accountant = Some(acc);
+            return Ok(());
         }
         let next_generation = self.coordinator_generation.checked_add(1).ok_or(
             RoundError::CoordinatorGenerationOverflow {
@@ -8168,6 +8207,197 @@ mod tests {
         .unwrap();
         assert_eq!(restored.current_round(), 2);
         assert_eq!(restored.model().parameters(), coord.model().parameters());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exact_training_resume_restores_dp_accountant_and_survives_after_cas_before_manifest_crash() {
+        use swarm_torch_core::aggregation::RobustAggregation;
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::dp::{
+            DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+            PrivacyAccountingClassificationV1,
+        };
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_net::gossip::PayloadKindV1;
+
+        let base = temp_dir("exact_resume_dp_and_after_cas_crash");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let run_id = RunId::from_bytes([0x94; 16]);
+        let signer = KeyPair::from_seed([0x95; 32]).unwrap();
+        let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+
+        let p1 = TestPeer::new(91);
+        let p2 = TestPeer::new(92);
+
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::GradientV1,
+            aggregation: RobustAggregation::CenteredClipping {
+                tau: 1.0,
+                max_iterations: 3,
+            },
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1.peer_id, p2.peer_id].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+
+        let dp_profile = DpMechanismProfileV1 {
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 10.0,
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        };
+
+        let mut session = DataOpsSession::create(
+            &base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let run_dir = session.sink().bundle().run_dir().to_path_buf();
+
+        let mut opt = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 0.0).unwrap();
+        let mut coord = SwarmRoundCoordinator::initialize(
+            run_id,
+            config.clone(),
+            linear_model_2_1(&[1.0, 2.0, 0.5]),
+            &mut session,
+            1_000,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+        coord.configure_dp_accountant(&run_dir, dp_profile).unwrap();
+
+        // Commit Round 1 with DP accounting enabled:
+        let s1 = p1.establish_session(&mut coord, 1, 0x21, 100);
+        let s2 = p2.establish_session(&mut coord, 1, 0x22, 100);
+        for (p, s) in [(&p1, s1), (&p2, s2)] {
+            let b = p.build_dense_delivery(
+                &coord,
+                s,
+                1,
+                1,
+                100,
+                1,
+                coord.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.2, -0.1, 0.05],
+                0,
+            );
+            coord
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 100)
+                .unwrap();
+        }
+        coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt),
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(coord.dp_accountant().unwrap().committed_rounds(), 1);
+
+        // Resume Round 1 under TrustPolicy::Strict WITHOUT calling configure_dp_accountant:
+        // dp_accountant MUST be automatically restored from CoordinatorResumeStateV2 + dp/ledger.ndjson!
+        drop(session);
+        let (mut session2, _) = DataOpsSession::resume(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut opt2 = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 0.0).unwrap();
+        let mut recovered1 = SwarmRoundCoordinator::resume_exact_training_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt2),
+            &session2,
+            &strict_policy,
+        )
+        .unwrap()
+        .with_manifest_signer(signer.clone());
+        assert_eq!(recovered1.dp_accountant().unwrap().committed_rounds(), 1);
+        assert_eq!(recovered1.dp_accountant().unwrap().profile(), &dp_profile);
+
+        // Round 2: Crash at AfterCasBeforeManifest (AFTER Round 2 debited dp/ledger.ndjson and
+        // appended to materializations.ndjson, BEFORE manifest.json updated):
+        let s1_r2 = p1.establish_session(&mut recovered1, 2, 0x31, 110);
+        let s2_r2 = p2.establish_session(&mut recovered1, 2, 0x32, 110);
+        for (p, s) in [(&p1, s1_r2), (&p2, s2_r2)] {
+            let b = p.build_dense_delivery(
+                &recovered1,
+                s,
+                2,
+                1,
+                110,
+                2,
+                recovered1.parent_digest(),
+                PayloadKindV1::GradientV1,
+                &[0.1, 0.2, -0.1],
+                0,
+            );
+            recovered1
+                .submit_verified_delivery(&b, DEFAULT_MAX_GOSSIP_DELIVERY_BYTES, 110)
+                .unwrap();
+        }
+        recovered1.set_test_commit_fail_point(CommitFailPoint::AfterCasBeforeManifest);
+        assert!(recovered1
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, DummyEvaluator>(
+                &[],
+                Some(&mut opt2),
+                None,
+                &mut session2,
+                3_000,
+            )
+            .is_err());
+
+        // Restarting process right after AfterCasBeforeManifest under TrustPolicy::Strict MUST
+        // succeed (prefix-verifying append-only NDJSON against Round 1's signed manifest) AND
+        // preserve Round 2's non-refundable DP debit (`committed_rounds() == 2`)!
+        drop(session2);
+        let (session3, _) = DataOpsSession::resume(
+            &run_dir,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let mut opt3 = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 0.0).unwrap();
+        let recovered2 = SwarmRoundCoordinator::resume_exact_training_state(
+            config.clone(),
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt3),
+            &session3,
+            &strict_policy,
+        )
+        .unwrap();
+        assert_eq!(recovered2.current_round(), 2);
+        assert_eq!(recovered2.dp_accountant().unwrap().committed_rounds(), 2);
+
+        // Tampering with byte 0 of dp/ledger.ndjson (inside the committed Round 1 prefix) MUST fail closed!
+        let ledger_path = run_dir.join(crate::artifacts::DP_LEDGER_REL_PATH);
+        let mut ledger_bytes = fs::read(&ledger_path).unwrap();
+        ledger_bytes[0] ^= 0x01;
+        fs::write(&ledger_path, &ledger_bytes).unwrap();
+        let mut opt4 = SgdOptimizer::<LinearModel, 16>::with_hyperparams(0.05, 0.9, 0.0).unwrap();
+        assert!(SwarmRoundCoordinator::resume_exact_training_state(
+            config,
+            LinearModel::new(2, 1).unwrap(),
+            Some(&mut opt4),
+            &session3,
+            &strict_policy,
+        )
+        .is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

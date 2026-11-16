@@ -560,6 +560,8 @@ pub fn validate_metric_record(r: &MetricRecord) -> Result<(), RecordValidationEr
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::string::ToString;
     use serde::Serialize;
 
     #[test]

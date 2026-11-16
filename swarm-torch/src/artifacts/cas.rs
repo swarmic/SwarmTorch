@@ -293,6 +293,8 @@ pub struct CoordinatorResumeStateV2 {
     pub fedasync_hinge_threshold: u64,
     pub fedasync_clip_norm: Option<f32>,
     pub bucketing: Option<BucketingConfig>,
+    #[serde(default)]
+    pub dp_profile: Option<swarm_torch_core::dp::DpMechanismProfileV1>,
     pub committed_unix_nanos: u64,
 }
 

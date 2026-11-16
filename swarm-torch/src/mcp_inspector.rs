@@ -688,35 +688,24 @@ fn tool_trace_aggregation_budget(
     verified: &VerifiedBundleV1,
     report: &Report,
 ) -> Result<Value, (i64, String)> {
-    // Only trust ledger bytes verified inside the Ed25519-signed manifest!
+    // Only trust ledger bytes verified inside the Ed25519-signed manifest (`AR-14-04`)!
     let ledger_entries: Vec<DpLedgerEntryV1> = match verified.get_bytes(DP_LEDGER_REL_PATH) {
-        Some(raw) => {
-            let text = std::str::from_utf8(raw).map_err(|e| {
-                (
-                    JSONRPC_BUNDLE_VERIFICATION_FAILED,
-                    format!("verified dp ledger is invalid UTF-8: {e}"),
-                )
-            })?;
-            let mut entries = Vec::new();
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let entry: DpLedgerEntryV1 = serde_json::from_str(trimmed).map_err(|e| {
-                    (
-                        JSONRPC_BUNDLE_VERIFICATION_FAILED,
-                        format!("verified dp ledger contains corrupt NDJSON record: {e}"),
-                    )
-                })?;
-                entries.push(entry);
-            }
-            entries
-        }
+        Some(raw) => crate::artifacts::parse_and_validate_dp_ledger_slice(raw).map_err(|e| {
+            (
+                JSONRPC_BUNDLE_VERIFICATION_FAILED,
+                format!("verified dp ledger failed bounded/structural validation: {e}"),
+            )
+        })?,
         None => Vec::new(),
     };
 
     let latest_ledger = ledger_entries.last();
+    let guarantees_dp = latest_ledger
+        .map(|e| e.guarantees_differential_privacy)
+        .unwrap_or(false);
+    let accounting_cls = latest_ledger
+        .map(|e| e.accounting_classification.as_str())
+        .unwrap_or(crate::artifacts::dp_ledger::EXPERIMENTAL_DP_CLASSIFICATION_V1);
     let dp_metrics: Vec<Value> = report
         .metrics
         .iter()
@@ -739,8 +728,8 @@ fn tool_trace_aggregation_budget(
 
     Ok(json!({
         "strict_signature_verified": verified.is_strict_verified(),
-        "guarantees_differential_privacy": false,
-        "accounting_classification": crate::artifacts::dp_ledger::EXPERIMENTAL_DP_CLASSIFICATION_V1,
+        "guarantees_differential_privacy": guarantees_dp,
+        "accounting_classification": accounting_cls,
         "privacy_notice": "Experimental hypothetical RDP budget accounting only: SwarmRoundCoordinator does not execute Poisson client subsampling or calibrated Gaussian noise injection.",
         "dp_ledger_present_in_signed_manifest": verified.get_bytes(DP_LEDGER_REL_PATH).is_some(),
         "dp_ledger_entry_count": ledger_entries.len(),

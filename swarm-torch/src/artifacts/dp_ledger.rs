@@ -101,6 +101,32 @@ pub fn derive_dp_receipt_id(
     hex_lower(&digest)
 }
 
+/// Parse and structurally validate bounded `dp/ledger.ndjson` bytes (`ADR-0023` §4.2, `AR-14-01`, `AR-14-04`).
+pub fn parse_and_validate_dp_ledger_slice(bytes: &[u8]) -> io::Result<Vec<DpLedgerEntryV1>> {
+    let entries: Vec<DpLedgerEntryV1> =
+        parse_ndjson_slice_bounded(bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+    for entry in &entries {
+        if entry.schema_version != DP_LEDGER_SCHEMA_V1
+            || entry.cumulative_rdp_orders.len() != RDP_GRID_LEN
+            || entry.receipt_id.is_empty()
+            || entry.guarantees_differential_privacy
+            || entry.accounting_classification != EXPERIMENTAL_DP_CLASSIFICATION_V1
+            || entry
+                .cumulative_rdp_orders
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            || !entry.converted_epsilon.is_finite()
+            || entry.converted_epsilon < 0.0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed or unsupported dp/ledger.ndjson entry",
+            ));
+        }
+    }
+    Ok(entries)
+}
+
 /// Read all persisted [`DpLedgerEntryV1`] records from `run_dir/dp/ledger.ndjson`.
 ///
 /// Returns `Ok(Vec::new())` when no ledger has been created yet.
@@ -110,22 +136,7 @@ pub fn read_dp_ledger_entries(run_dir: &Path) -> io::Result<Vec<DpLedgerEntryV1>
         return Ok(Vec::new());
     }
     let bytes = read_bytes_bounded(&path, MAX_SINGLE_ARTIFACT_BYTES)?;
-    let entries: Vec<DpLedgerEntryV1> =
-        parse_ndjson_slice_bounded(&bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
-    for entry in &entries {
-        if entry.schema_version != DP_LEDGER_SCHEMA_V1
-            || entry.cumulative_rdp_orders.len() != RDP_GRID_LEN
-            || entry.receipt_id.is_empty()
-            || entry.guarantees_differential_privacy
-            || entry.accounting_classification != EXPERIMENTAL_DP_CLASSIFICATION_V1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "malformed or unsupported dp/ledger.ndjson entry",
-            ));
-        }
-    }
-    Ok(entries)
+    parse_and_validate_dp_ledger_slice(&bytes)
 }
 
 /// Durably append a pre-release DP debit record to `run_dir/dp/ledger.ndjson` (`sync_all()` +
@@ -254,9 +265,8 @@ pub fn pre_release_debit_dp_accountant(
     Ok((newly_appended, entry))
 }
 
-/// Reconstruct an [`RdpAccountantV1`] from the latest entry in `run_dir/dp/ledger.ndjson` (or fresh if absent).
-pub fn reconstruct_dp_accountant_from_ledger(
-    run_dir: &Path,
+fn reconstruct_dp_accountant_from_entries(
+    entries: &[DpLedgerEntryV1],
     profile: DpMechanismProfileV1,
 ) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
     if profile.classification
@@ -266,7 +276,6 @@ pub fn reconstruct_dp_accountant_from_ledger(
             CryptoError::InvalidPrivacyParameter,
         ));
     }
-    let entries = read_dp_ledger_entries(run_dir).map_err(CryptoErrorOrIo::Io)?;
     match entries.last() {
         None => RdpAccountantV1::new(profile).map_err(CryptoErrorOrIo::Crypto),
         Some(last) => {
@@ -287,6 +296,27 @@ pub fn reconstruct_dp_accountant_from_ledger(
                 .map_err(CryptoErrorOrIo::Crypto)
         }
     }
+}
+
+/// Reconstruct an [`RdpAccountantV1`] from a [`super::bundle::VerifiedBundleV1`] snapshot (`AR-14-01`).
+pub fn reconstruct_dp_accountant_from_verified_bundle(
+    verified: &super::bundle::VerifiedBundleV1,
+    profile: DpMechanismProfileV1,
+) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
+    let entries = match verified.get_bytes(DP_LEDGER_REL_PATH) {
+        Some(bytes) => parse_and_validate_dp_ledger_slice(bytes).map_err(CryptoErrorOrIo::Io)?,
+        None => Vec::new(),
+    };
+    reconstruct_dp_accountant_from_entries(&entries, profile)
+}
+
+/// Reconstruct an [`RdpAccountantV1`] from the latest entry in `run_dir/dp/ledger.ndjson` (or fresh if absent).
+pub fn reconstruct_dp_accountant_from_ledger(
+    run_dir: &Path,
+    profile: DpMechanismProfileV1,
+) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
+    let entries = read_dp_ledger_entries(run_dir).map_err(CryptoErrorOrIo::Io)?;
+    reconstruct_dp_accountant_from_entries(&entries, profile)
 }
 
 /// Error returned by [`pre_release_debit_dp_accountant`] and [`reconstruct_dp_accountant_from_ledger`].

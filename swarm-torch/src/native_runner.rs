@@ -31,7 +31,7 @@ use crate::artifacts::schema_check::{
 };
 use crate::artifacts::{
     hex_lower, parse_cas_uri_digest, read_bytes_bounded, write_once_cas_blob, OutputSpec,
-    MAX_SINGLE_ARTIFACT_BYTES,
+    MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES, MAX_SINGLE_ARTIFACT_BYTES,
 };
 use crate::wasm_sandbox::{
     parse_sha256_hex_v1, preflight_wasm_extension_v1, SandboxedExtensionPolicyV1,
@@ -623,6 +623,18 @@ impl NativeOpRunner {
     }
 
     fn parse_ndjson_rows(raw: &[u8]) -> io::Result<Vec<(String, Value)>> {
+        for raw_line in raw.split(|&b| b == b'\n') {
+            let line_bytes = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line_bytes.len() > MAX_NDJSON_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "NDJSON line length {} exceeds maximum {MAX_NDJSON_LINE_BYTES}",
+                        line_bytes.len()
+                    ),
+                ));
+            }
+        }
         let text = std::str::from_utf8(raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let mut parsed = Vec::new();
@@ -630,6 +642,12 @@ impl NativeOpRunner {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
+            }
+            if parsed.len() >= MAX_NDJSON_LINES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("NDJSON row count exceeds maximum {MAX_NDJSON_LINES}"),
+                ));
             }
             let obj: Value = serde_json::from_str(trimmed)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -697,8 +715,28 @@ impl NativeOpRunner {
         input_content_types: &BTreeMap<String, String>,
     ) -> io::Result<PhysicalExecOutcomeV1> {
         let col_name = canon_param_str(&node.params, "column");
-        let op = canon_param_str(&node.params, "op").unwrap_or("eq");
+        let raw_op = canon_param_str(&node.params, "op").unwrap_or("eq");
         let target_val = canon_param_str(&node.params, "value");
+        if col_name.is_some() != target_val.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "filter_rows requires both 'column' and 'value' parameters when filtering",
+            ));
+        }
+        let op = match raw_op {
+            "eq" => "eq",
+            "ne" => "ne",
+            "gt" => "gt",
+            "ge" | "gte" => "ge",
+            "lt" => "lt",
+            "le" | "lte" => "le",
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported filter_rows operator '{other}'"),
+                ));
+            }
+        };
 
         let mut instances = Vec::with_capacity(inputs.len());
         let mut output_specs = Vec::with_capacity(inputs.len());
@@ -1765,6 +1803,44 @@ mod tests {
                 .map(String::as_str),
             Some(CONTENT_TYPE_NDJSON)
         );
+
+        // 4. Partial filter_rows params (`column` without `value`) and unknown `op` fail closed (`AR-14-08`)!
+        let mut partial_node = filter_node.clone();
+        partial_node.params.remove("value");
+        let err_partial = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &partial_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+                &nd_cts,
+            )
+            .unwrap_err();
+        assert_eq!(err_partial.kind(), io::ErrorKind::InvalidInput);
+
+        let mut bad_op_node = filter_node;
+        bad_op_node
+            .params
+            .insert("op".to_string(), CanonValue::Str("regex_match".to_string()));
+        let err_op = runner
+            .run_in_session_with_content_types(
+                &ctx,
+                &run_dir,
+                &bad_op_node,
+                std::slice::from_ref(&inp_nd),
+                &emitter,
+                None,
+                &nd_cts,
+            )
+            .unwrap_err();
+        assert_eq!(err_op.kind(), io::ErrorKind::InvalidInput);
+
+        // 5. Oversized NDJSON line (> MAX_NDJSON_LINE_BYTES) fails closed before serde_json allocation!
+        let oversized_line = vec![b'a'; MAX_NDJSON_LINE_BYTES + 1];
+        let err_oversized = NativeOpRunner::parse_ndjson_rows(&oversized_line).unwrap_err();
+        assert_eq!(err_oversized.kind(), io::ErrorKind::InvalidData);
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

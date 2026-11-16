@@ -221,6 +221,8 @@ fn timeline_materialization_includes_node_id_and_node_def_hash() {
 
     let report = Report {
         run_dir: PathBuf::from("/tmp/test"),
+        verification_status: crate::artifacts::VerificationStatus::UnverifiedLegacyPermissive,
+        dp_accounting_classification: None,
         graph: GraphV1 {
             schema_version: 1,
             graph_id: None,
@@ -298,6 +300,8 @@ fn timeline_materialization_includes_unsafe_reasons_when_present() {
 
     let report = Report {
         run_dir: PathBuf::from("/tmp/test"),
+        verification_status: crate::artifacts::VerificationStatus::UnverifiedLegacyPermissive,
+        dp_accounting_classification: None,
         graph: GraphV1 {
             schema_version: 1,
             graph_id: None,
@@ -356,6 +360,8 @@ fn report_warning_lists_unsafe_materialization_reasons() {
 
     let report = Report {
         run_dir: PathBuf::from("/tmp/test"),
+        verification_status: crate::artifacts::VerificationStatus::UnverifiedLegacyPermissive,
+        dp_accounting_classification: None,
         graph: GraphV1 {
             schema_version: 1,
             graph_id: None,
@@ -873,6 +879,80 @@ fn load_report_ignores_unlisted_snapshot_pair_commit_and_prevents_toctou() {
             .iter()
             .any(|d| d.asset_key == "dataset://ns/trusted_snap"),
         "trusted snapshot must not be discarded by unlisted marker"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn generate_report_with_policy_enforces_strict_signature_and_surfaces_dp_classification() {
+    use crate::artifacts::{
+        pre_release_debit_dp_accountant, TrustPolicy, VerificationStatus,
+        EXPERIMENTAL_DP_CLASSIFICATION_V1,
+    };
+    use crate::report::generate_report_with_policy;
+    use swarm_torch_core::crypto::KeyPair;
+    use swarm_torch_core::dp::{
+        DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
+        PrivacyAccountingClassificationV1, RdpAccountantV1,
+    };
+
+    let base = temp_dir("generate_report_strict_policy");
+    let run_id = RunId::from_bytes([0x66; 16]);
+    let signer = KeyPair::from_seed([0x77; 32]).unwrap();
+    let wrong_signer = KeyPair::from_seed([0x78; 32]).unwrap();
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let dp_profile = DpMechanismProfileV1 {
+        clipping_radius_tau: 1.0,
+        noise_multiplier: 1.2,
+        target_delta: 1e-5,
+        max_epsilon: 5.0,
+        unit: DpUnitV1::ClientLevel,
+        adjacency: DpAdjacencyV1::AddRemoveOne,
+        conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+        classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+    };
+    let mut acc = RdpAccountantV1::new(dp_profile).unwrap();
+    pre_release_debit_dp_accountant(
+        bundle.run_dir(),
+        run_id,
+        1,
+        &"a".repeat(64),
+        &mut acc,
+        1.0,
+        0.5,
+        2_000,
+    )
+    .unwrap();
+
+    bundle.finalize_signed_manifest(&signer).unwrap();
+
+    let html_out = base.join("strict_report.html");
+    let json_out = base.join("strict_report.json");
+    let wrong_policy = TrustPolicy::strict_with_key(*wrong_signer.public_key());
+    assert!(
+        generate_report_with_policy(bundle.run_dir(), &html_out, Some(&json_out), &wrong_policy)
+            .is_err(),
+        "wrong public key must fail closed in generate_report_with_policy"
+    );
+
+    let strict_policy = TrustPolicy::strict_with_key(*signer.public_key());
+    generate_report_with_policy(bundle.run_dir(), &html_out, Some(&json_out), &strict_policy)
+        .unwrap();
+
+    let html = fs::read_to_string(&html_out).unwrap();
+    assert!(html.contains("VerifiedStrict"));
+    assert!(html.contains(EXPERIMENTAL_DP_CLASSIFICATION_V1));
+
+    let (loaded, _) = load_report_with_policy(bundle.run_dir(), &strict_policy).unwrap();
+    assert!(matches!(
+        loaded.verification_status,
+        VerificationStatus::VerifiedStrict { .. }
+    ));
+    assert_eq!(
+        loaded.dp_accounting_classification.as_deref(),
+        Some(EXPERIMENTAL_DP_CLASSIFICATION_V1)
     );
 
     let _ = fs::remove_dir_all(&base);

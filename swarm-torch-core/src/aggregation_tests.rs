@@ -589,6 +589,7 @@ fn centered_clipping_validates_hyperparameters_and_handles_zero_norm_and_outlier
     assert!((res[1] - 1.0).abs() < 0.2);
 }
 
+#[cfg(all(feature = "krum", feature = "bulyan"))]
 #[test]
 fn s_bucketing_enforces_uniform_weights_arrival_order_invariance_and_conservative_quorum() {
     let seed = [0x42u8; 32];
@@ -644,6 +645,7 @@ fn s_bucketing_enforces_uniform_weights_arrival_order_invariance_and_conservativ
     assert_eq!(bulyan_err, Error::InsufficientPeers);
 }
 
+#[cfg(feature = "krum")]
 #[test]
 fn shared_seed_sparse_subspace_aggregation_matches_full_space_and_verifies_merkle_openings() {
     use crate::compression::derive_verifiable_round_seed_v1;

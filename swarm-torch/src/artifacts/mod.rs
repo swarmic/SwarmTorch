@@ -35,9 +35,10 @@ pub use cas::{
     ROUND_RESUME_STATE_REL_PATH, ROUND_RESUME_STATE_SCHEMA_V1,
 };
 pub use dp_ledger::{
-    append_dp_release_record_durable, derive_dp_receipt_id, pre_release_debit_dp_accountant,
-    read_dp_ledger_entries, reconstruct_dp_accountant_from_ledger, CryptoErrorOrIo,
-    DpLedgerEntryV1, DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1,
+    append_dp_release_record_durable, derive_dp_receipt_id, parse_and_validate_dp_ledger_slice,
+    pre_release_debit_dp_accountant, read_dp_ledger_entries, reconstruct_dp_accountant_from_ledger,
+    reconstruct_dp_accountant_from_verified_bundle, CryptoErrorOrIo, DpLedgerEntryV1,
+    DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1, EXPERIMENTAL_DP_CLASSIFICATION_V1,
 };
 pub use io::{
     DurabilityPolicyV1, MAX_MANIFEST_BYTES, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,

@@ -1508,7 +1508,7 @@ mod tests {
 
         // 2. Genuine seq=1 still accepted directly over StrictOneToOne 1-RTT QUIC!
         let (s_ok, r_ok) = tokio::join!(
-            client_ep.send_frame_1rtt(addr, &valid_bytes),
+            client_ep.send_frame_1rtt(addr.clone(), &valid_bytes),
             server_ep.accept_envelope_over_quic([0x82; 16], &mut replay, 1000, None),
         );
         s_ok.unwrap();
@@ -1516,6 +1516,53 @@ mod tests {
         assert!(!accepted.binding().relayed_via_intermediary());
         assert_eq!(accepted.binding().originator_peer_id(), origin_kp.peer_id());
         assert_eq!(accepted.envelope.payload, vec![9, 8, 7]);
+
+        // 3. After idle window expiry (`t = 1200 > 1000 + 120`) and record reclamation,
+        //    replaying seq=1 with a fresh timestamp over live 1-RTT QUIC MUST fail closed (`AR-14-05`, `14C-1`),
+        //    while advancing to seq=2 succeeds!
+        assert_eq!(replay.reclaim_expired(1200), 1);
+        let mut replay_after_idle = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![9, 8, 7],
+        );
+        replay_after_idle.sequence = 1;
+        replay_after_idle.timestamp = 1200;
+        let replay_bytes = replay_after_idle
+            .sign_with(&origin_auth)
+            .serialize()
+            .unwrap();
+        let (s_rep, r_rep) = tokio::join!(
+            client_ep.send_frame_1rtt(addr.clone(), &replay_bytes),
+            server_ep.accept_envelope_over_quic([0x83; 16], &mut replay, 1200, None),
+        );
+        s_rep.unwrap();
+        assert!(matches!(r_rep, Err(IrohCarrierError::Envelope(_))));
+
+        let mut next_env = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![4, 5, 6],
+        );
+        next_env.sequence = 2;
+        next_env.timestamp = 1200;
+        let next_bytes = next_env.sign_with(&origin_auth).serialize().unwrap();
+        let (s_next, r_next) = tokio::join!(
+            client_ep.send_frame_1rtt(addr, &next_bytes),
+            server_ep.accept_envelope_over_quic([0x84; 16], &mut replay, 1200, None),
+        );
+        s_next.unwrap();
+        assert_eq!(r_next.unwrap().envelope.sequence, 2);
 
         client_ep.close().await;
         server_ep.close().await;

@@ -629,21 +629,21 @@ impl SwarmTransport for UdpGossipTransport {
 
     fn broadcast<'a>(&'a self, msg: &'a [u8]) -> Self::BroadcastFuture<'a> {
         Box::pin(async move {
-            let targets: Vec<SocketAddr> = self
+            let peers: Vec<PeerId> = self
                 .peers
                 .read()
                 .map_err(|_| Error::TransportUnavailable)?
-                .values()
+                .keys()
                 .copied()
                 .collect();
             let mut stats = BroadcastStats {
-                peers_sent: targets.len(),
+                peers_sent: peers.len(),
                 confirmed: 0,
                 failed: 0,
             };
-            for dest in targets {
-                match self.send_to_addr(dest, msg) {
-                    Ok(_) => stats.confirmed += 1,
+            for peer in peers {
+                match self.send(peer, msg).await {
+                    Ok(()) => stats.confirmed += 1,
                     Err(_) => stats.failed += 1,
                 }
             }

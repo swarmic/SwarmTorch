@@ -5,7 +5,40 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-16 (Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D`)
+## [Unreleased] - 2026-11-17 (Wave 14 Phases `14A`, `14B`, `14C`, & `14D` — Full-Spectrum Wave 13 Audit Remediations `AR-14-01`..`AR-14-09`)
+
+### Replay Hardening, Cryptographic DP Resume, & Verified Reports (`Phase 14A` — `AR-14-05`, `AR-14-01`, `AR-14-02`)
+- **Active-Session Monotonicity Across Idle Windows (`AR-14-05`):**
+  - Updated `ReplayProtection` (`swarm-torch-core::replay`) to persist per-session `high_water_sequence: u64` inside `peer_epochs` and `active_sessions_v2` so sequence numbers can never regress (`TooOld`) or replay (`Replay`) after sliding-window expiry (`> max_clock_skew_secs`) and record reclamation within the same `(session_epoch, session_id)`.
+  - Fixed `commit_v1_unchecked` and `commit_v2_unchecked` to prune expired sessions at `current_time` rather than packet `timestamp`, enforced session-map capacity during read-only preflight (`check_v*_admission_readonly`) and recovery handshakes, and enforced `check_timestamp_only` in `validate_sequence_scoped_at`.
+- **Cryptographic DP Accountant Resume & Crash-Consistent NDJSON Prefix Verification (`AR-14-01`):**
+  - Added `dp_profile: Option<DpMechanismProfileV1>` to `CoordinatorResumeStateV2` (`swarm-torch::artifacts::cas`), `parse_and_validate_dp_ledger_slice` + `reconstruct_dp_accountant_from_verified_bundle` (`dp_ledger.rs`), and automatic `dp_accountant` reconstruction in `SwarmRoundCoordinator::resume_exact_training_state` (`coordinator.rs`), failing closed if `dp/ledger.ndjson` exists on disk while `dp_accountant` is unconfigured.
+  - Unified `RunArtifactBundle::verify_committed_head` (`bundle.rs`) to verify committed `.ndjson` prefixes (`&bytes[..entry.bytes]`) against the signed checkpoint manifest across mid-round `AfterCasBeforeManifest` crash recovery while preserving non-refundable pre-release DP debits.
+- **Verified Report Generation & CLI Trust Enforcement (`AR-14-02`):**
+  - Added `verification_status: VerificationStatus` and `dp_accounting_classification: Option<String>` to `Report`, added `generate_report_with_policy` / `generate_report_html_with_policy` (`swarm-torch::report`), and updated `swarm_torch_report` CLI (`src/bin/swarm_torch_report.rs`) to require explicit `--public-key-hex <64-hex>` (`TrustPolicy::Strict`) or `--legacy-permissive-untrusted` (`TrustPolicy::LegacyPermissive`).
+
+### `[W | b]` Backend Layout Alignment & Live 2-Layer ReLU MLP Bridges (`Phase 14B` — `AR-14-07`, `14B-1`, `14B-2`)
+- **In-Memory `[W | b]` Parameter & Gradient Alignment (`AR-14-07`):**
+  - Aligned `ReferenceLinearModule`, `BurnLinearBridgeV1`, and `CandleLinearBridgeV1` (`adapters/swarm-torch-backends`) in-memory `SwarmModel::parameters()`, `load_parameters()`, and `backward_mse()` gradients to canonical `[weight | bias]` (`[W | b]`) order matching `SwarmTorch::LinearModel` (`ModelFlatTensorLayoutV1::for_linear`) 1:1 with zero manual index permutation.
+- **2-Layer ReLU MLP Bridges (`BurnMlpBridgeV1` & `CandleMlpBridgeV1`) & Federated Round Parity (`14B-1`, `14B-2`):**
+  - Implemented `BurnMlpBridgeV1` (`burn 0.21.0` `Autodiff<NdArray<f32>>`) and `CandleMlpBridgeV1` (`candle-core`/`candle-nn` `0.10.2`) in canonical `[W_1 | b_1 | W_2 | b_2]` layout matching `SwarmTorch::MlpModel` (`ModelFlatTensorLayoutV1::for_mlp`), verified with cross-framework forward/backward numerical equivalence (`< 1e-5`), SafeTensors checkpoint handoff, and a multi-peer `TrimmedMean` + `RdpAccountantV1` federated training round.
+
+### Non-Blocking Broadcast, TCP Connection Caps, Live Transport Replay Tests, & Adapter CI (`Phase 14C` — `AR-14-09`, `14C-1`, `AR-14-03`)
+- **Async `SwarmTransport::broadcast` & Bounded TCP Active Connections (`AR-14-09`):**
+  - Updated `TcpTransport::broadcast` (`swarm-torch-net::tcp`) and `UdpGossipTransport::broadcast` (`swarm-torch-net::udp`) to await `self.send(peer, msg).await` rather than blocking on `send_sync` or non-awaited `send_to_addr`.
+  - Added `DEFAULT_MAX_ACTIVE_TCP_CONNECTIONS = 256` (`TcpTransport::bind_with_limits` and `TcpFrameReaderState::is_idle`) to evict oldest idle connections at capacity and prevent Slowloris connection growth.
+- **Live `Iroh` & `Zenoh` Post-Idle Sequence Rollback Conformance & Adapter CI (`14C-1`, `AR-14-03`):**
+  - Added post-idle-expiry sequence rollback rejection and monotonic continuation tests over live `Iroh` 1-RTT QUIC (`adapters/swarm-torch-transport-iroh`) and live `Zenoh` TCP pub/sub (`adapters/swarm-torch-transport-zenoh`).
+  - Added the `standalone_adapters` CI job to `.github/workflows/rust.yml` covering all 5 standalone adapters and completed the scheduled Wave 14 `cargo-vet` review in `supply-chain/exemption-rationale.md`.
+
+### Wasm `(start)` Fuel Slice Cap, Bounded NDJSON & `filter_rows` Validation, & MCP Subprocess Conformance (`Phase 14D` — `AR-14-06`, `AR-14-04`, `AR-14-08`)
+- **Wasm `(start)` Instantiation Fuel Slicing (`AR-14-06`):**
+  - Capped initial fuel during `linker.instantiate_and_start` in `adapters/swarm-torch-wasm` to `policy.limits.max_fuel.min(FUEL_SLICE_UNITS)` (`10,000` units) before checking `timeout_ms` and refilling the remaining budget for resumable export execution.
+- **Bounded NDJSON Parsing, Strict `filter_rows` Validation, & MCP Child-Process Test (`AR-14-04`, `AR-14-08`):**
+  - Wired `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) to `parse_and_validate_dp_ledger_slice` and added an OS child-process (`std::process::Command` stdio pipe) JSON-RPC conformance test in `adapters/swarm-torch-mcp` (promoting `swarm-torch-mcp` to **`Integration verified`**).
+  - Enforced `MAX_NDJSON_LINE_BYTES` / `MAX_NDJSON_LINES` in `NativeOpRunner::parse_ndjson_rows` and fail-closed validation on partial `column`/`value` pairs or unknown `op` strings in `NativeOpRunner::physical_filter_rows` (`swarm-torch::native_runner`).
+
+## [0.3.0-alpha.13] - 2026-11-16 (Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D`)
 
 ### External Integrations, `wasmi` Sandbox, & Cross-Framework Parity (`Phase 13D` — `ST-08`, `ST-09`)
 - **Isolated `wasmi 2.0.0` Extension Sandbox & Bespoke VM Retirement (`ST-09`, `13D-1`):**

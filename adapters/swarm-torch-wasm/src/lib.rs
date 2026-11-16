@@ -230,8 +230,9 @@ fn prepare_instance(
 
     let mut store = Store::new(&engine, store_limits);
     store.limiter(|limits| limits);
+    let start_fuel_cap = policy.limits.max_fuel.min(FUEL_SLICE_UNITS);
     store
-        .set_fuel(policy.limits.max_fuel)
+        .set_fuel(start_fuel_cap)
         .map_err(|err| WasmSandboxError::ExecutionTrap(err.to_string()))?;
 
     let linker = Linker::<StoreLimits>::new(&engine);
@@ -240,6 +241,12 @@ fn prepare_instance(
         .map_err(|err| map_instantiation_error(err, policy))?;
 
     check_timeout(started_at, policy.limits.timeout_ms)?;
+    let unspent_start_fuel = store.get_fuel().unwrap_or(0);
+    let start_consumed = start_fuel_cap.saturating_sub(unspent_start_fuel);
+    let remaining_after_start = policy.limits.max_fuel.saturating_sub(start_consumed);
+    store
+        .set_fuel(remaining_after_start)
+        .map_err(|err| WasmSandboxError::ExecutionTrap(err.to_string()))?;
 
     Ok(PreparedModule {
         module_sha256,
@@ -1036,5 +1043,42 @@ mod tests {
 
         drop(session);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn wasm_start_section_loop_is_capped_at_fuel_slice_units() {
+        let mut start_loop = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut start_loop, 1, &[2, 0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut start_loop, 3, &[2, 0, 1]);
+        let mut sec7 = vec![1];
+        push_name(&mut sec7, "run");
+        sec7.push(0x00);
+        sec7.push(0x01);
+        push_section(&mut start_loop, 7, &sec7);
+        push_section(&mut start_loop, 8, &[0]);
+        let body0 = [0x00u8, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b];
+        let body1 = [0x00u8, 0x20, 0x00, 0x0b];
+        let mut sec10 = vec![2];
+        push_leb_u32(&mut sec10, body0.len() as u32);
+        sec10.extend_from_slice(&body0);
+        push_leb_u32(&mut sec10, body1.len() as u32);
+        sec10.extend_from_slice(&body1);
+        push_section(&mut start_loop, 10, &sec10);
+
+        let mut policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&start_loop),
+        );
+        policy.limits.max_fuel = 10_000_000;
+        policy.limits.timeout_ms = 50;
+
+        let started = Instant::now();
+        let err = WasmiExtensionExecutorV1::new()
+            .execute_scalar_i32(&policy, &start_loop, "run", 7)
+            .unwrap_err();
+        assert!(
+            matches!(err, WasmSandboxError::OutOfFuel { .. }),
+            "expected OutOfFuel on start loop, got {err:?}"
+        );
+        assert!(started.elapsed().as_millis() < 500);
     }
 }

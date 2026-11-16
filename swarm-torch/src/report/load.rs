@@ -11,8 +11,9 @@ use swarm_torch_core::observe::{EventRecord, MetricRecord, SpanRecord};
 use swarm_torch_core::run_graph::GraphV1;
 
 use crate::artifacts::{
-    hex_lower, parse_json_slice, parse_ndjson_slice_bounded, RunArtifactBundle, TrustPolicy,
-    VerifiedBundleV1, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES,
+    hex_lower, parse_and_validate_dp_ledger_slice, parse_json_slice, parse_ndjson_slice_bounded,
+    RunArtifactBundle, TrustPolicy, VerifiedBundleV1, DP_LEDGER_REL_PATH, MAX_NDJSON_LINES,
+    MAX_NDJSON_LINE_BYTES,
 };
 
 use super::model::Report;
@@ -151,9 +152,19 @@ pub fn load_report_from_verified(
         .collect();
     materializations.sort_by_key(|m| (m.ts_unix_nanos, m.record_seq));
 
+    let dp_accounting_classification = match verified.get_bytes(DP_LEDGER_REL_PATH) {
+        Some(bytes) => {
+            let entries = parse_and_validate_dp_ledger_slice(bytes)?;
+            entries.last().map(|e| e.accounting_classification.clone())
+        }
+        None => None,
+    };
+
     Ok((
         Report {
             run_dir: verified.run_dir().to_path_buf(),
+            verification_status: verified.status(),
+            dp_accounting_classification,
             graph,
             registry,
             lineage,

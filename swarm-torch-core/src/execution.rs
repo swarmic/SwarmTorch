@@ -111,6 +111,8 @@ impl ExecutionPolicy for PermissivePolicy {
 mod tests {
     use super::*;
     use crate::run_graph::{CanonParams, NodeV1, OpKind};
+    use alloc::string::ToString;
+    use alloc::vec;
 
     fn test_node(trust: ExecutionTrust) -> NodeV1 {
         NodeV1 {

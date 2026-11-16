@@ -169,3 +169,39 @@ jobs:
 
       - name: Check Embassy runtime alloc no_std (thumbv7em)
         run: cargo check -p swarm-torch-runtime --target thumbv7em-none-eabihf --no-default-features --features "alloc,embassy" --locked
+
+  standalone_adapters:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Conformance (adapters/swarm-torch-wasm)
+        run: |
+          cargo clippy --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --locked
+
+      - name: Conformance (adapters/swarm-torch-mcp)
+        run: |
+          cargo clippy --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-mcp/Cargo.toml --locked
+
+      - name: Conformance (adapters/swarm-torch-transport-iroh)
+        run: |
+          cargo clippy --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-features --locked
+
+      - name: Conformance (adapters/swarm-torch-transport-zenoh)
+        run: |
+          cargo clippy --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-features --locked
+
+      - name: Conformance (adapters/swarm-torch-backends real-burn + real-candle)
+        run: |
+          cargo clippy --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --features "real-burn,real-candle" --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --features "real-burn,real-candle" --locked

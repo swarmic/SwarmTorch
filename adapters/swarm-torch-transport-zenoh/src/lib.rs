@@ -759,6 +759,55 @@ mod tests {
         assert_eq!(g_topic.round_id, 9);
         assert_eq!(accepted_gossip.wrapper.delivery_seq, 2);
 
+        // 4. After idle window expiry (`t = 1200 > 1000 + 120`) and record reclamation,
+        //    attempting sequence rollback `seq = 1 < 2` with a fresh timestamp over live Zenoh pub/sub
+        //    MUST fail closed (`AR-14-05`, `14C-1`), while `seq = 3 > 2` succeeds!
+        assert_eq!(replay.reclaim_expired(1200), 1);
+        let rollback_env = MessageEnvelope::new_v2(
+            *orig_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            5,
+            MessageType::GradientUpdate,
+            vec![1, 1, 1],
+        )
+        .with_sequence(1)
+        .with_timestamp(1200)
+        .sign_with(&orig_auth);
+        bridge_pub.publish_envelope(&rollback_env).await.unwrap();
+        let rollback_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope(&mut replay, 1200),
+        )
+        .await
+        .unwrap();
+        assert!(rollback_res.is_err());
+
+        let monotonic_env = MessageEnvelope::new_v2(
+            *orig_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            5,
+            MessageType::GradientUpdate,
+            vec![3, 3, 3],
+        )
+        .with_sequence(3)
+        .with_timestamp(1200)
+        .sign_with(&orig_auth);
+        bridge_pub.publish_envelope(&monotonic_env).await.unwrap();
+        let (_, accepted_after_idle) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope(&mut replay, 1200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepted_after_idle.sequence, 3);
+
         drop(sub);
         bridge_pub.close().await.unwrap();
         bridge_sub.close().await.unwrap();

@@ -3,17 +3,29 @@ use std::fs;
 
 use swarm_torch_core::run_graph::{GraphV1, NodeId};
 
-use super::load::load_report;
+use super::load::{load_report, load_report_with_policy};
 use super::model::{
     build_registry_trust_index, format_transform_names, format_unsafe_reasons,
     is_node_unsafe_with_index, Report,
 };
+use crate::artifacts::{hex_lower, TrustPolicy, VerificationStatus};
 
 pub fn generate_report_html(
     run_dir: impl AsRef<std::path::Path>,
     out_path: impl AsRef<std::path::Path>,
 ) -> std::io::Result<()> {
     let report = load_report(run_dir)?;
+    let html = render_html(&report);
+    fs::write(out_path, html)
+}
+
+/// Generate HTML report enforcing the caller-supplied [`TrustPolicy`] (`AR-14-02`).
+pub fn generate_report_html_with_policy(
+    run_dir: impl AsRef<std::path::Path>,
+    out_path: impl AsRef<std::path::Path>,
+    policy: &TrustPolicy,
+) -> std::io::Result<()> {
+    let (report, _) = load_report_with_policy(run_dir, policy)?;
     let html = render_html(&report);
     fs::write(out_path, html)
 }
@@ -26,7 +38,17 @@ pub fn generate_report(
     html_out: impl AsRef<std::path::Path>,
     json_out: Option<impl AsRef<std::path::Path>>,
 ) -> std::io::Result<()> {
-    let report = load_report(&run_dir)?;
+    generate_report_with_policy(run_dir, html_out, json_out, &TrustPolicy::LegacyPermissive)
+}
+
+/// Generate HTML (and optional JSON) report enforcing the caller-supplied [`TrustPolicy`] (`AR-14-02`).
+pub fn generate_report_with_policy(
+    run_dir: impl AsRef<std::path::Path>,
+    html_out: impl AsRef<std::path::Path>,
+    json_out: Option<impl AsRef<std::path::Path>>,
+    policy: &TrustPolicy,
+) -> std::io::Result<()> {
+    let (report, _) = load_report_with_policy(&run_dir, policy)?;
     let html = render_html(&report);
     fs::write(&html_out, html)?;
 
@@ -259,6 +281,28 @@ pub(crate) fn render_html(report: &Report) -> String {
         "<p><strong>Run dir:</strong> <code>{}</code></p>",
         escape_html(&report.run_dir.display().to_string())
     ));
+
+    match report.verification_status {
+        VerificationStatus::VerifiedStrict {
+            signer_public_key,
+            signed_unix_nanos,
+        } => {
+            html.push_str(&format!(
+                "<div class=\"ok\"><strong>Bundle verification:</strong> VerifiedStrict (signer=<code>{}</code>, signed_unix_nanos=<code>{signed_unix_nanos}</code>)</div>",
+                hex_lower(&signer_public_key)
+            ));
+        }
+        VerificationStatus::UnverifiedLegacyPermissive => {
+            html.push_str("<div class=\"warn\"><strong>Bundle verification:</strong> UnverifiedLegacyPermissive (no external Ed25519 trust anchor verified)</div>");
+        }
+    }
+
+    if let Some(ref dp_cls) = report.dp_accounting_classification {
+        html.push_str(&format!(
+            "<p><strong>DP accounting classification:</strong> <code>{}</code> (guarantees_differential_privacy=<code>false</code>)</p>",
+            escape_html(dp_cls)
+        ));
+    }
 
     if unsafe_nodes.is_empty() && unsafe_datasets.is_empty() && unsafe_materializations.is_empty() {
         html.push_str("<div class=\"ok\"><strong>Unsafe surfaces:</strong> none detected in the current artifacts.</div>");

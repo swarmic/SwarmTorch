@@ -14,7 +14,10 @@ pub use load::{
     load_report_with_warnings, LoadWarning,
 };
 pub use model::{is_node_unsafe, Report};
-pub use render::{generate_report, generate_report_html};
+pub use render::{
+    generate_report, generate_report_html, generate_report_html_with_policy,
+    generate_report_with_policy,
+};
 
 #[cfg(test)]
 mod tests;

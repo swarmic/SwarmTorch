@@ -266,9 +266,11 @@ impl core::fmt::Display for ReplayConfigError {
 impl std::error::Error for ReplayConfigError {}
 
 #[cfg(feature = "alloc")]
+type SessionScopeV1Entry = (SessionEpoch, u64, u64);
+#[cfg(feature = "alloc")]
 type SessionScopeV2Key = (SwarmInstanceId, [u8; 16], PeerId);
 #[cfg(feature = "alloc")]
-type ActiveSessionV2Entry = (SessionEpoch, [u8; 32], u64);
+type ActiveSessionV2Entry = (SessionEpoch, [u8; 32], u64, u64);
 
 /// Safe expiry-indexed replay protection state (`ADR-0008`, `ADR-0021`, `W9-02`, `ST-03`).
 #[derive(Debug)]
@@ -278,9 +280,9 @@ pub struct ReplayProtection {
     records: BTreeMap<ReplayRecordKey, PeerReplayState>,
     /// Scoped v2 replay state keyed by `(SwarmInstanceId, RunId, PeerId, SessionEpoch, SessionId)`.
     records_v2: BTreeMap<ReplayRecordKeyV2, PeerReplayState>,
-    /// Active v1 session epoch and latest expiry deadline per `(SwarmInstanceId, PeerId)`.
-    peer_epochs: BTreeMap<(SwarmInstanceId, PeerId), (SessionEpoch, u64)>,
-    /// Active receiver-bound v2 session `(SessionEpoch, SessionId, expires_at)` per `(SwarmInstanceId, RunId, PeerId)`.
+    /// Active v1 session `(SessionEpoch, expires_at, high_water_sequence)` per `(SwarmInstanceId, PeerId)`.
+    peer_epochs: BTreeMap<(SwarmInstanceId, PeerId), SessionScopeV1Entry>,
+    /// Active receiver-bound v2 session `(SessionEpoch, SessionId, expires_at, high_water_sequence)` per `(SwarmInstanceId, RunId, PeerId)`.
     active_sessions_v2: BTreeMap<SessionScopeV2Key, ActiveSessionV2Entry>,
     /// Secondary expiry index `(expires_at_secs, key)` for $O(\log N)$ post-window reclamation.
     expiry_index: BTreeMap<(u64, ReplayRecordKey), ()>,
@@ -488,7 +490,7 @@ impl ReplayProtection {
     /// currently established for `(swarm_instance_id, peer)`.
     pub fn check_epoch_continuity(&self, key: &ReplayRecordKey) -> Result<(), ReplayError> {
         match self.peer_epochs.get(&(key.swarm_instance_id, key.peer)) {
-            Some(&(active_epoch, _)) => {
+            Some(&(active_epoch, _, _)) => {
                 if key.session_epoch < active_epoch {
                     return Err(ReplayError::StaleSessionEpoch {
                         peer: key.peer,
@@ -527,7 +529,7 @@ impl ReplayProtection {
             .active_sessions_v2
             .get(&(key.swarm_instance_id, key.run_id, key.peer))
         {
-            Some(&(active_epoch, active_session_id, _)) => {
+            Some(&(active_epoch, active_session_id, _, _)) => {
                 if key.session_epoch < active_epoch {
                     return Err(ReplayError::StaleSessionEpoch {
                         peer: key.peer,
@@ -569,7 +571,47 @@ impl ReplayProtection {
     ) -> Option<(SessionEpoch, [u8; 32])> {
         self.active_sessions_v2
             .get(&(swarm_instance_id, run_id, *peer))
-            .map(|&(epoch, sid, _)| (epoch, sid))
+            .map(|&(epoch, sid, _, _)| (epoch, sid))
+    }
+
+    fn check_post_expiry_sequence(
+        seq: u64,
+        high_water_sequence: u64,
+        peer: PeerId,
+    ) -> Result<(), ReplayError> {
+        if seq == high_water_sequence {
+            return Err(ReplayError::Replay { peer, seq });
+        }
+        if seq < high_water_sequence {
+            return Err(ReplayError::TooOld {
+                peer,
+                seq,
+                last_seen: high_water_sequence,
+            });
+        }
+        Ok(())
+    }
+
+    fn has_prunable_v1_session(&self, cutoff_u64: u64) -> bool {
+        self.peer_epochs
+            .iter()
+            .any(|(&(swarm_id, peer), &(epoch, exp, _))| {
+                exp < cutoff_u64
+                    || !self
+                        .records
+                        .contains_key(&ReplayRecordKey::new(swarm_id, peer, epoch))
+            })
+    }
+
+    fn has_prunable_v2_session(&self, cutoff_u64: u64) -> bool {
+        self.active_sessions_v2
+            .iter()
+            .any(|(&(swarm_id, run_id, peer), &(epoch, sid, exp, _))| {
+                exp < cutoff_u64
+                    || !self
+                        .records_v2
+                        .contains_key(&ReplayRecordKeyV2::new(swarm_id, run_id, peer, epoch, sid))
+            })
     }
 
     fn total_records(&self) -> usize {
@@ -591,10 +633,10 @@ impl ReplayProtection {
         v1.saturating_add(v2)
     }
 
-    /// Read-only preflight for v1 records (`ST-01`, `ST-03`).
+    /// Read-only preflight for v1 records (`ST-01`, `ST-03`, `AR-14-05`).
     ///
-    /// Performs ALL authorization, timestamp, floor, epoch/policy, sequence window, and
-    /// capacity checks without mutating any state.
+    /// Performs ALL authorization, timestamp, floor, epoch/policy, sequence window, post-expiry
+    /// session monotonicity, and capacity checks without mutating any state.
     pub fn check_v1_admission_readonly(
         &self,
         key: &ReplayRecordKey,
@@ -617,6 +659,7 @@ impl ReplayProtection {
         self.check_peer_authorized(&key.peer)?;
         self.check_epoch_continuity(key)?;
 
+        let epoch_key = (key.swarm_instance_id, key.peer);
         let now_u64 = current_time as u64;
         if let Some(state) = self.records.get(key) {
             if state.expires_at >= now_u64 {
@@ -628,12 +671,31 @@ impl ReplayProtection {
                     current_time,
                 });
             }
+            if state.recent_sequences.contains(&seq) {
+                return Err(ReplayError::Replay {
+                    peer: key.peer,
+                    seq,
+                });
+            }
+            Self::check_post_expiry_sequence(seq, state.last_sequence, key.peer)?;
+        } else if let Some(&(active_epoch, _, high_water_seq)) = self.peer_epochs.get(&epoch_key) {
+            if active_epoch == key.session_epoch {
+                Self::check_post_expiry_sequence(seq, high_water_seq, key.peer)?;
+            }
         }
 
         let projected_used = self
             .total_records()
             .saturating_sub(self.count_expired(current_time));
         if projected_used >= self.capacity {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
+        if !self.peer_epochs.contains_key(&epoch_key)
+            && self.peer_epochs.len() >= self.capacity
+            && !self.has_prunable_v1_session(now_u64)
+        {
             return Err(ReplayError::CacheFull {
                 capacity: self.capacity,
             });
@@ -647,10 +709,10 @@ impl ReplayProtection {
         })
     }
 
-    /// Read-only preflight for session-id-bound v2 records (`ST-01`, `ST-03`).
+    /// Read-only preflight for session-id-bound v2 records (`ST-01`, `ST-03`, `AR-14-05`).
     ///
     /// Performs ALL authorization, timestamp, floor, session continuity, `session_id`, sequence
-    /// window, and capacity checks without mutating any state.
+    /// window, post-expiry session monotonicity, and capacity checks without mutating any state.
     pub fn check_v2_admission_readonly(
         &self,
         key: &ReplayRecordKeyV2,
@@ -662,6 +724,7 @@ impl ReplayProtection {
         self.check_peer_authorized(&key.peer)?;
         self.check_v2_session_continuity(key)?;
 
+        let session_map_key = (key.swarm_instance_id, key.run_id, key.peer);
         let now_u64 = current_time as u64;
         if let Some(state) = self.records_v2.get(key) {
             if state.expires_at >= now_u64 {
@@ -673,12 +736,33 @@ impl ReplayProtection {
                     current_time,
                 });
             }
+            if state.recent_sequences.contains(&seq) {
+                return Err(ReplayError::Replay {
+                    peer: key.peer,
+                    seq,
+                });
+            }
+            Self::check_post_expiry_sequence(seq, state.last_sequence, key.peer)?;
+        } else if let Some(&(active_epoch, active_sid, _, high_water_seq)) =
+            self.active_sessions_v2.get(&session_map_key)
+        {
+            if active_epoch == key.session_epoch && active_sid == key.session_id {
+                Self::check_post_expiry_sequence(seq, high_water_seq, key.peer)?;
+            }
         }
 
         let projected_used = self
             .total_records()
             .saturating_sub(self.count_expired(current_time));
         if projected_used >= self.capacity {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
+        if !self.active_sessions_v2.contains_key(&session_map_key)
+            && self.active_sessions_v2.len() >= self.capacity
+            && !self.has_prunable_v2_session(now_u64)
+        {
             return Err(ReplayError::CacheFull {
                 capacity: self.capacity,
             });
@@ -706,14 +790,28 @@ impl ReplayProtection {
                 self.check_peer_authorized(&key.peer)?;
                 self.check_epoch_continuity(&key)?;
                 self.reclaim_expired(prepared.current_time);
-                self.commit_v1_unchecked(&key, prepared.sequence, prepared.timestamp, tw, skew)
+                self.commit_v1_unchecked(
+                    &key,
+                    prepared.sequence,
+                    prepared.timestamp,
+                    prepared.current_time,
+                    tw,
+                    skew,
+                )
             }
             PreparedReplayKey::V2(key) => {
                 self.check_timestamp_only(prepared.timestamp, prepared.current_time)?;
                 self.check_peer_authorized(&key.peer)?;
                 self.check_v2_session_continuity(&key)?;
                 self.reclaim_expired(prepared.current_time);
-                self.commit_v2_unchecked(&key, prepared.sequence, prepared.timestamp, tw, skew)
+                self.commit_v2_unchecked(
+                    &key,
+                    prepared.sequence,
+                    prepared.timestamp,
+                    prepared.current_time,
+                    tw,
+                    skew,
+                )
             }
         }
     }
@@ -723,6 +821,7 @@ impl ReplayProtection {
         key: &ReplayRecordKey,
         seq: u64,
         timestamp: u32,
+        current_time: u32,
         tw: usize,
         skew: u32,
     ) -> Result<(), ReplayError> {
@@ -737,9 +836,16 @@ impl ReplayProtection {
             }
             self.peer_epochs.insert(
                 (key.swarm_instance_id, key.peer),
-                (key.session_epoch, state.expires_at),
+                (key.session_epoch, state.expires_at, state.last_sequence),
             );
             return Ok(());
+        }
+
+        let epoch_key = (key.swarm_instance_id, key.peer);
+        if let Some(&(active_epoch, _, high_water_seq)) = self.peer_epochs.get(&epoch_key) {
+            if active_epoch == key.session_epoch {
+                Self::check_post_expiry_sequence(seq, high_water_seq, key.peer)?;
+            }
         }
 
         if self.total_records() >= self.capacity {
@@ -748,16 +854,20 @@ impl ReplayProtection {
             });
         }
 
-        let epoch_key = (key.swarm_instance_id, key.peer);
         if self.peer_epochs.len() >= self.capacity && !self.peer_epochs.contains_key(&epoch_key) {
-            self.prune_oldest_expired_v1_session(timestamp as u64);
+            self.prune_oldest_expired_v1_session(current_time as u64);
+            if self.peer_epochs.len() >= self.capacity {
+                return Err(ReplayError::CacheFull {
+                    capacity: self.capacity,
+                });
+            }
         }
 
         let state = PeerReplayState::new(seq, timestamp, skew);
         let expires_at = state.expires_at;
         self.records.insert(*key, state);
         self.peer_epochs
-            .insert(epoch_key, (key.session_epoch, expires_at));
+            .insert(epoch_key, (key.session_epoch, expires_at, seq));
         self.expiry_index.insert((expires_at, *key), ());
         Ok(())
     }
@@ -767,6 +877,7 @@ impl ReplayProtection {
         key: &ReplayRecordKeyV2,
         seq: u64,
         timestamp: u32,
+        current_time: u32,
         tw: usize,
         skew: u32,
     ) -> Result<(), ReplayError> {
@@ -782,9 +893,22 @@ impl ReplayProtection {
             }
             self.active_sessions_v2.insert(
                 session_map_key,
-                (key.session_epoch, key.session_id, state.expires_at),
+                (
+                    key.session_epoch,
+                    key.session_id,
+                    state.expires_at,
+                    state.last_sequence,
+                ),
             );
             return Ok(());
+        }
+
+        if let Some(&(active_epoch, active_sid, _, high_water_seq)) =
+            self.active_sessions_v2.get(&session_map_key)
+        {
+            if active_epoch == key.session_epoch && active_sid == key.session_id {
+                Self::check_post_expiry_sequence(seq, high_water_seq, key.peer)?;
+            }
         }
 
         if self.total_records() >= self.capacity {
@@ -796,7 +920,12 @@ impl ReplayProtection {
         if self.active_sessions_v2.len() >= self.capacity
             && !self.active_sessions_v2.contains_key(&session_map_key)
         {
-            self.prune_oldest_expired_v2_session(timestamp as u64);
+            self.prune_oldest_expired_v2_session(current_time as u64);
+            if self.active_sessions_v2.len() >= self.capacity {
+                return Err(ReplayError::CacheFull {
+                    capacity: self.capacity,
+                });
+            }
         }
 
         let state = PeerReplayState::new(seq, timestamp, skew);
@@ -804,7 +933,7 @@ impl ReplayProtection {
         self.records_v2.insert(*key, state);
         self.active_sessions_v2.insert(
             session_map_key,
-            (key.session_epoch, key.session_id, expires_at),
+            (key.session_epoch, key.session_id, expires_at, seq),
         );
         self.expiry_index_v2.insert((expires_at, *key), ());
         Ok(())
@@ -814,13 +943,13 @@ impl ReplayProtection {
         let victim = self
             .peer_epochs
             .iter()
-            .filter(|(&(swarm_id, peer), &(epoch, exp))| {
+            .filter(|(&(swarm_id, peer), &(epoch, exp, _))| {
                 exp < cutoff_u64
-                    && !self
+                    || !self
                         .records
                         .contains_key(&ReplayRecordKey::new(swarm_id, peer, epoch))
             })
-            .min_by_key(|(_, &(_, exp))| exp)
+            .min_by_key(|(_, &(_, exp, _))| exp)
             .map(|(&k, _)| k);
         if let Some(k) = victim {
             self.peer_epochs.remove(&k);
@@ -831,13 +960,13 @@ impl ReplayProtection {
         let victim = self
             .active_sessions_v2
             .iter()
-            .filter(|(&(swarm_id, run_id, peer), &(epoch, sid, exp))| {
+            .filter(|(&(swarm_id, run_id, peer), &(epoch, sid, exp, _))| {
                 exp < cutoff_u64
-                    && !self
+                    || !self
                         .records_v2
                         .contains_key(&ReplayRecordKeyV2::new(swarm_id, run_id, peer, epoch, sid))
             })
-            .min_by_key(|(_, &(_, _, exp))| exp)
+            .min_by_key(|(_, &(_, _, exp, _))| exp)
             .map(|(&k, _)| k);
         if let Some(k) = victim {
             self.active_sessions_v2.remove(&k);
@@ -879,11 +1008,7 @@ impl ReplayProtection {
         timestamp: u32,
         current_time: u32,
     ) -> Result<(), ReplayError> {
-        let prepared = self.check_v1_sequence_readonly_inner(key, seq, timestamp, current_time)?;
-        self.reclaim_expired(prepared.current_time);
-        let tw = self.tolerance_window;
-        let skew = self.max_clock_skew_secs;
-        self.commit_v1_unchecked(key, prepared.sequence, prepared.timestamp, tw, skew)
+        self.validate_scoped(key, seq, timestamp, current_time)
     }
 
     /// Validate sequence number and update state (default single-swarm scope).
@@ -937,7 +1062,7 @@ impl ReplayProtection {
         if challenge.challenge_nonce == [0u8; 32] {
             return Err(ReplayError::HandshakeVerificationFailed);
         }
-        if let Some(&(active_epoch, _)) = self
+        if let Some(&(active_epoch, _, _)) = self
             .peer_epochs
             .get(&(challenge.swarm_instance_id, challenge.sender_peer))
         {
@@ -975,7 +1100,7 @@ impl ReplayProtection {
             challenge.run_id,
             challenge.sender_peer,
         );
-        if let Some(&(active_epoch, _, _)) = self.active_sessions_v2.get(&session_key) {
+        if let Some(&(active_epoch, _, _, _)) = self.active_sessions_v2.get(&session_key) {
             if challenge.requested_epoch <= active_epoch {
                 return Err(ReplayError::StaleSessionEpoch {
                     peer: challenge.sender_peer,
@@ -1021,7 +1146,7 @@ impl ReplayProtection {
         self.check_timestamp_floor(current_time)?;
 
         let existing_epoch = self.peer_epochs.get(&challenge_key).copied();
-        if let Some((active_epoch, _)) = existing_epoch {
+        if let Some((active_epoch, _, _)) = existing_epoch {
             if challenge.requested_epoch <= active_epoch {
                 return Err(ReplayError::StaleSessionEpoch {
                     peer: sender_peer,
@@ -1037,7 +1162,7 @@ impl ReplayProtection {
         // Dry-run capacity BEFORE mutating pending_challenges, peer_epochs, or records.
         let now_u64 = current_time as u64;
         let expired_count = self.count_expired(current_time);
-        let superseded_live_slot = if let Some((old_epoch, _)) = existing_epoch {
+        let superseded_live_slot = if let Some((old_epoch, _, _)) = existing_epoch {
             let old_key = ReplayRecordKey::new(swarm_instance_id, sender_peer, old_epoch);
             match self.records.get(&old_key) {
                 Some(old_state) if old_state.expires_at >= now_u64 => 1usize,
@@ -1055,12 +1180,20 @@ impl ReplayProtection {
                 capacity: self.capacity,
             });
         }
+        if existing_epoch.is_none()
+            && self.peer_epochs.len() >= self.capacity
+            && !self.has_prunable_v1_session(now_u64)
+        {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
 
         // All validations and capacity checks passed — commit atomically.
         self.pending_challenges.remove(&challenge_key);
         self.reclaim_expired(current_time);
 
-        if let Some((old_epoch, _)) = existing_epoch {
+        if let Some((old_epoch, _, _)) = existing_epoch {
             let old_key = ReplayRecordKey::new(swarm_instance_id, sender_peer, old_epoch);
             if let Some(old_state) = self.records.remove(&old_key) {
                 self.expiry_index.remove(&(old_state.expires_at, old_key));
@@ -1081,8 +1214,14 @@ impl ReplayProtection {
         );
         let expires_at = state.expires_at;
         self.records.insert(new_key, state);
-        self.peer_epochs
-            .insert(challenge_key, (challenge.requested_epoch, expires_at));
+        self.peer_epochs.insert(
+            challenge_key,
+            (
+                challenge.requested_epoch,
+                expires_at,
+                challenge.initial_sequence,
+            ),
+        );
         self.expiry_index.insert((expires_at, new_key), ());
         Ok(new_key)
     }
@@ -1114,7 +1253,7 @@ impl ReplayProtection {
         self.check_timestamp_floor(current_time)?;
 
         let existing_session = self.active_sessions_v2.get(&session_key).copied();
-        if let Some((active_epoch, _, _)) = existing_session {
+        if let Some((active_epoch, _, _, _)) = existing_session {
             if challenge.requested_epoch <= active_epoch {
                 return Err(ReplayError::StaleSessionEpoch {
                     peer: sender_peer,
@@ -1131,7 +1270,7 @@ impl ReplayProtection {
         // Dry-run capacity BEFORE mutating pending_challenges_v2, active_sessions_v2, or records_v2.
         let now_u64 = current_time as u64;
         let expired_count = self.count_expired(current_time);
-        let superseded_live_slot = if let Some((old_epoch, old_sid, _)) = existing_session {
+        let superseded_live_slot = if let Some((old_epoch, old_sid, _, _)) = existing_session {
             let old_key =
                 ReplayRecordKeyV2::new(swarm_instance_id, run_id, sender_peer, old_epoch, old_sid);
             match self.records_v2.get(&old_key) {
@@ -1150,12 +1289,20 @@ impl ReplayProtection {
                 capacity: self.capacity,
             });
         }
+        if existing_session.is_none()
+            && self.active_sessions_v2.len() >= self.capacity
+            && !self.has_prunable_v2_session(now_u64)
+        {
+            return Err(ReplayError::CacheFull {
+                capacity: self.capacity,
+            });
+        }
 
         // All validations and capacity checks passed — commit atomically.
         self.pending_challenges_v2.remove(&session_key);
         self.reclaim_expired(current_time);
 
-        if let Some((old_epoch, old_sid, _)) = existing_session {
+        if let Some((old_epoch, old_sid, _, _)) = existing_session {
             let old_key =
                 ReplayRecordKeyV2::new(swarm_instance_id, run_id, sender_peer, old_epoch, old_sid);
             if let Some(old_state) = self.records_v2.remove(&old_key) {
@@ -1186,7 +1333,12 @@ impl ReplayProtection {
         self.records_v2.insert(new_key, state);
         self.active_sessions_v2.insert(
             session_key,
-            (challenge.requested_epoch, session_id, expires_at),
+            (
+                challenge.requested_epoch,
+                session_id,
+                expires_at,
+                challenge.initial_sequence,
+            ),
         );
         self.expiry_index_v2.insert((expires_at, new_key), ());
         Ok(new_key)

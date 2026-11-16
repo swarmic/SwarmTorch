@@ -851,3 +851,115 @@ fn timestamp_floor_and_readonly_preflight_enforce_bounds_without_mutation() {
         }
     );
 }
+
+#[test]
+fn active_session_rejects_sequence_rollback_and_replay_after_idle_window_expiry() {
+    let swarm_id = [0x44u8; 16];
+    let run_id = [0x55u8; 16];
+    let policy_digest = [0x66u8; 32];
+    let receiver_kp = KeyPair::from_seed([80u8; 32]).unwrap();
+    let sender_kp = KeyPair::from_seed([81u8; 32]).unwrap();
+    let sender_auth = MessageAuth::new(sender_kp.clone());
+    let sender_peer = sender_kp.peer_id();
+    let mut guard = ReplayProtection::try_with_config(8, 60).unwrap();
+
+    let ch = SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer,
+        requested_epoch: 1,
+        initial_sequence: 10,
+        receiver_nonce: [0xABu8; 32],
+        issued_at_secs: 1_000,
+    };
+    guard.register_recovery_challenge_v2(ch).unwrap();
+    let hs_sig = sender_auth.sign_session_handshake_v2(&ch).unwrap();
+    let v2_key = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, sender_kp.public_key(), &hs_sig, 1_000)
+        .unwrap();
+    assert!(guard
+        .validate_session_v2_at(&v2_key, 50, 1_000, 1_000)
+        .is_ok());
+
+    // Advance past idle expiry (`1_100 > 1_060`) BEFORE `reclaim_expired` runs:
+    assert_eq!(
+        guard
+            .check_v2_admission_readonly(&v2_key, 50, 1_100, 1_100)
+            .unwrap_err(),
+        ReplayError::Replay {
+            peer: sender_peer,
+            seq: 50,
+        }
+    );
+    assert_eq!(
+        guard
+            .check_v2_admission_readonly(&v2_key, 12, 1_100, 1_100)
+            .unwrap_err(),
+        ReplayError::TooOld {
+            peer: sender_peer,
+            seq: 12,
+            last_seen: 50,
+        }
+    );
+
+    // Explicitly reclaim expired sliding-window records (`cache_size() == 0`), while session remains active:
+    assert_eq!(guard.reclaim_expired(1_100), 1);
+    assert_eq!(guard.cache_size(), 0);
+
+    // Sequence rollback or duplicate at fresh timestamp `1_100` MUST STILL fail closed!
+    assert_eq!(
+        guard.validate_session_v2_at(&v2_key, 50, 1_100, 1_100),
+        Err(ReplayError::Replay {
+            peer: sender_peer,
+            seq: 50,
+        })
+    );
+    assert_eq!(
+        guard.validate_session_v2_at(&v2_key, 1, 1_100, 1_100),
+        Err(ReplayError::TooOld {
+            peer: sender_peer,
+            seq: 1,
+            last_seen: 50,
+        })
+    );
+    assert_eq!(guard.cache_size(), 0);
+
+    // Monotonically advancing sequence `51 > 50` in the same session succeeds cleanly:
+    assert!(guard
+        .validate_session_v2_at(&v2_key, 51, 1_100, 1_100)
+        .is_ok());
+    assert_eq!(guard.cache_size(), 1);
+}
+
+#[test]
+fn session_map_prunes_at_current_time_and_validate_sequence_scoped_at_checks_timestamp() {
+    let mut guard = ReplayProtection::try_with_config(2, 60)
+        .unwrap()
+        .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap);
+    let p1 = make_peer(1);
+    let p2 = make_peer(2);
+    let p3 = make_peer(3);
+
+    assert!(guard.validate(&p1, 10, 1_000, 1_000).is_ok());
+    assert!(guard.validate(&p2, 20, 1_000, 1_000).is_ok());
+
+    // At current_time=1_061, p1 and p2 have expired (`expires_at = 1_060 < 1_061`).
+    // p3 sends a valid message with packet timestamp=1_005 (`1_061 - 1_005 = 56 <= 60`).
+    // Pruning uses `current_time = 1_061` (not packet timestamp `1_005`), so p3 succeeds
+    // and `peer_epochs` stays bounded at `capacity = 2`.
+    assert!(guard.validate(&p3, 1, 1_005, 1_061).is_ok());
+    assert_eq!(guard.cache_size(), 1);
+
+    // `validate_sequence_scoped_at` enforces `check_timestamp_only(timestamp, current_time)`:
+    let key_p3 = ReplayRecordKey::default_for_peer(p3);
+    assert_eq!(
+        guard.validate_sequence_scoped_at(&key_p3, 2, 900, 1_061),
+        Err(ReplayError::Expired {
+            ts: 900,
+            now: 1_061,
+            window: 60,
+        })
+    );
+}

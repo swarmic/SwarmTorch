@@ -11,8 +11,12 @@
 
 use std::sync::Arc;
 
-use swarm_torch::artifacts::{DataOpsSession, OutputSpec, RunArtifactBundle, RunArtifactSink};
+use swarm_torch::artifacts::{
+    DataOpsSession, OutputSpec, RunArtifactBundle, RunArtifactSink, TrustPolicy,
+};
 use swarm_torch::report;
+
+use swarm_torch_core::crypto::KeyPair;
 
 use swarm_torch_core::dataops::{
     DatasetRegistryV1, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
@@ -237,20 +241,44 @@ fn main() {
     println!("    left:  {fp_left}");
     println!("    right: {fp_right}");
 
-    // --- Finalize (writes manifest) ---
-    session.finalize().unwrap();
-    println!("✓ Session finalized (manifest.json written)");
+    // --- Commit & sign manifest with Ed25519 keypair (TrustPolicy::Strict) ---
+    let signer = KeyPair::from_seed([0xCD; 32]).unwrap();
+    let strict_policy = TrustPolicy::Strict {
+        trusted_public_keys: vec![*signer.public_key()],
+        expected_run_id: Some(run_id),
+        min_signed_unix_nanos: None,
+    };
+    let commit_receipt = session.commit_and_close(Some(&signer)).unwrap();
+    assert!(
+        commit_receipt.manifest.signature.is_some(),
+        "manifest must carry Ed25519 signature"
+    );
+    println!(
+        "✓ Session committed, sealed (gen={}), and signed (manifest.json written)",
+        commit_receipt.sealed_generation
+    );
 
-    // --- Generate report ---
+    // --- Generate report enforcing TrustPolicy::Strict ---
     let html_out = base.join("report.html");
     let json_out = base.join("report.json");
-    report::generate_report(sink.bundle().run_dir(), &html_out, Some(&json_out)).unwrap();
-    println!("✓ Report generated:");
+    report::generate_report_with_policy(
+        sink.bundle().run_dir(),
+        &html_out,
+        Some(&json_out),
+        &strict_policy,
+    )
+    .unwrap();
+    println!("✓ Report generated under TrustPolicy::Strict:");
     println!("    HTML: {}", html_out.display());
     println!("    JSON: {}", json_out.display());
 
-    // --- Validate report loads (proves manifest round-trip) ---
-    let loaded = report::load_report(sink.bundle().run_dir()).unwrap();
+    // --- Validate report loads under TrustPolicy::Strict (proves signed manifest round-trip) ---
+    let (loaded, warnings) =
+        report::load_report_with_policy(sink.bundle().run_dir(), &strict_policy).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "strict signed bundle should emit zero warnings: {warnings:?}"
+    );
     assert_eq!(loaded.graph.nodes.len(), 3, "graph should have 3 nodes");
     assert_eq!(
         loaded.registry.datasets.len(),

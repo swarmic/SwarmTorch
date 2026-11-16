@@ -2,15 +2,21 @@
 //! (`ADR-0016`, `ADR-0023` §3.3, `P2-20a`, `W10-02`).
 //!
 //! Evaluates the canonical `schemas/v1/*.schema.json` contracts directly against
-//! JSON and NDJSON values using `serde_json::Value`, preserving exact 64-bit unsigned
-//! integer (`u64`) precision (`serde_json::Number::is_u64()`) without IEEE-754 `f64` coercion.
+//! JSON and NDJSON values using `serde_json::Value`, preserving exact 64-bit integer
+//! (`i64`/`u64`) and finite float ordering without `> 2^53` coercion, Unicode scalar
+//! `minLength`/`maxLength` counts, and linear-time size-bounded `regex` patterns.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io;
 
 use serde_json::Value;
 
 use super::bundle::VerifiedBundleV1;
-use super::io::{MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES};
+use super::io::{cmp_json_numbers, MAX_NDJSON_LINES, MAX_NDJSON_LINE_BYTES};
+
+const MAX_SCHEMA_REGEX_LEN: usize = 4_096;
+const REGEX_COMPILE_SIZE_LIMIT_BYTES: usize = 1 << 20;
 
 /// Expected JSON Schema meta-schema URI for Draft 2020-12.
 pub const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -115,7 +121,8 @@ pub fn validate_json_bytes_against_schema(
             instance_path: "$".to_string(),
             message: format!("malformed JSON: {e}"),
         })?;
-    validate_value_node(&instance, &root_schema, &root_schema, "$")
+    let mut regex_cache = HashMap::new();
+    validate_value_node(&instance, &root_schema, &root_schema, "$", &mut regex_cache)
 }
 
 /// Validate an NDJSON byte slice line-by-line against a JSON Schema 2020-12 line contract.
@@ -124,6 +131,7 @@ pub fn validate_ndjson_bytes_against_schema(
     schema_str: &str,
 ) -> Result<(), SchemaValidationError> {
     let root_schema = parse_and_check_schema_meta(schema_str)?;
+    let mut regex_cache = HashMap::new();
     let mut line_count = 0usize;
     for (idx, raw_line) in ndjson_bytes.split(|&b| b == b'\n').enumerate() {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
@@ -151,7 +159,13 @@ pub fn validate_ndjson_bytes_against_schema(
             instance_path: format!("$[{idx}]"),
             message: format!("malformed NDJSON line: {e}"),
         })?;
-        validate_value_node(&instance, &root_schema, &root_schema, &format!("$[{idx}]"))?;
+        validate_value_node(
+            &instance,
+            &root_schema,
+            &root_schema,
+            &format!("$[{idx}]"),
+            &mut regex_cache,
+        )?;
     }
     Ok(())
 }
@@ -270,28 +284,35 @@ fn matches_type_name(instance: &Value, expected_type: &str) -> bool {
     }
 }
 
-fn matches_pattern(s: &str, pattern: &str) -> Result<bool, SchemaValidationError> {
-    let ok = match pattern {
-        "^[0-9a-f]{16}$" => {
-            s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
-        "^[0-9a-f]{32}$" => {
-            s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
-        "^[0-9a-f]{64}$" => {
-            s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
-        "^[0-9a-f]{128}$" => {
-            s.len() == 128 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
-        other => {
-            return Err(SchemaValidationError {
-                instance_path: "$".to_string(),
-                message: format!("unsupported schema regex pattern: {other}"),
-            })
-        }
-    };
-    Ok(ok)
+fn matches_pattern(
+    s: &str,
+    pattern: &str,
+    path: &str,
+    regex_cache: &mut HashMap<String, regex::Regex>,
+) -> Result<bool, SchemaValidationError> {
+    if pattern.len() > MAX_SCHEMA_REGEX_LEN {
+        return Err(SchemaValidationError {
+            instance_path: path.to_string(),
+            message: format!(
+                "schema regex pattern length {} exceeds maximum {MAX_SCHEMA_REGEX_LEN}",
+                pattern.len()
+            ),
+        });
+    }
+    if let Some(re) = regex_cache.get(pattern) {
+        return Ok(re.is_match(s));
+    }
+    let compiled = regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_COMPILE_SIZE_LIMIT_BYTES)
+        .dfa_size_limit(REGEX_COMPILE_SIZE_LIMIT_BYTES)
+        .build()
+        .map_err(|e| SchemaValidationError {
+            instance_path: path.to_string(),
+            message: format!("invalid schema regex pattern '{pattern}': {e}"),
+        })?;
+    let matched = compiled.is_match(s);
+    regex_cache.insert(pattern.to_string(), compiled);
+    Ok(matched)
 }
 
 fn validate_value_node(
@@ -299,6 +320,7 @@ fn validate_value_node(
     schema: &Value,
     root_schema: &Value,
     path: &str,
+    regex_cache: &mut HashMap<String, regex::Regex>,
 ) -> Result<(), SchemaValidationError> {
     let schema_obj = schema.as_object().ok_or_else(|| SchemaValidationError {
         instance_path: path.to_string(),
@@ -307,14 +329,14 @@ fn validate_value_node(
 
     if let Some(ref_val) = schema_obj.get("$ref").and_then(Value::as_str) {
         let target = resolve_local_ref(ref_val, root_schema, path)?;
-        return validate_value_node(instance, target, root_schema, path);
+        return validate_value_node(instance, target, root_schema, path, regex_cache);
     }
 
     if let Some(one_of) = schema_obj.get("oneOf").and_then(Value::as_array) {
         let mut matched_count = 0usize;
         let mut last_err = None;
         for candidate in one_of {
-            match validate_value_node(instance, candidate, root_schema, path) {
+            match validate_value_node(instance, candidate, root_schema, path, regex_cache) {
                 Ok(()) => matched_count += 1,
                 Err(e) => last_err = Some(e),
             }
@@ -331,7 +353,7 @@ fn validate_value_node(
         let mut matched = false;
         let mut last_err = None;
         for candidate in any_of {
-            match validate_value_node(instance, candidate, root_schema, path) {
+            match validate_value_node(instance, candidate, root_schema, path, regex_cache) {
                 Ok(()) => {
                     matched = true;
                     break;
@@ -385,61 +407,89 @@ fn validate_value_node(
         }
     }
 
-    // Integer bounds (lossless u64 / i64 without f64 precision coercion)
+    // Numeric bounds (lossless i64 / u64 / finite f64 without > 2^53 precision coercion)
     if let Some(num) = instance.as_number() {
         if let Some(min_val) = schema_obj.get("minimum").and_then(Value::as_number) {
-            if let Some(min_u64) = min_val.as_u64() {
-                let actual_u64 = num.as_u64().ok_or_else(|| SchemaValidationError {
+            let ord = cmp_json_numbers(num, min_val).ok_or_else(|| SchemaValidationError {
+                instance_path: path.to_string(),
+                message: format!("non-finite numeric comparison for {num} vs minimum {min_val}"),
+            })?;
+            if ord == Ordering::Less {
+                return Err(SchemaValidationError {
                     instance_path: path.to_string(),
-                    message: format!("integer {num} is below minimum {min_u64} or not a valid u64"),
-                })?;
-                if actual_u64 < min_u64 {
-                    return Err(SchemaValidationError {
-                        instance_path: path.to_string(),
-                        message: format!("integer {actual_u64} < minimum {min_u64}"),
-                    });
-                }
+                    message: format!("number {num} < minimum {min_val}"),
+                });
             }
         }
         if let Some(max_val) = schema_obj.get("maximum").and_then(Value::as_number) {
-            if let Some(max_u64) = max_val.as_u64() {
-                if let Some(actual_u64) = num.as_u64() {
-                    if actual_u64 > max_u64 {
-                        return Err(SchemaValidationError {
-                            instance_path: path.to_string(),
-                            message: format!("integer {actual_u64} > maximum {max_u64}"),
-                        });
-                    }
-                } else if num.as_i64().is_none() {
-                    return Err(SchemaValidationError {
-                        instance_path: path.to_string(),
-                        message: format!("integer {num} exceeds 64-bit unsigned range"),
-                    });
-                }
+            let ord = cmp_json_numbers(num, max_val).ok_or_else(|| SchemaValidationError {
+                instance_path: path.to_string(),
+                message: format!("non-finite numeric comparison for {num} vs maximum {max_val}"),
+            })?;
+            if ord == Ordering::Greater {
+                return Err(SchemaValidationError {
+                    instance_path: path.to_string(),
+                    message: format!("number {num} > maximum {max_val}"),
+                });
+            }
+        }
+        if let Some(ex_min) = schema_obj
+            .get("exclusiveMinimum")
+            .and_then(Value::as_number)
+        {
+            let ord = cmp_json_numbers(num, ex_min).ok_or_else(|| SchemaValidationError {
+                instance_path: path.to_string(),
+                message: format!(
+                    "non-finite numeric comparison for {num} vs exclusiveMinimum {ex_min}"
+                ),
+            })?;
+            if ord != Ordering::Greater {
+                return Err(SchemaValidationError {
+                    instance_path: path.to_string(),
+                    message: format!("number {num} <= exclusiveMinimum {ex_min}"),
+                });
+            }
+        }
+        if let Some(ex_max) = schema_obj
+            .get("exclusiveMaximum")
+            .and_then(Value::as_number)
+        {
+            let ord = cmp_json_numbers(num, ex_max).ok_or_else(|| SchemaValidationError {
+                instance_path: path.to_string(),
+                message: format!(
+                    "non-finite numeric comparison for {num} vs exclusiveMaximum {ex_max}"
+                ),
+            })?;
+            if ord != Ordering::Less {
+                return Err(SchemaValidationError {
+                    instance_path: path.to_string(),
+                    message: format!("number {num} >= exclusiveMaximum {ex_max}"),
+                });
             }
         }
     }
 
-    // String constraints
+    // String constraints (Draft 2020-12 §6.3.1-6.3.2 Unicode scalar count + linear-time regex)
     if let Some(s) = instance.as_str() {
+        let char_len = s.chars().count() as u64;
         if let Some(min_len) = schema_obj.get("minLength").and_then(Value::as_u64) {
-            if (s.len() as u64) < min_len {
+            if char_len < min_len {
                 return Err(SchemaValidationError {
                     instance_path: path.to_string(),
-                    message: format!("string length {} < minLength {min_len}", s.len()),
+                    message: format!("string char length {char_len} < minLength {min_len}"),
                 });
             }
         }
         if let Some(max_len) = schema_obj.get("maxLength").and_then(Value::as_u64) {
-            if (s.len() as u64) > max_len {
+            if char_len > max_len {
                 return Err(SchemaValidationError {
                     instance_path: path.to_string(),
-                    message: format!("string length {} > maxLength {max_len}", s.len()),
+                    message: format!("string char length {char_len} > maxLength {max_len}"),
                 });
             }
         }
         if let Some(pattern) = schema_obj.get("pattern").and_then(Value::as_str) {
-            if !matches_pattern(s, pattern)? {
+            if !matches_pattern(s, pattern, path, regex_cache)? {
                 return Err(SchemaValidationError {
                     instance_path: path.to_string(),
                     message: format!("string '{s}' does not match pattern {pattern}"),
@@ -450,6 +500,14 @@ fn validate_value_node(
 
     // Array constraints
     if let Some(arr) = instance.as_array() {
+        if let Some(min_items) = schema_obj.get("minItems").and_then(Value::as_u64) {
+            if (arr.len() as u64) < min_items {
+                return Err(SchemaValidationError {
+                    instance_path: path.to_string(),
+                    message: format!("array length {} < minItems {min_items}", arr.len()),
+                });
+            }
+        }
         if let Some(max_items) = schema_obj.get("maxItems").and_then(Value::as_u64) {
             if (arr.len() as u64) > max_items {
                 return Err(SchemaValidationError {
@@ -461,7 +519,7 @@ fn validate_value_node(
         if let Some(item_schema) = schema_obj.get("items") {
             for (idx, item) in arr.iter().enumerate() {
                 let child_path = format!("{path}[{idx}]");
-                validate_value_node(item, item_schema, root_schema, &child_path)?;
+                validate_value_node(item, item_schema, root_schema, &child_path, regex_cache)?;
             }
         }
     }
@@ -496,14 +554,14 @@ fn validate_value_node(
         for (k, v) in obj {
             let child_path = format!("{path}.{k}");
             if let Some(prop_schema) = props.and_then(|p| p.get(k)) {
-                validate_value_node(v, prop_schema, root_schema, &child_path)?;
+                validate_value_node(v, prop_schema, root_schema, &child_path, regex_cache)?;
             } else if let Some(Value::Bool(false)) = additional {
                 return Err(SchemaValidationError {
                     instance_path: child_path,
                     message: format!("unexpected additional property '{k}'"),
                 });
             } else if let Some(add_schema @ Value::Object(_)) = additional {
-                validate_value_node(v, add_schema, root_schema, &child_path)?;
+                validate_value_node(v, add_schema, root_schema, &child_path, regex_cache)?;
             }
         }
     }

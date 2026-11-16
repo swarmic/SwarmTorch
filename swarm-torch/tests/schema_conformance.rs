@@ -310,6 +310,68 @@ fn schema_validator_rejects_negative_fixtures_across_contracts() {
         .expect("valid columnar_table.v1 instance must conform");
     let bad_col = br#"{"schema_version":1,"table_format":"stcl-json-v1","row_count":-1,"columns":[{"name":"id","dtype":"complex128","nullable":false}],"rows":[]}"#;
     assert!(validate_json_bytes_against_schema(bad_col, COLUMNAR_TABLE_SCHEMA_JSON).is_err());
+
+    // 6. ST-15B-3: Unicode scalar minLength/maxLength (256 x 'é' = 256 chars, 512 bytes passes maxLength: 256; 257 fails)
+    let ok_unicode_col = format!(
+        r#"{{"schema_version":1,"table_format":"stcl-json-v1","row_count":0,"columns":[{{"name":"{}","dtype":"i64","nullable":false}}],"rows":[]}}"#,
+        "é".repeat(256)
+    );
+    validate_json_bytes_against_schema(ok_unicode_col.as_bytes(), COLUMNAR_TABLE_SCHEMA_JSON)
+        .expect("256-char multi-byte Unicode column name must conform to maxLength: 256");
+    let bad_unicode_col = format!(
+        r#"{{"schema_version":1,"table_format":"stcl-json-v1","row_count":0,"columns":[{{"name":"{}","dtype":"i64","nullable":false}}],"rows":[]}}"#,
+        "é".repeat(257)
+    );
+    assert!(validate_json_bytes_against_schema(
+        bad_unicode_col.as_bytes(),
+        COLUMNAR_TABLE_SCHEMA_JSON
+    )
+    .is_err());
+
+    // 7. ST-15B-3: Custom numeric bounds (floats vs maximum, >2^53 integers, exclusiveMinimum/Maximum) & regex patterns
+    let custom_schema = r#"{
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://swarmtorch.dev/schemas/v1/test_bounds.schema.json",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ratio", "big_id", "neg_bound", "uri", "tags"],
+        "properties": {
+            "ratio": { "type": "number", "minimum": -1.5, "maximum": 100, "exclusiveMinimum": -1.5, "exclusiveMaximum": 100.0 },
+            "big_id": { "type": "integer", "minimum": 9007199254740993, "maximum": 18446744073709551615 },
+            "neg_bound": { "type": "integer", "minimum": -9007199254740993, "maximum": -9007199254740992 },
+            "uri": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^dataset://[a-z0-9_]+/[a-z0-9_]+$" },
+            "tags": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "type": "string", "maxLength": 1 } }
+        }
+    }"#;
+    let valid_custom = r#"{"ratio":0.5,"big_id":9007199254740993,"neg_bound":-9007199254740993,"uri":"dataset://ns_1/table_2","tags":["🔥"]}"#.as_bytes();
+    validate_json_bytes_against_schema(valid_custom, custom_schema).expect(
+        "float < integer maximum, >2^53 bounds, emoji 1-char maxLength, and custom regex must pass",
+    );
+
+    // 9007199254740992 < minimum 9007199254740993 (caught without f64 rounding!)
+    let bad_big_id = br#"{"ratio":0.5,"big_id":9007199254740992,"neg_bound":-9007199254740993,"uri":"dataset://ns_1/table_2","tags":["a"]}"#;
+    assert!(validate_json_bytes_against_schema(bad_big_id, custom_schema).is_err());
+
+    // exclusiveMinimum boundary -1.5 and exclusiveMaximum boundary 100.0 must fail
+    let bad_ex_min = br#"{"ratio":-1.5,"big_id":9007199254740993,"neg_bound":-9007199254740993,"uri":"dataset://ns_1/table_2","tags":["a"]}"#;
+    assert!(validate_json_bytes_against_schema(bad_ex_min, custom_schema).is_err());
+    let bad_ex_max = br#"{"ratio":100,"big_id":9007199254740993,"neg_bound":-9007199254740993,"uri":"dataset://ns_1/table_2","tags":["a"]}"#;
+    assert!(validate_json_bytes_against_schema(bad_ex_max, custom_schema).is_err());
+
+    // Regex mismatch and minItems violation must fail
+    let bad_uri = br#"{"ratio":0.5,"big_id":9007199254740993,"neg_bound":-9007199254740993,"uri":"s3://Upper/Bad","tags":["a"]}"#;
+    assert!(validate_json_bytes_against_schema(bad_uri, custom_schema).is_err());
+    let bad_min_items = br#"{"ratio":0.5,"big_id":9007199254740993,"neg_bound":-9007199254740993,"uri":"dataset://ns_1/table_2","tags":[]}"#;
+    assert!(validate_json_bytes_against_schema(bad_min_items, custom_schema).is_err());
+
+    // Invalid regex syntax in schema fails closed
+    let bad_regex_schema = r#"{
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://swarmtorch.dev/schemas/v1/bad_re.schema.json",
+        "type": "string",
+        "pattern": "[unclosed"
+    }"#;
+    assert!(validate_json_bytes_against_schema(br#""abc""#, bad_regex_schema).is_err());
 }
 
 #[test]

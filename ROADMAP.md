@@ -9,8 +9,8 @@ For a high-level project overview and usage guide, see [`README.md`](README.md).
 | `v0.1.0-alpha.9` | Core Correctness, Security Hardening, & Dependency Isolation (Wave 9) | Completed |
 | `v0.1.0-beta.1` | Coordinator Learning Spine, Physical CAS Checkpoints, & Strict Artifact Trust (Wave 10) | Completed |
 | `v0.1.0` RC | Non-IID Resilience, Verifiable Sparse Co-Design, Low-MTU Framing, & SafeTensors Profile (Wave 11) | Completed |
-| `v0.2.0` | Isolated Adapter Contracts, LoRA/FLoRA, `FedAsync` + Accounting Ledger, & Wasm/Columnar Surface (Wave 12 + Wave 13 `13-0` & `13A`) | Containment + Auth/Replay/Reassembly Hardened (Wave 13 `13B`–`13D` In Progress) |
-| `v0.3.0+` | End-to-End Cryptographic Admission, Atomic Commits, `wasmi` & Live Adapter SDKs (Wave 13 `13A`–`13D`), Certified `DpFedAvgV1` | Planned |
+| `v0.2.0` | Isolated Adapter Contracts, LoRA/FLoRA, `FedAsync` + Accounting Ledger, & Wave 13 Full Remediation (`13-0`–`13D`) | Wave 13 `13-0`–`13D` Conformance Verified (Certified `DpFedAvgV1` Post-Wave-13) |
+| `v0.3.0+` | Certified `DpFedAvgV1`, Hardware Radio Drivers (`ble-transport`, `lora-transport`), & Local Viewer (`P2-16`) | Planned |
 
 ## Release Gates
 
@@ -59,17 +59,17 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
 
 ---
 
-### Wave 12 & Wave 13 Phases `13-0`, `13A`, `13B`, & `13C` (`v0.2.0` — Containment, Auth/Replay, Storage, Evented Runtime, & Collective Sparse Hardened)
-1. **Isolated Framework Bridges & LoRA / FLoRA Update Algebra (`W12-01`, `ADR-0024` §4):**
-   - Adds `BackendTensorBridge` / `BackendModelHandleV1` and explicit `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models`, coordinated atomically on staged base weights in `SwarmRoundCoordinator::aggregate_lora_cohort_round`, plus **`Simulation verified`** contract bridges in `adapters/swarm-torch-backends` (live `burn`/`candle` SDKs scheduled for Phase `13D-4`).
-2. **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4, `ST-08`):**
-   - Adds `QuicStreamHandshakePolicyV1`, `QuicLengthPrefixedCodecV1`, and `ZenohTopicContractV1` (`swarm-torch-net::carrier`), plus **`Simulation verified`** standalone adapters `adapters/swarm-torch-transport-iroh` (`IrohCarrierAdapterV1`, pre-replay originator binding + bounded sliding-window `LinkFrameQuotaTrackerV1`) and `adapters/swarm-torch-transport-zenoh` (`ZenohCarrierAdapterV1`) outside root `Cargo.lock`. Live `iroh`/`zenoh` SDKs ship in Phases `13D-2`/`13D-3`. Hardware `ble-transport`/`lora-transport` remain empty placeholder Cargo flags.
+### Wave 12 & Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D` (`v0.2.0` — Full Wave 13 Remediation & External SDK Integrations)
+1. **Isolated Framework Bridges & LoRA / FLoRA Update Algebra (`W12-01`, `ADR-0024` §4, `13D-4`):**
+   - Adds `BackendTensorBridge` / `BackendModelHandleV1` and explicit `LoraAdapterPairV1`, `FloraStackedDeltaV1`, `LoraAggregationModeV1` (`FreezeASingleFactorV1`, `FloraStackingV1`, `BiasedFactorFedAvgV1`), and `aggregate_lora_adapters_v1` in `swarm-torch-models`, coordinated atomically on staged base weights in `SwarmRoundCoordinator::aggregate_lora_cohort_round`, plus **`Integration verified`** live bridges in `adapters/swarm-torch-backends` (`BurnLinearBridgeV1` over `burn 0.21.0`, `CandleLinearBridgeV1` over `candle 0.10.2`, and `[W | b]` SafeTensors layout mapping in `ModelFlatTensorLayoutV1`).
+2. **Zenoh/Iroh Carrier Contracts & Isolated Adapters (`W12-02`, `ADR-0022` §4, `ST-08`, `13D-2`, `13D-3`):**
+   - Adds `QuicStreamHandshakePolicyV1`, `QuicLengthPrefixedCodecV1`, and `ZenohTopicContractV1` (`swarm-torch-net::carrier`), plus **`Integration verified`** standalone adapters `adapters/swarm-torch-transport-iroh` (`IrohEndpointBridgeV1` live 1-RTT QUIC) and `adapters/swarm-torch-transport-zenoh` (`ZenohSessionBridgeV1` live TCP peer pub/sub) outside root `Cargo.lock`. Hardware `ble-transport`/`lora-transport` remain empty placeholder Cargo flags.
 3. **Stale-Delta `FedAsync` Mixing & Experimental Budget Accounting (`W12-03`, `ADR-0023` §4, `ST-02`):**
    - Adds `no_std` IEEE-754 `exp_f64_soft`/`ln_f64_soft`/`log_sum_exp_pair_f64` (`swarm-torch-core::num`), `apply_fedasync_stale_delta_v1` (`swarm-torch-core::aggregation`), `RdpAccountantV1` (`swarm-torch-core::dp`), and `dp/ledger.ndjson` accounting records (`swarm-torch::artifacts::dp_ledger`).
    - **Phase `13-0` Reclassification (`ST-02`):** Because sampling, clipping, and noise injection are not yet enforced on coordinator releases, `RdpAccountantV1` and `dp/ledger.ndjson` provide **experimental accounting-only tracking** (`guarantees_differential_privacy = false`), and `VerifiedMechanismProtected` fails closed (`UnsupportedCertifiedDifferentialPrivacy`) until post-Wave-13 `DpFedAvgV1`.
-4. **Wasm Containment, Physical Columnar Runner, & Schema Contract (`W12-04`, `P2-20b`, `ADR-0025`, `ST-09`):**
+4. **Wasm Containment, Isolated `wasmi` Executor, Physical Columnar Runner, & Schema Contract (`W12-04`, `P2-20b`, `ADR-0025`, `ST-09`, `13D-1`):**
    - Adds `schemas/v1/columnar_table.schema.json` (mirrored byte-identically into `swarm-torch/schemas/v1/`) and schema-validated physical columnar/NDJSON execution (`NativeOpRunner::run_in_session`).
-   - **Phase `13-0` Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1`, `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) pending isolated `wasmi` execution in `adapters/swarm-torch-wasm` (Phase `13D-1`); the subset VM remains strictly hidden for trusted local unit fixtures only.
+   - **Wasm Containment + `wasmi` Integration (`ST-09`):** Default `NativeOpRunner::new()`, `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, and `Scheduler` fail closed (`UnsupportedUntrustedWasmSandbox`) unless configured with an external `WasmExtensionExecutor`; `adapters/swarm-torch-wasm` provides `WasmiExtensionExecutorV1` (`Adversarial conformance passed` over `wasmi 2.0.0`), while the legacy subset VM is gated strictly under `#[cfg(test)]`.
 5. **Zero-Port Read-Only Strict MCP Inspector (`W12-05`, `ADR-0016`):**
    - Adds `McpInspectorServerV1` and the `swarm_torch_mcp` `stdio` JSON-RPC 2.0 binary (`swarm-torch::mcp_inspector`) plus `adapters/swarm-torch-mcp` (`Simulation verified`), requiring `TrustPolicy::Strict` signatures on every request and surfacing `guarantees_differential_privacy: false` + `accounting_classification` on DP-budget tool output.
 6. **Phase `13A` End-to-End Authenticated Admission, Receiver-Bound V2 Replay Recovery, & Bounded Reassembly (`ST-01`, `ST-03`, `ST-06`, `ST-08`, `ST-13`):**
@@ -85,6 +85,10 @@ All releases must pass the conformance and benchmark gates defined in [ADR-0014]
    - Removes busy-yield polling loops in `swarm-torch-runtime` (`SwarmClock`, `SwarmRuntime::try_spawn`, `TokioRuntime`, `EmbassyRuntime::try_spawn_task`, `MockRuntime::poll_ready_tasks`) in favor of waker/timer-driven futures (`tokio::time::sleep`, `embassy_time::Timer::after`).
    - Fixes `Bulyan` Stage 2 aggregation (`bulyan_stage2_with_peers`, `bulyan_stage2_nearest_to_median`) to select the Q9 lower observed median nearest coordinates with deterministic `PeerId` tie-breaking instead of arithmetic means of synthetic quantiles.
    - Enforces two-phase collective `SharedSeedSparse` (`commit_sparse_commitment_submission`, `submit_sparse_commitment_delivery`, `finalize_sparse_commitments_with_beacon`) freezing `commitments_root` before public beacon seed derivation (`derive_context_bound_round_seed_v1`) and enforcing active-sparse mutual exclusion in Stage B/C before replay commit.
+9. **Phase `13D` Isolated `wasmi` Sandbox, Live Iroh/Zenoh Carriers, & SafeTensors/Burn/Candle Parity (`ST-08`, `ST-09`):**
+   - Gates the legacy bespoke Wasm interpreter behind `#[cfg(test)]`, introduces `WasmExtensionExecutor` + `NativeOpRunner::with_wasm_executor` + `Scheduler` `"wasm_transform"` CAS dispatch (defaulting fail-closed when unconfigured), and ships `adapters/swarm-torch-wasm` (`WasmiExtensionExecutorV1` over `wasmi 2.0.0` with `auto-dispatch`, `EnforcedLimits::strict()`, `StoreLimits`, fuel + timeout slicing, and physical CAS E2E tests).
+   - Ships `IrohEndpointBridgeV1` (`adapters/swarm-torch-transport-iroh`, live `iroh 1.4.1` 1-RTT QUIC with ALPN pinning, Ed25519 TLS `remote_id` challenge-response, and pre-auth quotas) and `ZenohSessionBridgeV1` (`adapters/swarm-torch-transport-zenoh`, live `zenoh 1.10.2` TCP peer pub/sub with bounded payload caps and topic verification).
+   - Fixes SafeTensors `[W | b]` / `[W1 | b1 | W2 | b2]` flat-offset mapping (`ModelFlatTensorLayoutV1` in `swarm-torch-models::safetensors_v1`, plus CAS/example/bench callers) and ships `BurnLinearBridgeV1` (`burn 0.21.0` `Autodiff<NdArray<f32>>`) + `CandleLinearBridgeV1` (`candle-core`/`candle-nn` `0.10.2`) in `adapters/swarm-torch-backends`, proving bit-exact SafeTensors roundtrips and forward/MSE-gradient parity.
 
 ---
 

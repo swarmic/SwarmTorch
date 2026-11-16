@@ -12,6 +12,7 @@ exclude = [
     "adapters/swarm-torch-transport-iroh",
     "adapters/swarm-torch-transport-zenoh",
     "adapters/swarm-torch-mcp",
+    "adapters/swarm-torch-wasm",
 ]
 
 [workspace.package]

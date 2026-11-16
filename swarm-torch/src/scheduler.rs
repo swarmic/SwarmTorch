@@ -275,7 +275,6 @@ pub fn execute_graph_with_isolation(
     run_id: RunId,
     clock_nanos: fn() -> u64,
 ) -> Result<SchedulerReport, SchedulerError> {
-    let _ = wasm_registry;
     let ordered = topological_sort_nodes(graph)?;
     let mut report = SchedulerReport::default();
     let trace_id = TraceId::from_bytes(*run_id.as_bytes());
@@ -455,22 +454,58 @@ pub fn execute_graph_with_isolation(
             }
             (
                 swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension,
-                RunnerIsolationProfile::WasmSandboxedV1(_),
+                RunnerIsolationProfile::WasmSandboxedV1(wasm_policy),
             ) => {
-                let error_code =
-                    "isolation_denied:UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until the isolated wasmi adapter is configured"
-                        .to_string();
-                session.record_node_error(&node, started, 0, error_code.clone())?;
-                emit_scheduler_event(
-                    session.sink().as_ref(),
-                    trace_id,
-                    started,
-                    "scheduler/node_denied",
-                    &node.node_key,
-                    Some(&error_code),
-                )?;
-                report.failed_nodes.push(node.node_key.clone());
-                continue;
+                if node.op_type != "wasm_transform" {
+                    let error_code = format!(
+                        "isolation_denied:SandboxedExtension only permits op_type 'wasm_transform', got '{}'",
+                        node.op_type
+                    );
+                    session.record_node_error(&node, started, 0, error_code.clone())?;
+                    emit_scheduler_event(
+                        session.sink().as_ref(),
+                        trace_id,
+                        started,
+                        "scheduler/node_denied",
+                        &node.node_key,
+                        Some(&error_code),
+                    )?;
+                    report.failed_nodes.push(node.node_key.clone());
+                    continue;
+                }
+                if runner.wasm_executor().is_none() {
+                    let error_code =
+                        "isolation_denied:UnsupportedUntrustedWasmSandbox: untrusted WebAssembly execution is disabled until an isolated WasmExtensionExecutor is configured"
+                            .to_string();
+                    session.record_node_error(&node, started, 0, error_code.clone())?;
+                    emit_scheduler_event(
+                        session.sink().as_ref(),
+                        trace_id,
+                        started,
+                        "scheduler/node_denied",
+                        &node.node_key,
+                        Some(&error_code),
+                    )?;
+                    report.failed_nodes.push(node.node_key.clone());
+                    continue;
+                }
+                let Some(registry) = wasm_registry else {
+                    let error_code =
+                        "isolation_denied:SandboxedExtension requires non-empty wasm_registry"
+                            .to_string();
+                    session.record_node_error(&node, started, 0, error_code.clone())?;
+                    emit_scheduler_event(
+                        session.sink().as_ref(),
+                        trace_id,
+                        started,
+                        "scheduler/node_denied",
+                        &node.node_key,
+                        Some(&error_code),
+                    )?;
+                    report.failed_nodes.push(node.node_key.clone());
+                    continue;
+                };
+                Some((wasm_policy, registry))
             }
             (swarm_torch_core::run_graph::ExecutionTrust::SandboxedExtension, _) => {
                 let error_code =

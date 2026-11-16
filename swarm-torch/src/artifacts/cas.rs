@@ -762,24 +762,39 @@ pub fn put_safetensors_checkpoint_v1<M: SwarmModel>(
     let bytes =
         swarm_torch_models::safetensors_v1::export_safetensors_checkpoint_v1(model, schema, limits)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let digest = CheckpointContentDigestV1::from_bytes_slice(&bytes);
-    write_once_cas_blob(run_dir, digest.as_bytes(), &bytes)?;
+    publish_safetensors_blob(run_dir, &bytes)
+}
+
+/// Export `model` as a `SwarmTorchCheckpointV1` SafeTensors v1 payload using an explicit
+/// [`swarm_torch_models::safetensors_v1::ModelFlatTensorLayoutV1`] (`[W | b]` / `[W1 | b1 | W2 | b2]`)
+/// and publish it to `runs/<run_id>/blobs/sha256/<hex_digest>`.
+pub fn put_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
+    run_dir: &Path,
+    model: &M,
+    layout: &swarm_torch_models::safetensors_v1::ModelFlatTensorLayoutV1,
+    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
+) -> io::Result<(CheckpointContentDigestV1, String, u64)> {
+    let bytes = swarm_torch_models::safetensors_v1::export_safetensors_checkpoint_with_layout_v1(
+        model, layout, limits,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    publish_safetensors_blob(run_dir, &bytes)
+}
+
+fn publish_safetensors_blob(
+    run_dir: &Path,
+    bytes: &[u8],
+) -> io::Result<(CheckpointContentDigestV1, String, u64)> {
+    let digest = CheckpointContentDigestV1::from_bytes_slice(bytes);
+    write_once_cas_blob(run_dir, digest.as_bytes(), bytes)?;
     let uri = digest.to_cas_uri();
     Ok((digest, uri, bytes.len() as u64))
 }
 
-/// Load and cryptographically verify a `SwarmTorchCheckpointV1` SafeTensors v1 checkpoint from
-/// `runs/<run_id>/blobs/sha256/<hex_digest>` into `template` (`ADR-0024` §3, `W11-04`).
-///
-/// Fails closed if the CAS blob is missing, its SHA-256 digest does not match `expected_digest`,
-/// its `model_schema_hash` or tensor layout differs from `expected_schema`, or any parameter is non-finite.
-pub fn get_verified_safetensors_checkpoint_v1<M: SwarmModel>(
+fn read_verified_safetensors_blob(
     run_dir: &Path,
-    mut template: M,
     expected_digest: &CheckpointContentDigestV1,
-    expected_schema: &swarm_torch_models::safetensors_v1::ModelTensorSchemaV1,
-    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
-) -> io::Result<M> {
+) -> io::Result<Vec<u8>> {
     let blob_path = run_dir
         .join("blobs")
         .join("sha256")
@@ -805,9 +820,45 @@ pub fn get_verified_safetensors_checkpoint_v1<M: SwarmModel>(
             ),
         ));
     }
+    Ok(bytes)
+}
+
+/// Load and cryptographically verify a `SwarmTorchCheckpointV1` SafeTensors v1 checkpoint from
+/// `runs/<run_id>/blobs/sha256/<hex_digest>` into `template` (`ADR-0024` §3, `W11-04`).
+///
+/// Fails closed if the CAS blob is missing, its SHA-256 digest does not match `expected_digest`,
+/// its `model_schema_hash` or tensor layout differs from `expected_schema`, or any parameter is non-finite.
+pub fn get_verified_safetensors_checkpoint_v1<M: SwarmModel>(
+    run_dir: &Path,
+    mut template: M,
+    expected_digest: &CheckpointContentDigestV1,
+    expected_schema: &swarm_torch_models::safetensors_v1::ModelTensorSchemaV1,
+    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
+) -> io::Result<M> {
+    let bytes = read_verified_safetensors_blob(run_dir, expected_digest)?;
     swarm_torch_models::safetensors_v1::import_safetensors_checkpoint_v1(
         &mut template,
         expected_schema,
+        &bytes,
+        limits,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(template)
+}
+
+/// Load and cryptographically verify a `SwarmTorchCheckpointV1` SafeTensors v1 checkpoint from
+/// `runs/<run_id>/blobs/sha256/<hex_digest>` into `template` using explicit flat tensor layout `expected_layout`.
+pub fn get_verified_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
+    run_dir: &Path,
+    mut template: M,
+    expected_digest: &CheckpointContentDigestV1,
+    expected_layout: &swarm_torch_models::safetensors_v1::ModelFlatTensorLayoutV1,
+    limits: &swarm_torch_models::safetensors_v1::SafeTensorsLimitsV1,
+) -> io::Result<M> {
+    let bytes = read_verified_safetensors_blob(run_dir, expected_digest)?;
+    swarm_torch_models::safetensors_v1::import_safetensors_checkpoint_with_layout_v1(
+        &mut template,
+        expected_layout,
         &bytes,
         limits,
     )
@@ -834,12 +885,13 @@ mod tests {
         model
             .load_parameters(&[0.1, 0.2, 0.3, -0.4, 0.5, -0.6, 0.05, -0.05])
             .expect("load params");
-        let schema = ModelTensorSchemaV1::for_linear(3, 2).expect("valid schema");
+        let layout = swarm_torch_models::safetensors_v1::ModelFlatTensorLayoutV1::for_linear(3, 2)
+            .expect("valid linear layout");
         let limits = SafeTensorsLimitsV1::default();
 
         let (digest, uri, size_bytes) =
-            put_safetensors_checkpoint_v1(&temp_dir, &model, &schema, &limits)
-                .expect("put_safetensors_checkpoint_v1 must succeed");
+            put_safetensors_checkpoint_with_layout_v1(&temp_dir, &model, &layout, &limits)
+                .expect("put_safetensors_checkpoint_with_layout_v1 must succeed");
         assert!(uri.starts_with("cas://sha256/"));
         assert!(size_bytes > 8);
 
@@ -859,11 +911,25 @@ mod tests {
             .is_some());
         assert_eq!(header_json["linear.weight"]["dtype"].as_str(), Some("F32"));
 
+        let data_start = 8 + header_len;
+        let bias_off0 = header_json["linear.bias"]["data_offsets"][0]
+            .as_u64()
+            .unwrap() as usize;
+        let bias_off1 = header_json["linear.bias"]["data_offsets"][1]
+            .as_u64()
+            .unwrap() as usize;
+        let bias_vals: Vec<f32> = raw_bytes[data_start + bias_off0..data_start + bias_off1]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(bias_vals, vec![0.05, -0.05]);
+
         // Verify roundtrip into a fresh template model
         let template = LinearModel::new(3, 2).expect("template");
-        let restored =
-            get_verified_safetensors_checkpoint_v1(&temp_dir, template, &digest, &schema, &limits)
-                .expect("get_verified_safetensors_checkpoint_v1 must succeed");
+        let restored = get_verified_safetensors_checkpoint_with_layout_v1(
+            &temp_dir, template, &digest, &layout, &limits,
+        )
+        .expect("get_verified_safetensors_checkpoint_with_layout_v1 must succeed");
         assert_eq!(restored.parameters(), model.parameters());
 
         // Verify schema mismatch fails closed

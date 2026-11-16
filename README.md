@@ -22,24 +22,23 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
 - [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 12 + Wave 13 `13-0` .. `13C` Hardening)
+## Implementation Reality (Wave 12 + Wave 13 `13-0` .. `13D` Complete)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
 - `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`, and `swarm-torch-runtime` `EmbassyRuntime`).
 - **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-13 work, and `VerifiedMechanismProtected` fails closed.
-- **Wasm Sandbox Containment (`ST-09`):** `RunnerIsolationProfile::WasmSandboxedV1` and `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` isolation lands (`Phase 13D-1`).
-- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, & Two-Phase Sparse (`13A`–`13C`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `Verified*SubmissionV1`) failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O (zero `thread::sleep` polling); `SwarmRuntime::try_spawn` is primary fallible alongside `embassy_time`/`SendSpawner` `EmbassyRuntime` & ARM CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; and two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation.
-- **Remaining Active Wave 13 Hardening:** Live external SDK wiring (`wasmi 2.0.x` + `iroh` + `zenoh` + `burn`/`candle` `[W | b]` SafeTensors layout mapping in `13D`) completes Wave 13.
+- **Wasm Sandbox Containment (`ST-09`, `13D-1`):** Default `NativeOpRunner::new()`, `WasmSandboxRunnerV1`, and `Scheduler` fail closed (`UnsupportedUntrustedWasmSandbox`) unless configured with a `WasmExtensionExecutor`; `adapters/swarm-torch-wasm` provides `WasmiExtensionExecutorV1` (`wasmi 2.0.0`, `EnforcedLimits::strict()`, fuel + wall-clock timeout slicing, zero imports, SHA-256 pinning, and end-to-end physical CAS DAG execution), while the legacy bespoke interpreter is gated under `#[cfg(test)]`.
+- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, Collective Sparse, & Live Adapters (`13A`–`13D`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O; `SwarmRuntime::try_spawn` is primary fallible alongside `EmbassyRuntime` & ARM CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation; and standalone adapters run live `iroh 1.4.1`, `zenoh 1.10.2`, and `burn 0.21.0`/`candle 0.10.2` integrations with `[W | b]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`).
 
 ### Adapter & Capability Maturity Matrix
 
 | Surface | Maturity Tier | Notes |
 |---------|---------------|-------|
-| `adapters/swarm-torch-transport-iroh` | `Simulation verified` | Pre-replay `bind_originator` + bounded quota (`ST-08`); live `iroh` endpoint SDK in `13D-2` |
-| `adapters/swarm-torch-transport-zenoh` | `Simulation verified` | Strict topic/envelope contract check; live `zenoh` session SDK in `13D-3` |
-| `adapters/swarm-torch-backends` | `Simulation verified` | Canonical schema + finiteness contract; live `burn`/`candle` SDKs in `13D-4` |
+| `adapters/swarm-torch-wasm` | `Adversarial conformance passed` | Isolated `wasmi 2.0.0` executor (`WasmiExtensionExecutorV1`), fuel + timeout slicing, memory/table bombs, physical CAS E2E (`ST-09`, `13D-1`) |
+| `adapters/swarm-torch-transport-iroh` | `Integration verified` | Live `iroh 1.4.1` 1-RTT QUIC (`IrohEndpointBridgeV1`), ALPN + `remote_id` attestation, pre-replay quota & binding checks (`ST-08`, `13D-2`) |
+| `adapters/swarm-torch-transport-zenoh` | `Integration verified` | Live `zenoh 1.10.2` TCP peer pub/sub (`ZenohSessionBridgeV1`), bounded `ZBytes` reads, strict topic parity (`ST-08`, `13D-3`) |
+| `adapters/swarm-torch-backends` | `Integration verified` | Live `burn 0.21.0` (`real-burn`) & `candle 0.10.2` (`real-candle`) bridges + cross-framework SafeTensors `[W | b]` forward/grad parity (`ST-08`, `13D-4`) |
 | `adapters/swarm-torch-mcp` | `Simulation verified` | Zero-port read-only stdio inspector; honest experimental DP notice (`ST-02`) |
-| `adapters/swarm-torch-wasm` | Planned (`13D-1`) | Untrusted Wasm fails closed (`ST-09`) until `wasmi` sandbox ships |
 | `ble-transport` / `lora-transport` | Placeholder flag only | Feature flag reservations; no radio drivers implemented yet |
 
 > **6-Tier Scale:** `Contract defined` < `Simulation verified` < `SDK integrated` < `Integration verified` < `Adversarial conformance passed` < `Deployment supported`.
@@ -451,7 +450,7 @@ cargo run -p swarm-torch --example byzantine_federated_round
 - ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`EnvelopeV1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
 - ✅ Wave 10 (`v0.1.0-beta.1`): Unified `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock (`BundleLockGuard`), Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`), and deterministic multi-node simulation
 - ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClippingAggregator` (`CClip`), Non-IID $s$-bucketing (`SBucketingTransformer`), verifiable `SharedSeedSparse` projection (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpPacketTransport` / `UdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
-- ⏳ Wave 12 (`v0.2.0` Expansion): Optional `swarm-torch-backends` (Burn/Candle/LoRA), optional `swarm-torch-transport-zenoh` & `swarm-torch-transport-iroh`, `FedAsync` stale-delta mixing + durable Rényi DP accounting, and `wasmi` extension sandbox + columnar data runner
+- ✅ Wave 12 & Wave 13 (`v0.2.0` + `13-0`–`13D`): Isolated `adapters/*` SDKs (`wasmi 2.0.0`, `iroh 1.4.1`, `zenoh 1.10.2`, `burn 0.21.0` + `candle 0.10.2`, `stdio` MCP inspector), LoRA/FLoRA updates, `FedAsync` + experimental accounting ledger (`ST-02`), 3-stage Ed25519/v2-replay admission, atomic `CommittedHeadV1` storage + `fs4` locks, `PhysicalStrict` columnar runner, evented transport/runtime (`EmbassyRuntime` + ARM CI), Q9 `Bulyan` Stage 2, two-phase collective `SharedSeedSparse`, and `[W | b]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`)
 
 ### v0.2.0 - Edge ML & Hardware Fleet Expansion
 

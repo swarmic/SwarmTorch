@@ -5,8 +5,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use swarm_torch::core::traits::{SwarmModel, SwarmOptimizer};
 use swarm_torch::models::optim::SgdOptimizer;
 use swarm_torch::models::safetensors_v1::{
-    export_safetensors_checkpoint_v1, import_safetensors_checkpoint_v1, ModelTensorSchemaV1,
-    SafeTensorsLimitsV1,
+    export_safetensors_checkpoint_with_layout_v1, import_safetensors_checkpoint_with_layout_v1,
+    ModelFlatTensorLayoutV1, SafeTensorsLimitsV1,
 };
 use swarm_torch::models::simple::LinearModelWithCapacity;
 use swarm_torch::net::chunked::{ChunkedFrameCodec, ObservedSourceReassembler, ReassemblerLimits};
@@ -37,15 +37,21 @@ fn swarm_benchmark(c: &mut Criterion) {
 
     type BenchLinear = LinearModelWithCapacity<1040, 16>;
     let model = BenchLinear::new(128, 8).unwrap().with_random_init(77);
-    let schema = ModelTensorSchemaV1::for_linear(128, 8).unwrap();
+    let layout = ModelFlatTensorLayoutV1::for_linear(128, 8).unwrap();
     let limits = SafeTensorsLimitsV1::default();
     c.bench_function("safetensors_checkpoint_v1_roundtrip_128x8", |b| {
         b.iter(|| {
             let bytes =
-                export_safetensors_checkpoint_v1(black_box(&model), &schema, &limits).unwrap();
+                export_safetensors_checkpoint_with_layout_v1(black_box(&model), &layout, &limits)
+                    .unwrap();
             let mut restored = BenchLinear::new(128, 8).unwrap();
-            import_safetensors_checkpoint_v1(&mut restored, &schema, black_box(&bytes), &limits)
-                .unwrap()
+            import_safetensors_checkpoint_with_layout_v1(
+                &mut restored,
+                &layout,
+                black_box(&bytes),
+                &limits,
+            )
+            .unwrap()
         })
     });
 

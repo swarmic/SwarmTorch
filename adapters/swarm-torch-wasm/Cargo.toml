@@ -1,0 +1,15 @@
+[package]
+name = "swarm-torch-wasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MPL-2.0"
+publish = false
+description = "Isolated wasmi 2.0 WebAssembly extension sandbox adapter for SwarmTorch"
+
+[workspace]
+
+[dependencies]
+swarm-torch = { path = "../../swarm-torch" }
+swarm-torch-core = { path = "../../swarm-torch-core" }
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "deterministic", "auto-dispatch"] }

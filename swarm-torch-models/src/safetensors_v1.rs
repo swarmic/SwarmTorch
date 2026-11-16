@@ -321,6 +321,43 @@ impl ModelTensorSchemaV1 {
         )
     }
 
+    /// Convenience schema for [`crate::mlp::MlpModel`] (`fc1.weight`, `fc1.bias`, `fc2.weight`, `fc2.bias`).
+    pub fn for_mlp(
+        input_dim: usize,
+        hidden_dim: usize,
+        output_dim: usize,
+    ) -> Result<Self, SafeTensorsError> {
+        Self::try_new(
+            vec![
+                ModelTensorDescriptorV1 {
+                    name: "mlp.fc1.bias".to_string(),
+                    dtype: SafeTensorDtypeV1::F32,
+                    trainable: true,
+                    shape: vec![hidden_dim],
+                },
+                ModelTensorDescriptorV1 {
+                    name: "mlp.fc1.weight".to_string(),
+                    dtype: SafeTensorDtypeV1::F32,
+                    trainable: true,
+                    shape: vec![hidden_dim, input_dim],
+                },
+                ModelTensorDescriptorV1 {
+                    name: "mlp.fc2.bias".to_string(),
+                    dtype: SafeTensorDtypeV1::F32,
+                    trainable: true,
+                    shape: vec![output_dim],
+                },
+                ModelTensorDescriptorV1 {
+                    name: "mlp.fc2.weight".to_string(),
+                    dtype: SafeTensorDtypeV1::F32,
+                    trainable: true,
+                    shape: vec![output_dim, hidden_dim],
+                },
+            ],
+            &SafeTensorsLimitsV1::default(),
+        )
+    }
+
     /// Convenience schema for a single flat `F32` parameter vector.
     pub fn single_f32_tensor(name: &str, num_elements: usize) -> Result<Self, SafeTensorsError> {
         Self::try_new(
@@ -402,15 +439,188 @@ fn push_json_escaped_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Disjoint flat-buffer element range (`[flat_offset .. flat_offset + num_elements)`) mapping
+/// a canonical SafeTensors tensor name to its position in [`SwarmModel::parameters()`] (`ST-08`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTensorFlatRangeV1 {
+    /// Canonical tensor name present in [`ModelTensorSchemaV1::tensors`].
+    pub name: String,
+    /// Starting `f32` element index in [`SwarmModel::parameters()`].
+    pub flat_offset: usize,
+    /// Exact number of `f32` elements declared by the schema descriptor.
+    pub num_elements: usize,
+}
+
+/// Validated bidirectional mapping between canonical sorted [`ModelTensorSchemaV1`] tensor
+/// entries and a model's contiguous [`SwarmModel::parameters()`] slice (`ST-08`).
+///
+/// Ensures models whose contiguous parameter buffer follows layer declaration order (such as
+/// [`crate::simple::LinearModel`] `[W | b]` or [`crate::mlp::MlpModel`] `[W1 | b1 | W2 | b2]`)
+/// serialize each named SafeTensors entry from its true slice rather than alphabetical order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelFlatTensorLayoutV1 {
+    schema: ModelTensorSchemaV1,
+    ranges_by_schema_order: Vec<ModelTensorFlatRangeV1>,
+    total_elements: usize,
+}
+
+impl ModelFlatTensorLayoutV1 {
+    /// Construct and strictly verify a disjoint, gap-free mapping covering `[0 .. schema.total_elements())`.
+    pub fn try_new(
+        schema: ModelTensorSchemaV1,
+        explicit_offsets: BTreeMap<String, usize>,
+        limits: &SafeTensorsLimitsV1,
+    ) -> Result<Self, SafeTensorsError> {
+        let validated = ModelTensorSchemaV1::try_new(schema.tensors, limits)?;
+        let total_elements = validated.total_elements()?;
+        if explicit_offsets.len() != validated.tensors.len() {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+
+        let mut ranges_by_schema_order = Vec::with_capacity(validated.tensors.len());
+        let mut intervals = Vec::with_capacity(validated.tensors.len());
+        for desc in &validated.tensors {
+            let &flat_offset = explicit_offsets
+                .get(&desc.name)
+                .ok_or(SafeTensorsError::SchemaMismatch)?;
+            let num_elements = desc.num_elements()?;
+            let flat_end = flat_offset
+                .checked_add(num_elements)
+                .ok_or(SafeTensorsError::ShapeOverflow)?;
+            if flat_end > total_elements {
+                return Err(SafeTensorsError::SchemaMismatch);
+            }
+            ranges_by_schema_order.push(ModelTensorFlatRangeV1 {
+                name: desc.name.clone(),
+                flat_offset,
+                num_elements,
+            });
+            intervals.push((flat_offset, flat_end));
+        }
+
+        intervals.sort_unstable();
+        let mut cursor = 0usize;
+        for (begin, end) in intervals {
+            if begin != cursor {
+                return Err(SafeTensorsError::SchemaMismatch);
+            }
+            cursor = end;
+        }
+        if cursor != total_elements {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+
+        Ok(Self {
+            schema: validated,
+            ranges_by_schema_order,
+            total_elements,
+        })
+    }
+
+    /// Construct the identity layout matching canonical sorted [`ModelTensorSchemaV1`] tensor order
+    /// (used by backends exporting parameters in sorted schema order).
+    pub fn canonical(schema: ModelTensorSchemaV1) -> Result<Self, SafeTensorsError> {
+        let validated =
+            ModelTensorSchemaV1::try_new(schema.tensors, &SafeTensorsLimitsV1::default())?;
+        let mut offsets = BTreeMap::new();
+        let mut cursor = 0usize;
+        for desc in &validated.tensors {
+            offsets.insert(desc.name.clone(), cursor);
+            cursor = cursor
+                .checked_add(desc.num_elements()?)
+                .ok_or(SafeTensorsError::ShapeOverflow)?;
+        }
+        Self::try_new(validated, offsets, &SafeTensorsLimitsV1::default())
+    }
+
+    /// Flat `[W | b]` parameter layout matching [`crate::simple::LinearModelWithCapacity`].
+    pub fn for_linear(input_dim: usize, output_dim: usize) -> Result<Self, SafeTensorsError> {
+        let schema = ModelTensorSchemaV1::for_linear(input_dim, output_dim)?;
+        let weight_count = input_dim
+            .checked_mul(output_dim)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let mut offsets = BTreeMap::new();
+        offsets.insert("linear.weight".to_string(), 0);
+        offsets.insert("linear.bias".to_string(), weight_count);
+        Self::try_new(schema, offsets, &SafeTensorsLimitsV1::default())
+    }
+
+    /// Flat `[W1 | b1 | W2 | b2]` parameter layout matching [`crate::mlp::MlpModelWithCapacity`].
+    pub fn for_mlp(
+        input_dim: usize,
+        hidden_dim: usize,
+        output_dim: usize,
+    ) -> Result<Self, SafeTensorsError> {
+        let schema = ModelTensorSchemaV1::for_mlp(input_dim, hidden_dim, output_dim)?;
+        let w1_count = input_dim
+            .checked_mul(hidden_dim)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let b1_offset = w1_count;
+        let w2_offset = b1_offset
+            .checked_add(hidden_dim)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let w2_count = hidden_dim
+            .checked_mul(output_dim)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let b2_offset = w2_offset
+            .checked_add(w2_count)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+
+        let mut offsets = BTreeMap::new();
+        offsets.insert("mlp.fc1.weight".to_string(), 0);
+        offsets.insert("mlp.fc1.bias".to_string(), b1_offset);
+        offsets.insert("mlp.fc2.weight".to_string(), w2_offset);
+        offsets.insert("mlp.fc2.bias".to_string(), b2_offset);
+        Self::try_new(schema, offsets, &SafeTensorsLimitsV1::default())
+    }
+
+    /// Borrow the underlying canonical sorted [`ModelTensorSchemaV1`].
+    pub const fn schema(&self) -> &ModelTensorSchemaV1 {
+        &self.schema
+    }
+
+    /// Borrow validated flat parameter ranges ordered to match `self.schema().tensors`.
+    pub fn ranges(&self) -> &[ModelTensorFlatRangeV1] {
+        &self.ranges_by_schema_order
+    }
+
+    /// Return the total mapped parameter element count.
+    pub const fn total_elements(&self) -> usize {
+        self.total_elements
+    }
+}
+
 /// Serialize a [`SwarmModel`] into a canonical `SwarmTorchCheckpointV1` SafeTensors binary buffer
-/// (`[u64_le(header_len) || utf8_json_header || raw_le_tensor_bytes]`).
+/// (`[u64_le(header_len) || utf8_json_header || raw_le_tensor_bytes]`) assuming canonical sorted
+/// [`ModelTensorSchemaV1`] parameter ordering.
+///
+/// Models with declaration-ordered flat parameters (`LinearModel` `[W | b]` or `MlpModel`
+/// `[W1 | b1 | W2 | b2]`) must use [`export_safetensors_checkpoint_with_layout_v1`].
 pub fn export_safetensors_checkpoint_v1<M: SwarmModel>(
     model: &M,
     schema: &ModelTensorSchemaV1,
     limits: &SafeTensorsLimitsV1,
 ) -> Result<Vec<u8>, SafeTensorsError> {
     let validated = ModelTensorSchemaV1::try_new(schema.tensors.clone(), limits)?;
+    let layout = ModelFlatTensorLayoutV1::canonical(validated)?;
+    export_safetensors_checkpoint_with_layout_v1(model, &layout, limits)
+}
+
+/// Serialize a [`SwarmModel`] into a canonical `SwarmTorchCheckpointV1` SafeTensors binary buffer
+/// using an explicit [`ModelFlatTensorLayoutV1`] mapping between tensor names and flat parameter
+/// offsets (`ST-08`).
+pub fn export_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
+    model: &M,
+    layout: &ModelFlatTensorLayoutV1,
+    limits: &SafeTensorsLimitsV1,
+) -> Result<Vec<u8>, SafeTensorsError> {
+    let validated = ModelTensorSchemaV1::try_new(layout.schema.tensors.clone(), limits)?;
     let expected_elements = validated.total_elements()?;
+    if expected_elements != layout.total_elements
+        || layout.ranges_by_schema_order.len() != validated.tensors.len()
+    {
+        return Err(SafeTensorsError::SchemaMismatch);
+    }
     let params = model.parameters();
     if params.len() != expected_elements {
         return Err(SafeTensorsError::SchemaMismatch);
@@ -423,15 +633,6 @@ pub fn export_safetensors_checkpoint_v1<M: SwarmModel>(
 
     let schema_hash_hex = validated.schema_hash_hex();
     let mut header_json = String::new();
-    header_json.push_str("{\"__metadata\":{\"format\":");
-    push_json_escaped_str(&mut header_json, SWARMTORCH_CHECKPOINT_FORMAT_V1);
-    header_json.push_str(",\"model_schema_hash\":");
-    push_json_escaped_str(&mut header_json, &schema_hash_hex);
-    header_json.push('}');
-
-    // Wait: standard HuggingFace SafeTensors uses `"__metadata__"` (with trailing double underscore).
-    // Let's write `"__metadata__"`!
-    header_json.clear();
     header_json.push_str("{\"__metadata__\":{\"format\":");
     push_json_escaped_str(&mut header_json, SWARMTORCH_CHECKPOINT_FORMAT_V1);
     header_json.push_str(",\"model_schema_hash\":");
@@ -486,8 +687,20 @@ pub fn export_safetensors_checkpoint_v1<M: SwarmModel>(
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len_u64.to_le_bytes());
     out.extend_from_slice(header_json.as_bytes());
-    for &p in params {
-        out.extend_from_slice(&p.to_le_bytes());
+    for (desc, range) in validated.tensors.iter().zip(&layout.ranges_by_schema_order) {
+        if desc.name != range.name || range.num_elements != desc.num_elements()? {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+        let end = range
+            .flat_offset
+            .checked_add(range.num_elements)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let slice = params
+            .get(range.flat_offset..end)
+            .ok_or(SafeTensorsError::SchemaMismatch)?;
+        for &p in slice {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
     }
     Ok(out)
 }
@@ -858,9 +1071,14 @@ pub fn parse_and_validate_safetensors_v1(
 /// (`ADR-0024` §3, `W11-04`).
 ///
 /// Guarantees all-or-nothing semantics (`F-07`):
+///
 /// 1. Validates header bounds, duplicate keys, contiguous offsets, and `model_schema_hash`.
 /// 2. Stages all decoded `f32` parameters and verifies `.is_finite()` on **every** element
 ///    before calling `model.load_parameters(&staged)` so `model` is never partially mutated on error.
+///
+/// Assumes canonical sorted tensor ordering; models with `[W | b]` or `[W1 | b1 | W2 | b2]` flat
+/// buffers must use [`import_safetensors_checkpoint_with_layout_v1`] with
+/// [`ModelFlatTensorLayoutV1::for_linear`] or [`ModelFlatTensorLayoutV1::for_mlp`].
 pub fn import_safetensors_checkpoint_v1<M: SwarmModel>(
     model: &mut M,
     expected_schema: &ModelTensorSchemaV1,
@@ -868,6 +1086,19 @@ pub fn import_safetensors_checkpoint_v1<M: SwarmModel>(
     limits: &SafeTensorsLimitsV1,
 ) -> Result<[u8; 32], SafeTensorsError> {
     let canonical_schema = ModelTensorSchemaV1::try_new(expected_schema.tensors.clone(), limits)?;
+    let layout = ModelFlatTensorLayoutV1::canonical(canonical_schema)?;
+    import_safetensors_checkpoint_with_layout_v1(model, &layout, bytes, limits)
+}
+
+/// Validate and transactionally import `SwarmTorchCheckpointV1` SafeTensors v1 bytes using an
+/// explicit [`ModelFlatTensorLayoutV1`] mapping between tensor names and `model.parameters()` (`ST-08`).
+pub fn import_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
+    model: &mut M,
+    layout: &ModelFlatTensorLayoutV1,
+    bytes: &[u8],
+    limits: &SafeTensorsLimitsV1,
+) -> Result<[u8; 32], SafeTensorsError> {
+    let canonical_schema = ModelTensorSchemaV1::try_new(layout.schema.tensors.clone(), limits)?;
     let parsed = parse_and_validate_safetensors_v1(bytes, limits)?;
 
     let fmt = parsed
@@ -888,15 +1119,28 @@ pub fn import_safetensors_checkpoint_v1<M: SwarmModel>(
         return Err(SafeTensorsError::SchemaMismatch);
     }
 
-    if parsed.tensors.len() != canonical_schema.tensors.len() {
+    if parsed.tensors.len() != canonical_schema.tensors.len()
+        || layout.ranges_by_schema_order.len() != canonical_schema.tensors.len()
+    {
         return Err(SafeTensorsError::SchemaMismatch);
     }
 
     let total_elems = canonical_schema.total_elements()?;
-    let mut staged_params = Vec::with_capacity(total_elems);
+    if total_elems != layout.total_elements || total_elems != model.num_parameters() {
+        return Err(SafeTensorsError::SchemaMismatch);
+    }
+
+    let mut staged_params = vec![0.0f32; total_elems];
     let data_section = &bytes[parsed.data_section_offset..];
 
-    for desc in &canonical_schema.tensors {
+    for (desc, range) in canonical_schema
+        .tensors
+        .iter()
+        .zip(&layout.ranges_by_schema_order)
+    {
+        if desc.name != range.name || range.num_elements != desc.num_elements()? {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
         let entry = parsed
             .tensors
             .get(&desc.name)
@@ -909,18 +1153,25 @@ pub fn import_safetensors_checkpoint_v1<M: SwarmModel>(
         }
         let (begin, end) = entry.data_offsets;
         let tensor_bytes = &data_section[begin..end];
-        for chunk in tensor_bytes.chunks_exact(4) {
+        let dest_end = range
+            .flat_offset
+            .checked_add(range.num_elements)
+            .ok_or(SafeTensorsError::ShapeOverflow)?;
+        let dest_slice = staged_params
+            .get_mut(range.flat_offset..dest_end)
+            .ok_or(SafeTensorsError::SchemaMismatch)?;
+        if tensor_bytes.len() != dest_slice.len() * 4 {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+        for (idx, chunk) in tensor_bytes.chunks_exact(4).enumerate() {
             let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if !val.is_finite() {
                 return Err(SafeTensorsError::NonFiniteParameter);
             }
-            staged_params.push(val);
+            dest_slice[idx] = val;
         }
     }
 
-    if staged_params.len() != model.num_parameters() {
-        return Err(SafeTensorsError::SchemaMismatch);
-    }
     model
         .load_parameters(&staged_params)
         .map_err(|_| SafeTensorsError::ModelLoadFailed)?;
@@ -996,5 +1247,109 @@ mod tests {
         );
         // Target model must still hold [9.0, 8.0, 7.0]!
         assert_eq!(target_model.parameters(), &[9.0, 8.0, 7.0]);
+    }
+
+    fn read_tensor_f32s(bytes: &[u8], parsed: &ParsedSafeTensorsHeaderV1, name: &str) -> Vec<f32> {
+        let entry = parsed.tensors.get(name).unwrap();
+        let (begin, end) = entry.data_offsets;
+        bytes[parsed.data_section_offset + begin..parsed.data_section_offset + end]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn layout_for_linear_maps_weights_before_bias_despite_alphabetical_sorting() {
+        let mut model = LinearModel::new(3, 2).unwrap();
+        // Distinct values across all 6 weights [W] and 2 biases [b]
+        let expected_weights = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let expected_bias = [0.25f32, -0.75];
+        let mut flat = Vec::from(expected_weights);
+        flat.extend_from_slice(&expected_bias);
+        model.load_parameters(&flat).unwrap();
+
+        let layout = ModelFlatTensorLayoutV1::for_linear(3, 2).unwrap();
+        let limits = SafeTensorsLimitsV1::default();
+        let bytes = export_safetensors_checkpoint_with_layout_v1(&model, &layout, &limits).unwrap();
+
+        // Parse raw SafeTensors header and verify "linear.bias" vs "linear.weight" bytes are NOT swapped!
+        let parsed = parse_and_validate_safetensors_v1(&bytes, &limits).unwrap();
+        assert_eq!(
+            read_tensor_f32s(&bytes, &parsed, "linear.bias"),
+            expected_bias
+        );
+        assert_eq!(
+            read_tensor_f32s(&bytes, &parsed, "linear.weight"),
+            expected_weights
+        );
+        // Must preserve identical schema hash as ModelTensorSchemaV1::for_linear(3, 2)
+        assert_eq!(
+            layout.schema().schema_hash(),
+            ModelTensorSchemaV1::for_linear(3, 2).unwrap().schema_hash()
+        );
+
+        let mut restored = LinearModel::new(3, 2).unwrap();
+        import_safetensors_checkpoint_with_layout_v1(&mut restored, &layout, &bytes, &limits)
+            .unwrap();
+        assert_eq!(restored.parameters(), &flat[..]);
+        let input = [0.5f32, -1.0, 2.0];
+        let out_orig = model.forward(&input).unwrap();
+        let out_restored = restored.forward(&input).unwrap();
+        assert_eq!(out_orig.as_slice(), out_restored.as_slice());
+    }
+
+    #[test]
+    fn layout_for_mlp_maps_fc1_fc2_weights_and_biases_without_swapping() {
+        use crate::mlp::MlpModel;
+        let mut mlp = MlpModel::new(2, 3, 2).unwrap();
+        // [W1(6) | b1(3) | W2(6) | b2(2)] = 17 distinct floats
+        let w1 = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let b1 = [-0.1f32, -0.2, -0.3];
+        let w2 = [1.1f32, 1.2, 1.3, 1.4, 1.5, 1.6];
+        let b2 = [2.25f32, -3.5];
+        let mut flat = Vec::new();
+        flat.extend_from_slice(&w1);
+        flat.extend_from_slice(&b1);
+        flat.extend_from_slice(&w2);
+        flat.extend_from_slice(&b2);
+        mlp.load_parameters(&flat).unwrap();
+
+        let layout = ModelFlatTensorLayoutV1::for_mlp(2, 3, 2).unwrap();
+        let limits = SafeTensorsLimitsV1::default();
+        let bytes = export_safetensors_checkpoint_with_layout_v1(&mlp, &layout, &limits).unwrap();
+
+        let parsed = parse_and_validate_safetensors_v1(&bytes, &limits).unwrap();
+        assert_eq!(read_tensor_f32s(&bytes, &parsed, "mlp.fc1.weight"), w1);
+        assert_eq!(read_tensor_f32s(&bytes, &parsed, "mlp.fc1.bias"), b1);
+        assert_eq!(read_tensor_f32s(&bytes, &parsed, "mlp.fc2.weight"), w2);
+        assert_eq!(read_tensor_f32s(&bytes, &parsed, "mlp.fc2.bias"), b2);
+
+        let mut restored = MlpModel::new(2, 3, 2).unwrap();
+        import_safetensors_checkpoint_with_layout_v1(&mut restored, &layout, &bytes, &limits)
+            .unwrap();
+        assert_eq!(restored.parameters(), &flat[..]);
+    }
+
+    #[test]
+    fn layout_try_new_rejects_overlaps_gaps_and_mismatched_names() {
+        let schema = ModelTensorSchemaV1::for_linear(2, 2).unwrap();
+        let limits = SafeTensorsLimitsV1::default();
+
+        // Overlapping offsets (both start at 0)
+        let mut overlap = BTreeMap::new();
+        overlap.insert("linear.weight".to_string(), 0);
+        overlap.insert("linear.bias".to_string(), 0);
+        assert_eq!(
+            ModelFlatTensorLayoutV1::try_new(schema.clone(), overlap, &limits).unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Missing key
+        let mut missing = BTreeMap::new();
+        missing.insert("linear.weight".to_string(), 0);
+        assert_eq!(
+            ModelFlatTensorLayoutV1::try_new(schema, missing, &limits).unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
     }
 }

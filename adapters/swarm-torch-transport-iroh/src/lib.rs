@@ -8,14 +8,18 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
+use swarm_torch_core::crypto::{KeyPair, MessageAuth, Signature};
 use swarm_torch_core::replay::ReplayProtection;
 use swarm_torch_core::traits::PeerId;
 use swarm_torch_net::carrier::{
-    CarrierError, LinkBindingPolicyV1, LinkHandshakeAttestationV1, QuicHandshakeStageV1,
-    QuicLengthPrefixedCodecV1, QuicStreamHandshakePolicyV1, VerifiedCarrierBindingV1,
-    VerifiedLinkPrincipalV1, ALPN_SWARMTORCH_DELIVERY_V1,
+    sign_link_attestation, CarrierError, LinkBindingPolicyV1, LinkHandshakeAttestationV1,
+    QuicHandshakeStageV1, QuicLengthPrefixedCodecV1, QuicStreamHandshakePolicyV1,
+    VerifiedCarrierBindingV1, VerifiedLinkPrincipalV1, ALPN_SWARMTORCH_DELIVERY_V1,
 };
 use swarm_torch_net::gossip::{
     BundledGossipDeliveryV1, BundledGossipDeliveryV2, GossipVerifyError,
@@ -46,6 +50,8 @@ pub enum IrohCarrierError {
     Envelope(VerifyError),
     /// Multi-hop gossip envelope verification failed.
     Gossip(GossipVerifyError),
+    /// Live `iroh` QUIC endpoint, dial, or stream I/O failure.
+    Transport(String),
 }
 
 impl fmt::Display for IrohCarrierError {
@@ -59,6 +65,7 @@ impl fmt::Display for IrohCarrierError {
             ),
             Self::Envelope(e) => write!(f, "envelope verification failed: {e}"),
             Self::Gossip(e) => write!(f, "gossip verification failed: {e}"),
+            Self::Transport(msg) => write!(f, "iroh transport error: {msg}"),
         }
     }
 }
@@ -69,7 +76,9 @@ impl std::error::Error for IrohCarrierError {
             Self::Carrier(e) => Some(e),
             Self::Envelope(e) => Some(e),
             Self::Gossip(e) => Some(e),
-            Self::LinkRateLimited { .. } | Self::LinkQuotaTableFull { .. } => None,
+            Self::LinkRateLimited { .. } | Self::LinkQuotaTableFull { .. } | Self::Transport(_) => {
+                None
+            }
         }
     }
 }
@@ -260,11 +269,11 @@ impl LinkFrameQuotaTrackerV1 {
     }
 
     fn insert_sorted_timestamp(q: &mut VecDeque<u64>, ts: u64) {
-        if q.back().map_or(true, |&last| ts >= last) {
+        if q.back().is_none_or(|&last| ts >= last) {
             q.push_back(ts);
         } else {
             let (front_slice, back_slice) = q.as_slices();
-            let pos = if back_slice.first().map_or(true, |&b| ts < b) {
+            let pos = if back_slice.first().is_none_or(|&b| ts < b) {
                 front_slice.partition_point(|&x| x <= ts)
             } else {
                 front_slice.len() + back_slice.partition_point(|&x| x <= ts)
@@ -532,6 +541,331 @@ impl IrohCarrierAdapterV1 {
             .map_err(IrohCarrierError::Gossip)?;
         debug_assert_eq!(verified_originator, originator);
         Ok((AcceptedIrohGossipV2 { binding, delivery }, rest))
+    }
+}
+
+/// Wire attestation header size sent ahead of the SwarmTorch length-prefixed frame:
+/// `[att_pubkey(32) || att_sig(64)]`.
+const LINK_ATTESTATION_HEADER_BYTES: usize = 32 + 64;
+
+/// Live `iroh 1.4` 1-RTT QUIC transport bridge enforcing SwarmTorch link attestation,
+/// strict 1-RTT completion (zero 0-RTT fast-path), TLS-keyed link binding, bounded reads,
+/// pre-auth link quotas, and replay-safe admission (`ST-08`, `ADR-0022`).
+pub struct IrohEndpointBridgeV1 {
+    endpoint: Endpoint,
+    link_auth: MessageAuth,
+    link_peer_id: PeerId,
+    adapter: IrohCarrierAdapterV1,
+}
+
+impl IrohEndpointBridgeV1 {
+    /// Bind a headless loopback `127.0.0.1:0` `iroh` QUIC endpoint with relay/DNS discovery
+    /// disabled, deterministic Ed25519 key identity from `seed`, and SwarmTorch ALPN pinning.
+    pub async fn bind_loopback(
+        seed: [u8; 32],
+        adapter: IrohCarrierAdapterV1,
+    ) -> Result<Self, IrohCarrierError> {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        Self::bind_at_with_alpn(
+            seed,
+            addr,
+            RelayMode::Disabled,
+            adapter,
+            IrohCarrierAdapterV1::expected_alpn(),
+        )
+        .await
+    }
+
+    /// Bind an `iroh` QUIC endpoint on `bind_addr` with the specified [`RelayMode`].
+    pub async fn bind_at(
+        seed: [u8; 32],
+        bind_addr: SocketAddr,
+        relay_mode: RelayMode,
+        adapter: IrohCarrierAdapterV1,
+    ) -> Result<Self, IrohCarrierError> {
+        Self::bind_at_with_alpn(
+            seed,
+            bind_addr,
+            relay_mode,
+            adapter,
+            IrohCarrierAdapterV1::expected_alpn(),
+        )
+        .await
+    }
+
+    async fn bind_at_with_alpn(
+        seed: [u8; 32],
+        bind_addr: SocketAddr,
+        relay_mode: RelayMode,
+        adapter: IrohCarrierAdapterV1,
+        alpn: &[u8],
+    ) -> Result<Self, IrohCarrierError> {
+        let kp =
+            KeyPair::from_seed(seed).map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let link_peer_id = kp.peer_id();
+        let link_auth = MessageAuth::new(kp);
+        let secret_key = SecretKey::from_bytes(&seed);
+
+        let builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![alpn.to_vec()])
+            .relay_mode(relay_mode)
+            .clear_address_lookup()
+            .clear_addr_filter()
+            .bind_addr(bind_addr)
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        Ok(Self {
+            endpoint,
+            link_auth,
+            link_peer_id,
+            adapter,
+        })
+    }
+
+    /// Access the underlying `iroh::Endpoint`.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Access the configured [`IrohCarrierAdapterV1`].
+    pub fn adapter(&self) -> &IrohCarrierAdapterV1 {
+        &self.adapter
+    }
+
+    /// Return the direct addressing info (`EndpointAddr`) for peers to dial this endpoint,
+    /// falling back to immediate `bound_sockets()` loopback addresses when discovery is disabled.
+    pub fn addr(&self) -> EndpointAddr {
+        let mut ep_addr = self.endpoint.addr();
+        if ep_addr.is_empty() {
+            ep_addr = EndpointAddr::from_parts(
+                self.endpoint.id(),
+                self.endpoint
+                    .bound_sockets()
+                    .into_iter()
+                    .map(TransportAddr::Ip),
+            );
+        }
+        ep_addr
+    }
+
+    /// Return the canonical `PeerId` derived from this endpoint's Ed25519 transport public key.
+    pub const fn link_peer_id(&self) -> PeerId {
+        self.link_peer_id
+    }
+
+    /// Gracefully close the underlying `iroh::Endpoint`.
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+    }
+
+    const STREAM_HELLO_V1: &'static [u8; 4] = b"STQ1";
+
+    /// Connect to `target` over a strictly completed `1-RTT` `iroh` QUIC connection (never 0-RTT),
+    /// exchange the receiver's fresh challenge nonce, sign a [`LinkHandshakeAttestationV1`], and
+    /// stream the bounded length-prefixed payload.
+    pub async fn send_frame_1rtt(
+        &self,
+        target: impl Into<EndpointAddr>,
+        payload: &[u8],
+    ) -> Result<(), IrohCarrierError> {
+        let wire_frame = self.adapter.encode_wire_frame(payload)?;
+        let conn = self
+            .endpoint
+            .connect(target, IrohCarrierAdapterV1::expected_alpn())
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        let negotiated_alpn = conn.alpn();
+        if negotiated_alpn != IrohCarrierAdapterV1::expected_alpn() {
+            conn.close(1u32.into(), b"alpn mismatch");
+            return Err(IrohCarrierError::Carrier(CarrierError::AlpnMismatch));
+        }
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        // Write 4-byte stream hello immediately so QUIC transmits client-initiated stream opening.
+        send.write_all(Self::STREAM_HELLO_V1)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        let mut receiver_nonce = [0u8; 16];
+        recv.read_exact(&mut receiver_nonce)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        if receiver_nonce == [0u8; 16] {
+            conn.close(2u32.into(), b"zero challenge nonce");
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation,
+            ));
+        }
+
+        let att = sign_link_attestation(&self.link_auth, negotiated_alpn, receiver_nonce)?;
+        let mut out = Vec::with_capacity(LINK_ATTESTATION_HEADER_BYTES + wire_frame.len());
+        out.extend_from_slice(&att.endpoint_public_key);
+        out.extend_from_slice(att.signature.as_bytes());
+        out.extend_from_slice(&wire_frame);
+
+        send.write_all(&out)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        send.finish()
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let _ = recv.read_to_end(1).await;
+        Ok(())
+    }
+
+    /// Accept one incoming `iroh` connection strictly after `1-RTT` TLS completion (never 0-RTT),
+    /// issue `receiver_nonce` challenge, verify both ALPN and TLS `remote_id == attestation_key`,
+    /// and return a sealed [`IrohVerifiedLinkPrincipalV1`] + bounded wire frame bytes.
+    pub async fn accept_1rtt_frame(
+        &self,
+        receiver_nonce: [u8; 16],
+    ) -> Result<(IrohVerifiedLinkPrincipalV1, Vec<u8>), IrohCarrierError> {
+        if receiver_nonce == [0u8; 16] {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation,
+            ));
+        }
+
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
+            .ok_or_else(|| IrohCarrierError::Transport("iroh endpoint closed".to_string()))?;
+
+        // Strictly require full 1-RTT QUIC/TLS completion (never call `.into_0rtt()`).
+        let accepting = incoming
+            .accept()
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let conn = accepting
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        let negotiated_alpn = conn.alpn().to_vec();
+        if negotiated_alpn.as_slice() != IrohCarrierAdapterV1::expected_alpn() {
+            conn.close(1u32.into(), b"alpn mismatch");
+            return Err(IrohCarrierError::Carrier(CarrierError::AlpnMismatch));
+        }
+        let remote_id_bytes: [u8; 32] = *conn.remote_id().as_bytes();
+
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        let mut hello = [0u8; 4];
+        recv.read_exact(&mut hello)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        if &hello != Self::STREAM_HELLO_V1 {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::EmptyOrTruncatedFrame,
+            ));
+        }
+
+        send.write_all(&receiver_nonce)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+
+        let max_read = LINK_ATTESTATION_HEADER_BYTES
+            .saturating_add(4)
+            .saturating_add(self.adapter.codec.max_frame_bytes);
+        let buf = recv
+            .read_to_end(max_read)
+            .await
+            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let _ = send.write_all(&[0x01]).await;
+        let _ = send.finish();
+
+        if buf.len() < LINK_ATTESTATION_HEADER_BYTES {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::EmptyOrTruncatedFrame,
+            ));
+        }
+
+        let mut att_pubkey = [0u8; 32];
+        att_pubkey.copy_from_slice(&buf[..32]);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&buf[32..LINK_ATTESTATION_HEADER_BYTES]);
+
+        // Cryptographic binding between QUIC TLS 1.3 `EndpointId` and SwarmTorch attestation key.
+        if att_pubkey != remote_id_bytes {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation,
+            ));
+        }
+
+        let att = LinkHandshakeAttestationV1 {
+            endpoint_public_key: att_pubkey,
+            negotiated_alpn: &negotiated_alpn,
+            receiver_nonce,
+            signature: Signature::from_bytes(sig_bytes),
+        };
+        let principal = self.adapter.accept_attested_link(
+            &receiver_nonce,
+            QuicHandshakeStageV1::OneRttComplete,
+            &att,
+        )?;
+        Ok((principal, buf[LINK_ATTESTATION_HEADER_BYTES..].to_vec()))
+    }
+
+    /// Accept one live `1-RTT` QUIC frame and admit a direct [`MessageEnvelope`] under
+    /// pre-auth link quota + replay protection.
+    pub async fn accept_envelope_over_quic(
+        &self,
+        receiver_nonce: [u8; 16],
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<AcceptedIrohEnvelopeV1, IrohCarrierError> {
+        let (principal, wire_frame) = self.accept_1rtt_frame(receiver_nonce).await?;
+        let (accepted, rest) = self.adapter.accept_envelope_frame(
+            principal,
+            &wire_frame,
+            replay_guard,
+            current_time_secs,
+            quota,
+        )?;
+        if !rest.is_empty() {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::EmptyOrTruncatedFrame,
+            ));
+        }
+        Ok(accepted)
+    }
+
+    /// Accept one live `1-RTT` QUIC frame and admit a v2 gossip [`BundledGossipDeliveryV2`].
+    pub async fn accept_gossip_v2_over_quic(
+        &self,
+        receiver_nonce: [u8; 16],
+        recipient_peer: PeerId,
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<AcceptedIrohGossipV2, IrohCarrierError> {
+        let (principal, wire_frame) = self.accept_1rtt_frame(receiver_nonce).await?;
+        let (accepted, rest) = self.adapter.accept_gossip_v2_frame(
+            principal,
+            recipient_peer,
+            &wire_frame,
+            replay_guard,
+            current_time_secs,
+            quota,
+        )?;
+        if !rest.is_empty() {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::EmptyOrTruncatedFrame,
+            ));
+        }
+        Ok(accepted)
     }
 }
 
@@ -897,5 +1231,293 @@ mod tests {
         tracker.record_frame_at(&p3, 230).unwrap();
         assert_eq!(tracker.tracked_link_count(), 1);
         assert_eq!(tracker.active_window_count(&p3.link_peer_id()), 1);
+    }
+
+    #[tokio::test]
+    async fn live_iroh_1rtt_quic_loopback_enforces_binding_alpn_quota_and_v2_gossip() {
+        let relay_seed = [0x11; 32];
+        let origin_seed = [0x22; 32];
+        let coord_seed = [0x33; 32];
+
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let coord_kp = KeyPair::from_seed(coord_seed).unwrap();
+
+        let relay_ep = IrohEndpointBridgeV1::bind_loopback(
+            relay_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::DecoupledRelayAllowed, 65_536),
+        )
+        .await
+        .unwrap();
+        let strict_ep = IrohEndpointBridgeV1::bind_loopback(
+            coord_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+        let relay_server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0x44; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::DecoupledRelayAllowed, 65_536),
+        )
+        .await
+        .unwrap();
+
+        let allowlist = CohortAllowlist::from_peers([origin_kp.peer_id()]);
+        let scope = [0x11; 16];
+        let run_id = [0x22; 16];
+        let policy_digest = [0x44; 32];
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: scope,
+            run_id,
+            policy_digest,
+            receiver_peer: coord_kp.peer_id(),
+            sender_peer: origin_kp.peer_id(),
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x77; 32],
+            issued_at_secs: 900,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        let hs_sig = origin_auth.sign_session_handshake_v2(&challenge).unwrap();
+
+        let mut strict_replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(allowlist.clone());
+        strict_replay
+            .register_recovery_challenge_v2(challenge)
+            .unwrap();
+        strict_replay
+            .complete_recovery_handshake_v2(scope, run_id, origin_kp.public_key(), &hs_sig, 900)
+            .unwrap();
+
+        let mut env_v2 = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![1, 2, 3, 4],
+        );
+        env_v2.sequence = 1;
+        env_v2.timestamp = 1000;
+        let env_v2 = env_v2.sign_with(&origin_auth);
+        let env_bytes = env_v2.serialize().unwrap();
+
+        // 1. StrictOneToOne over live QUIC 1-RTT MUST reject relay != originator WITHOUT mutating replay_guard.
+        let strict_addr = strict_ep.addr();
+        let (send_res, recv_res) = tokio::join!(
+            relay_ep.send_frame_1rtt(strict_addr, &env_bytes),
+            strict_ep.accept_envelope_over_quic([0x5A; 16], &mut strict_replay, 1000, None),
+        );
+        send_res.unwrap();
+        assert!(matches!(
+            recv_res,
+            Err(IrohCarrierError::Carrier(
+                CarrierError::StrictBindingMismatch { .. }
+            ))
+        ));
+
+        // 2. Mismatched ALPN endpoint dialed over live QUIC MUST fail closed before frame delivery.
+        let bad_ep = IrohEndpointBridgeV1::bind_at_with_alpn(
+            [0x55; 32],
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            RelayMode::Disabled,
+            IrohCarrierAdapterV1::default(),
+            b"other/wrong-alpn",
+        )
+        .await
+        .unwrap();
+        let bad_addr = bad_ep.addr();
+        let accept_task = tokio::spawn({
+            let ep = bad_ep.endpoint().clone();
+            async move {
+                if let Some(inc) = ep.accept().await {
+                    if let Ok(acc) = inc.accept() {
+                        let _ = acc.await;
+                    }
+                }
+            }
+        });
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_ep.send_frame_1rtt(bad_addr, &env_bytes),
+        )
+        .await
+        .expect("ALPN mismatch dial timed out")
+        .unwrap_err();
+        assert!(matches!(err, IrohCarrierError::Transport(_)));
+        bad_ep.close().await;
+        let _ = accept_task.await;
+
+        // 3. Relayed v2 gossip over live 1-RTT QUIC succeeds & records per-link quota!
+        let inner_v2 = InnerUpdateV2 {
+            originator_public_key: *origin_kp.public_key(),
+            swarm_instance_id: scope,
+            run_id,
+            round_id: 9,
+            contribution_id: 1,
+            base_checkpoint_digest: [0x11; 32],
+            context_policy_digest: policy_digest,
+            payload_kind: PayloadKindV1::ModelDeltaV1,
+            compression_schema_version: 0,
+            num_elements: 2,
+            reported_examples: 8,
+            encoded_payload: vec![1, 2, 3, 4],
+            originator_signature: Vec::new(),
+        };
+        let gossip_v2 = BundledGossipDeliveryV2::new_signed(
+            &origin_auth,
+            inner_v2,
+            coord_kp.peer_id(),
+            session_id,
+            1,
+            1,
+            1000,
+        );
+        let gossip_bytes = gossip_v2.to_bytes().unwrap();
+
+        let mut relay_replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(allowlist);
+        relay_replay
+            .register_recovery_challenge_v2(challenge)
+            .unwrap();
+        relay_replay
+            .complete_recovery_handshake_v2(scope, run_id, origin_kp.public_key(), &hs_sig, 900)
+            .unwrap();
+        let mut quota = LinkFrameQuotaTrackerV1::with_limits(1, 60, 8, 16);
+
+        let srv_addr = relay_server_ep.addr();
+        let (send_g, recv_g) = tokio::join!(
+            relay_ep.send_frame_1rtt(srv_addr.clone(), &gossip_bytes),
+            relay_server_ep.accept_gossip_v2_over_quic(
+                [0x6B; 16],
+                coord_kp.peer_id(),
+                &mut relay_replay,
+                1000,
+                Some(&mut quota),
+            ),
+        );
+        send_g.unwrap();
+        let accepted = recv_g.unwrap();
+        assert!(accepted.binding().relayed_via_intermediary());
+        assert_eq!(
+            accepted.binding().link_principal().link_peer_id(),
+            relay_ep.link_peer_id()
+        );
+        assert_eq!(accepted.binding().originator_peer_id(), origin_kp.peer_id());
+        assert_eq!(accepted.delivery.wrapper.session_id, session_id);
+        assert_eq!(quota.active_window_count(&relay_ep.link_peer_id()), 1);
+
+        // 4. Quota limit (1 frame/min) rejects 2nd live frame pre-replay with LinkRateLimited!
+        let (send_q, recv_q) = tokio::join!(
+            relay_ep.send_frame_1rtt(srv_addr, &gossip_bytes),
+            relay_server_ep.accept_gossip_v2_over_quic(
+                [0x7C; 16],
+                coord_kp.peer_id(),
+                &mut relay_replay,
+                1001,
+                Some(&mut quota),
+            ),
+        );
+        send_q.unwrap();
+        assert!(matches!(
+            recv_q,
+            Err(IrohCarrierError::LinkRateLimited { .. })
+        ));
+
+        relay_ep.close().await;
+        strict_ep.close().await;
+        relay_server_ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn live_iroh_1rtt_direct_strict_delivery_and_tamper_rejection() {
+        let origin_seed = [0x71; 32];
+        let server_seed = [0x72; 32];
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let server_kp = KeyPair::from_seed(server_seed).unwrap();
+
+        let client_ep = IrohEndpointBridgeV1::bind_loopback(
+            origin_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            server_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+
+        let allowlist = CohortAllowlist::from_peers([origin_kp.peer_id()]);
+        let scope = [0x11; 16];
+        let run_id = [0x22; 16];
+        let policy_digest = [0x55; 32];
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: scope,
+            run_id,
+            policy_digest,
+            receiver_peer: server_kp.peer_id(),
+            sender_peer: origin_kp.peer_id(),
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x88; 32],
+            issued_at_secs: 900,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        let hs_sig = origin_auth.sign_session_handshake_v2(&challenge).unwrap();
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(allowlist);
+        replay.register_recovery_challenge_v2(challenge).unwrap();
+        replay
+            .complete_recovery_handshake_v2(scope, run_id, origin_kp.public_key(), &hs_sig, 900)
+            .unwrap();
+
+        let mut env = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![9, 8, 7],
+        );
+        env.sequence = 1;
+        env.timestamp = 1000;
+        let env = env.sign_with(&origin_auth);
+        let valid_bytes = env.serialize().unwrap();
+        let mut tampered_bytes = valid_bytes.clone();
+        let last = tampered_bytes.len() - 1;
+        tampered_bytes[last] ^= 0xFF;
+
+        let addr = server_ep.addr();
+        // 1. Tampered payload fails signature verification without advancing seq=1!
+        let (s_bad, r_bad) = tokio::join!(
+            client_ep.send_frame_1rtt(addr.clone(), &tampered_bytes),
+            server_ep.accept_envelope_over_quic([0x81; 16], &mut replay, 1000, None),
+        );
+        s_bad.unwrap();
+        assert!(matches!(r_bad, Err(IrohCarrierError::Envelope(_))));
+
+        // 2. Genuine seq=1 still accepted directly over StrictOneToOne 1-RTT QUIC!
+        let (s_ok, r_ok) = tokio::join!(
+            client_ep.send_frame_1rtt(addr, &valid_bytes),
+            server_ep.accept_envelope_over_quic([0x82; 16], &mut replay, 1000, None),
+        );
+        s_ok.unwrap();
+        let accepted = r_ok.unwrap();
+        assert!(!accepted.binding().relayed_via_intermediary());
+        assert_eq!(accepted.binding().originator_peer_id(), origin_kp.peer_id());
+        assert_eq!(accepted.envelope.payload, vec![9, 8, 7]);
+
+        client_ep.close().await;
+        server_ep.close().await;
     }
 }

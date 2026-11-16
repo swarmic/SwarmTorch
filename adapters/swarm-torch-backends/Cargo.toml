@@ -11,9 +11,14 @@ description = "Isolated external DL framework adapter bridges (Burn / Candle) fo
 default = []
 burn = []
 candle = []
+real-burn = ["dep:burn"]
+real-candle = ["dep:candle-core", "dep:candle-nn"]
 
 [workspace]
 
 [dependencies]
+burn = { version = "0.21.0", optional = true, default-features = false, features = ["std", "ndarray", "autodiff"] }
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
 swarm-torch-core = { path = "../../swarm-torch-core" }
 swarm-torch-models = { path = "../../swarm-torch-models" }

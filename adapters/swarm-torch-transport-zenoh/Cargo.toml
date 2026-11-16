@@ -12,3 +12,5 @@ description = "Isolated Zenoh pub/sub topic contract carrier adapter for SwarmTo
 [dependencies]
 swarm-torch-core = { path = "../../swarm-torch-core" }
 swarm-torch-net = { path = "../../swarm-torch-net" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
+zenoh = { version = "1.10.2", default-features = false, features = ["transport_tcp"] }

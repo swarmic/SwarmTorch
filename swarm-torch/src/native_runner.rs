@@ -13,8 +13,10 @@
 //! Policy enforcement must happen BEFORE calling `run()`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use swarm_torch_core::execution::{AssetInstanceV1, OpRunner};
 use swarm_torch_core::observe::{AttrMap, RunEventEmitter, RunId, SpanId, SpanRecord, TraceId};
-use swarm_torch_core::run_graph::{CanonParams, CanonValue, NodeV1};
+use swarm_torch_core::run_graph::{CanonParams, CanonValue, ExecutionTrust, NodeV1};
 
 use crate::artifacts::schema_check::{
     validate_json_bytes_against_schema, COLUMNAR_TABLE_SCHEMA_JSON,
@@ -31,7 +33,10 @@ use crate::artifacts::{
     hex_lower, parse_cas_uri_digest, read_bytes_bounded, write_once_cas_blob, OutputSpec,
     MAX_SINGLE_ARTIFACT_BYTES,
 };
-use crate::wasm_sandbox::{SandboxedExtensionPolicyV1, WasmSandboxError};
+use crate::wasm_sandbox::{
+    parse_sha256_hex_v1, preflight_wasm_extension_v1, SandboxedExtensionPolicyV1,
+    WasmExtensionExecutor, WasmSandboxError,
+};
 
 /// Canonical column data type discriminator matching `schemas/v1/columnar_table.schema.json` (`P2-20b`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,9 +304,19 @@ fn deterministic_span_id(node_id_bytes: &[u8; 16], ts_nanos: u64) -> SpanId {
 /// - `"passthrough"` — validates/copies CAS inputs (or forwards metadata in [`RunnerExecutionModeV1::MetadataOnlyForTests`])
 /// - `"filter_rows"` — executes typed row filtering over `ColumnarTableV1` or NDJSON CAS blobs
 /// - `"union"` — merges homogeneous `ColumnarTableV1` or NDJSON CAS inputs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Default)]
 pub struct NativeOpRunner {
     mode: RunnerExecutionModeV1,
+    wasm_executor: Option<Arc<dyn WasmExtensionExecutor>>,
+}
+
+impl fmt::Debug for NativeOpRunner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeOpRunner")
+            .field("mode", &self.mode)
+            .field("has_wasm_executor", &self.wasm_executor.is_some())
+            .finish()
+    }
 }
 
 impl NativeOpRunner {
@@ -309,12 +324,27 @@ impl NativeOpRunner {
     pub const fn new() -> Self {
         Self {
             mode: RunnerExecutionModeV1::PhysicalStrict,
+            wasm_executor: None,
         }
     }
 
     /// Construct a runner with an explicit [`RunnerExecutionModeV1`].
     pub const fn with_mode(mode: RunnerExecutionModeV1) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            wasm_executor: None,
+        }
+    }
+
+    /// Attach an isolated external WebAssembly extension executor (`ST-09`).
+    pub fn with_wasm_executor(mut self, executor: Arc<dyn WasmExtensionExecutor>) -> Self {
+        self.wasm_executor = Some(executor);
+        self
+    }
+
+    /// Return the configured external WebAssembly extension executor, if any.
+    pub fn wasm_executor(&self) -> Option<&Arc<dyn WasmExtensionExecutor>> {
+        self.wasm_executor.as_ref()
     }
 
     /// Return the configured [`RunnerExecutionModeV1`].
@@ -466,12 +496,34 @@ impl NativeOpRunner {
         let span_id = deterministic_span_id(node_id.as_bytes(), start_nanos);
         let trace_id = TraceId::from_bytes(*ctx.run_id.as_bytes());
 
-        let _ = wasm_isolation;
         if node.op_type == "wasm_transform" {
-            // ST-09 containment: untrusted Wasm extension execution fails closed until `wasmi` isolation lands (`13D-1`).
+            let outcome = self.physical_wasm_transform(
+                run_dir,
+                node,
+                inputs,
+                wasm_isolation,
+                input_content_types,
+            )?;
+            let end_nanos = (ctx.clock_nanos)();
+            Self::emit_op_span(
+                trace_id,
+                span_id,
+                node,
+                inputs.len(),
+                outcome.instances.len(),
+                (start_nanos, end_nanos),
+                emitter,
+            )?;
+            return Ok(outcome);
+        }
+
+        if node.execution_trust != ExecutionTrust::Core {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                WasmSandboxError::UnsupportedUntrustedWasmSandbox.to_string(),
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "native op '{}' requires ExecutionTrust::Core, got {:?}",
+                    node.op_type, node.execution_trust
+                ),
             ));
         }
 
@@ -904,6 +956,166 @@ impl OpRunner for NativeOpRunner {
         };
         self.run_with_context(&ctx, node, inputs, emitter)
     }
+}
+
+impl NativeOpRunner {
+    fn physical_wasm_transform(
+        &self,
+        run_dir: &Path,
+        node: &NodeV1,
+        inputs: &[AssetInstanceV1],
+        wasm_isolation: Option<WasmIsolationCtx<'_>>,
+        input_content_types: &BTreeMap<String, String>,
+    ) -> io::Result<PhysicalExecOutcomeV1> {
+        let Some(executor) = self.wasm_executor.as_ref() else {
+            // ST-09 containment: untrusted Wasm extension execution fails closed unless an external executor is configured.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                WasmSandboxError::UnsupportedUntrustedWasmSandbox.to_string(),
+            ));
+        };
+        if node.execution_trust != ExecutionTrust::SandboxedExtension {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "wasm_transform requires ExecutionTrust::SandboxedExtension, got {:?}",
+                    node.execution_trust
+                ),
+            ));
+        }
+        let Some((policy, registry)) = wasm_isolation else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wasm_transform requires SandboxedExtension policy and module registry context",
+            ));
+        };
+        if inputs.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "wasm_transform requires exactly 1 physical CAS input, got {}",
+                    inputs.len()
+                ),
+            ));
+        }
+        if node.outputs.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "wasm_transform supports at most 1 output asset, got {}",
+                    node.outputs.len()
+                ),
+            ));
+        }
+
+        let module_hex = canon_param_str(&node.params, "module_sha256").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wasm_transform requires string parameter 'module_sha256'",
+            )
+        })?;
+        let declared_hash = parse_sha256_hex_v1(module_hex).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("wasm_transform invalid 64-hex lowercase module_sha256 '{module_hex}'"),
+            )
+        })?;
+        let export_name = canon_param_str(&node.params, "export")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "wasm_transform requires non-empty string parameter 'export'",
+                )
+            })?;
+
+        let wasm_bytes = registry.get(&declared_hash).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("wasm_transform module '{module_hex}' not present in wasm_registry"),
+            )
+        })?;
+        let verified_hash = preflight_wasm_extension_v1(policy, wasm_bytes, export_name)
+            .map_err(wasm_error_to_io)?;
+        if verified_hash != declared_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wasm_registry entry bytes do not match declared module_sha256 key",
+            ));
+        }
+
+        let fmt = Self::resolve_input_format(&inputs[0], input_content_types)?;
+        let raw_input = read_verified_cas_input(run_dir, &inputs[0])?;
+        let receipt = executor
+            .execute_byte_transform(policy, wasm_bytes, export_name, &raw_input)
+            .map_err(wasm_error_to_io)?;
+
+        if (receipt.output_bytes.len() as u64) > MAX_SINGLE_ARTIFACT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "wasm_transform output ({} bytes) exceeds MAX_SINGLE_ARTIFACT_BYTES ({MAX_SINGLE_ARTIFACT_BYTES})",
+                    receipt.output_bytes.len()
+                ),
+            ));
+        }
+        let rows_opt = match fmt {
+            ColumnarInputFormatV1::ColumnarTableV1 => {
+                Some(ColumnarTableV1::from_json_bytes_strict(&receipt.output_bytes)?.row_count)
+            }
+            ColumnarInputFormatV1::Ndjson => {
+                Some(Self::parse_ndjson_rows(&receipt.output_bytes)?.len() as u64)
+            }
+            ColumnarInputFormatV1::OpaqueBinary => None,
+        };
+
+        let (hex, uri, byte_len) = write_cas_bytes(run_dir, &receipt.output_bytes)?;
+        let out_key = node
+            .outputs
+            .first()
+            .map(|o| o.asset_key.clone())
+            .unwrap_or_else(|| inputs[0].asset_key.clone());
+        let mut output_content_types = BTreeMap::new();
+        output_content_types.insert(out_key.clone(), fmt.content_type().to_string());
+
+        Ok(PhysicalExecOutcomeV1 {
+            instances: vec![AssetInstanceV1 {
+                asset_key: out_key.clone(),
+                fingerprint_v0: hex,
+                uri: Some(uri),
+            }],
+            output_specs: vec![OutputSpec {
+                asset_key: out_key,
+                schema: None,
+                rows: rows_opt,
+                bytes: Some(byte_len),
+            }],
+            output_content_types,
+        })
+    }
+}
+
+fn wasm_error_to_io(err: WasmSandboxError) -> io::Error {
+    let kind = match &err {
+        WasmSandboxError::UnsupportedUntrustedWasmSandbox => io::ErrorKind::Unsupported,
+        WasmSandboxError::UntrustedModuleHash { .. }
+        | WasmSandboxError::ForbiddenImport { .. }
+        | WasmSandboxError::ExportNotAllowed(_) => io::ErrorKind::PermissionDenied,
+        WasmSandboxError::ExecutionTimeout { .. } => io::ErrorKind::TimedOut,
+        WasmSandboxError::ModuleTooLarge { .. }
+        | WasmSandboxError::InvalidWasmHeader
+        | WasmSandboxError::MalformedSectionOrLeb128
+        | WasmSandboxError::MultipleMemoriesForbidden
+        | WasmSandboxError::MultipleTablesForbidden
+        | WasmSandboxError::MemoryLimitExceeded { .. }
+        | WasmSandboxError::TableLimitExceeded { .. }
+        | WasmSandboxError::ExportSignatureMismatch(_)
+        | WasmSandboxError::OutOfBoundsMemoryAccess { .. } => io::ErrorKind::InvalidInput,
+        WasmSandboxError::OutOfFuel { .. }
+        | WasmSandboxError::MemoryGrowTrap { .. }
+        | WasmSandboxError::ExecutionTrap(_) => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, err.to_string())
 }
 
 fn write_cas_bytes(run_dir: &Path, bytes: &[u8]) -> io::Result<(String, String, u64)> {

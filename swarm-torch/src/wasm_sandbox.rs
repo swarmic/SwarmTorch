@@ -69,6 +69,8 @@ pub enum WasmSandboxError {
         len: usize,
         mem_len: usize,
     },
+    /// Wall-clock execution time exceeded [`WasmStoreLimitsV1::timeout_ms`].
+    ExecutionTimeout { elapsed_ms: u64, limit_ms: u64 },
     /// Division by zero, integer overflow trap, `unreachable`, or call stack overflow.
     ExecutionTrap(String),
 }
@@ -128,6 +130,13 @@ impl fmt::Display for WasmSandboxError {
             Self::OutOfBoundsMemoryAccess { addr, len, mem_len } => write!(
                 f,
                 "wasm out-of-bounds memory access: [{addr}..+{len}) in {mem_len} bytes"
+            ),
+            Self::ExecutionTimeout {
+                elapsed_ms,
+                limit_ms,
+            } => write!(
+                f,
+                "wasm execution timed out after {elapsed_ms} ms (limit {limit_ms} ms)"
             ),
             Self::ExecutionTrap(reason) => write!(f, "wasm execution trap: {reason}"),
         }
@@ -284,1173 +293,1243 @@ pub fn read_guest_slice(memory: &[u8], ptr: i32, len: i32) -> Result<Vec<u8>, Wa
     Ok(memory[start_usize..end_usize].to_vec())
 }
 
-// ---------------------------------------------------------------------------
-// Pure-Rust WebAssembly MVP Binary Decoder & Deterministic Stack Interpreter
-// ---------------------------------------------------------------------------
+/// Narrow execution boundary for an isolated external WebAssembly sandbox runtime (`ST-09`).
+///
+/// Implemented outside `swarm-torch` by `adapters/swarm-torch-wasm` using `wasmi`, while keeping
+/// `swarm-torch` dependency-free and fail-closed whenever no executor is configured.
+pub trait WasmExtensionExecutor: Send + Sync {
+    /// Execute a sandboxed byte-transform Wasm extension (`export(ptr: i32, len: i32) -> i32`)
+    /// under `policy`, enforcing fuel, wall-clock timeout, memory/table limits, and SHA-256 pinning.
+    fn execute_byte_transform(
+        &self,
+        policy: &SandboxedExtensionPolicyV1,
+        wasm_bytes: &[u8],
+        export_name: &str,
+        input_payload: &[u8],
+    ) -> Result<WasmExecutionReceiptV1, WasmSandboxError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WasmValType {
-    I32,
-    I64,
-    F32,
+    /// Execute a sandboxed scalar Wasm extension (`export(arg: i32) -> i32`)
+    /// under `policy`, enforcing fuel, wall-clock timeout, memory/table limits, and SHA-256 pinning.
+    fn execute_scalar_i32(
+        &self,
+        policy: &SandboxedExtensionPolicyV1,
+        wasm_bytes: &[u8],
+        export_name: &str,
+        arg: i32,
+    ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WasmFuncType {
-    params: Vec<WasmValType>,
-    results: Vec<WasmValType>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WasmValue {
-    raw_i32: i32,
-    raw_f32: u32,
-    raw_i64: i64,
-    ty: WasmValType,
-}
-
-impl WasmValue {
-    fn i32(v: i32) -> Self {
-        Self {
-            raw_i32: v,
-            raw_f32: v as u32,
-            raw_i64: v as i64,
-            ty: WasmValType::I32,
+/// Decode a strict 64-character lowercase hexadecimal SHA-256 digest string.
+pub fn parse_sha256_hex_v1(hex_str: &str) -> Option<[u8; 32]> {
+    let bytes = hex_str.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let hex_nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
         }
-    }
-    fn i64(v: i64) -> Self {
-        Self {
-            raw_i32: v as i32,
-            raw_f32: 0,
-            raw_i64: v,
-            ty: WasmValType::I64,
-        }
-    }
-    fn f32(v: f32) -> Self {
-        Self {
-            raw_i32: 0,
-            raw_f32: v.to_bits(),
-            raw_i64: 0,
-            ty: WasmValType::F32,
-        }
-    }
-    fn as_i32(self) -> Result<i32, WasmSandboxError> {
-        if self.ty != WasmValType::I32 {
-            return Err(WasmSandboxError::ExecutionTrap(
-                "type mismatch: expected i32".to_string(),
-            ));
-        }
-        Ok(self.raw_i32)
-    }
-    fn as_f32(self) -> Result<f32, WasmSandboxError> {
-        if self.ty != WasmValType::F32 {
-            return Err(WasmSandboxError::ExecutionTrap(
-                "type mismatch: expected f32".to_string(),
-            ));
-        }
-        Ok(f32::from_bits(self.raw_f32))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct WasmGlobalDecl {
-    val: WasmValue,
-    mutable: bool,
-}
-
-#[derive(Debug, Clone)]
-struct WasmDataSegment {
-    offset: usize,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct WasmCodeBody {
-    locals: Vec<WasmValType>,
-    expr: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct DecodedWasmModule {
-    types: Vec<WasmFuncType>,
-    func_type_indices: Vec<u32>,
-    initial_memory_pages: u32,
-    exports: std::collections::BTreeMap<String, u32>,
-    start_func: Option<u32>,
-    globals: Vec<WasmGlobalDecl>,
-    data_segments: Vec<WasmDataSegment>,
-    codes: Vec<WasmCodeBody>,
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.pos)
-    }
-    fn read_u8(&mut self) -> Result<u8, WasmSandboxError> {
-        let b = *self
-            .bytes
-            .get(self.pos)
-            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-        self.pos += 1;
-        Ok(b)
-    }
-    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], WasmSandboxError> {
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-        let slice = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-        self.pos = end;
-        Ok(slice)
-    }
-    fn read_u32_leb(&mut self) -> Result<u32, WasmSandboxError> {
-        let mut result: u32 = 0;
-        let mut shift = 0u32;
-        for _ in 0..5 {
-            let b = self.read_u8()?;
-            let low = (b & 0x7f) as u32;
-            if shift == 28 && (b & 0x70) != 0 {
-                return Err(WasmSandboxError::MalformedSectionOrLeb128);
-            }
-            result |= low << shift;
-            if (b & 0x80) == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-        }
-        Err(WasmSandboxError::MalformedSectionOrLeb128)
-    }
-    fn read_i32_leb(&mut self) -> Result<i32, WasmSandboxError> {
-        let mut result: i32 = 0;
-        let mut shift = 0u32;
-        let mut last_byte;
-        for _ in 0..5 {
-            let b = self.read_u8()?;
-            last_byte = b;
-            result |= ((b & 0x7f) as i32) << shift;
-            shift += 7;
-            if (b & 0x80) == 0 {
-                if shift < 32 && (last_byte & 0x40) != 0 {
-                    result |= !0i32 << shift;
-                }
-                return Ok(result);
-            }
-        }
-        Err(WasmSandboxError::MalformedSectionOrLeb128)
-    }
-    fn read_i64_leb(&mut self) -> Result<i64, WasmSandboxError> {
-        let mut result: i64 = 0;
-        let mut shift = 0u32;
-        for _ in 0..10 {
-            let b = self.read_u8()?;
-            result |= ((b & 0x7f) as i64) << shift;
-            shift += 7;
-            if (b & 0x80) == 0 {
-                if shift < 64 && (b & 0x40) != 0 {
-                    result |= !0i64 << shift;
-                }
-                return Ok(result);
-            }
-        }
-        Err(WasmSandboxError::MalformedSectionOrLeb128)
-    }
-    fn read_name(&mut self) -> Result<String, WasmSandboxError> {
-        let len = self.read_u32_leb()? as usize;
-        let slice = self.read_exact(len)?;
-        let s =
-            std::str::from_utf8(slice).map_err(|_| WasmSandboxError::MalformedSectionOrLeb128)?;
-        Ok(s.to_string())
-    }
-    fn read_val_type(&mut self) -> Result<WasmValType, WasmSandboxError> {
-        match self.read_u8()? {
-            0x7f => Ok(WasmValType::I32),
-            0x7e => Ok(WasmValType::I64),
-            0x7d => Ok(WasmValType::F32),
-            0x7c => Err(WasmSandboxError::ExecutionTrap(
-                "f64 value type is unsupported in experimental test fixture".to_string(),
-            )),
-            _ => Err(WasmSandboxError::MalformedSectionOrLeb128),
-        }
-    }
-}
-
-fn read_limits(cur: &mut Cursor<'_>) -> Result<(u32, Option<u32>), WasmSandboxError> {
-    let flags = cur.read_u8()?;
-    let initial = cur.read_u32_leb()?;
-    let max = match flags {
-        0x00 => None,
-        0x01 => {
-            let m = cur.read_u32_leb()?;
-            if m < initial {
-                return Err(WasmSandboxError::MalformedSectionOrLeb128);
-            }
-            Some(m)
-        }
-        _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
     };
-    Ok((initial, max))
-}
-
-fn eval_const_init_expr(cur: &mut Cursor<'_>) -> Result<WasmValue, WasmSandboxError> {
-    let val = match cur.read_u8()? {
-        0x41 => WasmValue::i32(cur.read_i32_leb()?),
-        0x42 => WasmValue::i64(cur.read_i64_leb()?),
-        0x43 => {
-            let b = cur.read_exact(4)?;
-            WasmValue::f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        }
-        _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
-    };
-    if cur.read_u8()? != 0x0b {
-        return Err(WasmSandboxError::MalformedSectionOrLeb128);
+    let mut out = [0u8; 32];
+    for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[idx] = (hi << 4) | lo;
     }
-    Ok(val)
+    Some(out)
 }
 
-fn decode_and_validate_module(
+/// Shared fail-closed Wasm extension preflight executed prior to any runtime instantiation (`ST-09`).
+///
+/// Enforces module size cap, `\0asm\x01\0\0\0` magic header, non-zero fuel budget,
+/// export allowlist policy, and SHA-256 pinning against
+/// [`SandboxedExtensionPolicyV1::allowed_module_hashes`].
+pub fn preflight_wasm_extension_v1(
+    policy: &SandboxedExtensionPolicyV1,
     wasm_bytes: &[u8],
-    limits: &WasmStoreLimitsV1,
-    fuel: &mut WasmFuelMeterV1,
-) -> Result<DecodedWasmModule, WasmSandboxError> {
-    if wasm_bytes.len() > limits.max_module_bytes {
+    export_name: &str,
+) -> Result<[u8; 32], WasmSandboxError> {
+    if wasm_bytes.len() > policy.limits.max_module_bytes {
         return Err(WasmSandboxError::ModuleTooLarge {
             len: wasm_bytes.len(),
-            max: limits.max_module_bytes,
+            max: policy.limits.max_module_bytes,
         });
     }
     if wasm_bytes.len() < 8 || wasm_bytes[..8] != WASM_MAGIC_AND_VERSION_V1 {
         return Err(WasmSandboxError::InvalidWasmHeader);
     }
+    let actual = SandboxedExtensionPolicyV1::sha256_module(wasm_bytes);
+    if policy.allowed_module_hashes.is_empty() || !policy.allowed_module_hashes.contains(&actual) {
+        return Err(WasmSandboxError::UntrustedModuleHash { actual });
+    }
+    if export_name.is_empty()
+        || (!policy.allowed_exports.is_empty() && !policy.allowed_exports.contains(export_name))
+    {
+        return Err(WasmSandboxError::ExportNotAllowed(export_name.to_string()));
+    }
+    if policy.limits.max_fuel == 0 {
+        return Err(WasmSandboxError::OutOfFuel {
+            consumed: 0,
+            limit: 0,
+        });
+    }
+    Ok(actual)
+}
 
-    let mut cur = Cursor::new(&wasm_bytes[8..]);
-    let mut types = Vec::new();
-    let mut func_type_indices = Vec::new();
-    let mut initial_memory_pages = 0u32;
-    let mut memory_count = 0u32;
-    let mut table_count = 0u32;
-    let mut exports = std::collections::BTreeMap::new();
-    let mut start_func = None;
-    let mut globals = Vec::new();
-    let mut data_segments = Vec::new();
-    let mut codes = Vec::new();
-    let mut last_non_custom_section = 0u8;
+#[cfg(test)]
+mod legacy_vm {
+    use super::*;
 
-    while cur.remaining() > 0 {
-        fuel.consume(1)?;
-        let section_id = cur.read_u8()?;
-        let section_len = cur.read_u32_leb()? as usize;
-        let section_bytes = cur.read_exact(section_len)?;
+    // ---------------------------------------------------------------------------
+    // Pure-Rust WebAssembly MVP Binary Decoder & Deterministic Stack Interpreter (test-only)
+    // ---------------------------------------------------------------------------
 
-        if section_id != 0 {
-            if section_id > 12 || section_id <= last_non_custom_section {
-                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WasmValType {
+        I32,
+        I64,
+        F32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct WasmFuncType {
+        params: Vec<WasmValType>,
+        results: Vec<WasmValType>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WasmValue {
+        raw_i32: i32,
+        raw_f32: u32,
+        raw_i64: i64,
+        ty: WasmValType,
+    }
+
+    impl WasmValue {
+        fn i32(v: i32) -> Self {
+            Self {
+                raw_i32: v,
+                raw_f32: v as u32,
+                raw_i64: v as i64,
+                ty: WasmValType::I32,
             }
-            last_non_custom_section = section_id;
+        }
+        fn i64(v: i64) -> Self {
+            Self {
+                raw_i32: v as i32,
+                raw_f32: 0,
+                raw_i64: v,
+                ty: WasmValType::I64,
+            }
+        }
+        fn f32(v: f32) -> Self {
+            Self {
+                raw_i32: 0,
+                raw_f32: v.to_bits(),
+                raw_i64: 0,
+                ty: WasmValType::F32,
+            }
+        }
+        fn as_i32(self) -> Result<i32, WasmSandboxError> {
+            if self.ty != WasmValType::I32 {
+                return Err(WasmSandboxError::ExecutionTrap(
+                    "type mismatch: expected i32".to_string(),
+                ));
+            }
+            Ok(self.raw_i32)
+        }
+        fn as_f32(self) -> Result<f32, WasmSandboxError> {
+            if self.ty != WasmValType::F32 {
+                return Err(WasmSandboxError::ExecutionTrap(
+                    "type mismatch: expected f32".to_string(),
+                ));
+            }
+            Ok(f32::from_bits(self.raw_f32))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct WasmGlobalDecl {
+        val: WasmValue,
+        mutable: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct WasmDataSegment {
+        offset: usize,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct WasmCodeBody {
+        locals: Vec<WasmValType>,
+        expr: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DecodedWasmModule {
+        types: Vec<WasmFuncType>,
+        func_type_indices: Vec<u32>,
+        initial_memory_pages: u32,
+        exports: std::collections::BTreeMap<String, u32>,
+        start_func: Option<u32>,
+        globals: Vec<WasmGlobalDecl>,
+        data_segments: Vec<WasmDataSegment>,
+        codes: Vec<WasmCodeBody>,
+    }
+
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Cursor<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, pos: 0 }
+        }
+        fn remaining(&self) -> usize {
+            self.bytes.len().saturating_sub(self.pos)
+        }
+        fn read_u8(&mut self) -> Result<u8, WasmSandboxError> {
+            let b = *self
+                .bytes
+                .get(self.pos)
+                .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+            self.pos += 1;
+            Ok(b)
+        }
+        fn read_exact(&mut self, len: usize) -> Result<&'a [u8], WasmSandboxError> {
+            let end = self
+                .pos
+                .checked_add(len)
+                .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+            let slice = self
+                .bytes
+                .get(self.pos..end)
+                .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+            self.pos = end;
+            Ok(slice)
+        }
+        fn read_u32_leb(&mut self) -> Result<u32, WasmSandboxError> {
+            let mut result: u32 = 0;
+            let mut shift = 0u32;
+            for _ in 0..5 {
+                let b = self.read_u8()?;
+                let low = (b & 0x7f) as u32;
+                if shift == 28 && (b & 0x70) != 0 {
+                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                }
+                result |= low << shift;
+                if (b & 0x80) == 0 {
+                    return Ok(result);
+                }
+                shift += 7;
+            }
+            Err(WasmSandboxError::MalformedSectionOrLeb128)
+        }
+        fn read_i32_leb(&mut self) -> Result<i32, WasmSandboxError> {
+            let mut result: i32 = 0;
+            let mut shift = 0u32;
+            let mut last_byte;
+            for _ in 0..5 {
+                let b = self.read_u8()?;
+                last_byte = b;
+                result |= ((b & 0x7f) as i32) << shift;
+                shift += 7;
+                if (b & 0x80) == 0 {
+                    if shift < 32 && (last_byte & 0x40) != 0 {
+                        result |= !0i32 << shift;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(WasmSandboxError::MalformedSectionOrLeb128)
+        }
+        fn read_i64_leb(&mut self) -> Result<i64, WasmSandboxError> {
+            let mut result: i64 = 0;
+            let mut shift = 0u32;
+            for _ in 0..10 {
+                let b = self.read_u8()?;
+                result |= ((b & 0x7f) as i64) << shift;
+                shift += 7;
+                if (b & 0x80) == 0 {
+                    if shift < 64 && (b & 0x40) != 0 {
+                        result |= !0i64 << shift;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(WasmSandboxError::MalformedSectionOrLeb128)
+        }
+        fn read_name(&mut self) -> Result<String, WasmSandboxError> {
+            let len = self.read_u32_leb()? as usize;
+            let slice = self.read_exact(len)?;
+            let s = std::str::from_utf8(slice)
+                .map_err(|_| WasmSandboxError::MalformedSectionOrLeb128)?;
+            Ok(s.to_string())
+        }
+        fn read_val_type(&mut self) -> Result<WasmValType, WasmSandboxError> {
+            match self.read_u8()? {
+                0x7f => Ok(WasmValType::I32),
+                0x7e => Ok(WasmValType::I64),
+                0x7d => Ok(WasmValType::F32),
+                0x7c => Err(WasmSandboxError::ExecutionTrap(
+                    "f64 value type is unsupported in experimental test fixture".to_string(),
+                )),
+                _ => Err(WasmSandboxError::MalformedSectionOrLeb128),
+            }
+        }
+    }
+
+    fn read_limits(cur: &mut Cursor<'_>) -> Result<(u32, Option<u32>), WasmSandboxError> {
+        let flags = cur.read_u8()?;
+        let initial = cur.read_u32_leb()?;
+        let max = match flags {
+            0x00 => None,
+            0x01 => {
+                let m = cur.read_u32_leb()?;
+                if m < initial {
+                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                }
+                Some(m)
+            }
+            _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
+        };
+        Ok((initial, max))
+    }
+
+    fn eval_const_init_expr(cur: &mut Cursor<'_>) -> Result<WasmValue, WasmSandboxError> {
+        let val = match cur.read_u8()? {
+            0x41 => WasmValue::i32(cur.read_i32_leb()?),
+            0x42 => WasmValue::i64(cur.read_i64_leb()?),
+            0x43 => {
+                let b = cur.read_exact(4)?;
+                WasmValue::f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            }
+            _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
+        };
+        if cur.read_u8()? != 0x0b {
+            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+        }
+        Ok(val)
+    }
+
+    fn decode_and_validate_module(
+        wasm_bytes: &[u8],
+        limits: &WasmStoreLimitsV1,
+        fuel: &mut WasmFuelMeterV1,
+    ) -> Result<DecodedWasmModule, WasmSandboxError> {
+        if wasm_bytes.len() > limits.max_module_bytes {
+            return Err(WasmSandboxError::ModuleTooLarge {
+                len: wasm_bytes.len(),
+                max: limits.max_module_bytes,
+            });
+        }
+        if wasm_bytes.len() < 8 || wasm_bytes[..8] != WASM_MAGIC_AND_VERSION_V1 {
+            return Err(WasmSandboxError::InvalidWasmHeader);
         }
 
-        let mut sc = Cursor::new(section_bytes);
-        match section_id {
-            0 => {
-                // Custom section skipped cleanly (bounded inside section_bytes).
+        let mut cur = Cursor::new(&wasm_bytes[8..]);
+        let mut types = Vec::new();
+        let mut func_type_indices = Vec::new();
+        let mut initial_memory_pages = 0u32;
+        let mut memory_count = 0u32;
+        let mut table_count = 0u32;
+        let mut exports = std::collections::BTreeMap::new();
+        let mut start_func = None;
+        let mut globals = Vec::new();
+        let mut data_segments = Vec::new();
+        let mut codes = Vec::new();
+        let mut last_non_custom_section = 0u8;
+
+        while cur.remaining() > 0 {
+            fuel.consume(1)?;
+            let section_id = cur.read_u8()?;
+            let section_len = cur.read_u32_leb()? as usize;
+            let section_bytes = cur.read_exact(section_len)?;
+
+            if section_id != 0 {
+                if section_id > 12 || section_id <= last_non_custom_section {
+                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                }
+                last_non_custom_section = section_id;
             }
-            1 => {
-                let count = sc.read_u32_leb()?;
-                for _ in 0..count {
-                    fuel.consume(1)?;
-                    if sc.read_u8()? != 0x60 {
-                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                    }
-                    let p_len = sc.read_u32_leb()?;
-                    let mut params = Vec::with_capacity((p_len as usize).min(256));
-                    for _ in 0..p_len {
+
+            let mut sc = Cursor::new(section_bytes);
+            match section_id {
+                0 => {
+                    // Custom section skipped cleanly (bounded inside section_bytes).
+                }
+                1 => {
+                    let count = sc.read_u32_leb()?;
+                    for _ in 0..count {
                         fuel.consume(1)?;
-                        params.push(sc.read_val_type()?);
-                    }
-                    let r_len = sc.read_u32_leb()?;
-                    let mut results = Vec::with_capacity((r_len as usize).min(256));
-                    for _ in 0..r_len {
-                        fuel.consume(1)?;
-                        results.push(sc.read_val_type()?);
-                    }
-                    types.push(WasmFuncType { params, results });
-                }
-            }
-            2 => {
-                // Zero-capability isolation: reject ALL WASI / external host imports!
-                let count = sc.read_u32_leb()?;
-                if count > 0 {
-                    let module = sc.read_name()?;
-                    let field = sc.read_name()?;
-                    return Err(WasmSandboxError::ForbiddenImport { module, field });
-                }
-            }
-            3 => {
-                let count = sc.read_u32_leb()?;
-                for _ in 0..count {
-                    let tidx = sc.read_u32_leb()?;
-                    if tidx as usize >= types.len() {
-                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                    }
-                    func_type_indices.push(tidx);
-                }
-            }
-            4 => {
-                let count = sc.read_u32_leb()?;
-                table_count = table_count.saturating_add(count);
-                if table_count > limits.max_tables {
-                    return Err(WasmSandboxError::MultipleTablesForbidden);
-                }
-                for _ in 0..count {
-                    let _elem_type = sc.read_u8()?;
-                    let (init, max) = read_limits(&mut sc)?;
-                    if init > limits.max_table_elements
-                        || max.unwrap_or(init) > limits.max_table_elements
-                    {
-                        return Err(WasmSandboxError::TableLimitExceeded {
-                            requested: max.unwrap_or(init),
-                            max: limits.max_table_elements,
-                        });
+                        if sc.read_u8()? != 0x60 {
+                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                        }
+                        let p_len = sc.read_u32_leb()?;
+                        let mut params = Vec::with_capacity((p_len as usize).min(256));
+                        for _ in 0..p_len {
+                            fuel.consume(1)?;
+                            params.push(sc.read_val_type()?);
+                        }
+                        let r_len = sc.read_u32_leb()?;
+                        let mut results = Vec::with_capacity((r_len as usize).min(256));
+                        for _ in 0..r_len {
+                            fuel.consume(1)?;
+                            results.push(sc.read_val_type()?);
+                        }
+                        types.push(WasmFuncType { params, results });
                     }
                 }
-            }
-            5 => {
-                let count = sc.read_u32_leb()?;
-                memory_count = memory_count.saturating_add(count);
-                if memory_count > limits.max_memories {
-                    return Err(WasmSandboxError::MultipleMemoriesForbidden);
-                }
-                for _ in 0..count {
-                    let (init, max) = read_limits(&mut sc)?;
-                    if init > limits.max_memory_pages {
-                        return Err(WasmSandboxError::MemoryLimitExceeded {
-                            requested_pages: init,
-                            max_pages: limits.max_memory_pages,
-                        });
+                2 => {
+                    // Zero-capability isolation: reject ALL WASI / external host imports!
+                    let count = sc.read_u32_leb()?;
+                    if count > 0 {
+                        let module = sc.read_name()?;
+                        let field = sc.read_name()?;
+                        return Err(WasmSandboxError::ForbiddenImport { module, field });
                     }
-                    if let Some(m) = max {
-                        if m > limits.max_memory_pages {
-                            return Err(WasmSandboxError::MemoryLimitExceeded {
-                                requested_pages: m,
-                                max_pages: limits.max_memory_pages,
+                }
+                3 => {
+                    let count = sc.read_u32_leb()?;
+                    for _ in 0..count {
+                        let tidx = sc.read_u32_leb()?;
+                        if tidx as usize >= types.len() {
+                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                        }
+                        func_type_indices.push(tidx);
+                    }
+                }
+                4 => {
+                    let count = sc.read_u32_leb()?;
+                    table_count = table_count.saturating_add(count);
+                    if table_count > limits.max_tables {
+                        return Err(WasmSandboxError::MultipleTablesForbidden);
+                    }
+                    for _ in 0..count {
+                        let _elem_type = sc.read_u8()?;
+                        let (init, max) = read_limits(&mut sc)?;
+                        if init > limits.max_table_elements
+                            || max.unwrap_or(init) > limits.max_table_elements
+                        {
+                            return Err(WasmSandboxError::TableLimitExceeded {
+                                requested: max.unwrap_or(init),
+                                max: limits.max_table_elements,
                             });
                         }
                     }
-                    initial_memory_pages = init;
                 }
-            }
-            6 => {
-                let count = sc.read_u32_leb()?;
-                for _ in 0..count {
-                    let _ty = sc.read_val_type()?;
-                    let mutable = sc.read_u8()? == 1;
-                    let val = eval_const_init_expr(&mut sc)?;
-                    globals.push(WasmGlobalDecl { val, mutable });
-                }
-            }
-            7 => {
-                let count = sc.read_u32_leb()?;
-                for _ in 0..count {
-                    let name = sc.read_name()?;
-                    let kind = sc.read_u8()?;
-                    let idx = sc.read_u32_leb()?;
-                    if kind == 0x00 {
-                        if idx as usize >= func_type_indices.len() {
-                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                        }
-                        exports.insert(name, idx);
-                    }
-                }
-            }
-            8 => {
-                let fidx = sc.read_u32_leb()?;
-                if fidx as usize >= func_type_indices.len() {
-                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                }
-                start_func = Some(fidx);
-            }
-            9 => {
-                // Element segments validated cleanly
-                let count = sc.read_u32_leb()?;
-                for _ in 0..count {
-                    let table_idx = sc.read_u32_leb()?;
-                    if table_idx >= table_count {
-                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                    }
-                    let _ = eval_const_init_expr(&mut sc)?;
-                    let num_fn = sc.read_u32_leb()?;
-                    for _ in 0..num_fn {
-                        let fidx = sc.read_u32_leb()?;
-                        if fidx as usize >= func_type_indices.len() {
-                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                        }
-                    }
-                }
-            }
-            10 => {
-                let count = sc.read_u32_leb()?;
-                if count as usize != func_type_indices.len() {
-                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                }
-                for _ in 0..count {
-                    fuel.consume(1)?;
-                    let body_len = sc.read_u32_leb()? as usize;
-                    let body_slice = sc.read_exact(body_len)?;
-                    let mut bc = Cursor::new(body_slice);
-                    let local_decls = bc.read_u32_leb()?;
-                    let mut locals = Vec::new();
-                    let mut total_locals = 0usize;
-                    for _ in 0..local_decls {
-                        fuel.consume(1)?;
-                        let rep = bc.read_u32_leb()?;
-                        let ty = bc.read_val_type()?;
-                        total_locals = total_locals
-                            .checked_add(rep as usize)
-                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-                        if total_locals > DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION {
-                            return Err(WasmSandboxError::ExecutionTrap(format!(
-                                "wasm function local count {total_locals} exceeds cap {DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION}"
-                            )));
-                        }
-                        for _ in 0..rep {
-                            fuel.consume(1)?;
-                            locals.push(ty);
-                        }
-                    }
-                    let expr = bc.bytes[bc.pos..].to_vec();
-                    let scan_cost = (expr.len() as u64).max(1) / 8 + 1;
-                    fuel.consume(scan_cost)?;
-                    if expr.last().copied() != Some(0x0b) {
-                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                    }
-                    codes.push(WasmCodeBody { locals, expr });
-                }
-            }
-            11 => {
-                let count = sc.read_u32_leb()?;
-                if count > 0 && memory_count == 0 {
-                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                }
-                for _ in 0..count {
-                    let mem_idx = sc.read_u32_leb()?;
-                    if mem_idx != 0 {
+                5 => {
+                    let count = sc.read_u32_leb()?;
+                    memory_count = memory_count.saturating_add(count);
+                    if memory_count > limits.max_memories {
                         return Err(WasmSandboxError::MultipleMemoriesForbidden);
                     }
-                    let offset_val = eval_const_init_expr(&mut sc)?.as_i32()?;
-                    if offset_val < 0 {
-                        return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
-                            addr: offset_val as u64,
-                            len: 0,
-                            mem_len: (initial_memory_pages as usize) * WASM_PAGE_BYTES,
+                    for _ in 0..count {
+                        let (init, max) = read_limits(&mut sc)?;
+                        if init > limits.max_memory_pages {
+                            return Err(WasmSandboxError::MemoryLimitExceeded {
+                                requested_pages: init,
+                                max_pages: limits.max_memory_pages,
+                            });
+                        }
+                        if let Some(m) = max {
+                            if m > limits.max_memory_pages {
+                                return Err(WasmSandboxError::MemoryLimitExceeded {
+                                    requested_pages: m,
+                                    max_pages: limits.max_memory_pages,
+                                });
+                            }
+                        }
+                        initial_memory_pages = init;
+                    }
+                }
+                6 => {
+                    let count = sc.read_u32_leb()?;
+                    for _ in 0..count {
+                        let _ty = sc.read_val_type()?;
+                        let mutable = sc.read_u8()? == 1;
+                        let val = eval_const_init_expr(&mut sc)?;
+                        globals.push(WasmGlobalDecl { val, mutable });
+                    }
+                }
+                7 => {
+                    let count = sc.read_u32_leb()?;
+                    for _ in 0..count {
+                        let name = sc.read_name()?;
+                        let kind = sc.read_u8()?;
+                        let idx = sc.read_u32_leb()?;
+                        if kind == 0x00 {
+                            if idx as usize >= func_type_indices.len() {
+                                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                            }
+                            exports.insert(name, idx);
+                        }
+                    }
+                }
+                8 => {
+                    let fidx = sc.read_u32_leb()?;
+                    if fidx as usize >= func_type_indices.len() {
+                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                    }
+                    start_func = Some(fidx);
+                }
+                9 => {
+                    // Element segments validated cleanly
+                    let count = sc.read_u32_leb()?;
+                    for _ in 0..count {
+                        let table_idx = sc.read_u32_leb()?;
+                        if table_idx >= table_count {
+                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                        }
+                        let _ = eval_const_init_expr(&mut sc)?;
+                        let num_fn = sc.read_u32_leb()?;
+                        for _ in 0..num_fn {
+                            let fidx = sc.read_u32_leb()?;
+                            if fidx as usize >= func_type_indices.len() {
+                                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                            }
+                        }
+                    }
+                }
+                10 => {
+                    let count = sc.read_u32_leb()?;
+                    if count as usize != func_type_indices.len() {
+                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                    }
+                    for _ in 0..count {
+                        fuel.consume(1)?;
+                        let body_len = sc.read_u32_leb()? as usize;
+                        let body_slice = sc.read_exact(body_len)?;
+                        let mut bc = Cursor::new(body_slice);
+                        let local_decls = bc.read_u32_leb()?;
+                        let mut locals = Vec::new();
+                        let mut total_locals = 0usize;
+                        for _ in 0..local_decls {
+                            fuel.consume(1)?;
+                            let rep = bc.read_u32_leb()?;
+                            let ty = bc.read_val_type()?;
+                            total_locals = total_locals
+                                .checked_add(rep as usize)
+                                .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+                            if total_locals > DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION {
+                                return Err(WasmSandboxError::ExecutionTrap(format!(
+                                "wasm function local count {total_locals} exceeds cap {DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION}"
+                            )));
+                            }
+                            for _ in 0..rep {
+                                fuel.consume(1)?;
+                                locals.push(ty);
+                            }
+                        }
+                        let expr = bc.bytes[bc.pos..].to_vec();
+                        let scan_cost = (expr.len() as u64).max(1) / 8 + 1;
+                        fuel.consume(scan_cost)?;
+                        if expr.last().copied() != Some(0x0b) {
+                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                        }
+                        codes.push(WasmCodeBody { locals, expr });
+                    }
+                }
+                11 => {
+                    let count = sc.read_u32_leb()?;
+                    if count > 0 && memory_count == 0 {
+                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                    }
+                    for _ in 0..count {
+                        let mem_idx = sc.read_u32_leb()?;
+                        if mem_idx != 0 {
+                            return Err(WasmSandboxError::MultipleMemoriesForbidden);
+                        }
+                        let offset_val = eval_const_init_expr(&mut sc)?.as_i32()?;
+                        if offset_val < 0 {
+                            return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                                addr: offset_val as u64,
+                                len: 0,
+                                mem_len: (initial_memory_pages as usize) * WASM_PAGE_BYTES,
+                            });
+                        }
+                        let dlen = sc.read_u32_leb()? as usize;
+                        let dbytes = sc.read_exact(dlen)?.to_vec();
+                        data_segments.push(WasmDataSegment {
+                            offset: offset_val as usize,
+                            bytes: dbytes,
                         });
                     }
-                    let dlen = sc.read_u32_leb()? as usize;
-                    let dbytes = sc.read_exact(dlen)?.to_vec();
-                    data_segments.push(WasmDataSegment {
-                        offset: offset_val as usize,
-                        bytes: dbytes,
-                    });
                 }
+                _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
             }
-            _ => return Err(WasmSandboxError::MalformedSectionOrLeb128),
-        }
-        if section_id != 0 && sc.remaining() != 0 {
-            return Err(WasmSandboxError::MalformedSectionOrLeb128);
-        }
-    }
-
-    if codes.len() != func_type_indices.len() {
-        return Err(WasmSandboxError::MalformedSectionOrLeb128);
-    }
-
-    Ok(DecodedWasmModule {
-        types,
-        func_type_indices,
-        initial_memory_pages,
-        exports,
-        start_func,
-        globals,
-        data_segments,
-        codes,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LabelKind {
-    Function,
-    Block,
-    Loop,
-    If,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ControlFrame {
-    kind: LabelKind,
-    start_pc: usize,
-    end_pc: usize,
-    stack_height: usize,
-}
-
-struct WasmVm<'a> {
-    module: &'a DecodedWasmModule,
-    limits: &'a WasmStoreLimitsV1,
-    memory: Vec<u8>,
-    peak_memory_bytes: usize,
-    globals: Vec<WasmValue>,
-    fuel: WasmFuelMeterV1,
-    call_depth: usize,
-}
-
-impl<'a> WasmVm<'a> {
-    fn instantiate(
-        module: &'a DecodedWasmModule,
-        limits: &'a WasmStoreLimitsV1,
-        fuel: WasmFuelMeterV1,
-    ) -> Result<Self, WasmSandboxError> {
-        let initial_bytes = (module.initial_memory_pages as usize)
-            .checked_mul(WASM_PAGE_BYTES)
-            .ok_or(WasmSandboxError::MemoryLimitExceeded {
-                requested_pages: module.initial_memory_pages,
-                max_pages: limits.max_memory_pages,
-            })?;
-        let mut memory = vec![0u8; initial_bytes];
-        for seg in &module.data_segments {
-            let end = seg.offset.checked_add(seg.bytes.len()).ok_or(
-                WasmSandboxError::OutOfBoundsMemoryAccess {
-                    addr: seg.offset as u64,
-                    len: seg.bytes.len(),
-                    mem_len: memory.len(),
-                },
-            )?;
-            if end > memory.len() {
-                return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
-                    addr: seg.offset as u64,
-                    len: seg.bytes.len(),
-                    mem_len: memory.len(),
-                });
-            }
-            memory[seg.offset..end].copy_from_slice(&seg.bytes);
-        }
-        let globals = module.globals.iter().map(|g| g.val).collect();
-        Ok(Self {
-            module,
-            limits,
-            memory,
-            peak_memory_bytes: initial_bytes,
-            globals,
-            fuel,
-            call_depth: 0,
-        })
-    }
-
-    fn effective_addr(
-        &self,
-        base: i32,
-        offset: u32,
-        width: usize,
-    ) -> Result<usize, WasmSandboxError> {
-        if base < 0 {
-            return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: base as u64,
-                len: width,
-                mem_len: self.memory.len(),
-            });
-        }
-        let addr = (base as usize).checked_add(offset as usize).ok_or(
-            WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: base as u64,
-                len: width,
-                mem_len: self.memory.len(),
-            },
-        )?;
-        let end = addr
-            .checked_add(width)
-            .ok_or(WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: addr as u64,
-                len: width,
-                mem_len: self.memory.len(),
-            })?;
-        if end > self.memory.len() {
-            return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
-                addr: addr as u64,
-                len: width,
-                mem_len: self.memory.len(),
-            });
-        }
-        Ok(addr)
-    }
-
-    fn call(
-        &mut self,
-        func_idx: u32,
-        args: &[WasmValue],
-    ) -> Result<Vec<WasmValue>, WasmSandboxError> {
-        if self.call_depth >= DEFAULT_WASM_MAX_CALL_DEPTH {
-            return Err(WasmSandboxError::ExecutionTrap(
-                "call stack depth limit exceeded".to_string(),
-            ));
-        }
-        let tidx = *self
-            .module
-            .func_type_indices
-            .get(func_idx as usize)
-            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-        let ftype = &self.module.types[tidx as usize];
-        if args.len() != ftype.params.len() {
-            return Err(WasmSandboxError::ExportSignatureMismatch(format!(
-                "func {func_idx}"
-            )));
-        }
-        let code = &self.module.codes[func_idx as usize];
-        let mut locals = Vec::with_capacity(args.len() + code.locals.len());
-        locals.extend_from_slice(args);
-        for &lty in &code.locals {
-            let z = match lty {
-                WasmValType::I32 => WasmValue::i32(0),
-                WasmValType::I64 => WasmValue::i64(0),
-                WasmValType::F32 => WasmValue::f32(0.0),
-            };
-            locals.push(z);
-        }
-
-        self.call_depth += 1;
-        let res = self.exec_body(&code.expr, ftype.results.len(), &mut locals);
-        self.call_depth -= 1;
-        res
-    }
-
-    fn exec_body(
-        &mut self,
-        expr: &[u8],
-        result_arity: usize,
-        locals: &mut [WasmValue],
-    ) -> Result<Vec<WasmValue>, WasmSandboxError> {
-        // Pre-scan structured control flow endpoints (block/loop/if/else/end) cleanly.
-        let mut matches_end = vec![0usize; expr.len()];
-        let mut matches_else: Vec<Option<usize>> = vec![None; expr.len()];
-        let mut scan_stack: Vec<(usize, Option<usize>)> = Vec::new();
-        {
-            let mut sc = Cursor::new(expr);
-            while sc.remaining() > 0 {
-                self.fuel.consume(1)?;
-                let op_pos = sc.pos;
-                let op = sc.read_u8()?;
-                match op {
-                    0x02..=0x04 => {
-                        let _bt = sc.read_u8()?;
-                        scan_stack.push((op_pos, None));
-                    }
-                    0x05 => {
-                        if let Some(top) = scan_stack.last_mut() {
-                            top.1 = Some(op_pos);
-                        } else {
-                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                        }
-                    }
-                    0x0b => {
-                        if let Some((start, else_p)) = scan_stack.pop() {
-                            matches_end[start] = op_pos;
-                            matches_else[start] = else_p;
-                        } else if sc.remaining() == 0 {
-                            matches_end[0] = op_pos;
-                        } else {
-                            return Err(WasmSandboxError::MalformedSectionOrLeb128);
-                        }
-                    }
-                    0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x3f | 0x40 => {
-                        let _ = sc.read_u32_leb()?;
-                    }
-                    0x41 => {
-                        let _ = sc.read_i32_leb()?;
-                    }
-                    0x42 => {
-                        let _ = sc.read_i64_leb()?;
-                    }
-                    0x43 => {
-                        let _ = sc.read_exact(4)?;
-                    }
-                    0x44 => {
-                        let _ = sc.read_exact(8)?;
-                    }
-                    0x28 | 0x2a | 0x2c | 0x2d | 0x36 | 0x38 | 0x3a => {
-                        let _align = sc.read_u32_leb()?;
-                        let _off = sc.read_u32_leb()?;
-                    }
-                    _ => {}
-                }
-            }
-            if !scan_stack.is_empty() {
+            if section_id != 0 && sc.remaining() != 0 {
                 return Err(WasmSandboxError::MalformedSectionOrLeb128);
             }
         }
 
-        let mut stack: Vec<WasmValue> = Vec::new();
-        let mut frames: Vec<ControlFrame> = vec![ControlFrame {
-            kind: LabelKind::Function,
-            start_pc: 0,
-            end_pc: expr.len() - 1,
-            stack_height: 0,
-        }];
-        let mut cur = Cursor::new(expr);
+        if codes.len() != func_type_indices.len() {
+            return Err(WasmSandboxError::MalformedSectionOrLeb128);
+        }
 
-        loop {
-            if cur.remaining() == 0 {
-                break;
+        Ok(DecodedWasmModule {
+            types,
+            func_type_indices,
+            initial_memory_pages,
+            exports,
+            start_func,
+            globals,
+            data_segments,
+            codes,
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LabelKind {
+        Function,
+        Block,
+        Loop,
+        If,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ControlFrame {
+        kind: LabelKind,
+        start_pc: usize,
+        end_pc: usize,
+        stack_height: usize,
+    }
+
+    struct WasmVm<'a> {
+        module: &'a DecodedWasmModule,
+        limits: &'a WasmStoreLimitsV1,
+        memory: Vec<u8>,
+        peak_memory_bytes: usize,
+        globals: Vec<WasmValue>,
+        fuel: WasmFuelMeterV1,
+        call_depth: usize,
+    }
+
+    impl<'a> WasmVm<'a> {
+        fn instantiate(
+            module: &'a DecodedWasmModule,
+            limits: &'a WasmStoreLimitsV1,
+            fuel: WasmFuelMeterV1,
+        ) -> Result<Self, WasmSandboxError> {
+            let initial_bytes = (module.initial_memory_pages as usize)
+                .checked_mul(WASM_PAGE_BYTES)
+                .ok_or(WasmSandboxError::MemoryLimitExceeded {
+                    requested_pages: module.initial_memory_pages,
+                    max_pages: limits.max_memory_pages,
+                })?;
+            let mut memory = vec![0u8; initial_bytes];
+            for seg in &module.data_segments {
+                let end = seg.offset.checked_add(seg.bytes.len()).ok_or(
+                    WasmSandboxError::OutOfBoundsMemoryAccess {
+                        addr: seg.offset as u64,
+                        len: seg.bytes.len(),
+                        mem_len: memory.len(),
+                    },
+                )?;
+                if end > memory.len() {
+                    return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                        addr: seg.offset as u64,
+                        len: seg.bytes.len(),
+                        mem_len: memory.len(),
+                    });
+                }
+                memory[seg.offset..end].copy_from_slice(&seg.bytes);
             }
-            self.fuel.consume(1)?;
-            let op_pos = cur.pos;
-            let op = cur.read_u8()?;
-            match op {
-                0x00 => {
-                    return Err(WasmSandboxError::ExecutionTrap(
-                        "wasm unreachable instruction executed".to_string(),
-                    ));
+            let globals = module.globals.iter().map(|g| g.val).collect();
+            Ok(Self {
+                module,
+                limits,
+                memory,
+                peak_memory_bytes: initial_bytes,
+                globals,
+                fuel,
+                call_depth: 0,
+            })
+        }
+
+        fn effective_addr(
+            &self,
+            base: i32,
+            offset: u32,
+            width: usize,
+        ) -> Result<usize, WasmSandboxError> {
+            if base < 0 {
+                return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                    addr: base as u64,
+                    len: width,
+                    mem_len: self.memory.len(),
+                });
+            }
+            let addr = (base as usize).checked_add(offset as usize).ok_or(
+                WasmSandboxError::OutOfBoundsMemoryAccess {
+                    addr: base as u64,
+                    len: width,
+                    mem_len: self.memory.len(),
+                },
+            )?;
+            let end = addr
+                .checked_add(width)
+                .ok_or(WasmSandboxError::OutOfBoundsMemoryAccess {
+                    addr: addr as u64,
+                    len: width,
+                    mem_len: self.memory.len(),
+                })?;
+            if end > self.memory.len() {
+                return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                    addr: addr as u64,
+                    len: width,
+                    mem_len: self.memory.len(),
+                });
+            }
+            Ok(addr)
+        }
+
+        fn call(
+            &mut self,
+            func_idx: u32,
+            args: &[WasmValue],
+        ) -> Result<Vec<WasmValue>, WasmSandboxError> {
+            if self.call_depth >= DEFAULT_WASM_MAX_CALL_DEPTH {
+                return Err(WasmSandboxError::ExecutionTrap(
+                    "call stack depth limit exceeded".to_string(),
+                ));
+            }
+            let tidx = *self
+                .module
+                .func_type_indices
+                .get(func_idx as usize)
+                .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+            let ftype = &self.module.types[tidx as usize];
+            if args.len() != ftype.params.len() {
+                return Err(WasmSandboxError::ExportSignatureMismatch(format!(
+                    "func {func_idx}"
+                )));
+            }
+            let code = &self.module.codes[func_idx as usize];
+            let mut locals = Vec::with_capacity(args.len() + code.locals.len());
+            locals.extend_from_slice(args);
+            for &lty in &code.locals {
+                let z = match lty {
+                    WasmValType::I32 => WasmValue::i32(0),
+                    WasmValType::I64 => WasmValue::i64(0),
+                    WasmValType::F32 => WasmValue::f32(0.0),
+                };
+                locals.push(z);
+            }
+
+            self.call_depth += 1;
+            let res = self.exec_body(&code.expr, ftype.results.len(), &mut locals);
+            self.call_depth -= 1;
+            res
+        }
+
+        fn exec_body(
+            &mut self,
+            expr: &[u8],
+            result_arity: usize,
+            locals: &mut [WasmValue],
+        ) -> Result<Vec<WasmValue>, WasmSandboxError> {
+            // Pre-scan structured control flow endpoints (block/loop/if/else/end) cleanly.
+            let mut matches_end = vec![0usize; expr.len()];
+            let mut matches_else: Vec<Option<usize>> = vec![None; expr.len()];
+            let mut scan_stack: Vec<(usize, Option<usize>)> = Vec::new();
+            {
+                let mut sc = Cursor::new(expr);
+                while sc.remaining() > 0 {
+                    self.fuel.consume(1)?;
+                    let op_pos = sc.pos;
+                    let op = sc.read_u8()?;
+                    match op {
+                        0x02..=0x04 => {
+                            let _bt = sc.read_u8()?;
+                            scan_stack.push((op_pos, None));
+                        }
+                        0x05 => {
+                            if let Some(top) = scan_stack.last_mut() {
+                                top.1 = Some(op_pos);
+                            } else {
+                                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                            }
+                        }
+                        0x0b => {
+                            if let Some((start, else_p)) = scan_stack.pop() {
+                                matches_end[start] = op_pos;
+                                matches_else[start] = else_p;
+                            } else if sc.remaining() == 0 {
+                                matches_end[0] = op_pos;
+                            } else {
+                                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                            }
+                        }
+                        0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x3f | 0x40 => {
+                            let _ = sc.read_u32_leb()?;
+                        }
+                        0x41 => {
+                            let _ = sc.read_i32_leb()?;
+                        }
+                        0x42 => {
+                            let _ = sc.read_i64_leb()?;
+                        }
+                        0x43 => {
+                            let _ = sc.read_exact(4)?;
+                        }
+                        0x44 => {
+                            let _ = sc.read_exact(8)?;
+                        }
+                        0x28 | 0x2a | 0x2c | 0x2d | 0x36 | 0x38 | 0x3a => {
+                            let _align = sc.read_u32_leb()?;
+                            let _off = sc.read_u32_leb()?;
+                        }
+                        _ => {}
+                    }
                 }
-                0x01 => {} // nop
-                0x02 => {
-                    let _bt = cur.read_u8()?;
-                    frames.push(ControlFrame {
-                        kind: LabelKind::Block,
-                        start_pc: op_pos,
-                        end_pc: matches_end[op_pos],
-                        stack_height: stack.len(),
-                    });
+                if !scan_stack.is_empty() {
+                    return Err(WasmSandboxError::MalformedSectionOrLeb128);
                 }
-                0x03 => {
-                    let _bt = cur.read_u8()?;
-                    frames.push(ControlFrame {
-                        kind: LabelKind::Loop,
-                        start_pc: cur.pos,
-                        end_pc: matches_end[op_pos],
-                        stack_height: stack.len(),
-                    });
+            }
+
+            let mut stack: Vec<WasmValue> = Vec::new();
+            let mut frames: Vec<ControlFrame> = vec![ControlFrame {
+                kind: LabelKind::Function,
+                start_pc: 0,
+                end_pc: expr.len() - 1,
+                stack_height: 0,
+            }];
+            let mut cur = Cursor::new(expr);
+
+            loop {
+                if cur.remaining() == 0 {
+                    break;
                 }
-                0x04 => {
-                    let _bt = cur.read_u8()?;
-                    let cond = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("stack underflow".into()))?
-                        .as_i32()?;
-                    let end_pc = matches_end[op_pos];
-                    let else_pc = matches_else[op_pos];
-                    if cond != 0 {
-                        frames.push(ControlFrame {
-                            kind: LabelKind::If,
-                            start_pc: op_pos,
-                            end_pc,
-                            stack_height: stack.len(),
-                        });
-                    } else if let Some(ep) = else_pc {
+                self.fuel.consume(1)?;
+                let op_pos = cur.pos;
+                let op = cur.read_u8()?;
+                match op {
+                    0x00 => {
+                        return Err(WasmSandboxError::ExecutionTrap(
+                            "wasm unreachable instruction executed".to_string(),
+                        ));
+                    }
+                    0x01 => {} // nop
+                    0x02 => {
+                        let _bt = cur.read_u8()?;
                         frames.push(ControlFrame {
                             kind: LabelKind::Block,
-                            start_pc: ep,
-                            end_pc,
+                            start_pc: op_pos,
+                            end_pc: matches_end[op_pos],
                             stack_height: stack.len(),
                         });
-                        cur.pos = ep + 1;
-                    } else {
-                        cur.pos = end_pc + 1;
                     }
-                }
-                0x05 => {
-                    // Reached end of true branch of `if`: jump to matching `end`
-                    let top = frames
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("frame underflow".into()))?;
-                    cur.pos = top.end_pc + 1;
-                }
-                0x0b => {
-                    let popped = frames
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("frame underflow".into()))?;
-                    if popped.kind == LabelKind::Function {
-                        break;
+                    0x03 => {
+                        let _bt = cur.read_u8()?;
+                        frames.push(ControlFrame {
+                            kind: LabelKind::Loop,
+                            start_pc: cur.pos,
+                            end_pc: matches_end[op_pos],
+                            stack_height: stack.len(),
+                        });
                     }
-                }
-                0x0c | 0x0d => {
-                    let depth = cur.read_u32_leb()? as usize;
-                    let should_branch = if op == 0x0d {
-                        stack
+                    0x04 => {
+                        let _bt = cur.read_u8()?;
+                        let cond = stack
                             .pop()
                             .ok_or_else(|| {
                                 WasmSandboxError::ExecutionTrap("stack underflow".into())
                             })?
-                            .as_i32()?
-                            != 0
-                    } else {
-                        true
-                    };
-                    if should_branch {
-                        if depth >= frames.len() {
+                            .as_i32()?;
+                        let end_pc = matches_end[op_pos];
+                        let else_pc = matches_else[op_pos];
+                        if cond != 0 {
+                            frames.push(ControlFrame {
+                                kind: LabelKind::If,
+                                start_pc: op_pos,
+                                end_pc,
+                                stack_height: stack.len(),
+                            });
+                        } else if let Some(ep) = else_pc {
+                            frames.push(ControlFrame {
+                                kind: LabelKind::Block,
+                                start_pc: ep,
+                                end_pc,
+                                stack_height: stack.len(),
+                            });
+                            cur.pos = ep + 1;
+                        } else {
+                            cur.pos = end_pc + 1;
+                        }
+                    }
+                    0x05 => {
+                        // Reached end of true branch of `if`: jump to matching `end`
+                        let top = frames.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("frame underflow".into())
+                        })?;
+                        cur.pos = top.end_pc + 1;
+                    }
+                    0x0b => {
+                        let popped = frames.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("frame underflow".into())
+                        })?;
+                        if popped.kind == LabelKind::Function {
+                            break;
+                        }
+                    }
+                    0x0c | 0x0d => {
+                        let depth = cur.read_u32_leb()? as usize;
+                        let should_branch = if op == 0x0d {
+                            stack
+                                .pop()
+                                .ok_or_else(|| {
+                                    WasmSandboxError::ExecutionTrap("stack underflow".into())
+                                })?
+                                .as_i32()?
+                                != 0
+                        } else {
+                            true
+                        };
+                        if should_branch {
+                            if depth >= frames.len() {
+                                return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                            }
+                            let target_idx = frames.len() - 1 - depth;
+                            let target = frames[target_idx];
+                            if target.kind == LabelKind::Function {
+                                break;
+                            } else if target.kind == LabelKind::Loop {
+                                frames.truncate(target_idx + 1);
+                                stack.truncate(target.stack_height);
+                                cur.pos = target.start_pc;
+                            } else {
+                                frames.truncate(target_idx);
+                                cur.pos = target.end_pc + 1;
+                            }
+                        }
+                    }
+                    0x0f => break, // return
+                    0x10 => {
+                        let target_fn = cur.read_u32_leb()?;
+                        let tidx = *self
+                            .module
+                            .func_type_indices
+                            .get(target_fn as usize)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+                        let arity = self.module.types[tidx as usize].params.len();
+                        if stack.len() < arity {
+                            return Err(WasmSandboxError::ExecutionTrap(
+                                "call stack underflow".into(),
+                            ));
+                        }
+                        let call_args = stack.split_off(stack.len() - arity);
+                        let call_res = self.call(target_fn, &call_args)?;
+                        stack.extend(call_res);
+                    }
+                    0x1a => {
+                        stack.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("drop underflow".into())
+                        })?;
+                    }
+                    0x1b => {
+                        let c = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("select underflow".into())
+                            })?
+                            .as_i32()?;
+                        let v2 = stack.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("select underflow".into())
+                        })?;
+                        let v1 = stack.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("select underflow".into())
+                        })?;
+                        stack.push(if c != 0 { v1 } else { v2 });
+                    }
+                    0x20 => {
+                        let idx = cur.read_u32_leb()? as usize;
+                        let v = *locals
+                            .get(idx)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+                        stack.push(v);
+                    }
+                    0x21 => {
+                        let idx = cur.read_u32_leb()? as usize;
+                        let v = stack.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("local.set underflow".into())
+                        })?;
+                        *locals
+                            .get_mut(idx)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)? = v;
+                    }
+                    0x22 => {
+                        let idx = cur.read_u32_leb()? as usize;
+                        let v = *stack.last().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("local.tee underflow".into())
+                        })?;
+                        *locals
+                            .get_mut(idx)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)? = v;
+                    }
+                    0x23 => {
+                        let idx = cur.read_u32_leb()? as usize;
+                        let g = self
+                            .globals
+                            .get(idx)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
+                        stack.push(*g);
+                    }
+                    0x24 => {
+                        let idx = cur.read_u32_leb()? as usize;
+                        let mutable = self
+                            .module
+                            .globals
+                            .get(idx)
+                            .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?
+                            .mutable;
+                        if !mutable {
                             return Err(WasmSandboxError::MalformedSectionOrLeb128);
                         }
-                        let target_idx = frames.len() - 1 - depth;
-                        let target = frames[target_idx];
-                        if target.kind == LabelKind::Function {
-                            break;
-                        } else if target.kind == LabelKind::Loop {
-                            frames.truncate(target_idx + 1);
-                            stack.truncate(target.stack_height);
-                            cur.pos = target.start_pc;
+                        let v = stack.pop().ok_or_else(|| {
+                            WasmSandboxError::ExecutionTrap("global.set underflow".into())
+                        })?;
+                        self.globals[idx] = v;
+                    }
+                    0x28 => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("load underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 4)?;
+                        let val = i32::from_le_bytes([
+                            self.memory[addr],
+                            self.memory[addr + 1],
+                            self.memory[addr + 2],
+                            self.memory[addr + 3],
+                        ]);
+                        stack.push(WasmValue::i32(val));
+                    }
+                    0x2a => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("load underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 4)?;
+                        let bits = u32::from_le_bytes([
+                            self.memory[addr],
+                            self.memory[addr + 1],
+                            self.memory[addr + 2],
+                            self.memory[addr + 3],
+                        ]);
+                        stack.push(WasmValue::f32(f32::from_bits(bits)));
+                    }
+                    0x2c | 0x2d => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("load8 underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 1)?;
+                        let b = self.memory[addr];
+                        let val = if op == 0x2c {
+                            (b as i8) as i32
                         } else {
-                            frames.truncate(target_idx);
-                            cur.pos = target.end_pc + 1;
+                            b as i32
+                        };
+                        stack.push(WasmValue::i32(val));
+                    }
+                    0x36 => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let val = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("store underflow".into())
+                            })?
+                            .as_i32()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("store underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 4)?;
+                        self.memory[addr..addr + 4].copy_from_slice(&val.to_le_bytes());
+                    }
+                    0x38 => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let val = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("fstore underflow".into())
+                            })?
+                            .as_f32()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("fstore underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 4)?;
+                        self.memory[addr..addr + 4].copy_from_slice(&val.to_bits().to_le_bytes());
+                    }
+                    0x3a => {
+                        let _align = cur.read_u32_leb()?;
+                        let off = cur.read_u32_leb()?;
+                        let val = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("store8 underflow".into())
+                            })?
+                            .as_i32()?;
+                        let base = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("store8 underflow".into())
+                            })?
+                            .as_i32()?;
+                        let addr = self.effective_addr(base, off, 1)?;
+                        self.memory[addr] = (val & 0xff) as u8;
+                    }
+                    0x3f => {
+                        let _mem_idx = cur.read_u32_leb()?;
+                        let pages = (self.memory.len() / WASM_PAGE_BYTES) as i32;
+                        stack.push(WasmValue::i32(pages));
+                    }
+                    0x40 => {
+                        let _mem_idx = cur.read_u32_leb()?;
+                        let delta = stack
+                            .pop()
+                            .ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("grow underflow".into())
+                            })?
+                            .as_i32()?;
+                        let current_pages = (self.memory.len() / WASM_PAGE_BYTES) as u32;
+                        let delta_u32 = delta as u32;
+                        let new_pages = current_pages.checked_add(delta_u32);
+                        if delta < 0
+                            || new_pages.map_or(true, |np| np > self.limits.max_memory_pages)
+                        {
+                            if self.limits.trap_on_grow_failure {
+                                return Err(WasmSandboxError::MemoryGrowTrap {
+                                    current_pages,
+                                    delta_pages: delta_u32,
+                                    max_pages: self.limits.max_memory_pages,
+                                });
+                            }
+                            stack.push(WasmValue::i32(-1));
+                        } else {
+                            let np = new_pages.unwrap();
+                            self.memory.resize((np as usize) * WASM_PAGE_BYTES, 0);
+                            if self.memory.len() > self.peak_memory_bytes {
+                                self.peak_memory_bytes = self.memory.len();
+                            }
+                            stack.push(WasmValue::i32(current_pages as i32));
                         }
                     }
-                }
-                0x0f => break, // return
-                0x10 => {
-                    let target_fn = cur.read_u32_leb()?;
-                    let tidx = *self
-                        .module
-                        .func_type_indices
-                        .get(target_fn as usize)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-                    let arity = self.module.types[tidx as usize].params.len();
-                    if stack.len() < arity {
-                        return Err(WasmSandboxError::ExecutionTrap(
-                            "call stack underflow".into(),
-                        ));
+                    0x41 => stack.push(WasmValue::i32(cur.read_i32_leb()?)),
+                    0x42 => stack.push(WasmValue::i64(cur.read_i64_leb()?)),
+                    0x43 => {
+                        let b = cur.read_exact(4)?;
+                        stack.push(WasmValue::f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
                     }
-                    let call_args = stack.split_off(stack.len() - arity);
-                    let call_res = self.call(target_fn, &call_args)?;
-                    stack.extend(call_res);
-                }
-                0x1a => {
-                    stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("drop underflow".into()))?;
-                }
-                0x1b => {
-                    let c = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("select underflow".into()))?
-                        .as_i32()?;
-                    let v2 = stack.pop().ok_or_else(|| {
-                        WasmSandboxError::ExecutionTrap("select underflow".into())
-                    })?;
-                    let v1 = stack.pop().ok_or_else(|| {
-                        WasmSandboxError::ExecutionTrap("select underflow".into())
-                    })?;
-                    stack.push(if c != 0 { v1 } else { v2 });
-                }
-                0x20 => {
-                    let idx = cur.read_u32_leb()? as usize;
-                    let v = *locals
-                        .get(idx)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-                    stack.push(v);
-                }
-                0x21 => {
-                    let idx = cur.read_u32_leb()? as usize;
-                    let v = stack.pop().ok_or_else(|| {
-                        WasmSandboxError::ExecutionTrap("local.set underflow".into())
-                    })?;
-                    *locals
-                        .get_mut(idx)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)? = v;
-                }
-                0x22 => {
-                    let idx = cur.read_u32_leb()? as usize;
-                    let v = *stack.last().ok_or_else(|| {
-                        WasmSandboxError::ExecutionTrap("local.tee underflow".into())
-                    })?;
-                    *locals
-                        .get_mut(idx)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)? = v;
-                }
-                0x23 => {
-                    let idx = cur.read_u32_leb()? as usize;
-                    let g = self
-                        .globals
-                        .get(idx)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?;
-                    stack.push(*g);
-                }
-                0x24 => {
-                    let idx = cur.read_u32_leb()? as usize;
-                    let mutable = self
-                        .module
-                        .globals
-                        .get(idx)
-                        .ok_or(WasmSandboxError::MalformedSectionOrLeb128)?
-                        .mutable;
-                    if !mutable {
-                        return Err(WasmSandboxError::MalformedSectionOrLeb128);
+                    0x45 => {
+                        let a = stack
+                            .pop()
+                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("eqz".into()))?
+                            .as_i32()?;
+                        stack.push(WasmValue::i32(i32::from(a == 0)));
                     }
-                    let v = stack.pop().ok_or_else(|| {
-                        WasmSandboxError::ExecutionTrap("global.set underflow".into())
-                    })?;
-                    self.globals[idx] = v;
-                }
-                0x28 => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("load underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 4)?;
-                    let val = i32::from_le_bytes([
-                        self.memory[addr],
-                        self.memory[addr + 1],
-                        self.memory[addr + 2],
-                        self.memory[addr + 3],
-                    ]);
-                    stack.push(WasmValue::i32(val));
-                }
-                0x2a => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("load underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 4)?;
-                    let bits = u32::from_le_bytes([
-                        self.memory[addr],
-                        self.memory[addr + 1],
-                        self.memory[addr + 2],
-                        self.memory[addr + 3],
-                    ]);
-                    stack.push(WasmValue::f32(f32::from_bits(bits)));
-                }
-                0x2c | 0x2d => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("load8 underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 1)?;
-                    let b = self.memory[addr];
-                    let val = if op == 0x2c {
-                        (b as i8) as i32
-                    } else {
-                        b as i32
-                    };
-                    stack.push(WasmValue::i32(val));
-                }
-                0x36 => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let val = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("store underflow".into()))?
-                        .as_i32()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("store underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 4)?;
-                    self.memory[addr..addr + 4].copy_from_slice(&val.to_le_bytes());
-                }
-                0x38 => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let val = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("fstore underflow".into()))?
-                        .as_f32()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("fstore underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 4)?;
-                    self.memory[addr..addr + 4].copy_from_slice(&val.to_bits().to_le_bytes());
-                }
-                0x3a => {
-                    let _align = cur.read_u32_leb()?;
-                    let off = cur.read_u32_leb()?;
-                    let val = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("store8 underflow".into()))?
-                        .as_i32()?;
-                    let base = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("store8 underflow".into()))?
-                        .as_i32()?;
-                    let addr = self.effective_addr(base, off, 1)?;
-                    self.memory[addr] = (val & 0xff) as u8;
-                }
-                0x3f => {
-                    let _mem_idx = cur.read_u32_leb()?;
-                    let pages = (self.memory.len() / WASM_PAGE_BYTES) as i32;
-                    stack.push(WasmValue::i32(pages));
-                }
-                0x40 => {
-                    let _mem_idx = cur.read_u32_leb()?;
-                    let delta = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("grow underflow".into()))?
-                        .as_i32()?;
-                    let current_pages = (self.memory.len() / WASM_PAGE_BYTES) as u32;
-                    let delta_u32 = delta as u32;
-                    let new_pages = current_pages.checked_add(delta_u32);
-                    if delta < 0 || new_pages.map_or(true, |np| np > self.limits.max_memory_pages) {
-                        if self.limits.trap_on_grow_failure {
-                            return Err(WasmSandboxError::MemoryGrowTrap {
-                                current_pages,
-                                delta_pages: delta_u32,
-                                max_pages: self.limits.max_memory_pages,
-                            });
-                        }
-                        stack.push(WasmValue::i32(-1));
-                    } else {
-                        let np = new_pages.unwrap();
-                        self.memory.resize((np as usize) * WASM_PAGE_BYTES, 0);
-                        if self.memory.len() > self.peak_memory_bytes {
-                            self.peak_memory_bytes = self.memory.len();
-                        }
-                        stack.push(WasmValue::i32(current_pages as i32));
+                    0x46..=0x4f => {
+                        let b = stack
+                            .pop()
+                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("cmp".into()))?
+                            .as_i32()?;
+                        let a = stack
+                            .pop()
+                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("cmp".into()))?
+                            .as_i32()?;
+                        let res = match op {
+                            0x46 => a == b,
+                            0x47 => a != b,
+                            0x48 => a < b,
+                            0x49 => (a as u32) < (b as u32),
+                            0x4a => a > b,
+                            0x4b => (a as u32) > (b as u32),
+                            0x4c => a <= b,
+                            0x4d => (a as u32) <= (b as u32),
+                            0x4e => a >= b,
+                            0x4f => (a as u32) >= (b as u32),
+                            _ => unreachable!(),
+                        };
+                        stack.push(WasmValue::i32(i32::from(res)));
                     }
-                }
-                0x41 => stack.push(WasmValue::i32(cur.read_i32_leb()?)),
-                0x42 => stack.push(WasmValue::i64(cur.read_i64_leb()?)),
-                0x43 => {
-                    let b = cur.read_exact(4)?;
-                    stack.push(WasmValue::f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
-                }
-                0x45 => {
-                    let a = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("eqz".into()))?
-                        .as_i32()?;
-                    stack.push(WasmValue::i32(i32::from(a == 0)));
-                }
-                0x46..=0x4f => {
-                    let b = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("cmp".into()))?
-                        .as_i32()?;
-                    let a = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("cmp".into()))?
-                        .as_i32()?;
-                    let res = match op {
-                        0x46 => a == b,
-                        0x47 => a != b,
-                        0x48 => a < b,
-                        0x49 => (a as u32) < (b as u32),
-                        0x4a => a > b,
-                        0x4b => (a as u32) > (b as u32),
-                        0x4c => a <= b,
-                        0x4d => (a as u32) <= (b as u32),
-                        0x4e => a >= b,
-                        0x4f => (a as u32) >= (b as u32),
-                        _ => unreachable!(),
-                    };
-                    stack.push(WasmValue::i32(i32::from(res)));
-                }
-                0x6a..=0x78 => {
-                    let b = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("alu".into()))?
-                        .as_i32()?;
-                    let a = stack
-                        .pop()
-                        .ok_or_else(|| WasmSandboxError::ExecutionTrap("alu".into()))?
-                        .as_i32()?;
-                    let res = match op {
-                        0x6a => a.wrapping_add(b),
-                        0x6b => a.wrapping_sub(b),
-                        0x6c => a.wrapping_mul(b),
-                        0x6d => a
-                            .checked_div(b)
-                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("div_s trap".into()))?,
-                        0x6e => (a as u32)
-                            .checked_div(b as u32)
-                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("div_u trap".into()))?
-                            as i32,
-                        0x6f => a
-                            .checked_rem(b)
-                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("rem_s trap".into()))?,
-                        0x71 => a & b,
-                        0x72 => a | b,
-                        0x73 => a ^ b,
-                        0x74 => a.wrapping_shl((b as u32) & 31),
-                        0x75 => a.wrapping_shr((b as u32) & 31),
-                        0x76 => ((a as u32).wrapping_shr((b as u32) & 31)) as i32,
-                        _ => {
-                            return Err(WasmSandboxError::ExecutionTrap(format!(
-                                "unsupported i32 opcode 0x{op:02x}"
-                            )))
-                        }
-                    };
-                    stack.push(WasmValue::i32(res));
-                }
-                _ => {
-                    return Err(WasmSandboxError::ExecutionTrap(format!(
-                        "unsupported wasm opcode 0x{op:02x}"
-                    )));
+                    0x6a..=0x78 => {
+                        let b = stack
+                            .pop()
+                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("alu".into()))?
+                            .as_i32()?;
+                        let a = stack
+                            .pop()
+                            .ok_or_else(|| WasmSandboxError::ExecutionTrap("alu".into()))?
+                            .as_i32()?;
+                        let res = match op {
+                            0x6a => a.wrapping_add(b),
+                            0x6b => a.wrapping_sub(b),
+                            0x6c => a.wrapping_mul(b),
+                            0x6d => a.checked_div(b).ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("div_s trap".into())
+                            })?,
+                            0x6e => (a as u32).checked_div(b as u32).ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("div_u trap".into())
+                            })? as i32,
+                            0x6f => a.checked_rem(b).ok_or_else(|| {
+                                WasmSandboxError::ExecutionTrap("rem_s trap".into())
+                            })?,
+                            0x71 => a & b,
+                            0x72 => a | b,
+                            0x73 => a ^ b,
+                            0x74 => a.wrapping_shl((b as u32) & 31),
+                            0x75 => a.wrapping_shr((b as u32) & 31),
+                            0x76 => ((a as u32).wrapping_shr((b as u32) & 31)) as i32,
+                            _ => {
+                                return Err(WasmSandboxError::ExecutionTrap(format!(
+                                    "unsupported i32 opcode 0x{op:02x}"
+                                )))
+                            }
+                        };
+                        stack.push(WasmValue::i32(res));
+                    }
+                    _ => {
+                        return Err(WasmSandboxError::ExecutionTrap(format!(
+                            "unsupported wasm opcode 0x{op:02x}"
+                        )));
+                    }
                 }
             }
+
+            if stack.len() < result_arity {
+                return Err(WasmSandboxError::ExecutionTrap(
+                    "missing return value on wasm stack".to_string(),
+                ));
+            }
+            Ok(stack.split_off(stack.len() - result_arity))
         }
-
-        if stack.len() < result_arity {
-            return Err(WasmSandboxError::ExecutionTrap(
-                "missing return value on wasm stack".to_string(),
-            ));
-        }
-        Ok(stack.split_off(stack.len() - result_arity))
-    }
-}
-
-/// Invocation mode for internal test-only experimental fallback fixtures (`ST-09`).
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
-pub enum ExperimentalTrustedFixtureCallV1<'a> {
-    /// Invoke `(ptr: i32, len: i32) -> i32` over guest memory initialized with the given payload.
-    ByteTransform(&'a [u8]),
-    /// Invoke scalar `(arg: i32) -> i32`.
-    ScalarI32(i32),
-}
-
-/// Fail-closed WebAssembly extension runner (`ADR-0018`, `W12-04`, `ST-09`).
-///
-/// Production entrypoints ([`Self::execute_byte_transform`] and [`Self::execute_scalar_i32`])
-/// unconditionally fail closed with [`WasmSandboxError::UnsupportedUntrustedWasmSandbox`] until
-/// the isolated `wasmi` adapter (`adapters/swarm-torch-wasm`) is wired in `13D-1`.
-pub struct WasmSandboxRunnerV1;
-
-impl WasmSandboxRunnerV1 {
-    /// Production untrusted Wasm byte-transform execution is **disabled (fail-closed)** in `13-0`
-    /// pending external `wasmi` sandbox integration (`ST-09`).
-    pub fn execute_byte_transform(
-        _policy: &SandboxedExtensionPolicyV1,
-        _wasm_bytes: &[u8],
-        _export_name: &str,
-        _input_payload: &[u8],
-    ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
-        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
     }
 
-    /// Production untrusted Wasm scalar execution is **disabled (fail-closed)** in `13-0`
-    /// pending external `wasmi` sandbox integration (`ST-09`).
-    pub fn execute_scalar_i32(
-        _policy: &SandboxedExtensionPolicyV1,
-        _wasm_bytes: &[u8],
-        _export_name: &str,
-        _arg: i32,
-    ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
-        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
-    }
-
-    /// **Experimental trusted local test fixture runner ONLY** (`#[doc(hidden)]`, `ST-09`).
-    ///
-    /// Must NEVER be called on untrusted manifests or in production scheduler/runner paths.
-    #[doc(hidden)]
-    pub fn run_experimental_trusted_test_fixture_only(
+    pub(super) fn exec_trusted_fixture(
         policy: &SandboxedExtensionPolicyV1,
         wasm_bytes: &[u8],
         export_name: &str,
@@ -1541,6 +1620,63 @@ impl WasmSandboxRunnerV1 {
                 })
             }
         }
+    }
+}
+
+/// Invocation mode for internal test-only experimental fallback fixtures (`ST-09`).
+#[cfg(test)]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub enum ExperimentalTrustedFixtureCallV1<'a> {
+    /// Invoke `(ptr: i32, len: i32) -> i32` over guest memory initialized with the given payload.
+    ByteTransform(&'a [u8]),
+    /// Invoke scalar `(arg: i32) -> i32`.
+    ScalarI32(i32),
+}
+
+/// Fail-closed WebAssembly extension runner (`ADR-0018`, `W12-04`, `ST-09`).
+///
+/// Production entrypoints ([`Self::execute_byte_transform`] and [`Self::execute_scalar_i32`])
+/// unconditionally fail closed with [`WasmSandboxError::UnsupportedUntrustedWasmSandbox`];
+/// configure [`WasmExtensionExecutor`] (for example `WasmiExtensionExecutorV1` in
+/// `adapters/swarm-torch-wasm`) to execute sandboxed extensions.
+pub struct WasmSandboxRunnerV1;
+
+impl WasmSandboxRunnerV1 {
+    /// Legacy in-crate untrusted Wasm byte-transform execution is **disabled (fail-closed)**;
+    /// configure an external [`WasmExtensionExecutor`] instead (`ST-09`).
+    pub fn execute_byte_transform(
+        _policy: &SandboxedExtensionPolicyV1,
+        _wasm_bytes: &[u8],
+        _export_name: &str,
+        _input_payload: &[u8],
+    ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
+        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
+    }
+
+    /// Legacy in-crate untrusted Wasm scalar execution is **disabled (fail-closed)**;
+    /// configure an external [`WasmExtensionExecutor`] instead (`ST-09`).
+    pub fn execute_scalar_i32(
+        _policy: &SandboxedExtensionPolicyV1,
+        _wasm_bytes: &[u8],
+        _export_name: &str,
+        _arg: i32,
+    ) -> Result<(i32, WasmExecutionReceiptV1), WasmSandboxError> {
+        Err(WasmSandboxError::UnsupportedUntrustedWasmSandbox)
+    }
+
+    /// **Experimental trusted local test fixture runner ONLY** (`#[cfg(test)]`, `#[doc(hidden)]`, `ST-09`).
+    ///
+    /// Must NEVER be called on untrusted manifests or in production scheduler/runner paths.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn run_experimental_trusted_test_fixture_only(
+        policy: &SandboxedExtensionPolicyV1,
+        wasm_bytes: &[u8],
+        export_name: &str,
+        invocation: ExperimentalTrustedFixtureCallV1<'_>,
+    ) -> Result<WasmExecutionReceiptV1, WasmSandboxError> {
+        legacy_vm::exec_trusted_fixture(policy, wasm_bytes, export_name, invocation)
     }
 }
 

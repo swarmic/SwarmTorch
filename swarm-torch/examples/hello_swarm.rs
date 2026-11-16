@@ -7,8 +7,8 @@ use swarm_torch::core::traits::{SwarmModel, SwarmOptimizer};
 use swarm_torch::models::loss::MseLoss;
 use swarm_torch::models::optim::SgdOptimizer;
 use swarm_torch::models::safetensors_v1::{
-    export_safetensors_checkpoint_v1, import_safetensors_checkpoint_v1, ModelTensorSchemaV1,
-    SafeTensorsLimitsV1,
+    export_safetensors_checkpoint_with_layout_v1, import_safetensors_checkpoint_with_layout_v1,
+    ModelFlatTensorLayoutV1, SafeTensorsLimitsV1,
 };
 use swarm_torch::models::simple::LinearModel;
 use swarm_torch::prelude::*;
@@ -60,13 +60,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     // 3. Export and verify a SwarmTorchCheckpointV1 SafeTensors v1 binary payload
-    let schema = ModelTensorSchemaV1::for_linear(4, 2)?;
+    let layout = ModelFlatTensorLayoutV1::for_linear(4, 2)?;
     let limits = SafeTensorsLimitsV1::default();
-    let checkpoint_bytes = export_safetensors_checkpoint_v1(&model, &schema, &limits)?;
+    let checkpoint_bytes = export_safetensors_checkpoint_with_layout_v1(&model, &layout, &limits)?;
 
     let mut restored = LinearModel::new(4, 2)?;
-    let schema_hash =
-        import_safetensors_checkpoint_v1(&mut restored, &schema, &checkpoint_bytes, &limits)?;
+    let schema_hash = import_safetensors_checkpoint_with_layout_v1(
+        &mut restored,
+        &layout,
+        &checkpoint_bytes,
+        &limits,
+    )?;
     assert_eq!(restored.parameters(), model.parameters());
     println!(
         "SafeTensors v1 checkpoint verified ({} bytes, schema_hash={:02x}{:02x}..)",

@@ -5,7 +5,19 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-14 (Wave 13 Phases `13-0`, `13A`, `13B`, & `13C`)
+## [Unreleased] - 2026-11-16 (Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D`)
+
+### External Integrations, `wasmi` Sandbox, & Cross-Framework Parity (`Phase 13D` — `ST-08`, `ST-09`)
+- **Isolated `wasmi 2.0.0` Extension Sandbox & Bespoke VM Retirement (`ST-09`, `13D-1`):**
+  - Added `WasmExtensionExecutor`, `WasmSandboxError::ExecutionTimeout`, `parse_sha256_hex_v1`, and `preflight_wasm_extension_v1` in `swarm-torch::wasm_sandbox`, gated the legacy bespoke VM behind `#[cfg(test)]` (zero bespoke VM code compiled in production `--lib` builds), and wired optional `NativeOpRunner::with_wasm_executor` + `Scheduler` `"wasm_transform"` execution over physical CAS assets (keeping unconfigured runners strictly fail-closed `UnsupportedUntrustedWasmSandbox`).
+  - Added standalone workspace crate `adapters/swarm-torch-wasm` (`WasmiExtensionExecutorV1` over `wasmi 2.0.0` with `auto-dispatch`, `validate`, `deterministic`, `EnforcedLimits::strict()`, `StoreLimits`, zero imports, SHA-256 pinning, and sliced `TypedResumableCall` enforcing both fuel and wall-clock `timeout_ms` across infinite loops, memory/table bombs, OOB reads, and physical `DataOpsSession` DAG execution).
+- **Live `iroh 1.4.1` 1-RTT QUIC Carrier Bridge (`ST-08`, `13D-2`):**
+  - Added `IrohEndpointBridgeV1` and `IrohCarrierError::Transport` in `adapters/swarm-torch-transport-iroh`, enforcing `presets::Minimal` strictly 1-RTT QUIC connect/accept (no 0-RTT fast path), SwarmTorch ALPN pinning, challenge-response `MessageAuth` Ed25519 binding to `conn.remote_id()`, bounded reads, pre-auth sliding-window `LinkFrameQuotaTrackerV1`, and live localhost QUIC loopback verification.
+- **Live `zenoh 1.10.2` TCP Peer Pub/Sub Session Bridge (`ST-08`, `13D-3`):**
+  - Added `ZenohSessionBridgeV1`, `ZenohValidatedSubscriberV1`, `ZenohCarrierAdapterV1::topic_for_gossip_v2`, and `ZenohCarrierError::Transport` in `adapters/swarm-torch-transport-zenoh`, enforcing pre-copy `ZBytes::len()` caps and strict `swarmtorch/v1/...` topic + signature + v2 session replay verification over live peer TCP sessions before mutating `ReplayProtection`.
+- **SafeTensors `[W | b]` / `[W1 | b1 | W2 | b2]` Layout Mapping & Live `Burn` + `Candle` Bridges (`ST-08`, `13D-4`):**
+  - Added `ModelTensorSchemaV1::for_mlp`, `ModelTensorFlatRangeV1`, `ModelFlatTensorLayoutV1` (`canonical`, `for_linear`, `for_mlp`, disjoint/gap-free `try_new`), `export_safetensors_checkpoint_with_layout_v1`, and `import_safetensors_checkpoint_with_layout_v1` in `swarm-torch-models::safetensors_v1` (plus `put_safetensors_checkpoint_with_layout_v1` / `get_verified_safetensors_checkpoint_with_layout_v1` in `swarm-torch::artifacts::cas`, updated `examples/hello_swarm.rs`, and `benches/swarm_bench.rs`) so declaration-ordered flat parameters never swap weights and biases under alphabetical SafeTensors sorting while preserving `model_schema_hash`.
+  - Added optional `real-burn` (`BurnLinearBridgeV1` over `burn 0.21.0` `Autodiff<NdArray<f32>>` with explicit `[in, out] <-> [out, in]` transpose and leaf `.require_grad()`) and `real-candle` (`CandleLinearBridgeV1` over `candle-core`/`candle-nn` `0.10.2` with atomic multi-tensor `VarMap` updates) in `adapters/swarm-torch-backends`, proving bit-exact SafeTensors roundtrips and forward/MSE-gradient parity (`< 1e-5`) across `SwarmTorch LinearModel <-> Burn <-> Candle`.
 
 ### Security, Async Runtime, & Aggregation (`Phase 13C` — Evented I/O, Embassy Runtime, Bulyan Stage 2, & Two-Phase `SharedSeedSparse`)
 - **Evented Transport Waiters, Fallible `SwarmRuntime::try_spawn`, & Real `EmbassyRuntime` (`ST-06`, `ST-07`, `13C-1`):**

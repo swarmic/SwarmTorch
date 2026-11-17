@@ -28,10 +28,19 @@ use crate::run_graph::{node_def_hash_v1, NodeId, NodeV1, OpKind};
 
 pub const DATAOPS_SCHEMA_V1: u32 = 1;
 pub const MATERIALIZATION_SCHEMA_V2: u32 = 2;
+/// Maximum persisted (normalized, redacted) source URI length in bytes.
 pub const MAX_SOURCE_URI_LEN: usize = 2048;
 /// Pre-allocation raw URI length bound (2x MAX_SOURCE_URI_LEN to allow query/userinfo stripping while preventing heap DoS).
 pub const MAX_RAW_SOURCE_URI_LEN: usize = 4096;
+/// Maximum persisted (trimmed) `etag_or_version` length in bytes.
 pub const MAX_ETAG_OR_VERSION_LEN: usize = 512;
+/// Maximum persisted (trimmed) `content_type` length in bytes.
+///
+/// RFC 6838 §4.2 caps media type and subtype names at 127 characters each, so a bare
+/// `type/subtype` fits in 255 bytes; parameters beyond that bound are rejected.
+pub const MAX_SOURCE_CONTENT_TYPE_LEN: usize = 256;
+/// Maximum `AuthModeMarker::Custom` marker length in bytes (a marker label, never a secret).
+pub const MAX_AUTH_MODE_CUSTOM_LEN: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -221,21 +230,36 @@ pub struct TransformAuditV0 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceDescriptorError {
+    EmptyUri,
     UriTooLong { len: usize, max: usize },
+    EmptyContentType,
     EtagOrVersionTooLong { len: usize, max: usize },
+    ContentTypeTooLong { len: usize, max: usize },
+    AuthModeCustomTooLong { len: usize, max: usize },
 }
 
 impl core::fmt::Display for SourceDescriptorError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::EmptyUri => write!(f, "source descriptor uri must not be empty"),
             Self::UriTooLong { len, max } => {
                 write!(f, "source descriptor uri too long: {} > {}", len, max)
             }
+            Self::EmptyContentType => write!(f, "source descriptor content_type must not be empty"),
             Self::EtagOrVersionTooLong { len, max } => {
                 write!(
                     f,
                     "source descriptor etag_or_version too long: {} > {}",
                     len, max
+                )
+            }
+            Self::ContentTypeTooLong { len, max } => {
+                write!(f, "source descriptor content_type too long: {len} > {max}")
+            }
+            Self::AuthModeCustomTooLong { len, max } => {
+                write!(
+                    f,
+                    "source descriptor custom auth_mode marker too long: {len} > {max}"
                 )
             }
         }
@@ -434,46 +458,59 @@ fn normalize_and_redact_source_descriptor(source: &SourceDescriptorV0) -> Source
 /// Guarantees:
 /// - URI userinfo is redacted (`user[:pass]@` -> `<redacted>@`)
 /// - normalized whitespace/casing rules match fingerprint canonicalization
-/// - oversized URI / etag_or_version values are rejected
+/// - oversized URI / etag_or_version / content_type / custom auth marker values are rejected
+///   before any normalization allocation
 pub fn sanitize_source_descriptor_v0(
     source: &SourceDescriptorV0,
 ) -> core::result::Result<SourceDescriptorV0, SourceDescriptorError> {
+    // Pre-allocation bounds on the raw input. Normalization only trims `content_type` /
+    // `etag_or_version` and clones `auth_mode`, so those use their persisted bounds directly;
+    // the URI gets a wider raw bound because query/fragment/userinfo stripping shrinks it.
     let trimmed_raw_len = source.uri.trim().len();
+    if trimmed_raw_len == 0 {
+        return Err(SourceDescriptorError::EmptyUri);
+    }
     if trimmed_raw_len > MAX_RAW_SOURCE_URI_LEN {
         return Err(SourceDescriptorError::UriTooLong {
             len: trimmed_raw_len,
-            max: MAX_SOURCE_URI_LEN,
+            max: MAX_RAW_SOURCE_URI_LEN,
         });
     }
-    if let Some(etag_or_version) = source.etag_or_version.as_ref() {
-        let trimmed_etag_len = etag_or_version.trim().len();
-        if trimmed_etag_len > MAX_ETAG_OR_VERSION_LEN {
-            return Err(SourceDescriptorError::EtagOrVersionTooLong {
-                len: trimmed_etag_len,
-                max: MAX_ETAG_OR_VERSION_LEN,
-            });
-        }
-    }
+    check_non_uri_field_bounds(
+        source.content_type.trim(),
+        &source.auth_mode,
+        source.etag_or_version.as_deref().map(str::trim),
+    )?;
     let sanitized = normalize_and_redact_source_descriptor(source);
     check_descriptor_bounds(&sanitized)?;
     Ok(sanitized)
 }
 
-/// Shared bounds check for source descriptors.
-///
-/// Used by both the write-path (`sanitize_source_descriptor_v0`) and
-/// the read-path (`validate_source_descriptor_bounds`) to ensure
-/// one validation core with no drift.
-fn check_descriptor_bounds(
-    desc: &SourceDescriptorV0,
+/// Bounds shared by the raw pre-allocation check and the persisted-form check, so the
+/// write path and the read path cannot drift on any non-URI field.
+fn check_non_uri_field_bounds(
+    content_type: &str,
+    auth_mode: &AuthModeMarker,
+    etag_or_version: Option<&str>,
 ) -> core::result::Result<(), SourceDescriptorError> {
-    if desc.uri.len() > MAX_SOURCE_URI_LEN {
-        return Err(SourceDescriptorError::UriTooLong {
-            len: desc.uri.len(),
-            max: MAX_SOURCE_URI_LEN,
+    if content_type.is_empty() {
+        return Err(SourceDescriptorError::EmptyContentType);
+    }
+    if content_type.len() > MAX_SOURCE_CONTENT_TYPE_LEN {
+        return Err(SourceDescriptorError::ContentTypeTooLong {
+            len: content_type.len(),
+            max: MAX_SOURCE_CONTENT_TYPE_LEN,
         });
     }
-    if let Some(etag_or_version) = desc.etag_or_version.as_ref() {
+    if let AuthModeMarker::Custom(marker) = auth_mode {
+        if marker.len() > MAX_AUTH_MODE_CUSTOM_LEN {
+            return Err(SourceDescriptorError::AuthModeCustomTooLong {
+                len: marker.len(),
+                max: MAX_AUTH_MODE_CUSTOM_LEN,
+            });
+        }
+    }
+    if let Some(etag_or_version) = etag_or_version {
         if etag_or_version.len() > MAX_ETAG_OR_VERSION_LEN {
             return Err(SourceDescriptorError::EtagOrVersionTooLong {
                 len: etag_or_version.len(),
@@ -484,11 +521,35 @@ fn check_descriptor_bounds(
     Ok(())
 }
 
+/// Shared bounds check for persisted source descriptors.
+///
+/// Used by both the write-path (`sanitize_source_descriptor_v0`) and
+/// the read-path (`validate_source_descriptor_bounds`) to ensure
+/// one validation core with no drift.
+fn check_descriptor_bounds(
+    desc: &SourceDescriptorV0,
+) -> core::result::Result<(), SourceDescriptorError> {
+    if desc.uri.is_empty() {
+        return Err(SourceDescriptorError::EmptyUri);
+    }
+    if desc.uri.len() > MAX_SOURCE_URI_LEN {
+        return Err(SourceDescriptorError::UriTooLong {
+            len: desc.uri.len(),
+            max: MAX_SOURCE_URI_LEN,
+        });
+    }
+    check_non_uri_field_bounds(
+        &desc.content_type,
+        &desc.auth_mode,
+        desc.etag_or_version.as_deref(),
+    )
+}
+
 /// Validate source descriptor bounds without mutation (read-path check).
 ///
-/// Returns `Ok(())` if the descriptor's URI and etag/version lengths are within
-/// acceptable limits. This function does not sanitize or redact — it is intended
-/// for use at deserialization boundaries (e.g., `load_report`).
+/// Returns `Ok(())` if the descriptor's URI, etag/version, content type, and custom auth
+/// marker lengths are within acceptable limits. This function does not sanitize or redact —
+/// it is intended for use at deserialization boundaries (e.g., `load_report`).
 pub fn validate_source_descriptor_bounds(
     desc: &SourceDescriptorV0,
 ) -> core::result::Result<(), SourceDescriptorError> {
@@ -602,7 +663,44 @@ pub fn derived_source_fingerprint_v0(asset_key: &str) -> Result<[u8; 32], postca
     sha256_postcard(&format!("derived_v0:{}", asset_key))
 }
 
+/// Error building a [`DatasetEntryV1`] via [`dataset_entry_v1`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatasetEntryError {
+    /// The provided source descriptor failed sanitization bounds.
+    Source(SourceDescriptorError),
+    /// Canonical postcard encoding for fingerprinting failed.
+    Encoding(postcard::Error),
+}
+
+impl core::fmt::Display for DatasetEntryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Source(e) => write!(f, "invalid dataset source descriptor: {e}"),
+            Self::Encoding(e) => write!(f, "dataset fingerprint encoding failed: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DatasetEntryError {}
+
+impl From<SourceDescriptorError> for DatasetEntryError {
+    fn from(e: SourceDescriptorError) -> Self {
+        Self::Source(e)
+    }
+}
+
+impl From<postcard::Error> for DatasetEntryError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Encoding(e)
+    }
+}
+
 /// Convenience: build a registry entry (v1) from the provided descriptors.
+///
+/// `source` is always passed through [`sanitize_source_descriptor_v0`] before hashing and
+/// persistence, so URI userinfo/query/fragment never reach the registry and every field is
+/// bounded identically to `DataOpsSession::register_source`.
 ///
 /// **Warning:** For derived outputs (source = None), use `derived_dataset_entry_v1()` instead
 /// to ensure proper asset_key salting in source_fingerprint.
@@ -612,7 +710,12 @@ pub fn dataset_entry_v1(
     source: Option<SourceDescriptorV0>,
     schema: Option<SchemaDescriptorV0>,
     recipe_hash: [u8; 32],
-) -> Result<DatasetEntryV1, postcard::Error> {
+) -> Result<DatasetEntryV1, DatasetEntryError> {
+    // Validate/sanitize before any hashing or allocation of the entry (prepare -> validate).
+    let source = source
+        .as_ref()
+        .map(sanitize_source_descriptor_v0)
+        .transpose()?;
     let asset_key = asset_key.into();
 
     // Use canonical helper for missing schema
@@ -1107,7 +1210,276 @@ mod tests {
         };
         assert!(matches!(
             sanitize_source_descriptor_v0(&oversized_raw),
-            Err(SourceDescriptorError::UriTooLong { .. })
+            Err(SourceDescriptorError::UriTooLong {
+                max: MAX_RAW_SOURCE_URI_LEN,
+                ..
+            })
         ));
+    }
+
+    fn bounded_desc(content_type: String, auth_mode: AuthModeMarker) -> SourceDescriptorV0 {
+        SourceDescriptorV0 {
+            uri: "s3://bucket/path".to_string(),
+            content_type,
+            auth_mode,
+            etag_or_version: None,
+        }
+    }
+
+    #[test]
+    fn content_type_and_custom_auth_marker_are_bounded_on_write_and_read_paths() {
+        // Exactly-at-limit values are accepted on both paths (surrounding whitespace is trimmed
+        // before the raw pre-allocation check, matching normalization).
+        let at_limit = bounded_desc(
+            format!("  {}  ", "a".repeat(MAX_SOURCE_CONTENT_TYPE_LEN)),
+            AuthModeMarker::Custom("m".repeat(MAX_AUTH_MODE_CUSTOM_LEN)),
+        );
+        let sanitized = sanitize_source_descriptor_v0(&at_limit).unwrap();
+        assert_eq!(sanitized.content_type.len(), MAX_SOURCE_CONTENT_TYPE_LEN);
+        assert!(validate_source_descriptor_bounds(&sanitized).is_ok());
+
+        let long_ct = bounded_desc(
+            "a".repeat(MAX_SOURCE_CONTENT_TYPE_LEN + 1),
+            AuthModeMarker::None,
+        );
+        let expected_ct = SourceDescriptorError::ContentTypeTooLong {
+            len: MAX_SOURCE_CONTENT_TYPE_LEN + 1,
+            max: MAX_SOURCE_CONTENT_TYPE_LEN,
+        };
+        assert_eq!(sanitize_source_descriptor_v0(&long_ct), Err(expected_ct));
+        assert_eq!(
+            validate_source_descriptor_bounds(&long_ct),
+            Err(expected_ct)
+        );
+
+        let long_custom = bounded_desc(
+            "text/csv".to_string(),
+            AuthModeMarker::Custom("m".repeat(MAX_AUTH_MODE_CUSTOM_LEN + 1)),
+        );
+        let expected_custom = SourceDescriptorError::AuthModeCustomTooLong {
+            len: MAX_AUTH_MODE_CUSTOM_LEN + 1,
+            max: MAX_AUTH_MODE_CUSTOM_LEN,
+        };
+        assert_eq!(
+            sanitize_source_descriptor_v0(&long_custom),
+            Err(expected_custom)
+        );
+        assert_eq!(
+            validate_source_descriptor_bounds(&long_custom),
+            Err(expected_custom)
+        );
+    }
+
+    #[test]
+    fn dataset_entry_v1_sanitizes_source_and_matches_sanitized_fingerprint() {
+        let raw = SourceDescriptorV0 {
+            uri: " s3://alice:secret@bucket/data.parquet?token=abc#frag ".to_string(),
+            content_type: " Application/Parquet ".to_string(),
+            auth_mode: AuthModeMarker::BearerToken,
+            etag_or_version: Some(" v7 ".to_string()),
+        };
+        let entry = dataset_entry_v1(
+            "dataset://ns/src",
+            TrustClass::Trusted,
+            Some(raw.clone()),
+            None,
+            [7u8; 32],
+        )
+        .unwrap();
+        let stored = entry.source.as_ref().expect("source persisted");
+        assert_eq!(stored.uri, "s3://<redacted>@bucket/data.parquet");
+        assert_eq!(stored.content_type, "application/parquet");
+        assert_eq!(stored.etag_or_version.as_deref(), Some("v7"));
+        // Sanitization is fingerprint-neutral: the persisted form hashes like the raw form.
+        assert_eq!(
+            entry.source_fingerprint_v0,
+            hex_lower(&source_fingerprint_v0(stored).unwrap())
+        );
+        assert_eq!(
+            entry.source_fingerprint_v0,
+            hex_lower(&source_fingerprint_v0(&raw).unwrap())
+        );
+
+        let oversized = SourceDescriptorV0 {
+            etag_or_version: Some("e".repeat(MAX_ETAG_OR_VERSION_LEN + 1)),
+            ..raw
+        };
+        assert!(matches!(
+            dataset_entry_v1(
+                "dataset://ns/src",
+                TrustClass::Trusted,
+                Some(oversized),
+                None,
+                [7u8; 32]
+            ),
+            Err(DatasetEntryError::Source(
+                SourceDescriptorError::EtagOrVersionTooLong { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn source_descriptor_utf8_bytes_redaction_expansion_and_raw_uri_limits() {
+        // Multi-byte UTF-8: "é" is 2 bytes, so 128 copies == 256 bytes (at limit), 129 == 258 bytes (> 256).
+        let ct_utf8_at = "é".repeat(MAX_SOURCE_CONTENT_TYPE_LEN / 2);
+        let desc_utf8_ok = bounded_desc(
+            ct_utf8_at.clone(),
+            AuthModeMarker::Custom("é".repeat(MAX_AUTH_MODE_CUSTOM_LEN / 2)),
+        );
+        let sanitized_ok = sanitize_source_descriptor_v0(&desc_utf8_ok).unwrap();
+        assert_eq!(sanitized_ok.content_type.len(), MAX_SOURCE_CONTENT_TYPE_LEN);
+        assert!(validate_source_descriptor_bounds(&sanitized_ok).is_ok());
+
+        let ct_utf8_over = "é".repeat((MAX_SOURCE_CONTENT_TYPE_LEN / 2) + 1);
+        let desc_utf8_bad = bounded_desc(ct_utf8_over.clone(), AuthModeMarker::None);
+        let expected_err = SourceDescriptorError::ContentTypeTooLong {
+            len: ct_utf8_over.len(),
+            max: MAX_SOURCE_CONTENT_TYPE_LEN,
+        };
+        assert_eq!(
+            sanitize_source_descriptor_v0(&desc_utf8_bad),
+            Err(expected_err)
+        );
+        assert_eq!(
+            validate_source_descriptor_bounds(&desc_utf8_bad),
+            Err(expected_err)
+        );
+
+        // Userinfo redaction ("<redacted>@" = 11 bytes) expanding a < 2048 raw URI past MAX_SOURCE_URI_LEN
+        // must fail with UriTooLong { max: MAX_SOURCE_URI_LEN }, NOT MAX_RAW_SOURCE_URI_LEN.
+        let expanding_uri = format!("s3://@{}", "a".repeat(2040));
+        assert!(expanding_uri.len() <= MAX_SOURCE_URI_LEN);
+        let expanding_desc = SourceDescriptorV0 {
+            uri: expanding_uri,
+            content_type: "text/plain".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        assert_eq!(
+            sanitize_source_descriptor_v0(&expanding_desc),
+            Err(SourceDescriptorError::UriTooLong {
+                len: 2056,
+                max: MAX_SOURCE_URI_LEN,
+            })
+        );
+
+        // Exact raw limit: 4096 bytes with query stripped to <= 2048 succeeds, 4097 bytes fails with MAX_RAW_SOURCE_URI_LEN.
+        let prefix = "s3://bucket/path?q=";
+        let at_raw_limit = SourceDescriptorV0 {
+            uri: format!(
+                "{prefix}{}",
+                "q".repeat(MAX_RAW_SOURCE_URI_LEN - prefix.len())
+            ),
+            content_type: "text/plain".to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        };
+        assert_eq!(at_raw_limit.uri.len(), MAX_RAW_SOURCE_URI_LEN);
+        let stripped = sanitize_source_descriptor_v0(&at_raw_limit).unwrap();
+        assert_eq!(stripped.uri, "s3://bucket/path");
+
+        let over_raw_limit = SourceDescriptorV0 {
+            uri: format!(
+                "{prefix}{}",
+                "q".repeat(MAX_RAW_SOURCE_URI_LEN - prefix.len() + 1)
+            ),
+            ..at_raw_limit
+        };
+        assert_eq!(
+            sanitize_source_descriptor_v0(&over_raw_limit),
+            Err(SourceDescriptorError::UriTooLong {
+                len: MAX_RAW_SOURCE_URI_LEN + 1,
+                max: MAX_RAW_SOURCE_URI_LEN,
+            })
+        );
+
+        // dataset_entry_v1 rejects ContentTypeTooLong and AuthModeCustomTooLong cleanly.
+        assert_eq!(
+            dataset_entry_v1(
+                "dataset://ns/ct",
+                TrustClass::Trusted,
+                Some(desc_utf8_bad),
+                None,
+                [1u8; 32],
+            ),
+            Err(DatasetEntryError::Source(expected_err))
+        );
+        let bad_custom = bounded_desc(
+            "text/plain".to_string(),
+            AuthModeMarker::Custom("x".repeat(MAX_AUTH_MODE_CUSTOM_LEN + 1)),
+        );
+        assert_eq!(
+            dataset_entry_v1(
+                "dataset://ns/auth",
+                TrustClass::Trusted,
+                Some(bad_custom),
+                None,
+                [1u8; 32],
+            ),
+            Err(DatasetEntryError::Source(
+                SourceDescriptorError::AuthModeCustomTooLong {
+                    len: MAX_AUTH_MODE_CUSTOM_LEN + 1,
+                    max: MAX_AUTH_MODE_CUSTOM_LEN,
+                }
+            ))
+        );
+
+        // Empty or query-stripping-to-empty URIs and empty/whitespace content_types fail closed.
+        for bad_uri in ["", "   ", "?token=only", "#frag_only"] {
+            let desc = SourceDescriptorV0 {
+                uri: bad_uri.to_string(),
+                content_type: "text/plain".to_string(),
+                auth_mode: AuthModeMarker::None,
+                etag_or_version: None,
+            };
+            assert_eq!(
+                sanitize_source_descriptor_v0(&desc),
+                Err(SourceDescriptorError::EmptyUri),
+                "bad uri {bad_uri:?} must fail closed"
+            );
+            assert_eq!(
+                dataset_entry_v1(
+                    "dataset://ns/empty_uri",
+                    TrustClass::Trusted,
+                    Some(desc),
+                    None,
+                    [1u8; 32]
+                ),
+                Err(DatasetEntryError::Source(SourceDescriptorError::EmptyUri))
+            );
+        }
+        assert_eq!(
+            validate_source_descriptor_bounds(&SourceDescriptorV0 {
+                uri: String::new(),
+                content_type: "text/plain".to_string(),
+                auth_mode: AuthModeMarker::None,
+                etag_or_version: None,
+            }),
+            Err(SourceDescriptorError::EmptyUri)
+        );
+
+        for bad_ct in ["", "   \t\n "] {
+            let desc = bounded_desc(bad_ct.to_string(), AuthModeMarker::None);
+            assert_eq!(
+                sanitize_source_descriptor_v0(&desc),
+                Err(SourceDescriptorError::EmptyContentType)
+            );
+            assert_eq!(
+                dataset_entry_v1(
+                    "dataset://ns/empty_ct",
+                    TrustClass::Trusted,
+                    Some(desc),
+                    None,
+                    [1u8; 32]
+                ),
+                Err(DatasetEntryError::Source(
+                    SourceDescriptorError::EmptyContentType
+                ))
+            );
+        }
+        assert_eq!(
+            validate_source_descriptor_bounds(&bounded_desc(String::new(), AuthModeMarker::None)),
+            Err(SourceDescriptorError::EmptyContentType)
+        );
     }
 }

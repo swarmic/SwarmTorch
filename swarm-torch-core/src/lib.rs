@@ -56,8 +56,9 @@ pub mod prelude {
     #[cfg(feature = "alloc")]
     pub use crate::dataops::{
         dataset_entry_v1, dataset_fingerprint_v0, recipe_hash_v0, schema_hash_v0,
-        source_fingerprint_v0, DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
-        MaterializationRecordV1, SchemaDescriptorV0, SourceDescriptorV0, TrustClass,
+        source_fingerprint_v0, DatasetEntryError, DatasetEntryV1, DatasetLineageV1,
+        DatasetRegistryV1, LineageEdgeV1, MaterializationRecordV1, SchemaDescriptorV0,
+        SourceDescriptorError, SourceDescriptorV0, TrustClass,
     };
     #[cfg(feature = "alloc")]
     pub use crate::execution::{AssetInstanceV1, ExecutionPolicy, OpRunner, PolicyDecision};

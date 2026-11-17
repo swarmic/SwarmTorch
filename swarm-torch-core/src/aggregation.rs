@@ -15,8 +15,9 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "alloc")]
 use crate::compression::{
-    sample_shared_indices_v1, verify_shared_seed_openings_v1, CompressedGradient, CompressionError,
-    CompressionMethod, MerkleOpeningBatchV1, PreSeedVectorCommitmentV1, SharedSeedSparsePayloadV1,
+    sample_shared_indices_v1, topk_keep_count, verify_shared_seed_openings_v1, CompressedGradient,
+    CompressionError, CompressionMethod, MerkleOpeningBatchV1, PreSeedVectorCommitmentV1,
+    SharedSeedSparsePayloadV1,
 };
 #[cfg(feature = "alloc")]
 use crate::dataops::TransformAuditV0;
@@ -231,17 +232,12 @@ impl<A: RobustAggregator> AggregationPipeline<A> {
         let estimated_compressed_bytes =
             self.compression.as_ref().and_then(|method| match method {
                 CompressionMethod::TopK { k_ratio } => {
-                    if gradient_len == 0 || num_peers == 0 {
+                    let k = topk_keep_count(gradient_len, *k_ratio)?;
+                    if num_peers == 0 || k == 0 {
                         return Some(0);
                     }
-                    let raw = (gradient_len as f32) * *k_ratio;
-                    let mut k = raw as u64;
-                    if (k as f32) < raw {
-                        k = k.saturating_add(1);
-                    }
-                    let k = k.max(1).min(gradient_len as u64);
                     // sparse wire estimate: u32 index + f32 value per kept element
-                    Some(k.saturating_mul(8))
+                    Some((k as u64).saturating_mul(8))
                 }
                 _ => None,
             });
@@ -357,6 +353,18 @@ impl Default for TrimmedMean {
     }
 }
 
+/// Canonical per-side trim count shared by [`TrimmedMean::aggregate`] and
+/// [`validate_post_bucketing_quorum`] so admission-time quorum validation and execution-time
+/// trimming can never disagree (previously validation multiplied in `f32` while execution used
+/// `f64`, so a configuration could be approved with a different `trim_count` than the one run).
+///
+/// Callers must reject non-finite or negative `trim_ratio` before calling. The product is
+/// computed in `f64` (exact for `total <= 2^53`) and truncated toward zero; the float-to-int
+/// `as` cast saturates, so the result never exceeds `total`.
+pub(crate) fn trimmed_mean_trim_count(total: usize, trim_ratio: f32) -> usize {
+    ((total as f64) * f64::from(trim_ratio)) as usize
+}
+
 impl RobustAggregator for TrimmedMean {
     #[cfg(feature = "alloc")]
     fn aggregate(&self, updates: &[GradientUpdate]) -> Result<Vec<f32>> {
@@ -365,7 +373,7 @@ impl RobustAggregator for TrimmedMean {
         }
         let dim = validate_gradient_shapes_and_finiteness(updates)?;
         let n = updates.len();
-        let trim_count = ((n as f64) * (self.trim_ratio as f64)) as usize;
+        let trim_count = trimmed_mean_trim_count(n, self.trim_ratio);
 
         if trim_count
             .checked_mul(2)
@@ -1335,7 +1343,7 @@ pub fn validate_post_bucketing_quorum(
             if !trim_ratio.is_finite() || !(0.0..0.5).contains(&trim_ratio) {
                 return Err(Error::InvalidThreshold);
             }
-            let trim_count = ((num_buckets as f32) * trim_ratio) as usize;
+            let trim_count = trimmed_mean_trim_count(num_buckets, trim_ratio);
             let two_trim = trim_count.checked_mul(2).ok_or(Error::ResourceExhausted)?;
             if trim_count < effective_f || two_trim >= num_buckets {
                 return Err(Error::InsufficientPeers);

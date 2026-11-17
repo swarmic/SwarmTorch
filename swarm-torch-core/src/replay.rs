@@ -997,7 +997,40 @@ impl ReplayProtection {
             reclaimed += 1;
         }
 
+        // Pending recovery challenges share the same expiry semantics; purge them here so
+        // stalled/abandoned handshakes cannot pin `max_pending_challenges` forever.
+        self.purge_expired_challenges(current_time);
+
         reclaimed
+    }
+
+    /// Returns `true` when a pending challenge issued at `issued_at` can never again pass
+    /// `check_timestamp_only(issued_at, t)` for any `t >= now`: it is below the configured
+    /// timestamp floor, or it lies strictly more than `skew` seconds in the past.
+    ///
+    /// Challenges issued in the future relative to `now` are NOT considered expired (they may
+    /// still become valid), mirroring the one-sided reclaim semantics of `expiry_index`.
+    fn challenge_expired(floor: Option<u32>, skew: u32, issued_at: u32, now: u32) -> bool {
+        floor.is_some_and(|f| issued_at < f) || now.saturating_sub(issued_at) > skew
+    }
+
+    /// Purge pending v1 + v2 recovery challenges that have permanently expired at `now`.
+    ///
+    /// Returns the number of purged challenges. Called by [`Self::reclaim_expired`] and lazily by
+    /// `register_recovery_challenge{,_v2}` before reporting `PendingChallengesFull`. Note that
+    /// [`Self::reclaim_expired`]'s return value continues to count replay records only.
+    pub fn purge_expired_challenges(&mut self, now: u32) -> usize {
+        let before = self.pending_challenge_count();
+        if before == 0 {
+            return 0;
+        }
+        let floor = self.timestamp_floor_secs;
+        let skew = self.max_clock_skew_secs;
+        self.pending_challenges
+            .retain(|_, c| !Self::challenge_expired(floor, skew, c.issued_at_secs, now));
+        self.pending_challenges_v2
+            .retain(|_, c| !Self::challenge_expired(floor, skew, c.issued_at_secs, now));
+        before.saturating_sub(self.pending_challenge_count())
     }
 
     /// Validate sequence number and update scoped v1 state at `(timestamp, current_time)`.
@@ -1059,7 +1092,8 @@ impl ReplayProtection {
         challenge: SessionHandshakeChallenge,
     ) -> Result<(), ReplayError> {
         self.check_peer_authorized(&challenge.sender_peer)?;
-        if challenge.challenge_nonce == [0u8; 32] {
+        self.check_timestamp_floor(challenge.issued_at_secs)?;
+        if challenge.challenge_nonce == [0u8; 32] || challenge.requested_epoch == 0 {
             return Err(ReplayError::HandshakeVerificationFailed);
         }
         if let Some(&(active_epoch, _, _)) = self
@@ -1078,6 +1112,13 @@ impl ReplayProtection {
         if !self.pending_challenges.contains_key(&challenge_key)
             && self.pending_challenge_count() >= self.max_pending_challenges
         {
+            // Receiver-generated `issued_at_secs` is the local clock reference: evict stalled
+            // handshakes before failing closed so expired floods cannot brick recovery.
+            self.purge_expired_challenges(challenge.issued_at_secs);
+        }
+        if !self.pending_challenges.contains_key(&challenge_key)
+            && self.pending_challenge_count() >= self.max_pending_challenges
+        {
             return Err(ReplayError::PendingChallengesFull {
                 capacity: self.max_pending_challenges,
             });
@@ -1092,6 +1133,7 @@ impl ReplayProtection {
         challenge: SessionHandshakeChallengeV2,
     ) -> Result<(), ReplayError> {
         self.check_peer_authorized(&challenge.sender_peer)?;
+        self.check_timestamp_floor(challenge.issued_at_secs)?;
         if challenge.receiver_nonce == [0u8; 32] || challenge.requested_epoch == 0 {
             return Err(ReplayError::HandshakeVerificationFailed);
         }
@@ -1108,6 +1150,12 @@ impl ReplayProtection {
                     received_epoch: challenge.requested_epoch,
                 });
             }
+        }
+        if !self.pending_challenges_v2.contains_key(&session_key)
+            && self.pending_challenge_count() >= self.max_pending_challenges
+        {
+            // Sibling parity with v1: evict expired handshakes before failing closed.
+            self.purge_expired_challenges(challenge.issued_at_secs);
         }
         if !self.pending_challenges_v2.contains_key(&session_key)
             && self.pending_challenge_count() >= self.max_pending_challenges

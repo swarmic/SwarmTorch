@@ -963,3 +963,292 @@ fn session_map_prunes_at_current_time_and_validate_sequence_scoped_at_checks_tim
         })
     );
 }
+
+#[test]
+fn expired_pending_challenges_are_purged_lazily_and_by_reclaim_with_v1_v2_parity() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver_kp = KeyPair::from_seed([80u8; 32]).unwrap();
+    let kp1 = KeyPair::from_seed([81u8; 32]).unwrap();
+    let kp2 = KeyPair::from_seed([82u8; 32]).unwrap();
+    let kp3 = KeyPair::from_seed([83u8; 32]).unwrap();
+    let kp4 = KeyPair::from_seed([84u8; 32]).unwrap();
+    let mut guard = ReplayProtection::try_with_config(8, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(2)
+        .unwrap();
+
+    let v1 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallenge {
+        swarm_instance_id: swarm_id,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 1,
+        challenge_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+    let v2 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+
+    // Stalled handshakes (one v1, one v2) fill the shared table at t=1000.
+    let stale_v1 = v1(&kp1, 1, 1_000);
+    guard.register_recovery_challenge(stale_v1).unwrap();
+    guard
+        .register_recovery_challenge_v2(v2(&kp2, 2, 1_000))
+        .unwrap();
+
+    // Within the skew window (inclusive boundary: 1060 - 1000 == 60) the table still fails closed.
+    for t in [1_030u32, 1_060] {
+        assert_eq!(
+            guard.register_recovery_challenge_v2(v2(&kp3, 3, t)),
+            Err(ReplayError::PendingChallengesFull { capacity: 2 })
+        );
+        assert_eq!(
+            guard.register_recovery_challenge(v1(&kp3, 3, t)),
+            Err(ReplayError::PendingChallengesFull { capacity: 2 })
+        );
+        assert_eq!(guard.pending_challenge_count(), 2);
+    }
+
+    // One second past the window, the lazy purge evicts both stalled challenges before admission.
+    let fresh = v2(&kp3, 4, 1_061);
+    guard.register_recovery_challenge_v2(fresh).unwrap();
+    assert_eq!(guard.pending_challenge_count(), 1);
+
+    // The purged stale v1 challenge can no longer be completed, even with a valid signature.
+    let stale_sig = MessageAuth::new(kp1.clone()).sign_session_handshake(&stale_v1);
+    assert_eq!(
+        guard.complete_recovery_handshake(swarm_id, kp1.public_key(), &stale_sig, 1_061),
+        Err(ReplayError::HandshakeVerificationFailed)
+    );
+
+    // The legitimate fresh handshake still completes.
+    let fresh_sig = MessageAuth::new(kp3.clone())
+        .sign_session_handshake_v2(&fresh)
+        .unwrap();
+    let key3 = guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, kp3.public_key(), &fresh_sig, 1_061)
+        .unwrap();
+    assert_eq!(key3.peer, kp3.peer_id());
+    assert_eq!(guard.pending_challenge_count(), 0);
+
+    // `reclaim_expired` purges expired challenges as well, but keeps counting records only.
+    guard
+        .register_recovery_challenge(v1(&kp4, 5, 1_100))
+        .unwrap();
+    // A future-dated challenge (relative to the reclaim clock) is not considered expired.
+    guard
+        .register_recovery_challenge_v2(v2(&kp1, 6, 5_000))
+        .unwrap();
+    assert_eq!(guard.pending_challenge_count(), 2);
+    assert_eq!(guard.reclaim_expired(1_200), 1, "only kp3's replay record");
+    assert_eq!(guard.pending_challenge_count(), 1);
+    assert_eq!(guard.purge_expired_challenges(1_200), 0);
+    assert_eq!(guard.purge_expired_challenges(5_061), 1);
+    assert_eq!(guard.pending_challenge_count(), 0);
+}
+
+#[test]
+fn pending_challenges_below_timestamp_floor_are_rejected_and_upgraded_floors_purge_them() {
+    let receiver_kp = KeyPair::from_seed([90u8; 32]).unwrap();
+    let kp1 = KeyPair::from_seed([91u8; 32]).unwrap();
+    let kp2 = KeyPair::from_seed([92u8; 32]).unwrap();
+    let mk_v1 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallenge {
+        swarm_instance_id: [0x11u8; 16],
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 1,
+        challenge_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+    let mk_v2 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallengeV2 {
+        swarm_instance_id: [0x11u8; 16],
+        run_id: [0x22u8; 16],
+        policy_digest: [0x33u8; 32],
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+
+    // Fail-fast rejection when a floor is already configured (v1 + v2 parity).
+    let mut floored = ReplayProtection::try_with_config(8, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap()
+        .with_timestamp_floor(2_000);
+    assert_eq!(
+        floored.register_recovery_challenge(mk_v1(&kp1, 1, 1_990)),
+        Err(ReplayError::TimestampBelowFloor {
+            ts: 1_990,
+            floor: 2_000,
+        })
+    );
+    assert_eq!(
+        floored.register_recovery_challenge_v2(mk_v2(&kp1, 1, 1_999)),
+        Err(ReplayError::TimestampBelowFloor {
+            ts: 1_999,
+            floor: 2_000,
+        })
+    );
+    assert_eq!(floored.pending_challenge_count(), 0);
+
+    // Chaining `with_timestamp_floor` after pre-existing challenges were registered still purges
+    // them lazily so they cannot pin capacity.
+    let mut guard = ReplayProtection::try_with_config(8, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap();
+    guard
+        .register_recovery_challenge(mk_v1(&kp1, 1, 1_990))
+        .unwrap();
+    let mut upgraded = guard.with_timestamp_floor(2_000);
+    upgraded
+        .register_recovery_challenge(mk_v1(&kp2, 2, 2_000))
+        .unwrap();
+    assert_eq!(upgraded.pending_challenge_count(), 1);
+    assert_eq!(upgraded.purge_expired_challenges(2_000), 0);
+}
+
+#[test]
+fn pending_challenge_expiry_handles_u32_max_zero_skew_cross_version_v2_to_v1_and_future_window() {
+    let swarm_id = [0x11u8; 16];
+    let run_id = [0x22u8; 16];
+    let policy_digest = [0x33u8; 32];
+    let receiver_kp = KeyPair::from_seed([95u8; 32]).unwrap();
+    let kp1 = KeyPair::from_seed([96u8; 32]).unwrap();
+    let kp2 = KeyPair::from_seed([97u8; 32]).unwrap();
+
+    let mk_v1 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallenge {
+        swarm_instance_id: swarm_id,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 1,
+        challenge_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+    let mk_v2 = |kp: &KeyPair, nonce: u8, issued_at_secs: u32| SessionHandshakeChallengeV2 {
+        swarm_instance_id: swarm_id,
+        run_id,
+        policy_digest,
+        receiver_peer: receiver_kp.peer_id(),
+        sender_peer: kp.peer_id(),
+        requested_epoch: 1,
+        initial_sequence: 0,
+        receiver_nonce: [nonce; 32],
+        issued_at_secs,
+    };
+
+    // 1. u32::MAX wrap safety: `issued_at = u32::MAX - 60`, `skew = 60`, `now = u32::MAX` is on the
+    //    inclusive boundary (not expired) and completes cleanly without u32 overflow.
+    let mut near_max = ReplayProtection::try_with_config(4, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap();
+    let ch_near_max = mk_v2(&kp1, 1, u32::MAX - 60);
+    near_max
+        .register_recovery_challenge_v2(ch_near_max)
+        .unwrap();
+    assert_eq!(near_max.purge_expired_challenges(u32::MAX), 0);
+    assert_eq!(
+        near_max.register_recovery_challenge(mk_v1(&kp2, 2, u32::MAX)),
+        Err(ReplayError::PendingChallengesFull { capacity: 1 })
+    );
+    let sig_near_max = MessageAuth::new(kp1.clone())
+        .sign_session_handshake_v2(&ch_near_max)
+        .unwrap();
+    assert!(near_max
+        .complete_recovery_handshake_v2(swarm_id, run_id, kp1.public_key(), &sig_near_max, u32::MAX)
+        .is_ok());
+
+    // 2. skew = u32::MAX vs skew = u32::MAX - 1 across full u32 range [0, u32::MAX].
+    let mut max_skew = ReplayProtection::try_with_config(4, u32::MAX).unwrap();
+    max_skew
+        .register_recovery_challenge(mk_v1(&kp1, 3, 0))
+        .unwrap();
+    assert_eq!(max_skew.reclaim_expired(u32::MAX), 0);
+    assert_eq!(max_skew.pending_challenge_count(), 1);
+
+    let mut almost_max_skew = ReplayProtection::try_with_config(4, u32::MAX - 1).unwrap();
+    almost_max_skew
+        .register_recovery_challenge(mk_v1(&kp1, 4, 0))
+        .unwrap();
+    assert_eq!(almost_max_skew.purge_expired_challenges(u32::MAX - 1), 0);
+    assert_eq!(almost_max_skew.purge_expired_challenges(u32::MAX), 1);
+
+    // 3. Zero clock skew: exact equality retained, +1s evicted; also proves v2 -> v1 lazy eviction.
+    let mut zero_skew = ReplayProtection::try_with_config(4, 0)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap();
+    zero_skew
+        .register_recovery_challenge_v2(mk_v2(&kp1, 5, 1_000))
+        .unwrap();
+    assert_eq!(
+        zero_skew.register_recovery_challenge(mk_v1(&kp2, 6, 1_000)),
+        Err(ReplayError::PendingChallengesFull { capacity: 1 })
+    );
+    zero_skew
+        .register_recovery_challenge(mk_v1(&kp2, 7, 1_001))
+        .unwrap();
+    assert_eq!(zero_skew.pending_challenge_count(), 1);
+
+    // 4. `set_timestamp_floor` over pre-existing future-dated v2 challenge purges it lazily;
+    //    meanwhile without a floor bump, a future-dated challenge survives `reclaim_expired`
+    //    and succeeds once `now` reaches `issued_at - skew`.
+    let mut future_guard = ReplayProtection::try_with_config(4, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap();
+    let future_v2 = mk_v2(&kp1, 8, 5_000);
+    future_guard
+        .register_recovery_challenge_v2(future_v2)
+        .unwrap();
+    assert_eq!(future_guard.reclaim_expired(1_000), 0);
+    assert_eq!(future_guard.pending_challenge_count(), 1);
+    let future_sig = MessageAuth::new(kp1.clone())
+        .sign_session_handshake_v2(&future_v2)
+        .unwrap();
+    assert!(future_guard
+        .complete_recovery_handshake_v2(swarm_id, run_id, kp1.public_key(), &future_sig, 4_940)
+        .is_ok());
+
+    let mut floor_v2 = ReplayProtection::try_with_config(4, 60)
+        .unwrap()
+        .try_with_max_pending_challenges(1)
+        .unwrap();
+    floor_v2
+        .register_recovery_challenge_v2(mk_v2(&kp1, 9, 5_000))
+        .unwrap();
+    floor_v2.set_timestamp_floor(Some(5_001));
+    assert_eq!(floor_v2.reclaim_expired(1_000), 0);
+    assert_eq!(floor_v2.pending_challenge_count(), 0);
+
+    // 5. v1/v2 sibling parity: requested_epoch == 0 fails closed with HandshakeVerificationFailed.
+    let mut epoch_zero_v1 = mk_v1(&kp1, 10, 5_100);
+    epoch_zero_v1.requested_epoch = 0;
+    assert_eq!(
+        floor_v2.register_recovery_challenge(epoch_zero_v1),
+        Err(ReplayError::HandshakeVerificationFailed)
+    );
+    let mut epoch_zero_v2 = mk_v2(&kp1, 10, 5_100);
+    epoch_zero_v2.requested_epoch = 0;
+    assert_eq!(
+        floor_v2.register_recovery_challenge_v2(epoch_zero_v2),
+        Err(ReplayError::HandshakeVerificationFailed)
+    );
+}

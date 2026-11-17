@@ -1171,3 +1171,113 @@ fn load_report_rejects_bad_span_event_schema_and_oversized_unit() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn load_report_with_warnings_surfaces_all_four_descriptor_bounds_violations() {
+    use swarm_torch_core::dataops::{
+        AuthModeMarker, MAX_AUTH_MODE_CUSTOM_LEN, MAX_ETAG_OR_VERSION_LEN,
+        MAX_SOURCE_CONTENT_TYPE_LEN, MAX_SOURCE_URI_LEN,
+    };
+
+    let base = temp_dir("load_report_all_four_descriptor_bounds");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([95u8; 16]);
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+
+    let mk_entry = |asset_key: &str, source: SourceDescriptorV0| DatasetEntryV1 {
+        asset_key: asset_key.to_string(),
+        fingerprint_v0: "a".repeat(64),
+        source_fingerprint_v0: "b".repeat(64),
+        schema_hash_v0: "c".repeat(64),
+        recipe_hash_v0: "d".repeat(64),
+        trust: TrustClass::Trusted,
+        source: Some(source),
+        schema: None,
+        license_flags: vec![],
+        pii_tags: vec![],
+    };
+
+    bundle
+        .write_dataset_registry(&DatasetRegistryV1 {
+            schema_version: 1,
+            datasets: vec![
+                mk_entry(
+                    "dataset://ns/bad_uri",
+                    SourceDescriptorV0 {
+                        uri: "x".repeat(MAX_SOURCE_URI_LEN + 1),
+                        content_type: "text/plain".to_string(),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: None,
+                    },
+                ),
+                mk_entry(
+                    "dataset://ns/bad_etag",
+                    SourceDescriptorV0 {
+                        uri: "s3://b/k".to_string(),
+                        content_type: "text/plain".to_string(),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: Some("e".repeat(MAX_ETAG_OR_VERSION_LEN + 1)),
+                    },
+                ),
+                mk_entry(
+                    "dataset://ns/bad_ct",
+                    SourceDescriptorV0 {
+                        uri: "s3://b/k".to_string(),
+                        content_type: "c".repeat(MAX_SOURCE_CONTENT_TYPE_LEN + 1),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: None,
+                    },
+                ),
+                mk_entry(
+                    "dataset://ns/bad_auth",
+                    SourceDescriptorV0 {
+                        uri: "s3://b/k".to_string(),
+                        content_type: "text/plain".to_string(),
+                        auth_mode: AuthModeMarker::Custom("m".repeat(MAX_AUTH_MODE_CUSTOM_LEN + 1)),
+                        etag_or_version: None,
+                    },
+                ),
+                mk_entry(
+                    "dataset://ns/empty_uri",
+                    SourceDescriptorV0 {
+                        uri: String::new(),
+                        content_type: "text/plain".to_string(),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: None,
+                    },
+                ),
+                mk_entry(
+                    "dataset://ns/empty_ct",
+                    SourceDescriptorV0 {
+                        uri: "s3://b/k".to_string(),
+                        content_type: String::new(),
+                        auth_mode: AuthModeMarker::None,
+                        etag_or_version: None,
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+    bundle.finalize_manifest().unwrap();
+
+    let (_report, warnings) = load_report_with_warnings(bundle.run_dir()).unwrap();
+    for expected in [
+        "dataset://ns/bad_uri",
+        "dataset://ns/bad_etag",
+        "dataset://ns/bad_ct",
+        "dataset://ns/bad_auth",
+        "dataset://ns/empty_uri",
+        "dataset://ns/empty_ct",
+    ] {
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                LoadWarning::SourceDescriptorBoundsExceeded { asset_key, .. } if asset_key == expected
+            )),
+            "missing bounds warning for {expected}: {warnings:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -779,3 +779,148 @@ fn test_fedasync_staleness_policy_and_drift_compensated_mixing() {
     assert!((clipped.updated_weights[0] - 13.25).abs() < 1e-5);
     assert!((clipped.updated_weights[1] - 26.2).abs() < 1e-5);
 }
+
+#[test]
+fn trimmed_mean_trim_count_is_shared_between_quorum_validation_and_execution() {
+    // 0.35f32 == 0.3499999940395355..., so 20 * r is just below 7 in exact arithmetic.
+    // The legacy f32 product rounded up to 7.0 (validation) while f64 execution trimmed 6.
+    let r = 0.35f32;
+    let num_buckets = 20usize;
+    let legacy_f32 = ((num_buckets as f32) * r) as usize;
+    assert_eq!(legacy_f32, 7, "documents the historical f32 drift");
+    assert_eq!(trimmed_mean_trim_count(num_buckets, r), 6);
+
+    // Validation must now use the execution trim_count (6), so f_B = 7 is rejected
+    // instead of being approved against a trim_count execution never applies.
+    assert_eq!(
+        validate_post_bucketing_quorum(
+            num_buckets,
+            7,
+            PostBucketingRule::TrimmedMean { trim_ratio: r }
+        ),
+        Err(Error::InsufficientPeers)
+    );
+    assert!(validate_post_bucketing_quorum(
+        num_buckets,
+        6,
+        PostBucketingRule::TrimmedMean { trim_ratio: r }
+    )
+    .is_ok());
+
+    // Boundary / saturation behaviour of the shared helper.
+    assert_eq!(trimmed_mean_trim_count(0, 0.49), 0);
+    assert_eq!(trimmed_mean_trim_count(10, 0.0), 0);
+    assert_eq!(trimmed_mean_trim_count(10, 0.1), 1);
+    assert!(trimmed_mean_trim_count(usize::MAX, 0.49) <= usize::MAX / 2 + 1);
+}
+
+#[test]
+fn pipeline_trace_topk_shares_f64_keep_count_and_rejects_invalid_ratios() {
+    // At n = 16_777_217 (2^24 + 1), `(n as f32)` rounds down to 16_777_216.0. With
+    // k_ratio = 1.0f32 / 16_777_216.0f32 (exact power of 2 in f32):
+    // - legacy f32 arithmetic gives 16_777_216.0 * 2^-24 == 1.0 -> k = 1 (8 bytes)
+    // - exact f64 arithmetic gives 16_777_217 * 2^-24 > 1.0 -> ceil == 2 (16 bytes), matching
+    //   `CompressedGradient::compress`!
+    let n = (1usize << 24) + 1;
+    let k_ratio = 1.0f32 / (1u32 << 24) as f32;
+    let legacy_f32_raw = (n as f32) * k_ratio;
+    assert_eq!(legacy_f32_raw, 1.0f32);
+    assert_eq!(crate::compression::topk_keep_count(n, k_ratio), Some(2));
+
+    let trace = AggregationPipeline::new(FedAvg)
+        .with_compression(CompressionMethod::TopK { k_ratio })
+        .trace(n, 2);
+    assert_eq!(trace.estimated_compressed_bytes, Some(16));
+
+    // Invalid TopK ratios fail closed to None in trace across ALL shapes (including 0-len / 0-peer),
+    // matching `CompressedGradient::compress`, while valid ratios on zero-sized shapes return Some(0).
+    for (grad_len, peers, expected_bytes) in [
+        (128usize, 4usize, Some(256u64)),
+        (0, 4, Some(0)),
+        (128, 0, Some(0)),
+        (0, 0, Some(0)),
+    ] {
+        assert_eq!(
+            AggregationPipeline::new(FedAvg)
+                .with_compression(CompressionMethod::TopK { k_ratio: 0.25 })
+                .trace(grad_len, peers)
+                .estimated_compressed_bytes,
+            expected_bytes
+        );
+        for bad_ratio in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.1,
+            -0.0,
+            0.0,
+            1.01,
+        ] {
+            let bad_trace = AggregationPipeline::new(FedAvg)
+                .with_compression(CompressionMethod::TopK { k_ratio: bad_ratio })
+                .trace(grad_len, peers);
+            assert_eq!(
+                bad_trace.estimated_compressed_bytes, None,
+                "trace({grad_len}, {peers}) must fail closed for bad k_ratio={bad_ratio:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn trimmed_mean_execution_at_20_updates_matches_shared_trim_count_6() {
+    // At n = 20 and trim_ratio = 0.35f32, shared trimmed_mean_trim_count is 6 (NOT 7).
+    // Placing 6 extreme outliers on each side leaves 8 central values (1.0..=1.0), whereas 7
+    // outliers on the upper side forces 1 outlier into the kept slice -> direct execution proof.
+    let r = 0.35f32;
+    assert!(trimmed_mean_trim_count(usize::MAX, 0.49) < usize::MAX / 2);
+
+    let mut updates_6_outliers = Vec::with_capacity(20);
+    for i in 0..20usize {
+        let val = if i < 6 {
+            -10_000.0
+        } else if i >= 14 {
+            10_000.0
+        } else {
+            1.0
+        };
+        updates_6_outliers.push(update_with_meta((i + 1) as u8, 0, 1, vec![val]));
+    }
+    let tm = TrimmedMean::try_new(r).unwrap();
+    let res6 = tm.aggregate(&updates_6_outliers).unwrap();
+    assert!((res6[0] - 1.0).abs() < 1e-6);
+
+    let mut updates_7_outliers = updates_6_outliers;
+    updates_7_outliers[13].gradients[0] = 10_000.0;
+    let res7 = tm.aggregate(&updates_7_outliers).unwrap();
+    // 7 zeros/1.0s + 1 outlier of 10_000.0 averaged across 8 kept values = (7 + 10_000)/8 = 1250.875
+    assert!((res7[0] - 1_250.875).abs() < 1e-3);
+}
+
+#[test]
+fn topk_keep_count_boundary_and_negative_zero_edge_cases() {
+    use crate::compression::{topk_keep_count, DEFAULT_MAX_COMPRESSION_ELEMENTS};
+
+    assert_eq!(topk_keep_count(0, 0.5), Some(0));
+    assert_eq!(topk_keep_count(0, 1.0), Some(0));
+    assert_eq!(topk_keep_count(1, f32::MIN_POSITIVE), Some(1));
+    assert_eq!(topk_keep_count(16, -0.0), None);
+    assert_eq!(topk_keep_count(16, f32::NEG_INFINITY), None);
+
+    let near_one = f32::from_bits(1.0f32.to_bits() - 1);
+    assert!(near_one < 1.0);
+    // near_one == 1 - 2^-24, so at 2^24 the exact product is 2^24 - 1; at 2^24 + 1 it is
+    // (2^24 + 1)(1 - 2^-24) = 2^24 - 2^-24 -> ceil is 2^24.
+    assert_eq!(
+        topk_keep_count(DEFAULT_MAX_COMPRESSION_ELEMENTS, near_one),
+        Some(DEFAULT_MAX_COMPRESSION_ELEMENTS - 1)
+    );
+    assert_eq!(
+        topk_keep_count(DEFAULT_MAX_COMPRESSION_ELEMENTS + 1, near_one),
+        Some(DEFAULT_MAX_COMPRESSION_ELEMENTS)
+    );
+    assert_eq!(
+        topk_keep_count(DEFAULT_MAX_COMPRESSION_ELEMENTS, 1.0),
+        Some(DEFAULT_MAX_COMPRESSION_ELEMENTS)
+    );
+}

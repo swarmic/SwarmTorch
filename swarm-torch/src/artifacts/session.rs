@@ -6,13 +6,13 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use swarm_torch_core::crypto::KeyPair;
 use swarm_torch_core::dataops::{
-    cache_hit_from_decision, cache_key_v0, dataset_fingerprint_v0, derived_source_fingerprint_v0,
-    no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0, sanitize_source_descriptor_v0,
-    schema_hash_v0, source_fingerprint_v0, AuthModeMarker, CacheDecisionV0, DatasetEntryV1,
-    DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1, MaterializationRecordCompat,
-    MaterializationRecordV2, MaterializationStatusV0, OutputSpecCore, PredictedOutput,
-    SchemaDescriptorV0, SourceDescriptorV0, TransformAuditV0, TrustClass, UnsafeReasonV0,
-    DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
+    cache_hit_from_decision, cache_key_v0, dataset_entry_v1, dataset_fingerprint_v0,
+    derived_source_fingerprint_v0, no_schema_hash_v0, predict_output_fingerprints, recipe_hash_v0,
+    sanitize_source_descriptor_v0, schema_hash_v0, AuthModeMarker, CacheDecisionV0,
+    DatasetEntryError, DatasetEntryV1, DatasetLineageV1, DatasetRegistryV1, LineageEdgeV1,
+    MaterializationRecordCompat, MaterializationRecordV2, MaterializationStatusV0, OutputSpecCore,
+    PredictedOutput, SchemaDescriptorV0, SourceDescriptorV0, TransformAuditV0, TrustClass,
+    UnsafeReasonV0, DATAOPS_SCHEMA_V1, MATERIALIZATION_SCHEMA_V2,
 };
 use swarm_torch_core::execution::AssetInstanceV1;
 use swarm_torch_core::observe::RunId;
@@ -329,6 +329,23 @@ impl DataOpsSession {
             .and_then(|e| decode_hex_exact::<32>(&e.fingerprint_v0).ok())
     }
 
+    /// Validate/sanitize a CAS `SourceDescriptorV0` and verify the backing blob exists on disk.
+    fn build_verified_cas_source_descriptor(
+        run_dir: &Path,
+        cas_uri: &str,
+        content_type: &str,
+    ) -> io::Result<SourceDescriptorV0> {
+        let sanitized = sanitize_source_descriptor_v0(&SourceDescriptorV0 {
+            uri: cas_uri.to_string(),
+            content_type: content_type.to_string(),
+            auth_mode: AuthModeMarker::None,
+            etag_or_version: None,
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        verify_cas_uri_exists(run_dir, &sanitized.uri, None)?;
+        Ok(sanitized)
+    }
+
     /// Attach a verified physical CAS URI (`cas://sha256/<64_hex>`) to an already-materialized
     /// asset in the registry so downstream consumers and `verify_cache_hit` can verify its
     /// content-addressed backing blob (`ADR-0023` §2.2–2.3).
@@ -338,8 +355,11 @@ impl DataOpsSession {
         cas_uri: &str,
         content_type: &str,
     ) -> io::Result<()> {
-        let run_dir = self.sink.bundle().run_dir();
-        verify_cas_uri_exists(run_dir, cas_uri, None)?;
+        let sanitized = Self::build_verified_cas_source_descriptor(
+            self.sink.bundle().run_dir(),
+            cas_uri,
+            content_type,
+        )?;
         let entry = self.registry.get(asset_key).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -347,12 +367,7 @@ impl DataOpsSession {
             )
         })?;
         let mut updated = entry;
-        updated.source = Some(SourceDescriptorV0 {
-            uri: cas_uri.to_string(),
-            content_type: content_type.to_string(),
-            auth_mode: AuthModeMarker::None,
-            etag_or_version: None,
-        });
+        updated.source = Some(sanitized);
         self.sink.append_registry_update(&updated)?;
         self.registry.insert(asset_key.to_string(), updated);
         self.record_dataops_mutation()
@@ -367,39 +382,18 @@ impl DataOpsSession {
         schema: Option<SchemaDescriptorV0>,
         ingest_node: &NodeV1,
     ) -> io::Result<()> {
-        let source = sanitize_source_descriptor_v0(&source)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let source_fp = source_fingerprint_v0(&source)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let schema_fp = schema
-            .as_ref()
-            .map(schema_hash_v0)
-            .transpose()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-            .unwrap_or(
-                no_schema_hash_v0()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
-            );
-
         // recipe_hash for source = hash(ingest_node_def, [])
         let recipe = recipe_hash_v0(ingest_node, &[])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        let dataset_fp = dataset_fingerprint_v0(source_fp, schema_fp, recipe)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let entry = DatasetEntryV1 {
-            asset_key: asset_key.to_string(),
-            fingerprint_v0: hex_lower(&dataset_fp),
-            source_fingerprint_v0: hex_lower(&source_fp),
-            schema_hash_v0: hex_lower(&schema_fp),
-            recipe_hash_v0: hex_lower(&recipe),
-            trust,
-            source: Some(source),
-            schema,
-            license_flags: Vec::new(),
-            pii_tags: Vec::new(),
-        };
+        let entry =
+            dataset_entry_v1(asset_key, trust, Some(source), schema, recipe).map_err(|e| {
+                let kind = match e {
+                    DatasetEntryError::Source(_) => io::ErrorKind::InvalidInput,
+                    DatasetEntryError::Encoding(_) => io::ErrorKind::InvalidData,
+                };
+                io::Error::new(kind, e.to_string())
+            })?;
 
         self.sink.append_registry_update(&entry)?;
         self.registry.insert(asset_key.to_string(), entry);
@@ -512,14 +506,17 @@ impl DataOpsSession {
         }
 
         let run_dir = self.sink.bundle().run_dir();
+        let mut validated_cas_sources: BTreeMap<String, SourceDescriptorV0> = BTreeMap::new();
         for (asset_key, (cas_uri, content_type)) in cas_bindings {
-            if content_type.is_empty() || !provided.contains(asset_key) {
+            if !provided.contains(asset_key) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("invalid CAS binding for output asset {asset_key}"),
                 ));
             }
-            verify_cas_uri_exists(run_dir, cas_uri, None)?;
+            let sanitized =
+                Self::build_verified_cas_source_descriptor(run_dir, cas_uri, content_type)?;
+            validated_cas_sources.insert(asset_key.clone(), sanitized);
         }
 
         // ── SNAPSHOT INPUTS (pre-mutation) ───────────────────────────────
@@ -625,13 +622,8 @@ impl DataOpsSession {
                 .get(&output.asset_key)
                 .filter(|existing| existing.fingerprint_v0 == fp_hex);
             let preserved_source =
-                if let Some((cas_uri, content_type)) = cas_bindings.get(&output.asset_key) {
-                    Some(SourceDescriptorV0 {
-                        uri: cas_uri.clone(),
-                        content_type: content_type.clone(),
-                        auth_mode: AuthModeMarker::None,
-                        etag_or_version: None,
-                    })
+                if let Some(sanitized) = validated_cas_sources.get(&output.asset_key) {
+                    Some(sanitized.clone())
                 } else {
                     existing_same_fp.and_then(|existing| existing.source.clone())
                 };

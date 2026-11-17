@@ -112,6 +112,31 @@ pub fn try_usize_to_u32(val: usize) -> core::result::Result<u32, CompressionErro
     u32::try_from(val).map_err(|_| CompressionError::IndexOverflow)
 }
 
+/// Canonical Top-K keep count shared between [`CompressedGradient::compress`] and
+/// [`crate::aggregation::AggregationPipeline::trace`].
+///
+/// Computes `ceil(len * k_ratio)` in `f64` (exact for `len <= 2^53`) clamped to `[1, len]`,
+/// returning `0` when `len == 0` and returning `None` when `k_ratio` is invalid
+/// (non-finite, `<= 0.0`, or `> 1.0`).
+#[cfg(feature = "alloc")]
+pub(crate) fn topk_keep_count(len: usize, k_ratio: f32) -> Option<usize> {
+    if !k_ratio.is_finite() || k_ratio <= 0.0 || k_ratio > 1.0 {
+        return None;
+    }
+    if len == 0 {
+        return Some(0);
+    }
+    if k_ratio >= 1.0 {
+        return Some(len);
+    }
+    let raw = (len as f64) * f64::from(k_ratio);
+    let mut k = raw as usize;
+    if (k as f64) < raw {
+        k = k.saturating_add(1);
+    }
+    Some(k.clamp(1, len))
+}
+
 #[cfg(feature = "alloc")]
 fn validate_method_params(
     method: &CompressionMethod,
@@ -278,12 +303,8 @@ impl CompressedGradient {
                     });
                 }
 
-                let raw = (gradients.len() as f64) * (k_ratio as f64);
-                let mut k = raw as usize;
-                if (k as f64) < raw {
-                    k = k.saturating_add(1);
-                }
-                let k = k.max(1).min(gradients.len());
+                let k = topk_keep_count(gradients.len(), k_ratio)
+                    .ok_or(CompressionError::InvalidRatio)?;
 
                 let mut indexed: Vec<(usize, f32)> =
                     gradients.iter().enumerate().map(|(i, &v)| (i, v)).collect();

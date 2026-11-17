@@ -4293,3 +4293,168 @@ fn st15_bundle_create_rejects_dangling_symlink_and_verify_head_rejects_oversized
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn register_source_and_cas_bindings_reject_oversized_content_type_and_custom_auth_atomically() {
+    use swarm_torch_core::dataops::{
+        AuthModeMarker, MAX_AUTH_MODE_CUSTOM_LEN, MAX_SOURCE_CONTENT_TYPE_LEN,
+    };
+
+    let base = temp_dir("session_source_bounds_parity");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run_id = RunId::from_bytes([0xCE; 16]);
+    let mut session = DataOpsSession::create(
+        &base,
+        run_id,
+        ArtifactWriteProfile::default(),
+        LockAcquisitionPolicy::FailFast,
+    )
+    .unwrap();
+    let run_dir = session.sink().bundle().run_dir().to_path_buf();
+    let ingest = make_source_node("ingest/raw");
+
+    let bad_ct_src = SourceDescriptorV0 {
+        uri: "s3://bucket/raw.parquet".to_string(),
+        content_type: "c".repeat(MAX_SOURCE_CONTENT_TYPE_LEN + 1),
+        auth_mode: AuthModeMarker::None,
+        etag_or_version: None,
+    };
+    let ct_err = session
+        .register_source(
+            "dataset://ns/bad_ct",
+            TrustClass::Trusted,
+            bad_ct_src,
+            None,
+            &ingest,
+        )
+        .expect_err("oversized content_type must fail");
+    assert_eq!(ct_err.kind(), io::ErrorKind::InvalidInput);
+    assert!(session.fingerprint("dataset://ns/bad_ct").is_none());
+
+    let bad_auth_src = SourceDescriptorV0 {
+        uri: "s3://bucket/raw.parquet".to_string(),
+        content_type: "application/parquet".to_string(),
+        auth_mode: AuthModeMarker::Custom("m".repeat(MAX_AUTH_MODE_CUSTOM_LEN + 1)),
+        etag_or_version: None,
+    };
+    let auth_err = session
+        .register_source(
+            "dataset://ns/bad_auth",
+            TrustClass::Trusted,
+            bad_auth_src,
+            None,
+            &ingest,
+        )
+        .expect_err("oversized custom auth_mode must fail");
+    assert_eq!(auth_err.kind(), io::ErrorKind::InvalidInput);
+    assert!(session.fingerprint("dataset://ns/bad_auth").is_none());
+
+    session
+        .register_source(
+            "dataset://ns/raw",
+            TrustClass::Trusted,
+            SourceDescriptorV0 {
+                uri: " s3://user:secret@bucket/raw.parquet?token=1#frag ".to_string(),
+                content_type: " Application/Parquet ".to_string(),
+                auth_mode: AuthModeMarker::BearerToken,
+                etag_or_version: Some(" v1 ".to_string()),
+            },
+            None,
+            &ingest,
+        )
+        .unwrap();
+    assert_eq!(
+        session.asset_content_type("dataset://ns/raw"),
+        Some("application/parquet")
+    );
+
+    let blob_payload = b"cas-payload";
+    let digest: [u8; 32] = {
+        use sha2::Digest;
+        sha2::Sha256::digest(blob_payload).into()
+    };
+    super::io::write_once_cas_blob(&run_dir, &digest, blob_payload).unwrap();
+    let cas_uri = format!("cas://sha256/{}", hex_lower(&digest));
+
+    let node = make_transform_node(
+        "transform/core",
+        &["dataset://ns/raw"],
+        &["dataset://ns/out"],
+        ExecutionTrust::Core,
+    );
+    let mat_outputs = vec![OutputSpec {
+        asset_key: "dataset://ns/out".to_string(),
+        schema: None,
+        rows: Some(1),
+        bytes: Some(11),
+    }];
+
+    // Whitespace-only or oversized content_type in cas_bindings must fail with InvalidInput without mutating state.
+    for bad_ct in [
+        "x".repeat(MAX_SOURCE_CONTENT_TYPE_LEN + 1),
+        String::new(),
+        "   \t ".to_string(),
+    ] {
+        let mut bad_bindings = std::collections::BTreeMap::new();
+        bad_bindings.insert("dataset://ns/out".to_string(), (cas_uri.clone(), bad_ct));
+        let bind_err = session
+            .materialize_node_outputs_with_cas_bindings(
+                &node,
+                &mat_outputs,
+                &bad_bindings,
+                100,
+                CacheDecisionV0::Miss,
+                1,
+            )
+            .expect_err("invalid cas_bindings content_type must fail");
+        assert_eq!(bind_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(session.fingerprint("dataset://ns/out").is_none());
+    }
+
+    // Valid mixed-case/untrimmed content_type in cas_bindings is sanitized consistently.
+    let mut good_bindings = std::collections::BTreeMap::new();
+    good_bindings.insert(
+        "dataset://ns/out".to_string(),
+        (cas_uri.clone(), " Application/Octet-Stream ".to_string()),
+    );
+    session
+        .materialize_node_outputs_with_cas_bindings(
+            &node,
+            &mat_outputs,
+            &good_bindings,
+            100,
+            CacheDecisionV0::Miss,
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        session.asset_content_type("dataset://ns/out"),
+        Some("application/octet-stream")
+    );
+
+    // Sibling `bind_output_cas_uri` enforces identical bounds + sanitization and leaves prior source intact on rejection.
+    for bad_ct in [
+        "y".repeat(MAX_SOURCE_CONTENT_TYPE_LEN + 1),
+        String::new(),
+        "   ".to_string(),
+    ] {
+        let err = session
+            .bind_output_cas_uri("dataset://ns/out", &cas_uri, &bad_ct)
+            .expect_err("bind_output_cas_uri must reject empty/oversized content_type");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            session.asset_content_type("dataset://ns/out"),
+            Some("application/octet-stream")
+        );
+    }
+    session
+        .bind_output_cas_uri("dataset://ns/out", &cas_uri, " Text/CSV ")
+        .unwrap();
+    assert_eq!(
+        session.asset_content_type("dataset://ns/out"),
+        Some("text/csv")
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

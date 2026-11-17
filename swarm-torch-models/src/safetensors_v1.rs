@@ -258,11 +258,38 @@ pub struct ModelTensorSchemaV1 {
     pub lora_adapters: Vec<LoRaAdapterDescriptorV1>,
 }
 
+fn norm_alpha_bits(alpha: f32) -> u32 {
+    let norm = if alpha == 0.0 { 0.0f32 } else { alpha };
+    norm.to_bits()
+}
+
+fn sort_lora_adapters(adapters: &mut [LoRaAdapterDescriptorV1]) {
+    adapters.sort_by(|a, b| {
+        a.target_module
+            .as_bytes()
+            .cmp(b.target_module.as_bytes())
+            .then_with(|| a.tensor_a_name.as_bytes().cmp(b.tensor_a_name.as_bytes()))
+            .then_with(|| a.tensor_b_name.as_bytes().cmp(b.tensor_b_name.as_bytes()))
+            .then_with(|| a.rank.cmp(&b.rank))
+            .then_with(|| norm_alpha_bits(a.alpha).cmp(&norm_alpha_bits(b.alpha)))
+    });
+}
+
 impl ModelTensorSchemaV1 {
     /// Construct and validate a canonical [`ModelTensorSchemaV1`], sorting tensors by UTF-8 byte
     /// order of `name` and rejecting duplicate or invalid descriptors.
     pub fn try_new(
+        tensors: Vec<ModelTensorDescriptorV1>,
+        limits: &SafeTensorsLimitsV1,
+    ) -> Result<Self, SafeTensorsError> {
+        Self::try_with_lora(tensors, Vec::new(), limits)
+    }
+
+    /// Construct and validate a canonical [`ModelTensorSchemaV1`] with explicit [`LoRaAdapterDescriptorV1`]
+    /// bindings, canonically sorting both `tensors` and `lora_adapters` and enforcing `limits`.
+    pub fn try_with_lora(
         mut tensors: Vec<ModelTensorDescriptorV1>,
+        mut lora_adapters: Vec<LoRaAdapterDescriptorV1>,
         limits: &SafeTensorsLimitsV1,
     ) -> Result<Self, SafeTensorsError> {
         if tensors.is_empty() || tensors.len() > limits.max_tensors {
@@ -294,10 +321,72 @@ impl ModelTensorSchemaV1 {
             }
         }
 
+        if lora_adapters.len() > limits.max_tensors {
+            return Err(SafeTensorsError::TooManyOrEmptyTensors);
+        }
+        sort_lora_adapters(&mut lora_adapters);
+        let mut seen_lora_tensors = BTreeSet::new();
+        for (i, a) in lora_adapters.iter().enumerate() {
+            if a.target_module.is_empty()
+                || a.target_module.len() > limits.max_name_bytes
+                || a.tensor_a_name.is_empty()
+                || a.tensor_a_name.len() > limits.max_name_bytes
+                || a.tensor_a_name == "__metadata__"
+                || a.tensor_b_name.is_empty()
+                || a.tensor_b_name.len() > limits.max_name_bytes
+                || a.tensor_b_name == "__metadata__"
+            {
+                return Err(SafeTensorsError::InvalidIdentifierLength);
+            }
+            if a.tensor_a_name == a.tensor_b_name {
+                return Err(SafeTensorsError::DuplicateKey);
+            }
+            if i > 0
+                && lora_adapters[i - 1].target_module == a.target_module
+                && lora_adapters[i - 1].tensor_a_name == a.tensor_a_name
+                && lora_adapters[i - 1].tensor_b_name == a.tensor_b_name
+            {
+                return Err(SafeTensorsError::DuplicateKey);
+            }
+            if !seen_lora_tensors.insert(a.tensor_a_name.as_str())
+                || !seen_lora_tensors.insert(a.tensor_b_name.as_str())
+            {
+                return Err(SafeTensorsError::DuplicateKey);
+            }
+            if a.rank == 0 || !a.alpha.is_finite() || a.alpha <= 0.0 {
+                return Err(SafeTensorsError::SchemaMismatch);
+            }
+            let tensor_a = tensors
+                .iter()
+                .find(|t| t.name == a.tensor_a_name)
+                .ok_or(SafeTensorsError::SchemaMismatch)?;
+            let tensor_b = tensors
+                .iter()
+                .find(|t| t.name == a.tensor_b_name)
+                .ok_or(SafeTensorsError::SchemaMismatch)?;
+            let r = usize::try_from(a.rank).map_err(|_| SafeTensorsError::ShapeOverflow)?;
+            if tensor_a.shape.len() != 2
+                || tensor_b.shape.len() != 2
+                || tensor_a.shape[0] != r
+                || tensor_b.shape[1] != r
+            {
+                return Err(SafeTensorsError::SchemaMismatch);
+            }
+        }
+
         Ok(Self {
             tensors,
-            lora_adapters: Vec::new(),
+            lora_adapters,
         })
+    }
+
+    /// Validate and canonicalize `self` (preserving and sorting both `tensors` and `lora_adapters`)
+    /// against caller-supplied `limits`.
+    pub fn validate_with_limits(
+        &self,
+        limits: &SafeTensorsLimitsV1,
+    ) -> Result<Self, SafeTensorsError> {
+        Self::try_with_lora(self.tensors.clone(), self.lora_adapters.clone(), limits)
     }
 
     /// Convenience schema for [`crate::simple::LinearModel`] (`weight: [output_dim, input_dim]`, `bias: [output_dim]`).
@@ -381,7 +470,7 @@ impl ModelTensorSchemaV1 {
 
     /// Compute the normative length-delimited binary `model_schema_hash` (`ADR-0024` §3, `W11-04`):
     ///
-    /// $$\text{SHA-256}\!\left(\texttt{"swarmtorch.schema.v1"} \;\|\; \text{u32\_le}(N_{\text{tensors}}) \;\|\; \bigoplus_{i=1}^{N_{\text{tensors}}} \left(\text{u32\_le}(\text{name\_len}) \;\|\; \text{name} \;\|\; \text{u8}(\text{dtype\_tag}) \;\|\; \text{u8}(\text{trainable}) \;\|\; \text{u32\_le}(\text{rank}) \;\|\; \bigoplus_{r} \text{u64\_le}(\text{dim}_r)\right)\right)$$
+    /// $$\text{SHA-256}\!\left(\texttt{"swarmtorch.schema.v1"} \;\|\; \text{u32\_le}(N_{\text{tensors}}) \;\|\; \bigoplus_{i=1}^{N_{\text{tensors}}} \left(\text{u32\_le}(\text{name\_len}) \;\|\; \text{name} \;\|\; \text{u8}(\text{dtype\_tag}) \;\|\; \text{u8}(\text{trainable}) \;\|\; \text{u32\_le}(\text{rank}) \;\|\; \bigoplus_{r} \text{u64\_le}(\text{dim}_r)\right) \;\|\; [\text{optional canonical LoRA descriptors}]\right)$$
     pub fn schema_hash(&self) -> [u8; 32] {
         let mut sorted = self.tensors.clone();
         sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
@@ -399,6 +488,21 @@ impl ModelTensorSchemaV1 {
             buf.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
             for &dim in &t.shape {
                 buf.extend_from_slice(&(dim as u64).to_le_bytes());
+            }
+        }
+
+        if !self.lora_adapters.is_empty() {
+            let mut sorted_lora = self.lora_adapters.clone();
+            sort_lora_adapters(&mut sorted_lora);
+            buf.extend_from_slice(&(sorted_lora.len() as u32).to_le_bytes());
+            for a in &sorted_lora {
+                for field in [&a.target_module, &a.tensor_a_name, &a.tensor_b_name] {
+                    let fb = field.as_bytes();
+                    buf.extend_from_slice(&(fb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(fb);
+                }
+                buf.extend_from_slice(&a.rank.to_le_bytes());
+                buf.extend_from_slice(&norm_alpha_bits(a.alpha).to_le_bytes());
             }
         }
 
@@ -471,7 +575,7 @@ impl ModelFlatTensorLayoutV1 {
         explicit_offsets: BTreeMap<String, usize>,
         limits: &SafeTensorsLimitsV1,
     ) -> Result<Self, SafeTensorsError> {
-        let validated = ModelTensorSchemaV1::try_new(schema.tensors, limits)?;
+        let validated = schema.validate_with_limits(limits)?;
         let total_elements = validated.total_elements()?;
         if explicit_offsets.len() != validated.tensors.len() {
             return Err(SafeTensorsError::SchemaMismatch);
@@ -518,10 +622,12 @@ impl ModelFlatTensorLayoutV1 {
     }
 
     /// Construct the identity layout matching canonical sorted [`ModelTensorSchemaV1`] tensor order
-    /// (used by backends exporting parameters in sorted schema order).
-    pub fn canonical(schema: ModelTensorSchemaV1) -> Result<Self, SafeTensorsError> {
-        let validated =
-            ModelTensorSchemaV1::try_new(schema.tensors, &SafeTensorsLimitsV1::default())?;
+    /// under explicit caller [`SafeTensorsLimitsV1`] (`ST-08`).
+    pub fn canonical_with_limits(
+        schema: ModelTensorSchemaV1,
+        limits: &SafeTensorsLimitsV1,
+    ) -> Result<Self, SafeTensorsError> {
+        let validated = schema.validate_with_limits(limits)?;
         let mut offsets = BTreeMap::new();
         let mut cursor = 0usize;
         for desc in &validated.tensors {
@@ -530,7 +636,13 @@ impl ModelFlatTensorLayoutV1 {
                 .checked_add(desc.num_elements()?)
                 .ok_or(SafeTensorsError::ShapeOverflow)?;
         }
-        Self::try_new(validated, offsets, &SafeTensorsLimitsV1::default())
+        Self::try_new(validated, offsets, limits)
+    }
+
+    /// Construct the identity layout matching canonical sorted [`ModelTensorSchemaV1`] tensor order
+    /// with default [`SafeTensorsLimitsV1`] (used by backends exporting parameters in sorted schema order).
+    pub fn canonical(schema: ModelTensorSchemaV1) -> Result<Self, SafeTensorsError> {
+        Self::canonical_with_limits(schema, &SafeTensorsLimitsV1::default())
     }
 
     /// Flat `[W | b]` parameter layout matching [`crate::simple::LinearModelWithCapacity`].
@@ -596,13 +708,39 @@ impl ModelFlatTensorLayoutV1 {
 ///
 /// Models with declaration-ordered flat parameters (`LinearModel` `[W | b]` or `MlpModel`
 /// `[W1 | b1 | W2 | b2]`) must use [`export_safetensors_checkpoint_with_layout_v1`].
+fn lora_metadata_entries(
+    adapters: &[LoRaAdapterDescriptorV1],
+    limits: &SafeTensorsLimitsV1,
+) -> Result<Vec<(String, String)>, SafeTensorsError> {
+    if adapters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pairs = Vec::with_capacity(1 + adapters.len() * 5);
+    pairs.push(("lora_count".to_string(), adapters.len().to_string()));
+    for (idx, a) in adapters.iter().enumerate() {
+        pairs.push((format!("lora.{idx}.module"), a.target_module.clone()));
+        pairs.push((format!("lora.{idx}.a"), a.tensor_a_name.clone()));
+        pairs.push((format!("lora.{idx}.b"), a.tensor_b_name.clone()));
+        pairs.push((format!("lora.{idx}.rank"), a.rank.to_string()));
+        pairs.push((
+            format!("lora.{idx}.alpha_bits"),
+            format!("{:08x}", norm_alpha_bits(a.alpha)),
+        ));
+    }
+    for (k, v) in &pairs {
+        if k.len() > limits.max_name_bytes || v.len() > limits.max_name_bytes {
+            return Err(SafeTensorsError::InvalidIdentifierLength);
+        }
+    }
+    Ok(pairs)
+}
+
 pub fn export_safetensors_checkpoint_v1<M: SwarmModel>(
     model: &M,
     schema: &ModelTensorSchemaV1,
     limits: &SafeTensorsLimitsV1,
 ) -> Result<Vec<u8>, SafeTensorsError> {
-    let validated = ModelTensorSchemaV1::try_new(schema.tensors.clone(), limits)?;
-    let layout = ModelFlatTensorLayoutV1::canonical(validated)?;
+    let layout = ModelFlatTensorLayoutV1::canonical_with_limits(schema.clone(), limits)?;
     export_safetensors_checkpoint_with_layout_v1(model, &layout, limits)
 }
 
@@ -614,7 +752,7 @@ pub fn export_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
     layout: &ModelFlatTensorLayoutV1,
     limits: &SafeTensorsLimitsV1,
 ) -> Result<Vec<u8>, SafeTensorsError> {
-    let validated = ModelTensorSchemaV1::try_new(layout.schema.tensors.clone(), limits)?;
+    let validated = layout.schema.validate_with_limits(limits)?;
     let expected_elements = validated.total_elements()?;
     if expected_elements != layout.total_elements
         || layout.ranges_by_schema_order.len() != validated.tensors.len()
@@ -632,11 +770,29 @@ pub fn export_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
     }
 
     let schema_hash_hex = validated.schema_hash_hex();
+    for meta_str in [
+        "__metadata__",
+        "format",
+        SWARMTORCH_CHECKPOINT_FORMAT_V1,
+        "model_schema_hash",
+        schema_hash_hex.as_str(),
+    ] {
+        if meta_str.len() > limits.max_name_bytes {
+            return Err(SafeTensorsError::InvalidIdentifierLength);
+        }
+    }
+    let lora_meta = lora_metadata_entries(&validated.lora_adapters, limits)?;
     let mut header_json = String::new();
     header_json.push_str("{\"__metadata__\":{\"format\":");
     push_json_escaped_str(&mut header_json, SWARMTORCH_CHECKPOINT_FORMAT_V1);
     header_json.push_str(",\"model_schema_hash\":");
     push_json_escaped_str(&mut header_json, &schema_hash_hex);
+    for (k, v) in &lora_meta {
+        header_json.push(',');
+        push_json_escaped_str(&mut header_json, k);
+        header_json.push(':');
+        push_json_escaped_str(&mut header_json, v);
+    }
     header_json.push('}');
 
     let mut byte_cursor = 0usize;
@@ -764,6 +920,37 @@ impl<'a> JsonHeaderCursor<'a> {
             .ok_or(SafeTensorsError::MalformedHeaderJson)
     }
 
+    fn parse_hex4(&mut self) -> Result<u16, SafeTensorsError> {
+        let slice = self
+            .src
+            .get(self.pos..self.pos + 4)
+            .ok_or(SafeTensorsError::MalformedHeaderJson)?;
+        let mut val: u16 = 0;
+        for &b in slice {
+            let nibble = match b {
+                b'0'..=b'9' => (b - b'0') as u16,
+                b'a'..=b'f' => (b - b'a' + 10) as u16,
+                b'A'..=b'F' => (b - b'A' + 10) as u16,
+                _ => return Err(SafeTensorsError::MalformedHeaderJson),
+            };
+            val = (val << 4) | nibble;
+        }
+        self.pos += 4;
+        Ok(val)
+    }
+
+    fn push_checked_byte(&self, out: &mut Vec<u8>, byte: u8) -> Result<(), SafeTensorsError> {
+        self.push_checked_bytes(out, core::slice::from_ref(&byte))
+    }
+
+    fn push_checked_bytes(&self, out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SafeTensorsError> {
+        if out.len().saturating_add(bytes.len()) > self.limits.max_name_bytes {
+            return Err(SafeTensorsError::InvalidIdentifierLength);
+        }
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
+
     fn parse_string(&mut self) -> Result<String, SafeTensorsError> {
         self.expect_byte(b'"')?;
         let mut out = Vec::new();
@@ -786,19 +973,42 @@ impl<'a> JsonHeaderCursor<'a> {
                 let esc = self.src[self.pos];
                 self.pos += 1;
                 match esc {
-                    b'"' | b'\\' | b'/' => out.push(esc),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
+                    b'"' | b'\\' | b'/' => self.push_checked_byte(&mut out, esc)?,
+                    b'b' => self.push_checked_byte(&mut out, 0x08)?,
+                    b'f' => self.push_checked_byte(&mut out, 0x0c)?,
+                    b'n' => self.push_checked_byte(&mut out, b'\n')?,
+                    b'r' => self.push_checked_byte(&mut out, b'\r')?,
+                    b't' => self.push_checked_byte(&mut out, b'\t')?,
+                    b'u' => {
+                        let code = self.parse_hex4()?;
+                        let ch = if (0xD800..=0xDBFF).contains(&code) {
+                            if self.src.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                return Err(SafeTensorsError::MalformedHeaderJson);
+                            }
+                            self.pos += 2;
+                            let low = self.parse_hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return Err(SafeTensorsError::MalformedHeaderJson);
+                            }
+                            let cp = 0x10000
+                                + ((((code as u32) - 0xD800) << 10) | ((low as u32) - 0xDC00));
+                            char::from_u32(cp).ok_or(SafeTensorsError::MalformedHeaderJson)?
+                        } else if (0xDC00..=0xDFFF).contains(&code) {
+                            return Err(SafeTensorsError::MalformedHeaderJson);
+                        } else {
+                            char::from_u32(code as u32)
+                                .ok_or(SafeTensorsError::MalformedHeaderJson)?
+                        };
+                        let mut utf8 = [0u8; 4];
+                        let encoded = ch.encode_utf8(&mut utf8);
+                        self.push_checked_bytes(&mut out, encoded.as_bytes())?;
+                    }
                     _ => return Err(SafeTensorsError::MalformedHeaderJson),
                 }
             } else if b < 0x20 {
                 return Err(SafeTensorsError::MalformedHeaderJson);
             } else {
-                out.push(b);
-            }
-            if out.len() > self.limits.max_name_bytes {
-                return Err(SafeTensorsError::InvalidIdentifierLength);
+                self.push_checked_byte(&mut out, b)?;
             }
         }
         Err(SafeTensorsError::MalformedHeaderJson)
@@ -961,7 +1171,8 @@ pub fn parse_and_validate_safetensors_v1(
     if header_len_u64 == 0 || header_len_u64 > (limits.max_header_bytes as u64) {
         return Err(SafeTensorsError::HeaderTooLarge);
     }
-    let header_len = header_len_u64 as usize;
+    let header_len =
+        usize::try_from(header_len_u64).map_err(|_| SafeTensorsError::HeaderTooLarge)?;
     let data_section_offset = 8usize
         .checked_add(header_len)
         .ok_or(SafeTensorsError::HeaderTooLarge)?;
@@ -1085,9 +1296,36 @@ pub fn import_safetensors_checkpoint_v1<M: SwarmModel>(
     bytes: &[u8],
     limits: &SafeTensorsLimitsV1,
 ) -> Result<[u8; 32], SafeTensorsError> {
-    let canonical_schema = ModelTensorSchemaV1::try_new(expected_schema.tensors.clone(), limits)?;
-    let layout = ModelFlatTensorLayoutV1::canonical(canonical_schema)?;
+    let layout = ModelFlatTensorLayoutV1::canonical_with_limits(expected_schema.clone(), limits)?;
     import_safetensors_checkpoint_with_layout_v1(model, &layout, bytes, limits)
+}
+
+fn verify_lora_metadata(
+    metadata: &BTreeMap<String, String>,
+    adapters: &[LoRaAdapterDescriptorV1],
+    limits: &SafeTensorsLimitsV1,
+) -> Result<(), SafeTensorsError> {
+    let lora_keys: Vec<(&String, &String)> = metadata
+        .iter()
+        .filter(|(k, _)| *k == "lora_count" || k.starts_with("lora."))
+        .collect();
+    if adapters.is_empty() {
+        if !lora_keys.is_empty() {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+        return Ok(());
+    }
+    let expected_entries = lora_metadata_entries(adapters, limits)?;
+    if lora_keys.len() != expected_entries.len() {
+        return Err(SafeTensorsError::SchemaMismatch);
+    }
+    for (k, expected_val) in &expected_entries {
+        let got_val = metadata.get(k).ok_or(SafeTensorsError::SchemaMismatch)?;
+        if got_val != expected_val {
+            return Err(SafeTensorsError::SchemaMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// Validate and transactionally import `SwarmTorchCheckpointV1` SafeTensors v1 bytes using an
@@ -1098,7 +1336,7 @@ pub fn import_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
     bytes: &[u8],
     limits: &SafeTensorsLimitsV1,
 ) -> Result<[u8; 32], SafeTensorsError> {
-    let canonical_schema = ModelTensorSchemaV1::try_new(layout.schema.tensors.clone(), limits)?;
+    let canonical_schema = layout.schema.validate_with_limits(limits)?;
     let parsed = parse_and_validate_safetensors_v1(bytes, limits)?;
 
     let fmt = parsed
@@ -1118,6 +1356,7 @@ pub fn import_safetensors_checkpoint_with_layout_v1<M: SwarmModel>(
     if got_hash_hex != &expected_hash_hex {
         return Err(SafeTensorsError::SchemaMismatch);
     }
+    verify_lora_metadata(&parsed.metadata, &canonical_schema.lora_adapters, limits)?;
 
     if parsed.tensors.len() != canonical_schema.tensors.len()
         || layout.ranges_by_schema_order.len() != canonical_schema.tensors.len()
@@ -1350,6 +1589,544 @@ mod tests {
         assert_eq!(
             ModelFlatTensorLayoutV1::try_new(schema, missing, &limits).unwrap_err(),
             SafeTensorsError::SchemaMismatch
+        );
+    }
+
+    #[test]
+    fn canonical_with_limits_honors_custom_bounds_above_and_below_defaults() {
+        let mut model = LinearModel::new(2, 1).unwrap();
+        model.load_parameters(&[1.0, 2.0, 3.0]).unwrap();
+
+        // Name longer than default `max_name_bytes = 256` fails under canonical(), succeeds under
+        // custom limits with `canonical_with_limits` and `export_safetensors_checkpoint_v1`.
+        let long_name = "layer.".to_string() + &"w".repeat(260);
+        let long_limits = SafeTensorsLimitsV1 {
+            max_name_bytes: 300,
+            ..SafeTensorsLimitsV1::default()
+        };
+        let long_schema = ModelTensorSchemaV1::try_new(
+            vec![ModelTensorDescriptorV1 {
+                name: long_name.clone(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![3],
+            }],
+            &long_limits,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ModelFlatTensorLayoutV1::canonical(long_schema.clone()).unwrap_err(),
+            SafeTensorsError::InvalidIdentifierLength
+        );
+        let custom_layout =
+            ModelFlatTensorLayoutV1::canonical_with_limits(long_schema.clone(), &long_limits)
+                .unwrap();
+        assert_eq!(custom_layout.schema().tensors[0].name, long_name);
+
+        let bytes = export_safetensors_checkpoint_v1(&model, &long_schema, &long_limits).unwrap();
+        let mut restored = LinearModel::new(2, 1).unwrap();
+        import_safetensors_checkpoint_v1(&mut restored, &long_schema, &bytes, &long_limits)
+            .unwrap();
+        assert_eq!(restored.parameters(), &[1.0, 2.0, 3.0]);
+
+        // Tighter data limit than 12 bytes fails cleanly through export_safetensors_checkpoint_v1.
+        let tight_limits = SafeTensorsLimitsV1 {
+            max_total_data_bytes: 8,
+            ..SafeTensorsLimitsV1::default()
+        };
+        assert_eq!(
+            export_safetensors_checkpoint_v1(
+                &model,
+                &ModelTensorSchemaV1::for_linear(2, 1).unwrap(),
+                &tight_limits,
+            )
+            .unwrap_err(),
+            SafeTensorsError::DataTooLarge
+        );
+    }
+
+    #[test]
+    fn schema_hash_and_checkpoint_roundtrip_preserve_and_verify_lora_adapters() {
+        use crate::simple::LinearModelWithCapacity;
+        // Build a 10-element contiguous buffer:
+        // "q_proj.lora_a" [2, 3] (6), "q_proj.lora_b" [2, 2] (4) -> canonical alphabetical order!
+        type TinyLoraModel = LinearModelWithCapacity<16, 2>;
+        let mut model2 = TinyLoraModel::new(9, 1).unwrap();
+        let params: Vec<f32> = (1..=10).map(|i| i as f32 * 0.25).collect();
+        model2.load_parameters(&params).unwrap();
+
+        let limits = SafeTensorsLimitsV1::default();
+        let tensors = vec![
+            ModelTensorDescriptorV1 {
+                name: "q_proj.lora_a".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 3],
+            },
+            ModelTensorDescriptorV1 {
+                name: "q_proj.lora_b".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 2],
+            },
+        ];
+        let base_only = ModelTensorSchemaV1::try_new(tensors.clone(), &limits).unwrap();
+        let lora_desc = LoRaAdapterDescriptorV1 {
+            target_module: "attn.q_proj".to_string(),
+            tensor_a_name: "q_proj.lora_a".to_string(),
+            tensor_b_name: "q_proj.lora_b".to_string(),
+            rank: 2,
+            alpha: 8.0,
+        };
+        let with_lora =
+            ModelTensorSchemaV1::try_with_lora(tensors.clone(), vec![lora_desc.clone()], &limits)
+                .unwrap();
+
+        assert_ne!(
+            base_only.schema_hash(),
+            with_lora.schema_hash(),
+            "lora_adapters must affect model_schema_hash"
+        );
+        let mut changed_alpha = with_lora.clone();
+        changed_alpha.lora_adapters[0].alpha = 16.0;
+        assert_ne!(with_lora.schema_hash(), changed_alpha.schema_hash());
+
+        // Export + import roundtrip verifies __metadata__ LoRA descriptors & hashes.
+        let bytes = export_safetensors_checkpoint_v1(&model2, &with_lora, &limits).unwrap();
+        let parsed = parse_and_validate_safetensors_v1(&bytes, &limits).unwrap();
+        assert_eq!(
+            parsed.metadata.get("lora_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            parsed.metadata.get("lora.0.module").map(String::as_str),
+            Some("attn.q_proj")
+        );
+
+        let mut restored = TinyLoraModel::new(9, 1).unwrap();
+        let got_hash =
+            import_safetensors_checkpoint_v1(&mut restored, &with_lora, &bytes, &limits).unwrap();
+        assert_eq!(got_hash, with_lora.schema_hash());
+        assert_eq!(restored.parameters(), &params[..]);
+
+        // Importing a LoRA checkpoint against a non-LoRA schema fails closed with SchemaMismatch.
+        let mut base_target = TinyLoraModel::new(9, 1).unwrap();
+        assert_eq!(
+            import_safetensors_checkpoint_v1(&mut base_target, &base_only, &bytes, &limits)
+                .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Tampering lora.0.rank in metadata without touching tensor bytes fails SchemaMismatch
+        // (even if hash matched, or via hash mismatch).
+        let tampered_bytes = bytes
+            .windows(b"\"lora.0.rank\":\"2\"".len())
+            .position(|w| w == b"\"lora.0.rank\":\"2\"")
+            .map(|pos| {
+                let mut mutated = bytes.clone();
+                mutated[pos..pos + b"\"lora.0.rank\":\"2\"".len()]
+                    .copy_from_slice(b"\"lora.0.rank\":\"3\"");
+                mutated
+            })
+            .expect("lora.0.rank present");
+        let mut tamper_target = TinyLoraModel::new(9, 1).unwrap();
+        assert_eq!(
+            import_safetensors_checkpoint_v1(
+                &mut tamper_target,
+                &with_lora,
+                &tampered_bytes,
+                &limits
+            )
+            .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Invalid LoRA schema specs fail closed before checkpoint creation.
+        let mut bad_rank = lora_desc.clone();
+        bad_rank.rank = 99;
+        assert_eq!(
+            ModelTensorSchemaV1::try_with_lora(tensors.clone(), vec![bad_rank], &limits)
+                .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+        let mut dup_a = lora_desc;
+        dup_a.tensor_b_name = dup_a.tensor_a_name.clone();
+        assert_eq!(
+            ModelTensorSchemaV1::try_with_lora(tensors, vec![dup_a], &limits).unwrap_err(),
+            SafeTensorsError::DuplicateKey
+        );
+    }
+
+    #[test]
+    fn json_header_parser_supports_rfc8259_escapes_surrogates_and_rejects_malformed() {
+        fn wrap_header(json: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+            out.extend_from_slice(json.as_bytes());
+            out.extend_from_slice(&1.0f32.to_le_bytes());
+            out
+        }
+
+        let limits = SafeTensorsLimitsV1::default();
+
+        // Valid escapes: \b \f \n \r \t \/ \" \\ \u0041 ('A') \u03b1 ('α') \uD83D\uDD25 ('🔥')
+        let tensor_name_json = r#"a\b\f\n\r\t\/\"\\\u0041\u03b1\uD83D\uDD25"#;
+        let expected_name = "a\u{0008}\u{000c}\n\r\t/\"\\Aα🔥";
+        let header = format!(
+            "{{\"{tensor_name_json}\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}"
+        );
+        let parsed = parse_and_validate_safetensors_v1(&wrap_header(&header), &limits).unwrap();
+        assert!(parsed.tensors.contains_key(expected_name));
+
+        // UTF-8 expanded byte length enforces `max_name_bytes` (3 x 🔥 = 36 escaped bytes -> 12 UTF-8 bytes;
+        // `data_offsets` field key is 12 bytes, so `max_name_bytes = 12` accepts 12 bytes and rejects 13).
+        let exact_12_header = r#"{"\uD83D\uDD25\uD83D\uDD25\uD83D\uDD25":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let over_13_header = r#"{"\uD83D\uDD25\uD83D\uDD25\uD83D\uDD25x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let limit_12 = SafeTensorsLimitsV1 {
+            max_name_bytes: 12,
+            ..limits
+        };
+        let fire_parsed =
+            parse_and_validate_safetensors_v1(&wrap_header(exact_12_header), &limit_12).unwrap();
+        assert!(fire_parsed.tensors.contains_key("🔥🔥🔥"));
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_header(over_13_header), &limit_12).unwrap_err(),
+            SafeTensorsError::InvalidIdentifierLength
+        );
+
+        // Invalid RFC 8259 escapes / lone surrogates / non-hex / control chars MUST fail MalformedHeaderJson.
+        for bad_name in [
+            r#"\uD83D"#,       // lone high surrogate
+            r#"\uD83Dtail"#,   // high surrogate not followed by \u
+            r#"\uD83D\u0041"#, // high surrogate followed by non-low surrogate
+            r#"\uDC00"#,       // lone low surrogate
+            r#"\u123G"#,       // non-hex digit
+            r#"\u12"#,         // truncated \u escape
+            r#"\x41"#,         // non-JSON \x escape
+        ] {
+            let bad_header = format!(
+                "{{\"{bad_name}\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}"
+            );
+            assert_eq!(
+                parse_and_validate_safetensors_v1(&wrap_header(&bad_header), &limits).unwrap_err(),
+                SafeTensorsError::MalformedHeaderJson,
+                "expected MalformedHeaderJson for {bad_name}"
+            );
+        }
+
+        // Unescaped ASCII control character (< 0x20) inside JSON string fails MalformedHeaderJson.
+        let mut raw_ctrl =
+            wrap_header(r#"{"ab":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        raw_ctrl[10] = 0x08;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&raw_ctrl, &limits).unwrap_err(),
+            SafeTensorsError::MalformedHeaderJson
+        );
+    }
+
+    #[test]
+    fn lora_schema_hash_ordering_invariance_neg_zero_metadata_tamper_and_explicit_layout_roundtrip()
+    {
+        use crate::simple::LinearModelWithCapacity;
+
+        let limits = SafeTensorsLimitsV1 {
+            max_name_bytes: 300,
+            ..SafeTensorsLimitsV1::default()
+        };
+        let long_mod = "mod.".to_string() + &"m".repeat(260);
+        let tensors = vec![
+            ModelTensorDescriptorV1 {
+                name: "linear.bias".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2],
+            },
+            ModelTensorDescriptorV1 {
+                name: "linear.weight".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 3],
+            },
+            ModelTensorDescriptorV1 {
+                name: "a.lora_a".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 3],
+            },
+            ModelTensorDescriptorV1 {
+                name: "a.lora_b".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 2],
+            },
+            ModelTensorDescriptorV1 {
+                name: "z.lora_a".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![1, 3],
+            },
+            ModelTensorDescriptorV1 {
+                name: "z.lora_b".to_string(),
+                dtype: SafeTensorDtypeV1::F32,
+                trainable: true,
+                shape: vec![2, 1],
+            },
+        ];
+        let desc_a = LoRaAdapterDescriptorV1 {
+            target_module: long_mod,
+            tensor_a_name: "a.lora_a".to_string(),
+            tensor_b_name: "a.lora_b".to_string(),
+            rank: 2,
+            alpha: 4.0,
+        };
+        let desc_z = LoRaAdapterDescriptorV1 {
+            target_module: "z_proj".to_string(),
+            tensor_a_name: "z.lora_a".to_string(),
+            tensor_b_name: "z.lora_b".to_string(),
+            rank: 1,
+            alpha: 2.0,
+        };
+
+        let s_az = ModelTensorSchemaV1::try_with_lora(
+            tensors.clone(),
+            vec![desc_a.clone(), desc_z.clone()],
+            &limits,
+        )
+        .unwrap();
+        let s_za = ModelTensorSchemaV1::try_with_lora(
+            tensors.iter().rev().cloned().collect(),
+            vec![desc_z.clone(), desc_a.clone()],
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(s_az.schema_hash(), s_za.schema_hash());
+
+        // Raw schema_hash() canonicalizes -0.0 and +0.0 identically for alpha.
+        let mut raw_pos = s_az.clone();
+        raw_pos.lora_adapters[0].alpha = 0.0f32;
+        let mut raw_neg = s_az.clone();
+        raw_neg.lora_adapters[0].alpha = -0.0f32;
+        assert_eq!(raw_pos.schema_hash(), raw_neg.schema_hash());
+
+        // Explicit non-alphabetical flat offsets ([W | b | a_A | a_B | z_A | z_B]) preserve both
+        // custom limits and LoRA descriptors across export/import.
+        // Element counts: linear.weight(6), linear.bias(2), a.lora_a(6), a.lora_b(4), z.lora_a(3), z.lora_b(2) = 23.
+        let mut offsets = BTreeMap::new();
+        offsets.insert("linear.weight".to_string(), 0);
+        offsets.insert("linear.bias".to_string(), 6);
+        offsets.insert("a.lora_a".to_string(), 8);
+        offsets.insert("a.lora_b".to_string(), 14);
+        offsets.insert("z.lora_a".to_string(), 18);
+        offsets.insert("z.lora_b".to_string(), 21);
+
+        let layout = ModelFlatTensorLayoutV1::try_new(s_az.clone(), offsets, &limits).unwrap();
+        assert_eq!(layout.schema().lora_adapters.len(), 2);
+
+        type FlatLoraModel23 = LinearModelWithCapacity<32, 2>;
+        let mut model23 = FlatLoraModel23::new(22, 1).unwrap(); // 22*1 + 1 = 23 params
+        let params: Vec<f32> = (0..23).map(|i| i as f32 * 0.5 - 3.0).collect();
+        model23.load_parameters(&params).unwrap();
+
+        let bytes =
+            export_safetensors_checkpoint_with_layout_v1(&model23, &layout, &limits).unwrap();
+        let mut restored = FlatLoraModel23::new(22, 1).unwrap();
+        let got_hash =
+            import_safetensors_checkpoint_with_layout_v1(&mut restored, &layout, &bytes, &limits)
+                .unwrap();
+        assert_eq!(got_hash, s_az.schema_hash());
+        assert_eq!(restored.parameters(), &params[..]);
+
+        // Unexpected `lora.*` metadata injected into a non-LoRA checkpoint fails closed even if hash matches!
+        let base_schema = ModelTensorSchemaV1::for_linear(2, 1).unwrap();
+        let mut lin = LinearModel::new(2, 1).unwrap();
+        lin.load_parameters(&[1.0, 2.0, 3.0]).unwrap();
+        let base_bytes = export_safetensors_checkpoint_v1(&lin, &base_schema, &limits).unwrap();
+        let base_parsed = parse_and_validate_safetensors_v1(&base_bytes, &limits).unwrap();
+        let hash_val = base_parsed.metadata.get("model_schema_hash").unwrap();
+        let injected_hdr = format!(
+            "{{\"__metadata__\":{{\"format\":\"{SWARMTORCH_CHECKPOINT_FORMAT_V1}\",\"model_schema_hash\":\"{hash_val}\",\"lora_count\":\"1\"}},\"linear.bias\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}},\"linear.weight\":{{\"dtype\":\"F32\",\"shape\":[1,2],\"data_offsets\":[4,12]}}}}"
+        );
+        let mut injected_buf = Vec::new();
+        injected_buf.extend_from_slice(&(injected_hdr.len() as u64).to_le_bytes());
+        injected_buf.extend_from_slice(injected_hdr.as_bytes());
+        injected_buf.extend_from_slice(&[0u8; 12]);
+        let mut lin_target = LinearModel::new(2, 1).unwrap();
+        assert_eq!(
+            import_safetensors_checkpoint_v1(&mut lin_target, &base_schema, &injected_buf, &limits)
+                .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Tampering lora.0.alpha_bits on a LoRA checkpoint fails closed with SchemaMismatch.
+        let needle = b"\"lora.0.alpha_bits\":\"";
+        let alpha_pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("lora.0.alpha_bits present")
+            + needle.len();
+        let mut tampered_alpha = bytes.clone();
+        tampered_alpha[alpha_pos] = if tampered_alpha[alpha_pos] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        let mut tamper_target = FlatLoraModel23::new(22, 1).unwrap();
+        assert_eq!(
+            import_safetensors_checkpoint_with_layout_v1(
+                &mut tamper_target,
+                &layout,
+                &tampered_alpha,
+                &limits,
+            )
+            .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Negative try_with_lora validation matrix.
+        let mut missing_tensor = desc_z.clone();
+        missing_tensor.tensor_a_name = "missing.lora_a".to_string();
+        assert_eq!(
+            ModelTensorSchemaV1::try_with_lora(tensors.clone(), vec![missing_tensor], &limits)
+                .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        let mut shared_tensor = desc_z.clone();
+        shared_tensor.tensor_a_name = desc_a.tensor_a_name.clone();
+        assert_eq!(
+            ModelTensorSchemaV1::try_with_lora(
+                tensors.clone(),
+                vec![desc_a.clone(), shared_tensor],
+                &limits
+            )
+            .unwrap_err(),
+            SafeTensorsError::DuplicateKey
+        );
+
+        for bad_alpha in [0.0f32, -0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut bad = desc_a.clone();
+            bad.alpha = bad_alpha;
+            assert_eq!(
+                ModelTensorSchemaV1::try_with_lora(tensors.clone(), vec![bad], &limits)
+                    .unwrap_err(),
+                SafeTensorsError::SchemaMismatch
+            );
+        }
+
+        let mut meta_name = desc_a;
+        meta_name.tensor_a_name = "__metadata__".to_string();
+        assert_eq!(
+            ModelTensorSchemaV1::try_with_lora(tensors, vec![meta_name], &limits).unwrap_err(),
+            SafeTensorsError::InvalidIdentifierLength
+        );
+    }
+
+    #[test]
+    fn json_header_parser_handles_nul_escaped_duplicates_surrogate_bounds_and_framing_errors() {
+        fn wrap_with_data(json: &str, data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+            out.extend_from_slice(json.as_bytes());
+            out.extend_from_slice(data);
+            out
+        }
+
+        let limits = SafeTensorsLimitsV1::default();
+
+        // RFC 8259 \u0000 is valid JSON and preserved in Rust strings without C-string truncation.
+        let nul_hdr = r#"{"a\u0000b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let nul_parsed =
+            parse_and_validate_safetensors_v1(&wrap_with_data(nul_hdr, &[0u8; 4]), &limits)
+                .unwrap();
+        assert!(nul_parsed.tensors.contains_key("a\0b"));
+        assert!(!nul_parsed.tensors.contains_key("a"));
+
+        // Escaped format value with trailing \u0000 must fail SchemaMismatch (no C-string truncation).
+        let base_schema = ModelTensorSchemaV1::single_f32_tensor("w", 1).unwrap();
+        let hash_hex = base_schema.schema_hash_hex();
+        let nul_fmt_hdr = format!(
+            "{{\"__metadata__\":{{\"format\":\"{SWARMTORCH_CHECKPOINT_FORMAT_V1}\\u0000\",\"model_schema_hash\":\"{hash_hex}\"}},\"w\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}"
+        );
+        let mut m1 = LinearModel::new(0, 1).unwrap();
+        assert_eq!(
+            import_safetensors_checkpoint_v1(
+                &mut m1,
+                &base_schema,
+                &wrap_with_data(&nul_fmt_hdr, &1.0f32.to_le_bytes()),
+                &limits,
+            )
+            .unwrap_err(),
+            SafeTensorsError::SchemaMismatch
+        );
+
+        // Escaped duplicate top-level key (`"\u0061"` vs `"a"`) and `"__metadata__"` must fail DuplicateKey.
+        let esc_dup = r#"{"\u0061":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_with_data(esc_dup, &[0u8; 4]), &limits)
+                .unwrap_err(),
+            SafeTensorsError::DuplicateKey
+        );
+        let esc_meta_dup = r#"{"\u005f_metadata__":{"k":"v"},"__metadata__":{"k":"v"},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_with_data(esc_meta_dup, &[0u8; 4]), &limits)
+                .unwrap_err(),
+            SafeTensorsError::DuplicateKey
+        );
+
+        // Boundary surrogate pairs U+10000 and U+10FFFF succeed; invalid surrogate pairings fail.
+        let min_max_surr =
+            r#"{"\uD800\uDC00\uDBFF\uDFFF":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let surr_parsed =
+            parse_and_validate_safetensors_v1(&wrap_with_data(min_max_surr, &[0u8; 4]), &limits)
+                .unwrap();
+        assert!(surr_parsed.tensors.contains_key("\u{10000}\u{10FFFF}"));
+
+        for bad_surr in [r#"\uD800\uDBFF"#, r#"\uD800\uE000"#, r#"\uDFFF"#] {
+            let hdr = format!(
+                "{{\"{bad_surr}\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}"
+            );
+            assert_eq!(
+                parse_and_validate_safetensors_v1(&wrap_with_data(&hdr, &[0u8; 4]), &limits)
+                    .unwrap_err(),
+                SafeTensorsError::MalformedHeaderJson
+            );
+        }
+
+        // Trailing garbage after root JSON object, leading zero ints, trailing unmapped bytes,
+        // header_len = 0, and header_len = u64::MAX must all fail closed.
+        let trailing_json = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}junk"#;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_with_data(trailing_json, &[0u8; 4]), &limits)
+                .unwrap_err(),
+            SafeTensorsError::MalformedHeaderJson
+        );
+        let leading_zero = r#"{"a":{"dtype":"F32","shape":[01],"data_offsets":[0,4]}}"#;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_with_data(leading_zero, &[0u8; 4]), &limits)
+                .unwrap_err(),
+            SafeTensorsError::MalformedHeaderJson
+        );
+        let valid_hdr = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&wrap_with_data(valid_hdr, &[0u8; 8]), &limits)
+                .unwrap_err(),
+            SafeTensorsError::InvalidOffsets
+        );
+
+        let mut zero_hdr = Vec::new();
+        zero_hdr.extend_from_slice(&0u64.to_le_bytes());
+        zero_hdr.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&zero_hdr, &limits).unwrap_err(),
+            SafeTensorsError::HeaderTooLarge
+        );
+        let mut max_hdr = Vec::new();
+        max_hdr.extend_from_slice(&u64::MAX.to_le_bytes());
+        max_hdr.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            parse_and_validate_safetensors_v1(&max_hdr, &limits).unwrap_err(),
+            SafeTensorsError::HeaderTooLarge
         );
     }
 }

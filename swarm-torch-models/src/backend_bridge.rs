@@ -207,6 +207,9 @@ impl<B: BackendTensorBridge> SwarmModel for BackendModelHandleV1<B> {
         &self.shadow_parameters
     }
 
+    /// Borrow host `shadow_parameters` mutably. Callers mutating this slice directly MUST invoke
+    /// [`Self::commit_to_backend`] afterward to push changes onto the backend device; [`Self::load_parameters`]
+    /// and [`crate::optim::SgdOptimizer`] (`SwarmOptimizer::step`) synchronize the device backend automatically.
     fn parameters_mut(&mut self) -> &mut [f32] {
         &mut self.shadow_parameters
     }
@@ -337,5 +340,227 @@ mod tests {
         // Delta extraction works relative to baseline
         let delta = handle.delta_since(&[0.0, 1.0]).unwrap();
         assert_eq!(delta, vec![0.5, 3.0]);
+    }
+
+    #[test]
+    fn sgd_optimizer_step_syncs_backend_device_for_forward_and_rolls_back_on_push_failure() {
+        use crate::optim::{OptimError, SgdOptimizer};
+        use swarm_torch_core::traits::SwarmOptimizer;
+
+        // Params order for `for_linear(1, 1)`: ["linear.bias", "linear.weight"] = [1.0, 2.0].
+        // forward(&[3.0]) = 2.0 * 3.0 + 1.0 = 7.0.
+        let backend = ReferenceLinearBackend::new(1.0, 2.0);
+        let mut handle = BackendModelHandleV1::try_new(backend, None).unwrap();
+        assert_eq!(handle.forward(&[3.0]).unwrap(), vec![7.0]);
+
+        let mut opt =
+            SgdOptimizer::<BackendModelHandleV1<ReferenceLinearBackend>, 8>::new(0.5).unwrap();
+        // Step with grad=[2.0, 4.0], lr=0.5 => bias=0.0, weight=0.0.
+        opt.step(&mut handle, &[2.0, 4.0]).unwrap();
+        assert_eq!(handle.parameters(), &[0.0, 0.0]);
+        assert_eq!(handle.backend().params, vec![0.0, 0.0]);
+        assert_eq!(handle.forward(&[3.0]).unwrap(), vec![0.0]);
+
+        // Another step with lr=0.5, grad=[-1.0, -2.0] => bias=0.5, weight=1.0 -> forward(&[3.0]) = 3.5.
+        opt.step(&mut handle, &[-1.0, -2.0]).unwrap();
+        assert_eq!(handle.forward(&[3.0]).unwrap(), vec![3.5]);
+
+        // Simulated device push failure during optimizer step must leave BOTH device/shadow
+        // parameters AND optimizer velocity completely intact.
+        let mut failing_backend = ReferenceLinearBackend::new(1.0, 2.0);
+        failing_backend.fail_push = true;
+        let mut failing_handle = BackendModelHandleV1::try_new(failing_backend, None).unwrap();
+        let mut failing_opt =
+            SgdOptimizer::<BackendModelHandleV1<ReferenceLinearBackend>, 8>::with_hyperparams(
+                0.5, 0.9, 0.0,
+            )
+            .unwrap();
+        assert_eq!(
+            failing_opt.step(&mut failing_handle, &[1.0, 1.0]),
+            Err(OptimError::ModelUpdateFailed)
+        );
+        assert_eq!(failing_handle.parameters(), &[1.0, 2.0]);
+        assert_eq!(failing_handle.forward(&[3.0]).unwrap(), vec![7.0]);
+        assert!(failing_opt.velocity().is_empty());
+
+        // Step-2 push failure after a successful Step 1 with momentum > 0 and weight_decay > 0
+        // MUST preserve BOTH prior non-empty optimizer velocity and prior shadow/device weights.
+        let mut step2_handle =
+            BackendModelHandleV1::try_new(ReferenceLinearBackend::new(1.0, 2.0), None).unwrap();
+        let mut step2_opt =
+            SgdOptimizer::<BackendModelHandleV1<ReferenceLinearBackend>, 8>::with_hyperparams(
+                0.5, 0.9, 0.1,
+            )
+            .unwrap();
+        step2_opt.step(&mut step2_handle, &[1.0, 1.0]).unwrap();
+        let step1_params = step2_handle.parameters().to_vec();
+        let step1_vel = step2_opt.velocity().to_vec();
+        let step1_fwd = step2_handle.forward(&[3.0]).unwrap();
+        assert!(!step1_vel.is_empty());
+
+        // Simulate subsequent backend device unavailability without modifying schema/params.
+        // We wrap a failing backend initialized to the exact step-1 weights to verify rollback
+        // of non-empty velocity during Step 2 push failure.
+        let mut failing_step2_backend =
+            ReferenceLinearBackend::new(step1_params[0], step1_params[1]);
+        failing_step2_backend.fail_push = true;
+        let mut failing_step2_handle =
+            BackendModelHandleV1::try_new(failing_step2_backend, None).unwrap();
+        let snap_after_step1 = step2_opt.snapshot_state().unwrap().unwrap();
+        let mut resumed_step2_opt =
+            SgdOptimizer::<BackendModelHandleV1<ReferenceLinearBackend>, 8>::new(0.1).unwrap();
+        resumed_step2_opt.restore_state(&snap_after_step1).unwrap();
+        assert_eq!(
+            resumed_step2_opt.step(&mut failing_step2_handle, &[0.5, -0.5]),
+            Err(OptimError::ModelUpdateFailed)
+        );
+        assert_eq!(failing_step2_handle.parameters(), step1_params.as_slice());
+        assert_eq!(failing_step2_handle.forward(&[3.0]).unwrap(), step1_fwd);
+        assert_eq!(resumed_step2_opt.velocity(), step1_vel.as_slice());
+    }
+
+    #[test]
+    fn backend_handle_sync_commit_forward_and_delta_reject_non_finite_and_sync_manual_edits() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct MutableMockBackend {
+            schema: ModelTensorSchemaV1,
+            params: Vec<f32>,
+            corrupt_next_pull: AtomicBool,
+            next_output_override: Option<Vec<f32>>,
+        }
+
+        impl BackendTensorBridge for MutableMockBackend {
+            fn backend_name(&self) -> &str {
+                "mutable-mock"
+            }
+
+            fn placement(&self) -> DevicePlacementV1 {
+                DevicePlacementV1::Cpu
+            }
+
+            fn schema(&self) -> &ModelTensorSchemaV1 {
+                &self.schema
+            }
+
+            fn pull_flat_parameters(&self) -> Result<Vec<f32>, BackendBridgeError> {
+                if self.corrupt_next_pull.load(Ordering::SeqCst) {
+                    return Ok(vec![1.0, f32::NEG_INFINITY]);
+                }
+                Ok(self.params.clone())
+            }
+
+            fn push_flat_parameters(
+                &mut self,
+                flat_params: &[f32],
+            ) -> Result<(), BackendBridgeError> {
+                self.params = flat_params.to_vec();
+                Ok(())
+            }
+
+            fn forward_slice(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+                if let Some(out) = &self.next_output_override {
+                    return Ok(out.clone());
+                }
+                Ok(vec![self.params[1] * input[0] + self.params[0]])
+            }
+        }
+
+        let backend = MutableMockBackend {
+            schema: ModelTensorSchemaV1::for_linear(1, 1).unwrap(),
+            params: vec![1.0, 2.0],
+            corrupt_next_pull: AtomicBool::new(false),
+            next_output_override: None,
+        };
+        let mut handle = BackendModelHandleV1::try_new(backend, None).unwrap();
+
+        // Direct parameters_mut() followed by commit_to_backend() pushes to device for forward().
+        handle.parameters_mut()[0] = 5.0;
+        assert_eq!(handle.forward(&[3.0]).unwrap(), vec![7.0]); // still device value until commit
+        handle.commit_to_backend().unwrap();
+        assert_eq!(handle.forward(&[3.0]).unwrap(), vec![11.0]);
+
+        // Non-finite mutation via parameters_mut() is blocked before device upload by commit_to_backend().
+        handle.parameters_mut()[0] = f32::NAN;
+        assert_eq!(
+            handle.commit_to_backend().unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        assert_eq!(handle.backend().params, vec![5.0, 2.0]);
+        handle.parameters_mut()[0] = 5.0;
+
+        // forward() rejects empty input and non-finite input.
+        assert_eq!(
+            handle.forward(&[]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        assert_eq!(
+            handle.forward(&[f32::INFINITY]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+
+        // delta_since() rejects wrong length, non-finite baseline, and f32 overflow.
+        assert_eq!(
+            handle.delta_since(&[0.0]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 2,
+                got: 1,
+            }
+        );
+        assert_eq!(
+            handle.delta_since(&[0.0, f32::NAN]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        handle.load_parameters(&[f32::MAX, 1.0]).unwrap();
+        assert_eq!(
+            handle.delta_since(&[-f32::MAX, 0.0]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        handle.load_parameters(&[5.0, 2.0]).unwrap();
+
+        // sync_from_backend() rejects non-finite device pulls transactionally without clobbering shadow.
+        handle
+            .backend()
+            .corrupt_next_pull
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            handle.sync_from_backend().unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        assert_eq!(handle.parameters(), &[5.0, 2.0]);
+        handle
+            .backend()
+            .corrupt_next_pull
+            .store(false, Ordering::SeqCst);
+        assert_eq!(handle.sync_from_backend().unwrap(), &[5.0, 2.0]);
+
+        // forward() rejects non-finite backend output without mutating shadow state.
+        let h_bad_out = BackendModelHandleV1::try_new(
+            MutableMockBackend {
+                schema: ModelTensorSchemaV1::for_linear(1, 1).unwrap(),
+                params: vec![1.0, 2.0],
+                corrupt_next_pull: AtomicBool::new(false),
+                next_output_override: Some(vec![f32::NAN]),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            h_bad_out.forward(&[1.0]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        assert_eq!(h_bad_out.parameters(), &[1.0, 2.0]);
+
+        // load_parameters with wrong length and NaN/Inf leaves shadow untouched.
+        assert_eq!(
+            handle.load_parameters(&[1.0]).unwrap_err(),
+            CoreError::InvalidGradient
+        );
+        assert_eq!(
+            handle.load_parameters(&[1.0, f32::INFINITY]).unwrap_err(),
+            CoreError::InfDetected
+        );
+        assert_eq!(handle.parameters(), &[5.0, 2.0]);
     }
 }

@@ -15,13 +15,14 @@
 //!    $\bar{B}$ and $\bar{A}$ that computes the exact Frobenius cross-term drift residual
 //!    $\|\frac{\alpha}{r}\bar{B}\bar{A} - \frac{1}{n}\sum_i \frac{\alpha_i}{r_i} B_i A_i\|_F$ for audit reporting.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use swarm_torch_core::aggregation::RobustAggregator;
 use swarm_torch_core::crypto::sha256_bytes;
-use swarm_torch_core::num::sqrt_f64_soft;
+use swarm_torch_core::num::{abs_f64, sqrt_f64_soft};
 use swarm_torch_core::traits::{GradientUpdate, PeerId};
 
 use crate::safetensors_v1::LoRaAdapterDescriptorV1;
@@ -31,6 +32,10 @@ pub const LORA_FROZEN_A_DOMAIN_TAG_V1: &[u8] = b"swarmtorch.lora.a.v1";
 
 /// Maximum default stacked rank $R = \sum_i r_i$ for `FloraStackingV1`.
 pub const DEFAULT_MAX_FLORA_STACKED_RANK: u32 = 4_096;
+
+/// Relative tolerance for comparing LoRA scaling factors `alpha` across homogeneous-scale
+/// aggregation modes (`FreezeASingleFactorV1` and `BiasedFactorFedAvgV1`).
+pub const DEFAULT_ALPHA_MISMATCH_TOLERANCE: f32 = 1e-6;
 
 /// Errors returned during LoRA / FLoRA adapter validation, aggregation, or base-weight merging.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +54,8 @@ pub enum LoraError {
     HeterogeneousRankUnsupportedInMode,
     /// Total stacked rank $R = \sum_i r_i$ exceeds `max_stacked_rank`.
     StackedRankExceedsLimit,
+    /// Same [`PeerId`] submitted more than one adapter update in a single round cohort.
+    DuplicatePeerSubmission(PeerId),
     /// Underlying [`RobustAggregator`] returned an error.
     AggregationFailed(swarm_torch_core::Error),
 }
@@ -81,6 +88,9 @@ impl core::fmt::Display for LoraError {
             }
             Self::StackedRankExceedsLimit => {
                 write!(f, "FLoRA total stacked rank exceeds max_stacked_rank")
+            }
+            Self::DuplicatePeerSubmission(peer) => {
+                write!(f, "duplicate LoRA submission from peer {peer:?}")
             }
             Self::AggregationFailed(err) => write!(f, "LoRA robust aggregation failed: {err}"),
         }
@@ -116,32 +126,47 @@ impl LoraAdapterPairV1 {
         a_weights: Vec<f32>,
         b_weights: Vec<f32>,
     ) -> Result<Self, LoraError> {
-        if descriptor.target_module.is_empty() || descriptor.rank == 0 || d_in == 0 || d_out == 0 {
-            return Err(LoraError::InvalidRankOrDimension);
-        }
-        if !descriptor.alpha.is_finite() || descriptor.alpha <= 0.0 {
-            return Err(LoraError::InvalidAlpha);
-        }
-        let r = descriptor.rank as usize;
-        let expected_a = r
-            .checked_mul(d_in)
-            .ok_or(LoraError::InvalidRankOrDimension)?;
-        let expected_b = d_out
-            .checked_mul(r)
-            .ok_or(LoraError::InvalidRankOrDimension)?;
-        if a_weights.len() != expected_a || b_weights.len() != expected_b {
-            return Err(LoraError::InvalidRankOrDimension);
-        }
-        if a_weights.iter().any(|v| !v.is_finite()) || b_weights.iter().any(|v| !v.is_finite()) {
-            return Err(LoraError::NonFiniteWeight);
-        }
-        Ok(Self {
+        let pair = Self {
             descriptor,
             d_in,
             d_out,
             a_weights,
             b_weights,
-        })
+        };
+        pair.validate()?;
+        Ok(pair)
+    }
+
+    /// Validate matrix dimensions, buffer lengths, scaling factor `alpha`, and finiteness.
+    pub fn validate(&self) -> Result<(), LoraError> {
+        if self.descriptor.target_module.is_empty()
+            || self.descriptor.rank == 0
+            || self.d_in == 0
+            || self.d_out == 0
+        {
+            return Err(LoraError::InvalidRankOrDimension);
+        }
+        if !self.descriptor.alpha.is_finite() || self.descriptor.alpha <= 0.0 {
+            return Err(LoraError::InvalidAlpha);
+        }
+        let r =
+            usize::try_from(self.descriptor.rank).map_err(|_| LoraError::InvalidRankOrDimension)?;
+        let expected_a = r
+            .checked_mul(self.d_in)
+            .ok_or(LoraError::InvalidRankOrDimension)?;
+        let expected_b = self
+            .d_out
+            .checked_mul(r)
+            .ok_or(LoraError::InvalidRankOrDimension)?;
+        if self.a_weights.len() != expected_a || self.b_weights.len() != expected_b {
+            return Err(LoraError::InvalidRankOrDimension);
+        }
+        if self.a_weights.iter().any(|v| !v.is_finite())
+            || self.b_weights.iter().any(|v| !v.is_finite())
+        {
+            return Err(LoraError::NonFiniteWeight);
+        }
+        Ok(())
     }
 
     /// Compute the canonical SHA-256 commitment over the down-projection factor $A$
@@ -166,6 +191,7 @@ impl LoraAdapterPairV1 {
     /// Materialize the dense scaled update $\Delta W = \frac{\alpha}{r} B A \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$
     /// in widened `f64` arithmetic.
     pub fn materialize_scaled_delta(&self) -> Result<Vec<f32>, LoraError> {
+        self.validate()?;
         let total = self
             .d_out
             .checked_mul(self.d_in)
@@ -178,43 +204,84 @@ impl LoraAdapterPairV1 {
     /// Transactionally accumulate $W \leftarrow W + \frac{\alpha}{r} B A$ into `base_w`
     /// ($\mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ row-major) using widened `f64` dot products.
     pub fn apply_to_base_weights(&self, base_w: &mut [f32]) -> Result<(), LoraError> {
-        let expected_len = self
-            .d_out
-            .checked_mul(self.d_in)
-            .ok_or(LoraError::InvalidRankOrDimension)?;
-        if base_w.len() != expected_len {
-            return Err(LoraError::InvalidRankOrDimension);
-        }
-        if base_w.iter().any(|v| !v.is_finite()) {
-            return Err(LoraError::NonFiniteWeight);
-        }
-
-        let r = self.descriptor.rank as usize;
+        self.validate()?;
+        let r =
+            usize::try_from(self.descriptor.rank).map_err(|_| LoraError::InvalidRankOrDimension)?;
         let scale = (self.descriptor.alpha as f64) / (r as f64);
-        let mut staged = Vec::with_capacity(expected_len);
-
-        for row in 0..self.d_out {
-            let b_row_offset = row * r;
-            let w_row_offset = row * self.d_in;
-            for col in 0..self.d_in {
-                let mut dot = 0.0f64;
-                for k in 0..r {
-                    let b_val = self.b_weights[b_row_offset + k] as f64;
-                    let a_val = self.a_weights[k * self.d_in + col] as f64;
-                    dot += b_val * a_val;
-                }
-                let updated = (base_w[w_row_offset + col] as f64) + scale * dot;
-                let updated_f32 = updated as f32;
-                if !updated_f32.is_finite() {
-                    return Err(LoraError::NonFiniteWeight);
-                }
-                staged.push(updated_f32);
-            }
-        }
-
-        base_w.copy_from_slice(&staged);
-        Ok(())
+        apply_scaled_lora_product_to_base_weights(
+            self.d_out,
+            self.d_in,
+            r,
+            scale,
+            &self.b_weights,
+            &self.a_weights,
+            base_w,
+        )
     }
+}
+
+/// Shared widened `f64` transactional base-weight merge helper for both single-adapter and stacked
+/// FLoRA products: validates dimension/buffer invariants and stages all outputs before mutating
+/// `base_w`.
+fn apply_scaled_lora_product_to_base_weights(
+    d_out: usize,
+    d_in: usize,
+    rank: usize,
+    scale: f64,
+    b_weights: &[f32],
+    a_weights: &[f32],
+    base_w: &mut [f32],
+) -> Result<(), LoraError> {
+    if d_out == 0 || d_in == 0 || rank == 0 {
+        return Err(LoraError::InvalidRankOrDimension);
+    }
+    let expected_len = d_out
+        .checked_mul(d_in)
+        .ok_or(LoraError::InvalidRankOrDimension)?;
+    let expected_b = d_out
+        .checked_mul(rank)
+        .ok_or(LoraError::InvalidRankOrDimension)?;
+    let expected_a = rank
+        .checked_mul(d_in)
+        .ok_or(LoraError::InvalidRankOrDimension)?;
+    if base_w.len() != expected_len
+        || b_weights.len() != expected_b
+        || a_weights.len() != expected_a
+    {
+        return Err(LoraError::InvalidRankOrDimension);
+    }
+    if base_w.iter().any(|v| !v.is_finite())
+        || b_weights.iter().any(|v| !v.is_finite())
+        || a_weights.iter().any(|v| !v.is_finite())
+    {
+        return Err(LoraError::NonFiniteWeight);
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(LoraError::InvalidAlpha);
+    }
+
+    let mut staged = Vec::with_capacity(expected_len);
+    for row in 0..d_out {
+        let b_row_offset = row * rank;
+        let w_row_offset = row * d_in;
+        for col in 0..d_in {
+            let mut dot = 0.0f64;
+            for k in 0..rank {
+                let b_val = b_weights[b_row_offset + k] as f64;
+                let a_val = a_weights[k * d_in + col] as f64;
+                dot += b_val * a_val;
+            }
+            let updated = (base_w[w_row_offset + col] as f64) + scale * dot;
+            let updated_f32 = updated as f32;
+            if !updated_f32.is_finite() {
+                return Err(LoraError::NonFiniteWeight);
+            }
+            staged.push(updated_f32);
+        }
+    }
+
+    base_w.copy_from_slice(&staged);
+    Ok(())
 }
 
 /// Block-diagonally stacked FLoRA factor representation (`Wang et al., NeurIPS 2024`, `ADR-0024` §4)
@@ -240,8 +307,52 @@ pub struct FloraStackedDeltaV1 {
 }
 
 impl FloraStackedDeltaV1 {
+    /// Validate matrix dimensions, positive `client_ranks` sum matching `total_stacked_rank`,
+    /// exact buffer lengths, and element finiteness before indexing or allocating.
+    pub fn validate(&self) -> Result<(), LoraError> {
+        if self.target_module.is_empty()
+            || self.d_in == 0
+            || self.d_out == 0
+            || self.total_stacked_rank == 0
+            || self.client_ranks.is_empty()
+        {
+            return Err(LoraError::InvalidRankOrDimension);
+        }
+        let mut rank_sum = 0usize;
+        for &r in &self.client_ranks {
+            if r == 0 {
+                return Err(LoraError::InvalidRankOrDimension);
+            }
+            let r_usize = usize::try_from(r).map_err(|_| LoraError::InvalidRankOrDimension)?;
+            rank_sum = rank_sum
+                .checked_add(r_usize)
+                .ok_or(LoraError::InvalidRankOrDimension)?;
+        }
+        if rank_sum != self.total_stacked_rank {
+            return Err(LoraError::InvalidRankOrDimension);
+        }
+        let expected_b = self
+            .d_out
+            .checked_mul(self.total_stacked_rank)
+            .ok_or(LoraError::InvalidRankOrDimension)?;
+        let expected_a = self
+            .total_stacked_rank
+            .checked_mul(self.d_in)
+            .ok_or(LoraError::InvalidRankOrDimension)?;
+        if self.stacked_b.len() != expected_b || self.stacked_a.len() != expected_a {
+            return Err(LoraError::InvalidRankOrDimension);
+        }
+        if self.stacked_b.iter().any(|v| !v.is_finite())
+            || self.stacked_a.iter().any(|v| !v.is_finite())
+        {
+            return Err(LoraError::NonFiniteWeight);
+        }
+        Ok(())
+    }
+
     /// Materialize the exact dense update $\Delta W = \tilde{B}\tilde{A} = \sum_i w_i \frac{\alpha_i}{r_i} B_i A_i$.
     pub fn materialize_exact_delta(&self) -> Result<Vec<f32>, LoraError> {
+        self.validate()?;
         let total = self
             .d_out
             .checked_mul(self.d_in)
@@ -253,41 +364,16 @@ impl FloraStackedDeltaV1 {
 
     /// Transactionally merge $W \leftarrow W + \tilde{B}\tilde{A}$ into `base_w` in widened `f64`.
     pub fn apply_exact_to_base_weights(&self, base_w: &mut [f32]) -> Result<(), LoraError> {
-        let expected_len = self
-            .d_out
-            .checked_mul(self.d_in)
-            .ok_or(LoraError::InvalidRankOrDimension)?;
-        if base_w.len() != expected_len {
-            return Err(LoraError::InvalidRankOrDimension);
-        }
-        if base_w.iter().any(|v| !v.is_finite()) {
-            return Err(LoraError::NonFiniteWeight);
-        }
-
-        let big_r = self.total_stacked_rank;
-        let mut staged = Vec::with_capacity(expected_len);
-
-        for row in 0..self.d_out {
-            let b_row_offset = row * big_r;
-            let w_row_offset = row * self.d_in;
-            for col in 0..self.d_in {
-                let mut dot = 0.0f64;
-                for k in 0..big_r {
-                    let b_val = self.stacked_b[b_row_offset + k] as f64;
-                    let a_val = self.stacked_a[k * self.d_in + col] as f64;
-                    dot += b_val * a_val;
-                }
-                let updated = (base_w[w_row_offset + col] as f64) + dot;
-                let updated_f32 = updated as f32;
-                if !updated_f32.is_finite() {
-                    return Err(LoraError::NonFiniteWeight);
-                }
-                staged.push(updated_f32);
-            }
-        }
-
-        base_w.copy_from_slice(&staged);
-        Ok(())
+        self.validate()?;
+        apply_scaled_lora_product_to_base_weights(
+            self.d_out,
+            self.d_in,
+            self.total_stacked_rank,
+            1.0,
+            &self.stacked_b,
+            &self.stacked_a,
+            base_w,
+        )
     }
 }
 
@@ -333,6 +419,45 @@ pub enum LoraAggregationOutcomeV1 {
     },
 }
 
+fn alpha_within_tolerance(lhs: f32, rhs: f32, tolerance: f32) -> bool {
+    if !lhs.is_finite() || !rhs.is_finite() || !tolerance.is_finite() || tolerance < 0.0 {
+        return false;
+    }
+    let l = lhs as f64;
+    let r = rhs as f64;
+    let scale = abs_f64(l).max(abs_f64(r));
+    if scale == 0.0 {
+        return true;
+    }
+    abs_f64(l - r) <= (tolerance as f64) * scale
+}
+
+/// Verify uniform rank and order-invariant cohort-wide relative `alpha` agreement
+/// (`max_alpha - min_alpha <= DEFAULT_ALPHA_MISMATCH_TOLERANCE * max(|min_alpha|, |max_alpha|)`).
+fn validate_homogeneous_rank_and_alpha(
+    submissions: &[(PeerId, LoraAdapterPairV1)],
+) -> Result<(), LoraError> {
+    let r0 = submissions[0].1.descriptor.rank;
+    let mut min_alpha = submissions[0].1.descriptor.alpha;
+    let mut max_alpha = min_alpha;
+    for (_, pair) in submissions {
+        if pair.descriptor.rank != r0 {
+            return Err(LoraError::HeterogeneousRankUnsupportedInMode);
+        }
+        let alpha = pair.descriptor.alpha;
+        if alpha < min_alpha {
+            min_alpha = alpha;
+        }
+        if alpha > max_alpha {
+            max_alpha = alpha;
+        }
+    }
+    if !alpha_within_tolerance(min_alpha, max_alpha, DEFAULT_ALPHA_MISMATCH_TOLERANCE) {
+        return Err(LoraError::CohortMismatch);
+    }
+    Ok(())
+}
+
 /// Aggregate a cohort of peer [`LoraAdapterPairV1`] submissions under `mode` (`ADR-0024` §4, `W12-01`).
 pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
     submissions: &[(PeerId, LoraAdapterPairV1)],
@@ -347,18 +472,16 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
     let target_module = &first.descriptor.target_module;
     let d_in = first.d_in;
     let d_out = first.d_out;
+    let mut seen_peers = BTreeSet::new();
 
-    for (_, pair) in submissions {
-        let validated = LoraAdapterPairV1::try_new(
-            pair.descriptor.clone(),
-            pair.d_in,
-            pair.d_out,
-            pair.a_weights.clone(),
-            pair.b_weights.clone(),
-        )?;
-        if &validated.descriptor.target_module != target_module
-            || validated.d_in != d_in
-            || validated.d_out != d_out
+    for (peer, pair) in submissions {
+        if !seen_peers.insert(*peer) {
+            return Err(LoraError::DuplicatePeerSubmission(*peer));
+        }
+        pair.validate()?;
+        if &pair.descriptor.target_module != target_module
+            || pair.d_in != d_in
+            || pair.d_out != d_out
         {
             return Err(LoraError::CohortMismatch);
         }
@@ -366,21 +489,10 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
 
     match mode {
         LoraAggregationModeV1::FreezeASingleFactorV1 { expected_a_digest } => {
-            let r0 = first.descriptor.rank;
-            let alpha0 = first.descriptor.alpha;
+            validate_homogeneous_rank_and_alpha(submissions)?;
             let mut b_updates = Vec::with_capacity(submissions.len());
 
             for (idx, (peer, pair)) in submissions.iter().enumerate() {
-                if pair.descriptor.rank != r0 {
-                    return Err(LoraError::HeterogeneousRankUnsupportedInMode);
-                }
-                if swarm_torch_core::num::abs_f32(pair.descriptor.alpha - alpha0)
-                    > f32::EPSILON * swarm_torch_core::num::abs_f32(alpha0).max(1.0)
-                {
-                    // Reject conflicting alpha scaling inside FreezeASingleFactorV1 so no
-                    // participant can amplify its contribution via arbitrary alpha_i inflation.
-                    return Err(LoraError::CohortMismatch);
-                }
                 if pair.frozen_a_digest() != expected_a_digest {
                     return Err(LoraError::FrozenADigestMismatch);
                 }
@@ -411,13 +523,16 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
             let mut total_rank_u64 = 0u64;
             let mut client_ranks = Vec::with_capacity(submissions.len());
             for (_, pair) in submissions {
-                total_rank_u64 = total_rank_u64.saturating_add(pair.descriptor.rank as u64);
+                total_rank_u64 = total_rank_u64
+                    .checked_add(pair.descriptor.rank as u64)
+                    .ok_or(LoraError::StackedRankExceedsLimit)?;
                 client_ranks.push(pair.descriptor.rank);
             }
             if total_rank_u64 > (max_stacked_rank as u64) {
                 return Err(LoraError::StackedRankExceedsLimit);
             }
-            let total_stacked_rank = total_rank_u64 as usize;
+            let total_stacked_rank =
+                usize::try_from(total_rank_u64).map_err(|_| LoraError::StackedRankExceedsLimit)?;
             let b_len = d_out
                 .checked_mul(total_stacked_rank)
                 .ok_or(LoraError::InvalidRankOrDimension)?;
@@ -427,11 +542,13 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
 
             let mut stacked_b = vec![0.0f32; b_len];
             let mut stacked_a = Vec::with_capacity(a_len);
+            // Normative FLoRA stacking applies uniform 1/n peer weighting across unique participants.
             let weight_i = 1.0f64 / (submissions.len() as f64);
 
             let mut col_cursor = 0usize;
             for (_, pair) in submissions {
-                let r_i = pair.descriptor.rank as usize;
+                let r_i = usize::try_from(pair.descriptor.rank)
+                    .map_err(|_| LoraError::InvalidRankOrDimension)?;
                 let scale_i = weight_i * ((pair.descriptor.alpha as f64) / (r_i as f64));
                 for row in 0..d_out {
                     let src_offset = row * r_i;
@@ -448,28 +565,20 @@ pub fn aggregate_lora_adapters_v1<A: RobustAggregator + ?Sized>(
                 col_cursor += r_i;
             }
 
-            Ok(LoraAggregationOutcomeV1::FloraStacked {
-                stacked: FloraStackedDeltaV1 {
-                    target_module: target_module.clone(),
-                    d_in,
-                    d_out,
-                    total_stacked_rank,
-                    client_ranks,
-                    stacked_b,
-                    stacked_a,
-                },
-            })
+            let stacked = FloraStackedDeltaV1 {
+                target_module: target_module.clone(),
+                d_in,
+                d_out,
+                total_stacked_rank,
+                client_ranks,
+                stacked_b,
+                stacked_a,
+            };
+            stacked.validate()?;
+            Ok(LoraAggregationOutcomeV1::FloraStacked { stacked })
         }
         LoraAggregationModeV1::BiasedFactorFedAvgV1 => {
-            let r0 = first.descriptor.rank;
-            let alpha0 = first.descriptor.alpha;
-            for (_, pair) in submissions {
-                if pair.descriptor.rank != r0
-                    || swarm_torch_core::num::abs_f32(pair.descriptor.alpha - alpha0) > 1e-6
-                {
-                    return Err(LoraError::HeterogeneousRankUnsupportedInMode);
-                }
-            }
+            validate_homogeneous_rank_and_alpha(submissions)?;
 
             let n_inv = 1.0f64 / (submissions.len() as f64);
             let avg_a = mean_factor_slice(submissions, first.a_weights.len(), |p| &p.a_weights);
@@ -730,5 +839,358 @@ mod tests {
             }
             _ => panic!("expected BiasedFactorFedAvg"),
         }
+    }
+
+    #[test]
+    fn flora_stacked_validate_rejects_malformed_dimensions_lengths_and_non_finite_without_mutation()
+    {
+        let valid = FloraStackedDeltaV1 {
+            target_module: String::from("attn.q_proj"),
+            d_in: 2,
+            d_out: 2,
+            total_stacked_rank: 3,
+            client_ranks: vec![1, 2],
+            stacked_b: vec![0.1; 6],
+            stacked_a: vec![0.2; 6],
+        };
+        assert!(valid.validate().is_ok());
+        let mut base = vec![1.0f32; 4];
+
+        let mut short_b = valid.clone();
+        short_b.stacked_b.pop();
+        assert_eq!(short_b.validate(), Err(LoraError::InvalidRankOrDimension));
+        assert_eq!(
+            short_b.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+        assert_eq!(
+            short_b.materialize_exact_delta(),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+
+        let mut short_a = valid.clone();
+        short_a.stacked_a.pop();
+        assert_eq!(short_a.validate(), Err(LoraError::InvalidRankOrDimension));
+
+        let mut zero_rank = valid.clone();
+        zero_rank.client_ranks = vec![0, 3];
+        assert_eq!(
+            zero_rank.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+
+        let mut mismatched_rank_sum = valid.clone();
+        mismatched_rank_sum.client_ranks = vec![1, 1];
+        assert_eq!(
+            mismatched_rank_sum.validate(),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+
+        let mut empty_rank = valid.clone();
+        empty_rank.total_stacked_rank = 0;
+        empty_rank.client_ranks.clear();
+        empty_rank.stacked_b.clear();
+        empty_rank.stacked_a.clear();
+        assert_eq!(
+            empty_rank.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+
+        let mut nan_b = valid.clone();
+        nan_b.stacked_b[5] = f32::NAN;
+        assert_eq!(
+            nan_b.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::NonFiniteWeight)
+        );
+        let mut nan_a = valid.clone();
+        nan_a.stacked_a[5] = f32::INFINITY;
+        assert_eq!(
+            nan_a.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::NonFiniteWeight)
+        );
+        assert_eq!(base, vec![1.0f32; 4]);
+    }
+
+    #[test]
+    fn aggregate_lora_rejects_duplicate_peers_across_all_modes_and_enforces_alpha_symmetry() {
+        let d_in = 2;
+        let d_out = 2;
+        let p_a = PeerId::new([1u8; 32]);
+        let p_b = PeerId::new([2u8; 32]);
+        let pair_a = LoraAdapterPairV1::try_new(
+            sample_descriptor(1, 2.0),
+            d_in,
+            d_out,
+            vec![1.0, 0.5],
+            vec![0.2, -0.3],
+        )
+        .unwrap();
+        let digest = pair_a.frozen_a_digest();
+
+        // Duplicate PeerId must be rejected identically in all 3 modes.
+        let dup_subs = vec![(p_a, pair_a.clone()), (p_a, pair_a.clone())];
+        for mode in [
+            LoraAggregationModeV1::FreezeASingleFactorV1 {
+                expected_a_digest: digest,
+            },
+            LoraAggregationModeV1::FloraStackingV1 {
+                max_stacked_rank: 8,
+            },
+            LoraAggregationModeV1::BiasedFactorFedAvgV1,
+        ] {
+            assert_eq!(
+                aggregate_lora_adapters_v1(&dup_subs, mode, &FedAvg).unwrap_err(),
+                LoraError::DuplicatePeerSubmission(p_a)
+            );
+        }
+
+        // Alpha mismatch with identical rank rejects identically as CohortMismatch in BOTH
+        // FreezeASingleFactorV1 and BiasedFactorFedAvgV1.
+        let mismatched_alpha = LoraAdapterPairV1::try_new(
+            sample_descriptor(1, 2.5),
+            d_in,
+            d_out,
+            pair_a.a_weights.clone(),
+            pair_a.b_weights.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p_a, pair_a.clone()), (p_b, mismatched_alpha.clone())],
+                LoraAggregationModeV1::FreezeASingleFactorV1 {
+                    expected_a_digest: digest,
+                },
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::CohortMismatch
+        );
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p_a, pair_a), (p_b, mismatched_alpha)],
+                LoraAggregationModeV1::BiasedFactorFedAvgV1,
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::CohortMismatch
+        );
+    }
+
+    #[test]
+    fn flora_and_lora_enforce_dimension_overflow_base_rollback_and_mean_overflow_safety() {
+        let mut base = vec![1.0f32, f32::MAX, -1.0, 2.0];
+        let base_before = base.clone();
+
+        // Overflow during merge on element 1 must leave ALL elements of `base` (including element 0) untouched.
+        let pair_overflow = LoraAdapterPairV1::try_new(
+            sample_descriptor(1, 2.0),
+            2,
+            2,
+            vec![1.0, 1.0],
+            vec![1.0e38, 0.0],
+        )
+        .unwrap();
+        assert_eq!(
+            pair_overflow.apply_to_base_weights(&mut base),
+            Err(LoraError::NonFiniteWeight)
+        );
+        assert_eq!(base, base_before);
+
+        // FloraStackedDeltaV1::validate rejects empty target_module, zero dims, and product overflow.
+        let empty_mod = FloraStackedDeltaV1 {
+            target_module: String::new(),
+            d_in: 2,
+            d_out: 2,
+            total_stacked_rank: 1,
+            client_ranks: vec![1],
+            stacked_b: vec![0.1; 2],
+            stacked_a: vec![0.1; 2],
+        };
+        assert_eq!(empty_mod.validate(), Err(LoraError::InvalidRankOrDimension));
+
+        let zero_dim = FloraStackedDeltaV1 {
+            target_module: String::from("attn.q_proj"),
+            d_in: 0,
+            d_out: 2,
+            total_stacked_rank: 1,
+            client_ranks: vec![1],
+            stacked_b: vec![0.1; 2],
+            stacked_a: vec![],
+        };
+        assert_eq!(zero_dim.validate(), Err(LoraError::InvalidRankOrDimension));
+
+        let overflow_dim = FloraStackedDeltaV1 {
+            target_module: String::from("attn.q_proj"),
+            d_in: 2,
+            d_out: usize::MAX,
+            total_stacked_rank: 2,
+            client_ranks: vec![1, 1],
+            stacked_b: vec![],
+            stacked_a: vec![0.1; 4],
+        };
+        assert_eq!(
+            overflow_dim.validate(),
+            Err(LoraError::InvalidRankOrDimension)
+        );
+
+        let stacked_overflow = FloraStackedDeltaV1 {
+            target_module: String::from("attn.q_proj"),
+            d_in: 2,
+            d_out: 2,
+            total_stacked_rank: 1,
+            client_ranks: vec![1],
+            stacked_b: vec![1.0e38, 0.0],
+            stacked_a: vec![1.0, 1.0],
+        };
+        assert_eq!(
+            stacked_overflow.apply_exact_to_base_weights(&mut base),
+            Err(LoraError::NonFiniteWeight)
+        );
+        assert_eq!(base, base_before);
+
+        // BiasedFactorFedAvgV1 / mean_factor_slice accumulates in f64 so individual peer weights
+        // summing beyond f32::MAX (3e38 + 3e38 = 6e38) remain finite without overflow.
+        let p1 = PeerId::new([1u8; 32]);
+        let p2 = PeerId::new([2u8; 32]);
+        let big1 =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 1.0), 1, 1, vec![3.0e38], vec![0.5])
+                .unwrap();
+        let big2 =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 1.0), 1, 1, vec![3.0e38], vec![0.5])
+                .unwrap();
+        match aggregate_lora_adapters_v1(
+            &[(p1, big1), (p2, big2)],
+            LoraAggregationModeV1::BiasedFactorFedAvgV1,
+            &FedAvg,
+        )
+        .unwrap()
+        {
+            LoraAggregationOutcomeV1::BiasedFactorFedAvg { adapter, .. } => {
+                assert!(adapter.a_weights[0].is_finite());
+                assert!((adapter.a_weights[0] - 3.0e38).abs() / 3.0e38 < 1e-6);
+            }
+            _ => panic!("expected BiasedFactorFedAvg"),
+        }
+
+        // FloraStackingV1 rejects max_stacked_rank == 0, exceeded rank, and scaling overflow.
+        let small = LoraAdapterPairV1::try_new(
+            sample_descriptor(2, 1.0),
+            1,
+            1,
+            vec![1.0, 1.0],
+            vec![1.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p1, small.clone())],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 0
+                },
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::StackedRankExceedsLimit
+        );
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p1, small)],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 1
+                },
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::StackedRankExceedsLimit
+        );
+        let scale_overflow =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 10.0), 1, 1, vec![1.0], vec![f32::MAX])
+                .unwrap();
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p1, scale_overflow)],
+                LoraAggregationModeV1::FloraStackingV1 {
+                    max_stacked_rank: 4
+                },
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::NonFiniteWeight
+        );
+    }
+
+    #[test]
+    fn t_agent_alpha_within_tolerance_rejects_small_alpha_amplification_and_is_order_invariant() {
+        let p_a = PeerId::new([1u8; 32]);
+        let p_b = PeerId::new([2u8; 32]);
+        let p_c = PeerId::new([3u8; 32]);
+
+        // 10x alpha mismatch (1e-7 vs 1e-6) MUST be rejected as CohortMismatch in BOTH
+        // FreezeASingleFactorV1 and BiasedFactorFedAvgV1 under relative tolerance 1e-6.
+        let low_alpha =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 1e-7), 1, 1, vec![1.0], vec![1.0])
+                .unwrap();
+        let inflated_alpha =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 1e-6), 1, 1, vec![1.0], vec![1.0])
+                .unwrap();
+        let digest = low_alpha.frozen_a_digest();
+
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p_a, low_alpha.clone()), (p_b, inflated_alpha.clone())],
+                LoraAggregationModeV1::FreezeASingleFactorV1 {
+                    expected_a_digest: digest,
+                },
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::CohortMismatch
+        );
+        assert_eq!(
+            aggregate_lora_adapters_v1(
+                &[(p_a, low_alpha), (p_b, inflated_alpha)],
+                LoraAggregationModeV1::BiasedFactorFedAvgV1,
+                &FedAvg,
+            )
+            .unwrap_err(),
+            LoraError::CohortMismatch
+        );
+
+        // Cohort alpha validation must also be invariant to submission slice ordering.
+        let a_mid =
+            LoraAdapterPairV1::try_new(sample_descriptor(1, 100.0), 1, 1, vec![1.0], vec![1.0])
+                .unwrap();
+        let b_hi = LoraAdapterPairV1::try_new(
+            sample_descriptor(1, 100.0 + 9e-5),
+            1,
+            1,
+            vec![1.0],
+            vec![1.0],
+        )
+        .unwrap();
+        let c_lo = LoraAdapterPairV1::try_new(
+            sample_descriptor(1, 100.0 - 9e-5),
+            1,
+            1,
+            vec![1.0],
+            vec![1.0],
+        )
+        .unwrap();
+        let res_mid_first = aggregate_lora_adapters_v1(
+            &[
+                (p_a, a_mid.clone()),
+                (p_b, b_hi.clone()),
+                (p_c, c_lo.clone()),
+            ],
+            LoraAggregationModeV1::BiasedFactorFedAvgV1,
+            &FedAvg,
+        );
+        let res_hi_first = aggregate_lora_adapters_v1(
+            &[(p_b, b_hi), (p_a, a_mid), (p_c, c_lo)],
+            LoraAggregationModeV1::BiasedFactorFedAvgV1,
+            &FedAvg,
+        );
+        assert_eq!(res_mid_first.unwrap_err(), LoraError::CohortMismatch);
+        assert_eq!(res_hi_first.unwrap_err(), LoraError::CohortMismatch);
     }
 }

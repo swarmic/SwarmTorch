@@ -20,7 +20,6 @@ docs/audits/
 *_implementation_plan.md
 *implementation_plan*.md
 *_plan.md
-adapters/*/Cargo.lock
 .agents/
 .agent/
 AGENTS.md

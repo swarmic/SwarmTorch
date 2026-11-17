@@ -181,27 +181,77 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
+      - name: Lockfile gate (every --locked manifest has its Cargo.lock committed)
+        run: bash .github/scripts/check-locked-lockfiles.sh
+
+      # Each lane runs even if an earlier lane failed, so one broken adapter can
+      # never hide the other four behind `skipped`.
       - name: Conformance (adapters/swarm-torch-wasm)
+        id: wasm
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --locked
+          cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/wasm.log"
 
       - name: Conformance (adapters/swarm-torch-mcp)
+        id: mcp
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-targets --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-mcp/Cargo.toml --locked
+          cargo test --manifest-path adapters/swarm-torch-mcp/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/mcp.log"
 
       - name: Conformance (adapters/swarm-torch-transport-iroh)
+        id: iroh
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-targets --all-features --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-features --locked
+          cargo test --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/iroh.log"
 
       - name: Conformance (adapters/swarm-torch-transport-zenoh)
+        id: zenoh
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-targets --all-features --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-features --locked
+          cargo test --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/zenoh.log"
 
-      - name: Conformance (adapters/swarm-torch-backends real-burn + real-candle)
+      - name: Conformance (adapters/swarm-torch-backends default + all-features)
+        id: backends
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
-          cargo clippy --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --features "real-burn,real-candle" --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --features "real-burn,real-candle" --locked
+          cargo clippy --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/backends.log"
+          cargo clippy --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-features --locked 2>&1 | tee -a "$RUNNER_TEMP/backends.log"
+
+      - name: Require all five adapter lanes executed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          LANES: >-
+            wasm=${{ steps.wasm.outcome }}
+            mcp=${{ steps.mcp.outcome }}
+            iroh=${{ steps.iroh.outcome }}
+            zenoh=${{ steps.zenoh.outcome }}
+            backends=${{ steps.backends.outcome }}
+        run: |
+          fail=0
+          echo "| lane | outcome | tests passed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| :--- | :--- | ---: |" >> "$GITHUB_STEP_SUMMARY"
+          for entry in $LANES; do
+            lane="${entry%%=*}"; outcome="${entry#*=}"
+            passed=$(grep -ohE 'test result: ok\. [0-9]+ passed' "$RUNNER_TEMP/$lane.log" 2>/dev/null | awk '{s += $4} END {print s + 0}')
+            echo "| $lane | ${outcome:-missing} | $passed |" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$outcome" != "success" ]]; then
+              echo "::error::adapter lane '$lane' did not succeed (outcome: ${outcome:-missing})"; fail=1
+            elif [[ "$passed" -eq 0 ]]; then
+              echo "::error::adapter lane '$lane' succeeded but executed 0 tests"; fail=1
+            else
+              echo "ok   $lane: $passed tests passed"
+            fi
+          done
+          exit "$fail"

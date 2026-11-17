@@ -15,11 +15,17 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use swarm_torch_core::replay::ReplayProtection;
+use swarm_torch_core::observe::{EventRecord, RunEventEmitter};
+use swarm_torch_core::replay::{ReplayProtection, ReplayStartupPolicyV1};
 use swarm_torch_core::traits::PeerId;
 
-use crate::chunked::{ChunkedFrameCodec, ObservedSourceReassembler, ReassemblerLimits};
-use crate::protocol::{MessageEnvelope, VerifyError};
+use crate::audit::{AuditSeverity, TransportAuditBufferV1, TransportDiagnosticsSnapshotV1};
+use crate::chunked::{ChunkError, ChunkedFrameCodec, ObservedSourceReassembler, ReassemblerLimits};
+use crate::protocol::{EnvelopeVersionPolicyV1, MessageEnvelope, VerifyError};
+
+/// Default maximum consecutive transient UDP socket errors (`WSAECONNRESET` / `Interrupted`)
+/// absorbed per synchronous [`UdpGossipTransport::poll_reassembled_once`] drain pass.
+pub const DEFAULT_MAX_UDP_TRANSIENT_ERRORS_PER_POLL: usize = 256;
 use crate::traits::{
     BandwidthClass, BroadcastStats, PacketCapabilities, PacketRecvError, PacketSendError,
     PacketTransport, ReceivedFrame, ReliabilityClass, SwarmTransport, TransportCapabilities,
@@ -173,6 +179,13 @@ enum UdpBackend {
     InMemory(InMemoryUdpDatagramHub),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRecvErrorDisposition {
+    BreakWouldBlock,
+    ContinueTransient,
+    FatalReceiveFailed,
+}
+
 /// Chunked UDP [`SwarmTransport`] integrating [`ChunkedFrameCodec`] and
 /// [`ObservedSourceReassembler<SocketAddr>`] (`ADR-0022` §2, `W11-03`).
 pub struct UdpGossipTransport {
@@ -186,6 +199,7 @@ pub struct UdpGossipTransport {
     peers: RwLock<BTreeMap<PeerId, SocketAddr>>,
     reassembler: Mutex<ObservedSourceReassembler<SocketAddr>>,
     inbox: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
+    audit: TransportAuditBufferV1,
 }
 
 impl core::fmt::Debug for UdpGossipTransport {
@@ -226,6 +240,7 @@ impl UdpGossipTransport {
             peers: RwLock::new(BTreeMap::new()),
             reassembler: Mutex::new(reassembler),
             inbox: Mutex::new(VecDeque::new()),
+            audit: TransportAuditBufferV1::new(local_peer),
         }))
     }
 
@@ -255,7 +270,26 @@ impl UdpGossipTransport {
             peers: RwLock::new(BTreeMap::new()),
             reassembler: Mutex::new(reassembler),
             inbox: Mutex::new(VecDeque::new()),
+            audit: TransportAuditBufferV1::new(local_peer),
         }))
+    }
+
+    /// Return a point-in-time snapshot of bounded UDP drop, quarantine, and ICMP-reset diagnostics.
+    pub fn diagnostics(&self) -> TransportDiagnosticsSnapshotV1 {
+        self.audit.snapshot()
+    }
+
+    /// Drain buffered validated security audit [`EventRecord`] entries (`Decision A8`).
+    pub fn drain_audit_events(&self) -> Vec<EventRecord> {
+        self.audit.drain_records()
+    }
+
+    /// Flush buffered security audit [`EventRecord`] entries into a [`RunEventEmitter`].
+    pub fn flush_audit_events<E: RunEventEmitter>(
+        &self,
+        emitter: &E,
+    ) -> core::result::Result<usize, E::Error> {
+        self.audit.flush_to_emitter(emitter)
     }
 
     /// Local bound socket address.
@@ -274,7 +308,7 @@ impl UdpGossipTransport {
     }
 
     fn elapsed_mono_ms(&self) -> u64 {
-        self.start_instant.elapsed().as_millis() as u64
+        u64::try_from(self.start_instant.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn lookup_peer_addr(&self, peer: PeerId) -> Result<SocketAddr> {
@@ -326,11 +360,101 @@ impl UdpGossipTransport {
                 .map_err(|_| Error::TransportUnavailable)?;
             reasm.ingest_frame(self.adapter_generation, source_addr, datagram, now_ms)
         };
-        if let Ok(Some(done)) = completed {
-            let mut inbox = self.inbox.lock().map_err(|_| Error::TransportUnavailable)?;
-            inbox.push_back((done.key.observed_source, done.payload));
+        match completed {
+            Ok(Some(done)) => {
+                let mut inbox = self.inbox.lock().map_err(|_| Error::TransportUnavailable)?;
+                inbox.push_back((done.key.observed_source, done.payload));
+            }
+            Ok(None) => {}
+            Err(chunk_err) => {
+                let is_initial_conflict = matches!(
+                    chunk_err,
+                    ChunkError::ConflictingTotalChunks | ChunkError::ConflictingChunkPayload
+                );
+                let is_repeat_quarantine = matches!(
+                    chunk_err,
+                    ChunkError::TransferQuarantined | ChunkError::SourceQuarantined
+                );
+                let is_quarantine = is_initial_conflict || is_repeat_quarantine;
+                let (severity, event_name) = if is_initial_conflict {
+                    (
+                        AuditSeverity::Critical,
+                        "swarmtorch.net.udp.source_quarantined",
+                    )
+                } else if is_repeat_quarantine {
+                    (AuditSeverity::Noisy, "swarmtorch.net.udp.quarantined_drop")
+                } else {
+                    (AuditSeverity::Noisy, "swarmtorch.net.udp.datagram_rejected")
+                };
+                self.audit.record_event(
+                    severity,
+                    event_name,
+                    "udp",
+                    Some(source_addr.to_string()),
+                    &chunk_err.to_string(),
+                    move |c| {
+                        if is_quarantine {
+                            c.quarantined_udp_events = c.quarantined_udp_events.saturating_add(1);
+                        } else {
+                            c.dropped_malformed_frames =
+                                c.dropped_malformed_frames.saturating_add(1);
+                        }
+                    },
+                );
+            }
         }
         Ok(())
+    }
+
+    fn classify_udp_recv_error(&self, err: &io::Error) -> UdpRecvErrorDisposition {
+        match err.kind() {
+            io::ErrorKind::WouldBlock => UdpRecvErrorDisposition::BreakWouldBlock,
+            io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted => {
+                self.audit.record_event(
+                    AuditSeverity::Noisy,
+                    "swarmtorch.net.udp.icmp_reset_ignored",
+                    "udp",
+                    None,
+                    &err.to_string(),
+                    |c| {
+                        c.icmp_port_unreachable_resets =
+                            c.icmp_port_unreachable_resets.saturating_add(1);
+                    },
+                );
+                UdpRecvErrorDisposition::ContinueTransient
+            }
+            // Windows `WSAEMSGSIZE` (10040) on oversized UDP datagrams must drop & isolate rather
+            // than tearing down the shared socket receive loop.
+            _ if err.raw_os_error() == Some(10040) => {
+                self.audit.record_event(
+                    AuditSeverity::Noisy,
+                    "swarmtorch.net.udp.datagram_rejected",
+                    "udp",
+                    None,
+                    &err.to_string(),
+                    |c| {
+                        c.dropped_malformed_frames = c.dropped_malformed_frames.saturating_add(1);
+                    },
+                );
+                UdpRecvErrorDisposition::ContinueTransient
+            }
+            _ => {
+                self.audit.record_event(
+                    AuditSeverity::Critical,
+                    "swarmtorch.net.udp.recv_error",
+                    "udp",
+                    None,
+                    &err.to_string(),
+                    |c| {
+                        c.dropped_connection_errors = c.dropped_connection_errors.saturating_add(1);
+                    },
+                );
+                UdpRecvErrorDisposition::FatalReceiveFailed
+            }
+        }
     }
 
     fn pop_inbox_observed(&self) -> Result<Option<crate::traits::ObservedTransportMessage>> {
@@ -435,15 +559,41 @@ impl UdpGossipTransport {
             slot.ensure_tokio()?
         };
         let mut frame_buf = vec![0u8; self.limits.mtu + 64];
+        let mut consecutive_transient = 0usize;
         loop {
             if let Some(msg) = self.pop_inbox_observed()? {
                 return Ok(msg);
             }
-            let (len, source_addr) = sock
-                .recv_from(&mut frame_buf)
-                .await
-                .map_err(|_| Error::ReceiveFailed)?;
-            self.ingest_datagram(source_addr, &frame_buf[..len])?;
+            match sock.recv_from(&mut frame_buf).await {
+                Ok((len, source_addr)) => {
+                    consecutive_transient = 0;
+                    self.ingest_datagram(source_addr, &frame_buf[..len])?;
+                }
+                Err(ref err) => match self.classify_udp_recv_error(err) {
+                    UdpRecvErrorDisposition::BreakWouldBlock
+                    | UdpRecvErrorDisposition::ContinueTransient => {
+                        consecutive_transient += 1;
+                        if consecutive_transient >= 64 {
+                            consecutive_transient = 0;
+                            let mut yielded = false;
+                            core::future::poll_fn(|cx| {
+                                if !yielded {
+                                    yielded = true;
+                                    cx.waker().wake_by_ref();
+                                    Poll::Pending
+                                } else {
+                                    Poll::Ready(())
+                                }
+                            })
+                            .await;
+                        }
+                        continue;
+                    }
+                    UdpRecvErrorDisposition::FatalReceiveFailed => {
+                        return Err(Error::ReceiveFailed);
+                    }
+                },
+            }
         }
     }
 
@@ -499,6 +649,7 @@ impl UdpGossipTransport {
                 let slot = socket_slot
                     .lock()
                     .map_err(|_| Error::TransportUnavailable)?;
+                let mut transient_errors = 0usize;
                 loop {
                     let recv_res = match &*slot {
                         OsUdpSocketSlot::Std(socket) => socket.recv_from(&mut frame_buf),
@@ -511,8 +662,19 @@ impl UdpGossipTransport {
                         Ok((len, source_addr)) => {
                             self.ingest_datagram(source_addr, &frame_buf[..len])?;
                         }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => return Err(Error::ReceiveFailed),
+                        Err(ref err) => match self.classify_udp_recv_error(err) {
+                            UdpRecvErrorDisposition::BreakWouldBlock => break,
+                            UdpRecvErrorDisposition::ContinueTransient => {
+                                transient_errors += 1;
+                                if transient_errors >= DEFAULT_MAX_UDP_TRANSIENT_ERRORS_PER_POLL {
+                                    break;
+                                }
+                                continue;
+                            }
+                            UdpRecvErrorDisposition::FatalReceiveFailed => {
+                                return Err(Error::ReceiveFailed);
+                            }
+                        },
                     }
                 }
             }
@@ -539,15 +701,15 @@ impl UdpGossipTransport {
         Ok(next)
     }
 
-    /// Poll for a reassembled datagram payload and immediately verify it through the
-    /// [`MessageEnvelope::deserialize_bounded`] + [`MessageEnvelope::verify_authenticated`]
-    /// pipeline (`ADR-0022` §2).
-    pub fn poll_recv_verified_envelope_v1(
+    /// Poll for a reassembled datagram payload and verify it under an explicit
+    /// [`EnvelopeVersionPolicyV1`] (`ADR-0022` §2, `Decision A10`).
+    pub fn poll_recv_verified_envelope_with_policy(
         &self,
         expected_swarm_instance_id: &[u8; 16],
         expected_round_id: u64,
         replay: &mut ReplayProtection,
         now_secs: u32,
+        version_policy: EnvelopeVersionPolicyV1,
     ) -> core::result::Result<Option<(SocketAddr, PeerId, MessageEnvelope)>, VerifyError> {
         let Ok(Some((source_addr, bytes))) = self.poll_reassembled_once() else {
             return Ok(None);
@@ -557,11 +719,57 @@ impl UdpGossipTransport {
         {
             return Err(VerifyError::MalformedEnvelope);
         }
-        env.verify_authenticated(replay, now_secs)?;
+        env.verify_authenticated_with_policy(replay, now_secs, version_policy)?;
         let sender_peer = env
             .sender_peer_id()
             .map_err(|_| VerifyError::InvalidSenderKey)?;
         Ok(Some((source_addr, sender_peer, env)))
+    }
+
+    /// Poll for a reassembled datagram payload and strictly verify a `VERSION_V2` (`(0, 3)`)
+    /// [`MessageEnvelope`] through [`MessageEnvelope::verify_authenticated`].
+    pub fn poll_recv_verified_envelope_v2(
+        &self,
+        expected_swarm_instance_id: &[u8; 16],
+        expected_round_id: u64,
+        replay: &mut ReplayProtection,
+        now_secs: u32,
+    ) -> core::result::Result<Option<(SocketAddr, PeerId, MessageEnvelope)>, VerifyError> {
+        self.poll_recv_verified_envelope_with_policy(
+            expected_swarm_instance_id,
+            expected_round_id,
+            replay,
+            now_secs,
+            EnvelopeVersionPolicyV1::RequireV2,
+        )
+    }
+
+    /// Legacy v1/v2 compatibility datagram receiver (`ADR-0022` §2).
+    ///
+    /// Permits `VERSION_V1` only when `replay.startup_policy()` is explicitly
+    /// [`ReplayStartupPolicyV1::GenesisRosterBootstrap`]; under
+    /// [`ReplayStartupPolicyV1::RequireSessionHandshake`], enforces strict
+    /// [`EnvelopeVersionPolicyV1::RequireV2`].
+    pub fn poll_recv_verified_envelope_v1(
+        &self,
+        expected_swarm_instance_id: &[u8; 16],
+        expected_round_id: u64,
+        replay: &mut ReplayProtection,
+        now_secs: u32,
+    ) -> core::result::Result<Option<(SocketAddr, PeerId, MessageEnvelope)>, VerifyError> {
+        let policy = match replay.startup_policy() {
+            ReplayStartupPolicyV1::GenesisRosterBootstrap => {
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2
+            }
+            ReplayStartupPolicyV1::RequireSessionHandshake => EnvelopeVersionPolicyV1::RequireV2,
+        };
+        self.poll_recv_verified_envelope_with_policy(
+            expected_swarm_instance_id,
+            expected_round_id,
+            replay,
+            now_secs,
+            policy,
+        )
     }
 }
 
@@ -758,9 +966,34 @@ mod tests {
         let mut replay = ReplayProtection::try_with_config(64, 60)
             .unwrap()
             .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
-            .with_cohort_allowlist(allowlist);
+            .with_cohort_allowlist(allowlist.clone());
 
-        // Poll and verify through the MessageEnvelope gate on receiver B without polling sleeps
+        // Poll and verify through the MessageEnvelope gate on receiver B without polling sleeps.
+        // First confirm strict v2 rejects legacy v1 without touching replay state.
+        udp_a.send(peer_b, &wire_bytes).await.unwrap();
+        let mut strict_replay = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(allowlist);
+        assert!(matches!(
+            udp_b.poll_recv_verified_envelope_v2(&swarm_id, 5, &mut strict_replay, 1_700_000_000),
+            Err(VerifyError::UnsupportedVersion { major: 0, minor: 2 })
+        ));
+        assert_eq!(strict_replay.cache_size(), 0);
+        // Under default RequireSessionHandshake, even `poll_recv_verified_envelope_v1` rejects v1.
+        udp_a.send(peer_b, &wire_bytes).await.unwrap();
+        let mut default_handshake_replay = ReplayProtection::try_with_config(64, 60).unwrap();
+        assert!(matches!(
+            udp_b.poll_recv_verified_envelope_v1(
+                &swarm_id,
+                5,
+                &mut default_handshake_replay,
+                1_700_000_000,
+            ),
+            Err(VerifyError::UnsupportedVersion { major: 0, minor: 2 })
+        ));
+        assert_eq!(default_handshake_replay.cache_size(), 0);
+
         let (obs_addr, verified_peer, verified_env) = udp_b
             .poll_recv_verified_envelope_v1(&swarm_id, 5, &mut replay, 1_700_000_000)
             .unwrap()
@@ -848,5 +1081,431 @@ mod tests {
         udp_a.send(peer_b, &payload).await.unwrap();
         let observed = rx_task.await.unwrap();
         assert_eq!(observed.payload, payload);
+    }
+
+    #[test]
+    fn udp_recv_error_classifier_isolates_wsa_connreset_and_rejects_fatal() {
+        let limits = ReassemblerLimits::default();
+        let hub = InMemoryUdpDatagramHub::new();
+        let udp = UdpGossipTransport::bind_in_memory(
+            PeerId::new([0x90; 32]),
+            "127.0.0.1:42900".parse().unwrap(),
+            1,
+            limits,
+            hub,
+        )
+        .unwrap();
+
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "WSAECONNRESET"
+            )),
+            UdpRecvErrorDisposition::ContinueTransient
+        );
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(io::ErrorKind::Interrupted, "EINTR")),
+            UdpRecvErrorDisposition::ContinueTransient
+        );
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(io::ErrorKind::WouldBlock, "EWOULDBLOCK")),
+            UdpRecvErrorDisposition::BreakWouldBlock
+        );
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(io::ErrorKind::InvalidInput, "EINVAL")),
+            UdpRecvErrorDisposition::FatalReceiveFailed
+        );
+
+        let diag = udp.diagnostics();
+        assert_eq!(diag.icmp_port_unreachable_resets, 2);
+        assert_eq!(diag.dropped_connection_errors, 1);
+        assert!(udp
+            .drain_audit_events()
+            .iter()
+            .any(|e| e.name == "swarmtorch.net.udp.icmp_reset_ignored"));
+    }
+
+    #[tokio::test]
+    async fn udp_malformed_and_conflicting_datagrams_isolated_and_audited() {
+        let peer_a = PeerId::new([0x91; 32]);
+        let peer_rogue = PeerId::new([0x92; 32]);
+        let peer_b = PeerId::new([0x93; 32]);
+        let hub = InMemoryUdpDatagramHub::new();
+        let limits = ReassemblerLimits {
+            mtu: 64,
+            max_message_bytes: 1024,
+            ..ReassemblerLimits::default()
+        };
+        let addr_a: SocketAddr = "127.0.0.1:42911".parse().unwrap();
+        let addr_rogue: SocketAddr = "127.0.0.1:42912".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:42913".parse().unwrap();
+
+        let udp_a =
+            UdpGossipTransport::bind_in_memory(peer_a, addr_a, 1, limits, hub.clone()).unwrap();
+        let udp_b =
+            UdpGossipTransport::bind_in_memory(peer_b, addr_b, 1, limits, hub.clone()).unwrap();
+        udp_a.register_peer(peer_b, addr_b).unwrap();
+
+        // Inject malformed datagram + conflicting transfer_id=77 chunks from rogue into addr_b queue.
+        // Non-last chunks must match exact stride P = mtu - 16 = 48 bytes.
+        let mut conflict_a = [0u8; 64];
+        let ca_len =
+            ChunkedFrameCodec::encode_frame_into(77, 0, 2, &[0x11u8; 48], &mut conflict_a).unwrap();
+        let mut conflict_b = [0u8; 64];
+        let cb_len =
+            ChunkedFrameCodec::encode_frame_into(77, 1, 3, &[0x22u8; 48], &mut conflict_b).unwrap();
+        {
+            let mut state = hub.inner.lock().unwrap();
+            let q = state.queues.get_mut(&addr_b).unwrap();
+            q.push_back((addr_rogue, b"NOT_ST_HEADER".to_vec()));
+            q.push_back((addr_rogue, conflict_a[..ca_len].to_vec()));
+            q.push_back((addr_rogue, conflict_b[..cb_len].to_vec()));
+        }
+        let _ = peer_rogue;
+
+        // Honest peer sends valid multi-chunk message into the same receiver!
+        let honest_payload = vec![0x7Cu8; 180];
+        udp_a.send(peer_b, &honest_payload).await.unwrap();
+
+        let delivered = udp_b
+            .recv()
+            .await
+            .expect("malformed/quarantined datagrams must isolate and deliver honest message");
+        assert_eq!(delivered.payload, honest_payload);
+
+        let diag = udp_b.diagnostics();
+        assert!(diag.dropped_malformed_frames >= 1);
+        assert!(diag.quarantined_udp_events >= 1);
+        let events = udp_b.drain_audit_events();
+        assert!(events
+            .iter()
+            .any(|e| e.name == "swarmtorch.net.udp.datagram_rejected"));
+        assert!(events
+            .iter()
+            .any(|e| e.name == "swarmtorch.net.udp.source_quarantined"));
+    }
+
+    #[cfg(feature = "udp-transport")]
+    #[tokio::test]
+    async fn udp_os_socket_recovers_after_closed_peer_icmp_reset_and_garbage_datagram() {
+        use std::time::Duration;
+
+        let peer_a = PeerId::new([0x94; 32]);
+        let peer_b = PeerId::new([0x95; 32]);
+        let limits = ReassemblerLimits {
+            mtu: 256,
+            max_message_bytes: 8_192,
+            ..ReassemblerLimits::default()
+        };
+        let Ok(udp_a) = UdpGossipTransport::bind(peer_a, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+        let Ok(udp_b) = UdpGossipTransport::bind(peer_b, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+
+        // Trigger ICMP Port Unreachable (`WSAECONNRESET` on Windows) from udp_b -> closed socket.
+        if let Ok(closed_sock) = UdpSocket::bind("127.0.0.1:0") {
+            let dead_addr = closed_sock.local_addr().unwrap();
+            drop(closed_sock);
+            let _ = udp_b.send_to_addr(dead_addr, b"probe-closed-port");
+        }
+        // Also send raw garbage datagram directly at udp_b OS socket.
+        if let Ok(raw) = UdpSocket::bind("127.0.0.1:0") {
+            let _ = raw.send_to(b"CORRUPT_UDP_FRAME", udp_b.local_addr());
+        }
+
+        udp_a.register_peer(peer_b, udp_b.local_addr()).unwrap();
+        let rx_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), udp_b.recv())
+                .await
+                .expect("OS UDP receiver must survive WSAECONNRESET and garbage frames")
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        let payload = vec![0x55u8; 640];
+        udp_a.send(peer_b, &payload).await.unwrap();
+        let observed = rx_task.await.unwrap();
+        assert_eq!(observed.payload, payload);
+    }
+
+    #[test]
+    fn udp_recv_error_classifier_covers_icmp_variants_and_wsa_emsgsize() {
+        let limits = ReassemblerLimits::default();
+        let hub = InMemoryUdpDatagramHub::new();
+        let udp = UdpGossipTransport::bind_in_memory(
+            PeerId::new([0x96; 32]),
+            "127.0.0.1:42950".parse().unwrap(),
+            1,
+            limits,
+            hub,
+        )
+        .unwrap();
+
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "ECONNREFUSED"
+            )),
+            UdpRecvErrorDisposition::ContinueTransient
+        );
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "ECONNABORTED"
+            )),
+            UdpRecvErrorDisposition::ContinueTransient
+        );
+        assert_eq!(
+            udp.classify_udp_recv_error(&io::Error::from_raw_os_error(10040)),
+            UdpRecvErrorDisposition::ContinueTransient
+        );
+        let diag = udp.diagnostics();
+        assert_eq!(diag.icmp_port_unreachable_resets, 2);
+        assert_eq!(diag.dropped_malformed_frames, 1);
+    }
+
+    #[test]
+    fn udp_poll_reassembled_once_isolates_malformed_conflicts_and_icmp_resets() {
+        let peer_a = PeerId::new([0x97; 32]);
+        let peer_b = PeerId::new([0x98; 32]);
+        let limits = ReassemblerLimits {
+            mtu: 128,
+            max_message_bytes: 4096,
+            ..ReassemblerLimits::default()
+        };
+        let Ok(udp_a) = UdpGossipTransport::bind(peer_a, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+        let Ok(udp_b) = UdpGossipTransport::bind(peer_b, "127.0.0.1:0".parse().unwrap(), 1, limits)
+        else {
+            return;
+        };
+
+        // Probe dead port to trigger OS ICMP Port Unreachable (`WSAECONNRESET` on Windows),
+        // then send an oversized (> mtu + 64) raw datagram + garbage frame to udp_b.
+        if let Ok(closed_sock) = UdpSocket::bind("127.0.0.1:0") {
+            let dead = closed_sock.local_addr().unwrap();
+            drop(closed_sock);
+            let _ = udp_b.send_to_addr(dead, b"probe-dead");
+        }
+        if let Ok(raw) = UdpSocket::bind("127.0.0.1:0") {
+            let _ = raw.send_to(&[0xAAu8; 512], udp_b.local_addr());
+            let _ = raw.send_to(b"BAD_MAGIC", udp_b.local_addr());
+        }
+
+        let payload = vec![0x3Cu8; 300];
+        let _ = udp_a.send_to_addr(udp_b.local_addr(), &payload).unwrap();
+
+        let mut delivered = None;
+        for _ in 0..30 {
+            match udp_b.poll_reassembled_once() {
+                Ok(Some((_src, bytes))) => {
+                    delivered = Some(bytes);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(err) => {
+                    panic!("poll_reassembled_once must isolate transient/malformed: {err:?}")
+                }
+            }
+        }
+        assert_eq!(delivered, Some(payload));
+        assert!(udp_b.diagnostics().dropped_malformed_frames >= 1);
+    }
+
+    #[tokio::test]
+    async fn udp_poll_recv_verified_envelope_v2_accepts_v2_and_v1_rejects_v0_even_under_genesis() {
+        use swarm_torch_core::crypto::SessionHandshakeChallengeV2;
+
+        let kp_a = KeyPair::from_seed([0xA1; 32]).unwrap();
+        let kp_b = KeyPair::from_seed([0xA2; 32]).unwrap();
+        let peer_a = kp_a.peer_id();
+        let peer_b = kp_b.peer_id();
+        let auth_a = MessageAuth::new(kp_a.clone());
+
+        let limits = ReassemblerLimits {
+            mtu: 256,
+            max_message_bytes: 8_192,
+            ..ReassemblerLimits::default()
+        };
+        let hub = InMemoryUdpDatagramHub::new();
+        let addr_a: SocketAddr = "127.0.0.1:42961".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:42962".parse().unwrap();
+        let udp_a =
+            UdpGossipTransport::bind_in_memory(peer_a, addr_a, 1, limits, hub.clone()).unwrap();
+        let udp_b = UdpGossipTransport::bind_in_memory(peer_b, addr_b, 1, limits, hub).unwrap();
+        udp_a.register_peer(peer_b, addr_b).unwrap();
+
+        let swarm_id = [0xCD; 16];
+        let run_id = [0xEF; 16];
+        let now = 1_700_000_000u32;
+
+        // 1. Even under GenesisRosterBootstrap, poll_recv_verified_envelope_v1 must reject v0!
+        let mut genesis_replay = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([peer_a]));
+        let env_v0 =
+            MessageEnvelope::new_legacy_v0(*kp_a.public_key(), MessageType::Heartbeat, vec![1, 2])
+                .with_sequence(1)
+                .with_timestamp(now)
+                .sign_with(&auth_a);
+        udp_a
+            .send(peer_b, &env_v0.serialize().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_b
+                .poll_recv_verified_envelope_v1(&[0u8; 16], 0, &mut genesis_replay, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+        );
+        assert_eq!(genesis_replay.cache_size(), 0);
+
+        // 2. Complete v2 session handshake and verify poll_recv_verified_envelope_v2 admits v2!
+        let mut replay_v2 = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_cohort_allowlist(CohortAllowlist::from_peers([peer_a]));
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: swarm_id,
+            run_id,
+            policy_digest: [0x11; 32],
+            receiver_peer: peer_b,
+            sender_peer: peer_a,
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x22; 32],
+            issued_at_secs: now,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        replay_v2.register_recovery_challenge_v2(challenge).unwrap();
+        let hs_sig = auth_a.sign_session_handshake_v2(&challenge).unwrap();
+        replay_v2
+            .complete_recovery_handshake_v2(swarm_id, run_id, kp_a.public_key(), &hs_sig, now)
+            .unwrap();
+
+        let env_v2 = MessageEnvelope::new_v2(
+            *kp_a.public_key(),
+            swarm_id,
+            run_id,
+            1,
+            session_id,
+            7,
+            MessageType::GradientUpdate,
+            vec![9, 8, 7, 6],
+        )
+        .with_sequence(1)
+        .with_timestamp(now)
+        .sign_with(&auth_a);
+        udp_a
+            .send(peer_b, &env_v2.serialize().unwrap())
+            .await
+            .unwrap();
+        let (obs_addr, verified_peer, accepted) = udp_b
+            .poll_recv_verified_envelope_v2(&swarm_id, 7, &mut replay_v2, now)
+            .unwrap()
+            .expect("v2 envelope must admit cleanly under poll_recv_verified_envelope_v2");
+        assert_eq!(obs_addr, addr_a);
+        assert_eq!(verified_peer, peer_a);
+        assert_eq!(accepted.payload, vec![9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn udp_quarantined_source_flood_does_not_evict_critical_audit_records() {
+        let peer_b = PeerId::new([0xA3; 32]);
+        let hub = InMemoryUdpDatagramHub::new();
+        let limits = ReassemblerLimits {
+            mtu: 64,
+            max_message_bytes: 512,
+            max_quarantines_per_source: 2,
+            ..ReassemblerLimits::default()
+        };
+        let addr_b: SocketAddr = "127.0.0.1:42970".parse().unwrap();
+        let addr_rogue: SocketAddr = "127.0.0.1:42971".parse().unwrap();
+        let udp_b =
+            UdpGossipTransport::bind_in_memory(peer_b, addr_b, 1, limits, hub.clone()).unwrap();
+
+        // Record an earlier critical transport error before quarantined-peer flood.
+        assert_eq!(
+            udp_b.classify_udp_recv_error(&io::Error::new(io::ErrorKind::InvalidInput, "fatal")),
+            UdpRecvErrorDisposition::FatalReceiveFailed
+        );
+
+        // Escalate `addr_rogue` into SourceQuarantined (`max_quarantines_per_source = 2`).
+        for tid in 1..=2u32 {
+            let mut f1 = [0u8; 64];
+            let l1 = ChunkedFrameCodec::encode_frame_into(tid, 0, 2, &[0x11; 48], &mut f1).unwrap();
+            let mut f2 = [0u8; 64];
+            let l2 = ChunkedFrameCodec::encode_frame_into(tid, 0, 3, &[0x22; 48], &mut f2).unwrap();
+            udp_b.ingest_datagram(addr_rogue, &f1[..l1]).unwrap();
+            udp_b.ingest_datagram(addr_rogue, &f2[..l2]).unwrap();
+        }
+
+        // Now flood > DEFAULT_MAX_TRANSPORT_AUDIT_EVENTS junk packets from already-quarantined rogue.
+        // Repeat SourceQuarantined rejections must be rate-limited rather than evicting earlier Critical events!
+        for _ in 0..300 {
+            udp_b
+                .ingest_datagram(addr_rogue, b"quarantined-spam")
+                .unwrap();
+        }
+
+        let events = udp_b.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.name == "swarmtorch.net.udp.recv_error"),
+            "already-quarantined UDP source flood must not evict prior Critical audit records"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_poll_recv_verified_envelope_v2_rejects_v0_even_with_zero_scope_and_round() {
+        let kp_a = KeyPair::from_seed([0xA4; 32]).unwrap();
+        let kp_b = KeyPair::from_seed([0xA5; 32]).unwrap();
+        let auth_a = MessageAuth::new(kp_a.clone());
+
+        let limits = ReassemblerLimits {
+            mtu: 256,
+            max_message_bytes: 8_192,
+            ..ReassemblerLimits::default()
+        };
+        let hub = InMemoryUdpDatagramHub::new();
+        let addr_a: SocketAddr = "127.0.0.1:42981".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:42982".parse().unwrap();
+        let udp_a =
+            UdpGossipTransport::bind_in_memory(kp_a.peer_id(), addr_a, 1, limits, hub.clone())
+                .unwrap();
+        let udp_b =
+            UdpGossipTransport::bind_in_memory(kp_b.peer_id(), addr_b, 1, limits, hub).unwrap();
+        udp_a.register_peer(kp_b.peer_id(), addr_b).unwrap();
+
+        let now = 1_700_000_000u32;
+        let mut replay = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([kp_a.peer_id()]));
+
+        let env_v0 =
+            MessageEnvelope::new_legacy_v0(*kp_a.public_key(), MessageType::Heartbeat, vec![4, 2])
+                .with_sequence(1)
+                .with_timestamp(now)
+                .sign_with(&auth_a);
+        udp_a
+            .send(kp_b.peer_id(), &env_v0.serialize().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            udp_b
+                .poll_recv_verified_envelope_v2(&[0u8; 16], 0, &mut replay, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+        );
+        assert_eq!(replay.cache_size(), 0);
     }
 }

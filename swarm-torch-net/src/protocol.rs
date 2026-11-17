@@ -18,6 +18,41 @@ use swarm_torch_core::traits::PeerId;
 /// Default pre-deserialization wire frame bound (`1,048,576` bytes = 1 MiB).
 pub const DEFAULT_MAX_ENVELOPE_BYTES: usize = 1_048_576;
 
+/// Explicit wire-version admission policy for [`MessageEnvelope`] verification (`Decision A10`).
+///
+/// Defaults to [`Self::RequireV2`] (`VERSION_V2 = (0, 3)`) so legacy `VERSION_V0` and
+/// `VERSION_V1` envelopes fail closed unless an integration caller explicitly opts into a legacy
+/// transition profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvelopeVersionPolicyV1 {
+    /// Strict `VERSION_V2` (`(0, 3)`) only (fail-closed default).
+    #[default]
+    RequireV2,
+    /// Permit `VERSION_V1` (`(0, 2)`) alongside `VERSION_V2` (`(0, 3)`); reject `VERSION_V0`.
+    AllowLegacyV1AndV2,
+    /// Permit legacy `VERSION_V0` (`(0, 1)`), `VERSION_V1` (`(0, 2)`), and `VERSION_V2` (`(0, 3)`).
+    AllowLegacyAll,
+}
+
+impl EnvelopeVersionPolicyV1 {
+    /// Return `true` iff `version` is permitted under this admission policy.
+    pub const fn allows_version(self, version: (u8, u8)) -> bool {
+        match self {
+            Self::RequireV2 => matches!(version, MessageEnvelope::VERSION_V2),
+            Self::AllowLegacyV1AndV2 => matches!(
+                version,
+                MessageEnvelope::VERSION_V1 | MessageEnvelope::VERSION_V2
+            ),
+            Self::AllowLegacyAll => matches!(
+                version,
+                MessageEnvelope::VERSION_V0
+                    | MessageEnvelope::VERSION_V1
+                    | MessageEnvelope::VERSION_V2
+            ),
+        }
+    }
+}
+
 /// Message envelope for all swarm communications (`ADR-0008`, `ADR-0021`, `W9-02`, `ST-03`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
@@ -61,13 +96,17 @@ impl MessageEnvelope {
     pub const VERSION_V1: (u8, u8) = (0, 2);
     /// Receiver-session-bound v2 envelope version (`swarmtorch.envelope.v2`, `ST-03`).
     pub const VERSION_V2: (u8, u8) = (0, 3);
-    /// Current default protocol version for `new_with_public_key`.
-    pub const CURRENT_VERSION: (u8, u8) = Self::VERSION_V0;
-    /// Supported protocol versions.
+    /// Current default protocol version for [`MessageEnvelope`] (`VERSION_V2 = (0, 3)`).
+    pub const CURRENT_VERSION: (u8, u8) = Self::VERSION_V2;
+    /// Supported protocol versions across strict (`v2`) and explicit legacy compatibility policies.
     pub const SUPPORTED_VERSIONS: &'static [(u8, u8)] =
         &[Self::VERSION_V0, Self::VERSION_V1, Self::VERSION_V2];
 
-    /// Create a new legacy v0 message envelope with explicit public key bytes.
+    /// Create a new message envelope defaulting to [`Self::CURRENT_VERSION`] (`VERSION_V2 = (0, 3)`).
+    ///
+    /// Prefer [`Self::new_v2`] in production to bind `swarm_instance_id`, `run_id`, `session_epoch`,
+    /// `session_id`, and `round_id` directly, or [`Self::new_legacy_v0`] / [`Self::new_v1`] when
+    /// explicitly targeting legacy migration compatibility.
     #[cfg(feature = "alloc")]
     pub fn new_with_public_key(
         sender_public_key: [u8; 32],
@@ -76,6 +115,32 @@ impl MessageEnvelope {
     ) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            message_type,
+            sender: sender_public_key,
+            sequence: 0,
+            timestamp: 0,
+            swarm_instance_id: [0u8; 16],
+            run_id: [0u8; 16],
+            session_epoch: 0,
+            session_id: [0u8; 32],
+            round_id: 0,
+            payload,
+            signature: None,
+        }
+    }
+
+    /// Explicitly construct a legacy unscoped v0 message envelope (`VERSION_V0 = (0, 1)`).
+    ///
+    /// Legacy v0 envelopes are rejected by default under [`EnvelopeVersionPolicyV1::RequireV2`]
+    /// unless the verifier explicitly opts into [`EnvelopeVersionPolicyV1::AllowLegacyAll`].
+    #[cfg(feature = "alloc")]
+    pub fn new_legacy_v0(
+        sender_public_key: [u8; 32],
+        message_type: MessageType,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION_V0,
             message_type,
             sender: sender_public_key,
             sequence: 0,
@@ -171,10 +236,7 @@ impl MessageEnvelope {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| TimeError::BeforeEpoch)?;
         let seconds = duration.as_secs();
-        if seconds > u32::MAX as u64 {
-            return Err(TimeError::Overflow);
-        }
-        Ok(seconds as u32)
+        u32::try_from(seconds).map_err(|_| TimeError::Overflow)
     }
 
     /// Set the sequence number.
@@ -304,16 +366,33 @@ impl MessageEnvelope {
         postcard::from_bytes(bytes).map_err(|_| VerifyError::MalformedEnvelope)
     }
 
-    /// Read-only Stages 2–5 preflight returning `(sender_peer, PreparedReplayAdmission)` with ZERO
-    /// state mutation to `replay_guard` (`ST-01`, `ST-03`).
+    /// Read-only Stages 2–5 preflight returning `(sender_peer, PreparedReplayAdmission)` under
+    /// strict [`EnvelopeVersionPolicyV1::RequireV2`] with ZERO state mutation to `replay_guard`
+    /// (`ST-01`, `ST-03`).
     #[cfg(feature = "alloc")]
     pub fn verify_authenticated_prepared(
         &self,
         replay_guard: &ReplayProtection,
         current_time: u32,
     ) -> Result<(PeerId, PreparedReplayAdmission), VerifyError> {
+        self.verify_authenticated_prepared_with_policy(
+            replay_guard,
+            current_time,
+            EnvelopeVersionPolicyV1::default(),
+        )
+    }
+
+    /// Read-only Stages 2–5 preflight enforcing explicit [`EnvelopeVersionPolicyV1`] with ZERO
+    /// state mutation to `replay_guard` (`ST-01`, `ST-03`, `A10`).
+    #[cfg(feature = "alloc")]
+    pub fn verify_authenticated_prepared_with_policy(
+        &self,
+        replay_guard: &ReplayProtection,
+        current_time: u32,
+        version_policy: EnvelopeVersionPolicyV1,
+    ) -> Result<(PeerId, PreparedReplayAdmission), VerifyError> {
         // Stage 2a: Version & profile discipline check (before any state mutation).
-        if !self.is_version_supported() {
+        if !version_policy.allows_version(self.version) {
             return Err(VerifyError::UnsupportedVersion {
                 major: self.version.0,
                 minor: self.version.1,
@@ -431,29 +510,66 @@ impl MessageEnvelope {
         Ok(swarm_torch_core::crypto::Signature::from_bytes(sig_array))
     }
 
-    /// Execute Stages 2–5 of the atomic receive pipeline (`ADR-0021`, `W9-02`, `ST-03`).
+    /// Execute Stages 2–5 of the atomic receive pipeline under [`EnvelopeVersionPolicyV1::RequireV2`]
+    /// (`ADR-0021`, `W9-02`, `ST-03`).
     #[cfg(feature = "alloc")]
     pub fn verify_authenticated(
         &self,
         replay_guard: &mut ReplayProtection,
         current_time: u32,
     ) -> Result<(), VerifyError> {
-        let (_sender_id, prepared) =
-            self.verify_authenticated_prepared(replay_guard, current_time)?;
+        self.verify_authenticated_with_policy(
+            replay_guard,
+            current_time,
+            EnvelopeVersionPolicyV1::default(),
+        )
+    }
+
+    /// Execute Stages 2–5 of the atomic receive pipeline under an explicit
+    /// [`EnvelopeVersionPolicyV1`] (`ADR-0021`, `ST-03`, `A10`).
+    #[cfg(feature = "alloc")]
+    pub fn verify_authenticated_with_policy(
+        &self,
+        replay_guard: &mut ReplayProtection,
+        current_time: u32,
+        version_policy: EnvelopeVersionPolicyV1,
+    ) -> Result<(), VerifyError> {
+        let (_sender_id, prepared) = self.verify_authenticated_prepared_with_policy(
+            replay_guard,
+            current_time,
+            version_policy,
+        )?;
         replay_guard
             .commit_prepared_admission(prepared)
             .map_err(VerifyError::Replay)
     }
 
-    /// Execute the full 6-stage atomic receive pipeline, decoding the inner payload `T`
-    /// only after authentication and replay admission succeed (`ADR-0021`, `W9-02`).
+    /// Execute the full 6-stage atomic receive pipeline under [`EnvelopeVersionPolicyV1::RequireV2`],
+    /// decoding the inner payload `T` only after authentication and replay admission succeed
+    /// (`ADR-0021`, `W9-02`).
     #[cfg(feature = "alloc")]
     pub fn verify_and_decode_payload<T: serde::de::DeserializeOwned>(
         &self,
         replay_guard: &mut ReplayProtection,
         current_time: u32,
     ) -> Result<T, VerifyError> {
-        self.verify_authenticated(replay_guard, current_time)?;
+        self.verify_and_decode_payload_with_policy(
+            replay_guard,
+            current_time,
+            EnvelopeVersionPolicyV1::default(),
+        )
+    }
+
+    /// Execute the full 6-stage atomic receive pipeline under an explicit
+    /// [`EnvelopeVersionPolicyV1`].
+    #[cfg(feature = "alloc")]
+    pub fn verify_and_decode_payload_with_policy<T: serde::de::DeserializeOwned>(
+        &self,
+        replay_guard: &mut ReplayProtection,
+        current_time: u32,
+        version_policy: EnvelopeVersionPolicyV1,
+    ) -> Result<T, VerifyError> {
+        self.verify_authenticated_with_policy(replay_guard, current_time, version_policy)?;
         postcard::from_bytes(&self.payload).map_err(|_| VerifyError::MalformedPayload)
     }
 }
@@ -626,20 +742,36 @@ impl std::error::Error for TimeError {}
 #[cfg(feature = "alloc")]
 pub struct AuthenticatedEnvelopeVerifier {
     replay_guard: ReplayProtection,
+    version_policy: EnvelopeVersionPolicyV1,
 }
 
 #[cfg(feature = "alloc")]
 impl AuthenticatedEnvelopeVerifier {
-    /// Create a verifier with default replay protection configuration.
+    /// Create a verifier with default replay protection and strict [`EnvelopeVersionPolicyV1::RequireV2`].
     pub fn new() -> Self {
         Self {
             replay_guard: ReplayProtection::new(),
+            version_policy: EnvelopeVersionPolicyV1::default(),
         }
     }
 
-    /// Create a verifier with caller-provided replay protection state.
+    /// Create a verifier with caller-provided replay protection state and default `RequireV2` policy.
     pub fn with_replay_guard(replay_guard: ReplayProtection) -> Self {
-        Self { replay_guard }
+        Self {
+            replay_guard,
+            version_policy: EnvelopeVersionPolicyV1::default(),
+        }
+    }
+
+    /// Configure explicit wire version compatibility policy (opt-in legacy fallback).
+    pub const fn with_version_policy(mut self, version_policy: EnvelopeVersionPolicyV1) -> Self {
+        self.version_policy = version_policy;
+        self
+    }
+
+    /// Return the configured [`EnvelopeVersionPolicyV1`].
+    pub const fn version_policy(&self) -> EnvelopeVersionPolicyV1 {
+        self.version_policy
     }
 
     /// Verify and return the envelope using current wall clock time.
@@ -649,7 +781,11 @@ impl AuthenticatedEnvelopeVerifier {
         envelope: MessageEnvelope,
     ) -> Result<MessageEnvelope, VerifyError> {
         let now = MessageEnvelope::current_unix_secs().map_err(VerifyError::Time)?;
-        envelope.verify_authenticated(&mut self.replay_guard, now)?;
+        envelope.verify_authenticated_with_policy(
+            &mut self.replay_guard,
+            now,
+            self.version_policy,
+        )?;
         Ok(envelope)
     }
 
@@ -659,7 +795,11 @@ impl AuthenticatedEnvelopeVerifier {
         envelope: MessageEnvelope,
         current_time_secs: u32,
     ) -> Result<MessageEnvelope, VerifyError> {
-        envelope.verify_authenticated(&mut self.replay_guard, current_time_secs)?;
+        envelope.verify_authenticated_with_policy(
+            &mut self.replay_guard,
+            current_time_secs,
+            self.version_policy,
+        )?;
         Ok(envelope)
     }
 
@@ -678,5 +818,141 @@ impl AuthenticatedEnvelopeVerifier {
 impl Default for AuthenticatedEnvelopeVerifier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn current_version_defaults_to_v2_and_legacy_fallback_is_explicitly_gated() {
+        assert_eq!(
+            MessageEnvelope::CURRENT_VERSION,
+            MessageEnvelope::VERSION_V2
+        );
+        let default_env =
+            MessageEnvelope::new_with_public_key([0x11; 32], MessageType::Heartbeat, vec![1, 2]);
+        assert_eq!(default_env.version, MessageEnvelope::VERSION_V2);
+        let legacy_env =
+            MessageEnvelope::new_legacy_v0([0x11; 32], MessageType::Heartbeat, vec![1, 2]);
+        assert_eq!(legacy_env.version, MessageEnvelope::VERSION_V0);
+
+        assert!(EnvelopeVersionPolicyV1::default().allows_version(MessageEnvelope::VERSION_V2));
+        assert!(!EnvelopeVersionPolicyV1::RequireV2.allows_version(MessageEnvelope::VERSION_V1));
+        assert!(!EnvelopeVersionPolicyV1::RequireV2.allows_version(MessageEnvelope::VERSION_V0));
+        assert!(
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2.allows_version(MessageEnvelope::VERSION_V1)
+        );
+        assert!(
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2.allows_version(MessageEnvelope::VERSION_V2)
+        );
+        assert!(!EnvelopeVersionPolicyV1::AllowLegacyV1AndV2
+            .allows_version(MessageEnvelope::VERSION_V0));
+        assert!(EnvelopeVersionPolicyV1::AllowLegacyAll.allows_version(MessageEnvelope::VERSION_V0));
+        assert!(EnvelopeVersionPolicyV1::AllowLegacyAll.allows_version(MessageEnvelope::VERSION_V1));
+        assert!(EnvelopeVersionPolicyV1::AllowLegacyAll.allows_version(MessageEnvelope::VERSION_V2));
+    }
+
+    #[test]
+    fn default_require_v2_rejects_v0_and_v1_without_mutating_replay_guard() {
+        use swarm_torch_core::crypto::KeyPair;
+        use swarm_torch_core::replay::{CohortAllowlist, ReplayStartupPolicyV1};
+
+        let kp = KeyPair::from_seed([0x51; 32]).unwrap();
+        let auth = MessageAuth::new(kp.clone());
+        let now = 1_000u32;
+        let hb = HeartbeatMessage {
+            current_round: 3,
+            role: 1,
+            known_peers: 2,
+            load: 10,
+        };
+        let payload = postcard::to_allocvec(&hb).unwrap();
+
+        let env_v0 = MessageEnvelope::new_legacy_v0(
+            *kp.public_key(),
+            MessageType::Heartbeat,
+            payload.clone(),
+        )
+        .with_sequence(1)
+        .with_timestamp(now)
+        .sign_with(&auth);
+        let env_v1 = MessageEnvelope::new_v1(
+            *kp.public_key(),
+            [0x11; 16],
+            1,
+            3,
+            MessageType::Heartbeat,
+            payload,
+        )
+        .with_sequence(1)
+        .with_timestamp(now)
+        .sign_with(&auth);
+
+        let mut guard = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([kp.peer_id()]));
+
+        assert_eq!(
+            env_v0
+                .verify_authenticated_prepared(&guard, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+        );
+        assert_eq!(
+            env_v1
+                .verify_authenticated_prepared(&guard, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+        );
+        assert_eq!(
+            env_v0
+                .verify_and_decode_payload::<HeartbeatMessage>(&mut guard, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+        );
+        assert_eq!(
+            env_v1
+                .verify_and_decode_payload::<HeartbeatMessage>(&mut guard, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+        );
+        assert_eq!(guard.cache_size(), 0);
+
+        let mut strict_verifier = AuthenticatedEnvelopeVerifier::with_replay_guard(guard);
+        assert_eq!(
+            strict_verifier.version_policy(),
+            EnvelopeVersionPolicyV1::RequireV2
+        );
+        assert_eq!(
+            strict_verifier
+                .verify_and_unwrap_with_time(env_v1.clone(), now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+        );
+        assert_eq!(strict_verifier.replay_guard().cache_size(), 0);
+
+        let mut v1_verifier =
+            strict_verifier.with_version_policy(EnvelopeVersionPolicyV1::AllowLegacyV1AndV2);
+        assert_eq!(
+            v1_verifier
+                .verify_and_unwrap_with_time(env_v0, now)
+                .unwrap_err(),
+            VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+        );
+        assert_eq!(v1_verifier.replay_guard().cache_size(), 0);
+
+        let decoded: HeartbeatMessage = env_v1
+            .verify_and_decode_payload_with_policy(
+                v1_verifier.replay_guard_mut(),
+                now,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            )
+            .unwrap();
+        assert_eq!(decoded, hb);
+        assert_eq!(v1_verifier.replay_guard().cache_size(), 1);
     }
 }

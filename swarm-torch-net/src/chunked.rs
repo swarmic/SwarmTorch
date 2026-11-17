@@ -811,8 +811,14 @@ impl<E: Clone + Eq + Ord> ObservedSourceReassembler<E> {
             let word_idx = idx / 64;
             let bit_mask = 1u64 << (idx % 64);
             if (existing.received_bitmap[word_idx] & bit_mask) != 0 {
-                if existing.payload_buf[start..end] == *decoded.payload {
-                    // Byte-identical duplicate chunk: idempotent no-op without extending deadline.
+                let is_last = decoded.header.chunk_idx + 1 == existing.total_chunks;
+                let len_matches = if is_last {
+                    existing.exact_total_len == Some(end)
+                } else {
+                    decoded.payload.len() == stride_p
+                };
+                if len_matches && existing.payload_buf[start..end] == *decoded.payload {
+                    // Byte- and length-identical duplicate chunk: idempotent no-op without extending deadline.
                     return Ok(None);
                 } else {
                     let deadline = existing.deadline_mono_ms;
@@ -1259,5 +1265,107 @@ mod tests {
         assert_eq!(reasm.quarantine_tombstone_count(), 0);
         assert_eq!(reasm.quarantined_source_count(), 0);
         assert_eq!(reasm.global_reserved_bytes(), 0);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn duplicate_last_chunk_with_shorter_or_longer_prefix_quarantines_as_conflict() {
+        let limits = ReassemblerLimits {
+            mtu: 24, // stride P = 8 bytes
+            max_message_bytes: 64,
+            max_chunks_per_transfer: 8,
+            per_source_max_active_transfers: 2,
+            global_max_active_transfers: 4,
+            per_source_max_reserved_bytes: 2048,
+            global_max_reserved_bytes: 4096,
+            ..ReassemblerLimits::default()
+        };
+        let mut reasm = ObservedSourceReassembler::<u64>::new(limits).unwrap();
+
+        // 2-chunk transfer: chunk 0 = "AAAAAAAA" (8 bytes), chunk 1 = "BBBBB" (5 bytes).
+        let frames_full =
+            ChunkedFrameCodec::encode_message(42, 24, 64, 8, b"AAAAAAAABBBBB").unwrap();
+        // Forged conflicting final chunk 1 with matching prefix "BBB" (3 bytes != 5 bytes).
+        let mut short_last = [0u8; 24];
+        let short_len =
+            ChunkedFrameCodec::encode_frame_into(42, 1, 2, b"BBB", &mut short_last).unwrap();
+
+        // Scenario A: Receive final chunk 1 (5 bytes) first, then byte-and-length-identical dup -> Ok(None),
+        // then shorter prefix dup (3 bytes) -> must quarantine & fail with ConflictingChunkPayload!
+        assert!(reasm
+            .ingest_frame(1, 500, &frames_full[1], 100)
+            .unwrap()
+            .is_none());
+        assert!(reasm
+            .ingest_frame(1, 500, &frames_full[1], 101)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 500, &short_last[..short_len], 102)
+                .unwrap_err(),
+            ChunkError::ConflictingChunkPayload
+        );
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 500, &frames_full[0], 103)
+                .unwrap_err(),
+            ChunkError::TransferQuarantined
+        );
+
+        // Scenario B: Receive shorter final chunk 1 (3 bytes) first, then longer matching-prefix chunk (6 bytes)
+        // must also be rejected & quarantined rather than ignored!
+        let mut short_first = [0u8; 24];
+        let short_first_len =
+            ChunkedFrameCodec::encode_frame_into(43, 1, 2, b"BBB", &mut short_first).unwrap();
+        let mut long_dup = [0u8; 24];
+        let long_dup_len =
+            ChunkedFrameCodec::encode_frame_into(43, 1, 2, b"BBBBBB", &mut long_dup).unwrap();
+        let mut chunk0_43 = [0u8; 24];
+        let chunk0_43_len =
+            ChunkedFrameCodec::encode_frame_into(43, 0, 2, b"AAAAAAAA", &mut chunk0_43).unwrap();
+        assert!(reasm
+            .ingest_frame(1, 501, &short_first[..short_first_len], 200)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 501, &long_dup[..long_dup_len], 201)
+                .unwrap_err(),
+            ChunkError::ConflictingChunkPayload
+        );
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 501, &chunk0_43[..chunk0_43_len], 202)
+                .unwrap_err(),
+            ChunkError::TransferQuarantined
+        );
+
+        // Scenario C: Zero-padded suffix on last chunk (`"BBB\0\0"` vs `"BBB"`) must also
+        // fail length-parity check and quarantine rather than matching zero-initialized buffer bytes!
+        let mut zero_padded_last = [0u8; 24];
+        let zp_len =
+            ChunkedFrameCodec::encode_frame_into(44, 1, 2, b"BBB\0\0", &mut zero_padded_last)
+                .unwrap();
+        let mut short_unpadded_last = [0u8; 24];
+        let su_len =
+            ChunkedFrameCodec::encode_frame_into(44, 1, 2, b"BBB", &mut short_unpadded_last)
+                .unwrap();
+        assert!(reasm
+            .ingest_frame(1, 502, &zero_padded_last[..zp_len], 300)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 502, &short_unpadded_last[..su_len], 301)
+                .unwrap_err(),
+            ChunkError::ConflictingChunkPayload
+        );
+        assert_eq!(
+            reasm
+                .ingest_frame(1, 502, &zero_padded_last[..zp_len], 302)
+                .unwrap_err(),
+            ChunkError::TransferQuarantined
+        );
     }
 }

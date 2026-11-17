@@ -4,7 +4,8 @@ use swarm_torch_core::crypto::{CryptoError, KeyPair, MessageAuth, SessionHandsha
 use swarm_torch_core::replay::{ReplayError, ReplayProtection, ReplayStartupPolicyV1};
 use swarm_torch_core::traits::PeerId;
 use swarm_torch_net::protocol::{
-    AuthenticatedEnvelopeVerifier, MessageEnvelope, MessageType, VerifyError,
+    AuthenticatedEnvelopeVerifier, EnvelopeVersionPolicyV1, MessageEnvelope, MessageType,
+    VerifyError,
 };
 
 fn new_genesis_replay_guard() -> ReplayProtection {
@@ -18,13 +19,10 @@ fn signed_heartbeat(
     timestamp: u32,
     payload: Vec<u8>,
 ) -> MessageEnvelope {
-    let mut envelope = MessageEnvelope::new_with_public_key(
-        *keypair.public_key(),
-        MessageType::Heartbeat,
-        payload,
-    )
-    .with_sequence(sequence)
-    .with_timestamp(timestamp);
+    let mut envelope =
+        MessageEnvelope::new_legacy_v0(*keypair.public_key(), MessageType::Heartbeat, payload)
+            .with_sequence(sequence)
+            .with_timestamp(timestamp);
 
     let sig = auth.sign(
         envelope.version,
@@ -45,8 +43,18 @@ fn envelope_verify_authenticated_golden_path() {
     let now = 1000;
 
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"test payload".to_vec());
+    // Default strict RequireV2 rejects legacy v0 envelopes without mutating replay state.
+    assert_eq!(
+        envelope.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::UnsupportedVersion { major: 0, minor: 1 })
+    );
+    assert_eq!(replay_guard.cache_size(), 0);
     assert!(envelope
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
 }
 
@@ -59,10 +67,18 @@ fn envelope_verify_authenticated_rejects_replay() {
 
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"test payload".to_vec());
     assert!(envelope
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Replay(ReplayError::Replay { .. }))
     ));
 }
@@ -77,7 +93,11 @@ fn envelope_verify_authenticated_rejects_expired() {
 
     let envelope = signed_heartbeat(&keypair, &auth, 1, old_ts, b"test payload".to_vec());
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Replay(ReplayError::Expired { .. }))
     ));
 }
@@ -88,7 +108,7 @@ fn envelope_verify_authenticated_signature_before_replay() {
     let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
-    let envelope = MessageEnvelope::new_with_public_key(
+    let envelope = MessageEnvelope::new_legacy_v0(
         *keypair.public_key(),
         MessageType::Heartbeat,
         b"test payload".to_vec(),
@@ -98,7 +118,11 @@ fn envelope_verify_authenticated_signature_before_replay() {
     .with_signature(vec![0xFF; 64]);
 
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Crypto(_))
     ));
     assert_eq!(replay_guard.cache_size(), 0);
@@ -110,7 +134,7 @@ fn envelope_verify_authenticated_rejects_missing_signature() {
     let now = 1000;
     let keypair = KeyPair::from_seed([5u8; 32]).expect("non-zero seed");
 
-    let envelope = MessageEnvelope::new_with_public_key(
+    let envelope = MessageEnvelope::new_legacy_v0(
         *keypair.public_key(),
         MessageType::Heartbeat,
         b"test".to_vec(),
@@ -119,7 +143,11 @@ fn envelope_verify_authenticated_rejects_missing_signature() {
     .with_timestamp(now);
 
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::MissingSignature)
     ));
 }
@@ -130,7 +158,7 @@ fn envelope_verify_authenticated_rejects_wrong_signature_length() {
     let now = 1000;
     let keypair = KeyPair::from_seed([6u8; 32]).expect("non-zero seed");
 
-    let envelope = MessageEnvelope::new_with_public_key(
+    let envelope = MessageEnvelope::new_legacy_v0(
         *keypair.public_key(),
         MessageType::Heartbeat,
         b"test".to_vec(),
@@ -140,7 +168,11 @@ fn envelope_verify_authenticated_rejects_wrong_signature_length() {
     .with_signature(vec![0u8; 32]);
 
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::InvalidSignatureLength {
             expected: 64,
             found: 32
@@ -159,7 +191,11 @@ fn envelope_verify_authenticated_rejects_tampered_payload() {
     envelope.payload = b"tampered payload".to_vec();
 
     assert!(matches!(
-        envelope.verify_authenticated(&mut replay_guard, now),
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Crypto(_))
     ));
 }
@@ -175,7 +211,11 @@ fn envelope_verify_authenticated_monotonic_sequences() {
         let payload = format!("message {}", sequence).into_bytes();
         let envelope = signed_heartbeat(&keypair, &auth, sequence, now, payload);
         assert!(envelope
-            .verify_authenticated(&mut replay_guard, now)
+            .verify_authenticated_with_policy(
+                &mut replay_guard,
+                now,
+                EnvelopeVersionPolicyV1::AllowLegacyAll
+            )
             .is_ok());
     }
 }
@@ -198,19 +238,39 @@ fn envelope_verify_authenticated_out_of_order_within_window() {
     };
 
     assert!(make_envelope(20)
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
     assert!(make_envelope(15)
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
     assert!(make_envelope(10)
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
     assert!(make_envelope(5)
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
     assert!(matches!(
-        make_envelope(3).verify_authenticated(&mut replay_guard, now),
+        make_envelope(3).verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Replay(ReplayError::TooOld { .. }))
     ));
 }
@@ -228,16 +288,28 @@ fn envelope_verify_authenticated_multi_peer_isolation() {
 
     let envelope_a = signed_heartbeat(&keypair_a, &auth_a, 5, now, b"peer a".to_vec());
     assert!(envelope_a
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
 
     let envelope_b = signed_heartbeat(&keypair_b, &auth_b, 5, now, b"peer b".to_vec());
     assert!(envelope_b
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        )
         .is_ok());
 
     assert!(matches!(
-        envelope_a.verify_authenticated(&mut replay_guard, now),
+        envelope_a.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll
+        ),
         Err(VerifyError::Replay(ReplayError::Replay { .. }))
     ));
 }
@@ -262,7 +334,7 @@ fn verify_authenticated_rejects_hashed_peer_id() {
     let now = 1000;
 
     let hashed_sender = PeerId::from_public_key(keypair.public_key());
-    let mut envelope = MessageEnvelope::new_with_public_key(
+    let mut envelope = MessageEnvelope::new_legacy_v0(
         *hashed_sender.as_bytes(),
         MessageType::Heartbeat,
         b"payload".to_vec(),
@@ -279,8 +351,16 @@ fn verify_authenticated_rejects_hashed_peer_id() {
     );
     envelope = envelope.with_signature(sig.as_bytes().to_vec());
 
-    assert!(matches!(
+    assert_eq!(
         envelope.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::UnsupportedVersion { major: 0, minor: 1 })
+    );
+    assert!(matches!(
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        ),
         Err(VerifyError::InvalidSenderKey) | Err(VerifyError::Crypto(_))
     ));
 }
@@ -300,7 +380,11 @@ fn verify_authenticated_requires_unix_seconds_not_millis() {
 
     let envelope_secs = signed_heartbeat(&keypair, &auth, 1, now_secs, b"seconds".to_vec());
     assert!(envelope_secs
-        .verify_authenticated(&mut replay_guard, now_secs)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now_secs,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        )
         .is_ok());
 
     let envelope_ms = signed_heartbeat(
@@ -312,7 +396,11 @@ fn verify_authenticated_requires_unix_seconds_not_millis() {
     );
     let now_millis = now_secs.saturating_mul(1000);
     assert!(matches!(
-        envelope_ms.verify_authenticated(&mut replay_guard, now_millis),
+        envelope_ms.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now_millis,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        ),
         Err(VerifyError::Replay(ReplayError::Expired { .. }))
     ));
 }
@@ -330,6 +418,14 @@ fn verify_authenticated_rejects_unsupported_version() {
     let result = envelope.verify_authenticated(&mut replay_guard, 1000);
     assert!(matches!(
         result,
+        Err(VerifyError::UnsupportedVersion { major: 9, minor: 9 })
+    ));
+    assert!(matches!(
+        envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            1000,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        ),
         Err(VerifyError::UnsupportedVersion { major: 9, minor: 9 })
     ));
     assert_eq!(replay_guard.cache_size(), 0);
@@ -362,6 +458,23 @@ fn verify_authenticated_rejects_zero_sender_key() {
         envelope.verify_authenticated(&mut replay_guard, now),
         Err(VerifyError::InvalidSenderKey)
     ));
+
+    let legacy_envelope = MessageEnvelope::new_legacy_v0(
+        [0u8; 32],
+        MessageType::Heartbeat,
+        b"zero sender legacy".to_vec(),
+    )
+    .with_sequence(1)
+    .with_timestamp(now)
+    .with_signature(vec![0u8; 64]);
+    assert!(matches!(
+        legacy_envelope.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        ),
+        Err(VerifyError::InvalidSenderKey)
+    ));
 }
 
 #[test]
@@ -371,8 +484,13 @@ fn verify_error_source_chain_includes_crypto() {
     let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
-    let envelope = MessageEnvelope::new_with_public_key(
+    let envelope = MessageEnvelope::new_v2(
         *keypair.public_key(),
+        [0x11; 16],
+        [0x22; 16],
+        1,
+        [0x33; 32],
+        1,
         MessageType::Heartbeat,
         b"invalid signature".to_vec(),
     )
@@ -403,7 +521,15 @@ fn authenticated_verifier_verify_and_unwrap_with_time() {
     let now = 1000;
     let envelope = signed_heartbeat(&keypair, &auth, 1, now, b"wrapped".to_vec());
 
-    let mut verifier = AuthenticatedEnvelopeVerifier::with_replay_guard(new_genesis_replay_guard());
+    let mut strict_verifier =
+        AuthenticatedEnvelopeVerifier::with_replay_guard(new_genesis_replay_guard());
+    assert!(matches!(
+        strict_verifier.verify_and_unwrap_with_time(envelope.clone(), now),
+        Err(VerifyError::UnsupportedVersion { major: 0, minor: 1 })
+    ));
+
+    let mut verifier = AuthenticatedEnvelopeVerifier::with_replay_guard(new_genesis_replay_guard())
+        .with_version_policy(EnvelopeVersionPolicyV1::AllowLegacyAll);
     let result = verifier.verify_and_unwrap_with_time(envelope.clone(), now);
 
     assert!(result.is_ok());
@@ -429,10 +555,14 @@ fn h02_verify_path_uses_canonical_peer_id_for_replay() {
     let mut replay_guard = new_genesis_replay_guard();
     let now = 1000;
 
-    // First message accepted
+    // First message accepted under explicit legacy policy
     let envelope1 = signed_heartbeat(&keypair, &auth, 1, now, b"msg1".to_vec());
     assert!(envelope1
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        )
         .is_ok());
 
     // The replay cache should have exactly 1 entry (the canonical PeerId)
@@ -441,7 +571,11 @@ fn h02_verify_path_uses_canonical_peer_id_for_replay() {
     // Second message with same keypair, different seq: accepted under same peer entry
     let envelope2 = signed_heartbeat(&keypair, &auth, 2, now, b"msg2".to_vec());
     assert!(envelope2
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyAll,
+        )
         .is_ok());
 
     // Still 1 entry — both messages are tracked under the same canonical PeerId
@@ -455,7 +589,11 @@ fn h02_verify_path_uses_canonical_peer_id_for_replay() {
     let replay = signed_heartbeat(&keypair, &auth, 1, now, b"msg1".to_vec());
     assert!(
         matches!(
-            replay.verify_authenticated(&mut replay_guard, now),
+            replay.verify_authenticated_with_policy(
+                &mut replay_guard,
+                now,
+                EnvelopeVersionPolicyV1::AllowLegacyAll,
+            ),
             Err(VerifyError::Replay(ReplayError::Replay { .. }))
         ),
         "replayed sequence must be detected — same PeerId in cache"
@@ -506,14 +644,19 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
     .sign_with(&unauthorized_auth);
 
     assert_eq!(
-        unauth_env.verify_authenticated(&mut replay_guard, now),
+        unauth_env.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        ),
         Err(VerifyError::Replay(ReplayError::UnauthorizedPeer {
             peer: unauthorized_kp.peer_id()
         }))
     );
     assert_eq!(replay_guard.cache_size(), 0);
 
-    // Stage 4-6: Authorized v1 envelope with serialized HeartbeatMessage verifies and decodes.
+    // Stage 4-6: Default RequireV2 rejects legacy v1 without mutating replay_guard,
+    // while explicit AllowLegacyV1AndV2 verifies and decodes HeartbeatMessage.
     let hb = HeartbeatMessage {
         current_round: 10,
         role: 1,
@@ -535,8 +678,17 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
 
     let wire = env_e1.serialize().unwrap();
     let decoded_env = MessageEnvelope::deserialize_bounded(&wire, 4096).unwrap();
+    assert_eq!(
+        decoded_env.verify_authenticated(&mut replay_guard, now),
+        Err(VerifyError::UnsupportedVersion { major: 0, minor: 2 })
+    );
+    assert_eq!(replay_guard.cache_size(), 0);
     let decoded_hb: HeartbeatMessage = decoded_env
-        .verify_and_decode_payload(&mut replay_guard, now)
+        .verify_and_decode_payload_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        )
         .unwrap();
     assert_eq!(decoded_hb, hb);
 
@@ -544,7 +696,11 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
     let mut cross_swarm = decoded_env.clone();
     cross_swarm.swarm_instance_id = [0x99u8; 16];
     assert_eq!(
-        cross_swarm.verify_authenticated(&mut replay_guard, now),
+        cross_swarm.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        ),
         Err(VerifyError::Crypto(CryptoError::VerificationFailed))
     );
 
@@ -562,7 +718,11 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
     .sign_with(&sender_auth);
 
     assert_eq!(
-        env_e2_unrecovered.verify_authenticated(&mut replay_guard, now),
+        env_e2_unrecovered.verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        ),
         Err(VerifyError::Replay(ReplayError::RecoveryRequired {
             peer: sender_kp.peer_id(),
             current_epoch: 1,
@@ -587,7 +747,11 @@ fn six_stage_pipeline_v1_envelope_allowlist_and_epoch_recovery_end_to_end() {
         .unwrap();
 
     assert!(env_e2_unrecovered
-        .verify_authenticated(&mut replay_guard, now)
+        .verify_authenticated_with_policy(
+            &mut replay_guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        )
         .is_ok());
 }
 
@@ -645,6 +809,14 @@ fn v2_envelope_session_id_and_restart_recovery_integration() {
     smuggled_v1.run_id = run_id;
     assert_eq!(
         smuggled_v1.verify_authenticated(&mut guard, now),
+        Err(VerifyError::UnsupportedVersion { major: 0, minor: 2 })
+    );
+    assert_eq!(
+        smuggled_v1.verify_authenticated_with_policy(
+            &mut guard,
+            now,
+            EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+        ),
         Err(VerifyError::MalformedEnvelope)
     );
 

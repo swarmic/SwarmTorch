@@ -484,6 +484,9 @@ pub enum GossipVerifyError {
         expected: u32,
         found: usize,
     },
+    InnerLengthOverflow {
+        len: usize,
+    },
     InnerDigestMismatch,
     InvalidOriginatorKey,
     InvalidSignatureLength {
@@ -536,6 +539,9 @@ impl core::fmt::Display for GossipVerifyError {
                     "wrapper inner_length ({expected}) != inner payload len ({found})"
                 )
             }
+            Self::InnerLengthOverflow { len } => {
+                write!(f, "inner payload length {len} exceeds u32::MAX")
+            }
             Self::InnerDigestMismatch => {
                 write!(
                     f,
@@ -559,20 +565,25 @@ impl core::fmt::Display for GossipVerifyError {
 impl std::error::Error for GossipVerifyError {}
 
 #[cfg(feature = "alloc")]
+fn checked_inner_payload_len(len: usize) -> core::result::Result<u32, GossipVerifyError> {
+    u32::try_from(len).map_err(|_| GossipVerifyError::InnerLengthOverflow { len })
+}
+
+#[cfg(feature = "alloc")]
 impl BundledGossipDeliveryV1 {
-    /// Construct and sign both [`InnerUpdateV1`] and [`RecipientWrapperV1`] using the originator's
-    /// [`MessageAuth`].
-    pub fn new_signed(
+    /// Fallibly construct and sign both [`InnerUpdateV1`] and [`RecipientWrapperV1`] using the
+    /// originator's [`MessageAuth`], failing cleanly on `u32` payload-length overflow.
+    pub fn try_new_signed(
         auth: &MessageAuth,
         mut inner: InnerUpdateV1,
         intended_recipient: PeerId,
         recipient_session_epoch: u64,
         delivery_seq: u64,
         timestamp_secs: u32,
-    ) -> Self {
+    ) -> core::result::Result<Self, GossipVerifyError> {
+        let inner_length = checked_inner_payload_len(inner.encoded_payload.len())?;
         inner = inner.sign_with(auth);
         let inner_digest = inner.canonical_digest();
-        let inner_length = inner.encoded_payload.len() as u32;
         let wrapper = RecipientWrapperV1 {
             version: RecipientWrapperV1::VERSION_V1,
             originator_public_key: inner.originator_public_key,
@@ -587,7 +598,28 @@ impl BundledGossipDeliveryV1 {
             wrapper_signature: Vec::new(),
         }
         .sign_with(auth);
-        Self { wrapper, inner }
+        Ok(Self { wrapper, inner })
+    }
+
+    /// Construct and sign both [`InnerUpdateV1`] and [`RecipientWrapperV1`] using the originator's
+    /// [`MessageAuth`].
+    pub fn new_signed(
+        auth: &MessageAuth,
+        inner: InnerUpdateV1,
+        intended_recipient: PeerId,
+        recipient_session_epoch: u64,
+        delivery_seq: u64,
+        timestamp_secs: u32,
+    ) -> Self {
+        Self::try_new_signed(
+            auth,
+            inner,
+            intended_recipient,
+            recipient_session_epoch,
+            delivery_seq,
+            timestamp_secs,
+        )
+        .expect("gossip inner encoded_payload length must fit in u32")
     }
 
     /// Serialize this delivery to postcard bytes.
@@ -695,10 +727,10 @@ impl BundledGossipDeliveryV1 {
 
 #[cfg(feature = "alloc")]
 impl BundledGossipDeliveryV2 {
-    /// Construct and sign both [`InnerUpdateV2`] and [`RecipientWrapperV2`] using the originator's
-    /// [`MessageAuth`].
+    /// Fallibly construct and sign both [`InnerUpdateV2`] and [`RecipientWrapperV2`] using the
+    /// originator's [`MessageAuth`], failing cleanly on `u32` payload-length overflow.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_signed(
+    pub fn try_new_signed(
         auth: &MessageAuth,
         mut inner: InnerUpdateV2,
         intended_recipient: PeerId,
@@ -706,10 +738,10 @@ impl BundledGossipDeliveryV2 {
         recipient_session_epoch: u64,
         delivery_seq: u64,
         timestamp_secs: u32,
-    ) -> Self {
+    ) -> core::result::Result<Self, GossipVerifyError> {
+        let inner_length = checked_inner_payload_len(inner.encoded_payload.len())?;
         inner = inner.sign_with(auth);
         let inner_digest = inner.canonical_digest();
-        let inner_length = inner.encoded_payload.len() as u32;
         let wrapper = RecipientWrapperV2 {
             version: RecipientWrapperV2::VERSION_V2,
             originator_public_key: inner.originator_public_key,
@@ -726,7 +758,31 @@ impl BundledGossipDeliveryV2 {
             wrapper_signature: Vec::new(),
         }
         .sign_with(auth);
-        Self { wrapper, inner }
+        Ok(Self { wrapper, inner })
+    }
+
+    /// Construct and sign both [`InnerUpdateV2`] and [`RecipientWrapperV2`] using the originator's
+    /// [`MessageAuth`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed(
+        auth: &MessageAuth,
+        inner: InnerUpdateV2,
+        intended_recipient: PeerId,
+        session_id: [u8; 32],
+        recipient_session_epoch: u64,
+        delivery_seq: u64,
+        timestamp_secs: u32,
+    ) -> Self {
+        Self::try_new_signed(
+            auth,
+            inner,
+            intended_recipient,
+            session_id,
+            recipient_session_epoch,
+            delivery_seq,
+            timestamp_secs,
+        )
+        .expect("gossip inner encoded_payload length must fit in u32")
     }
 
     /// Serialize this v2 delivery to postcard bytes.
@@ -1022,6 +1078,109 @@ mod tests {
                 peer: orig_peer,
                 seq: 1,
             }))
+        );
+    }
+
+    #[test]
+    fn checked_inner_payload_len_rejects_u32_overflow_without_truncation() {
+        assert_eq!(checked_inner_payload_len(u32::MAX as usize), Ok(u32::MAX));
+        let over = (u32::MAX as usize).checked_add(1);
+        if let Some(len) = over {
+            assert_eq!(
+                checked_inner_payload_len(len),
+                Err(GossipVerifyError::InnerLengthOverflow { len })
+            );
+        }
+    }
+
+    #[test]
+    fn try_new_signed_v1_and_v2_succeed_and_verify_within_u32_bounds() {
+        let orig_kp = KeyPair::from_seed([0x61; 32]).unwrap();
+        let orig_peer = orig_kp.peer_id();
+        let orig_auth = MessageAuth::new(orig_kp.clone());
+        let coord_kp = KeyPair::from_seed([0x62; 32]).unwrap();
+        let coord_peer = coord_kp.peer_id();
+
+        let swarm_id = [0xAA; 16];
+        let run_id = [0xBB; 16];
+        let policy_digest = [0xCC; 32];
+        let now = 2_000u32;
+
+        let inner_v1 = InnerUpdateV1 {
+            originator_public_key: *orig_kp.public_key(),
+            swarm_instance_id: swarm_id,
+            round_id: 1,
+            contribution_id: 1,
+            base_checkpoint_digest: [0x01; 32],
+            payload_kind: PayloadKindV1::ModelDeltaV1,
+            compression_schema_version: 0,
+            num_elements: 2,
+            reported_examples: 16,
+            encoded_payload: vec![1, 2, 3, 4],
+            originator_signature: Vec::new(),
+        };
+        let d1 =
+            BundledGossipDeliveryV1::try_new_signed(&orig_auth, inner_v1, coord_peer, 1, 1, now)
+                .expect("valid v1 payload length must succeed");
+        assert_eq!(d1.wrapper.inner_length, 4);
+        let mut replay_v1 = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([orig_peer]));
+        assert_eq!(
+            d1.verify_for_recipient(coord_peer, &mut replay_v1, now),
+            Ok(orig_peer)
+        );
+
+        let mut replay_v2 = ReplayProtection::try_with_config(64, 60)
+            .unwrap()
+            .with_cohort_allowlist(CohortAllowlist::from_peers([orig_peer]));
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: swarm_id,
+            run_id,
+            policy_digest,
+            receiver_peer: coord_peer,
+            sender_peer: orig_peer,
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x55; 32],
+            issued_at_secs: now,
+        };
+        replay_v2.register_recovery_challenge_v2(challenge).unwrap();
+        let hs_sig = orig_auth.sign_session_handshake_v2(&challenge).unwrap();
+        let active_key = replay_v2
+            .complete_recovery_handshake_v2(swarm_id, run_id, orig_kp.public_key(), &hs_sig, now)
+            .unwrap();
+
+        let inner_v2 = InnerUpdateV2 {
+            originator_public_key: *orig_kp.public_key(),
+            swarm_instance_id: swarm_id,
+            run_id,
+            round_id: 2,
+            contribution_id: 1,
+            base_checkpoint_digest: [0x02; 32],
+            context_policy_digest: policy_digest,
+            payload_kind: PayloadKindV1::ModelDeltaV1,
+            compression_schema_version: 0,
+            num_elements: 2,
+            reported_examples: 16,
+            encoded_payload: vec![5, 6, 7, 8, 9],
+            originator_signature: Vec::new(),
+        };
+        let d2 = BundledGossipDeliveryV2::try_new_signed(
+            &orig_auth,
+            inner_v2,
+            coord_peer,
+            active_key.session_id,
+            1,
+            1,
+            now,
+        )
+        .expect("valid v2 payload length must succeed");
+        assert_eq!(d2.wrapper.inner_length, 5);
+        assert_eq!(
+            d2.verify_for_recipient_v2(coord_peer, &mut replay_v2, now),
+            Ok(orig_peer)
         );
     }
 }

@@ -16,6 +16,8 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "std")]
+pub mod audit;
 pub mod carrier;
 pub mod chunked;
 pub mod gossip;

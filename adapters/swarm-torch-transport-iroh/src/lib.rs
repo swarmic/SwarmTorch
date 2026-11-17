@@ -25,7 +25,7 @@ use swarm_torch_net::gossip::{
     BundledGossipDeliveryV1, BundledGossipDeliveryV2, GossipVerifyError,
     DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
 };
-use swarm_torch_net::protocol::{MessageEnvelope, VerifyError};
+use swarm_torch_net::protocol::{EnvelopeVersionPolicyV1, MessageEnvelope, VerifyError};
 
 /// Default maximum number of distinct QUIC link principals tracked simultaneously in
 /// [`LinkFrameQuotaTrackerV1`] before fail-closed saturation (`ST-08`).
@@ -457,6 +457,7 @@ impl IrohCarrierAdapterV1 {
     /// Accept one length-prefixed direct [`MessageEnvelope`] frame from `stream_bytes`,
     /// enforcing per-link quota and link-vs-originator binding policy **before** replay admission,
     /// and return `(accepted, remaining_bytes)`.
+    /// Admit one wire [`MessageEnvelope`] frame under strict [`EnvelopeVersionPolicyV1::RequireV2`].
     pub fn accept_envelope_frame<'a>(
         &self,
         link_principal: IrohVerifiedLinkPrincipalV1,
@@ -464,6 +465,26 @@ impl IrohCarrierAdapterV1 {
         replay_guard: &mut ReplayProtection,
         current_time_secs: u32,
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<(AcceptedIrohEnvelopeV1, &'a [u8]), IrohCarrierError> {
+        self.accept_envelope_frame_with_policy(
+            link_principal,
+            stream_bytes,
+            replay_guard,
+            current_time_secs,
+            quota,
+            EnvelopeVersionPolicyV1::RequireV2,
+        )
+    }
+
+    /// Admit one wire [`MessageEnvelope`] frame under an explicit [`EnvelopeVersionPolicyV1`].
+    pub fn accept_envelope_frame_with_policy<'a>(
+        &self,
+        link_principal: IrohVerifiedLinkPrincipalV1,
+        stream_bytes: &'a [u8],
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+        version_policy: EnvelopeVersionPolicyV1,
     ) -> Result<(AcceptedIrohEnvelopeV1, &'a [u8]), IrohCarrierError> {
         let (frame, rest) =
             self.prepare_frame_and_quota(&link_principal, stream_bytes, current_time_secs, quota)?;
@@ -474,7 +495,7 @@ impl IrohCarrierAdapterV1 {
             .map_err(|_| IrohCarrierError::Envelope(VerifyError::InvalidSenderKey))?;
         let binding = self.bind_sealed_originator(link_principal, originator)?;
         envelope
-            .verify_authenticated(replay_guard, current_time_secs)
+            .verify_authenticated_with_policy(replay_guard, current_time_secs, version_policy)
             .map_err(IrohCarrierError::Envelope)?;
         Ok((AcceptedIrohEnvelopeV1 { binding, envelope }, rest))
     }
@@ -818,7 +839,7 @@ impl IrohEndpointBridgeV1 {
     }
 
     /// Accept one live `1-RTT` QUIC frame and admit a direct [`MessageEnvelope`] under
-    /// pre-auth link quota + replay protection.
+    /// pre-auth link quota + replay protection + strict [`EnvelopeVersionPolicyV1::RequireV2`].
     pub async fn accept_envelope_over_quic(
         &self,
         receiver_nonce: [u8; 16],
@@ -826,13 +847,34 @@ impl IrohEndpointBridgeV1 {
         current_time_secs: u32,
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
     ) -> Result<AcceptedIrohEnvelopeV1, IrohCarrierError> {
+        self.accept_envelope_over_quic_with_policy(
+            receiver_nonce,
+            replay_guard,
+            current_time_secs,
+            quota,
+            EnvelopeVersionPolicyV1::RequireV2,
+        )
+        .await
+    }
+
+    /// Accept one live `1-RTT` QUIC frame and admit a direct [`MessageEnvelope`] under
+    /// an explicit [`EnvelopeVersionPolicyV1`].
+    pub async fn accept_envelope_over_quic_with_policy(
+        &self,
+        receiver_nonce: [u8; 16],
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+        version_policy: EnvelopeVersionPolicyV1,
+    ) -> Result<AcceptedIrohEnvelopeV1, IrohCarrierError> {
         let (principal, wire_frame) = self.accept_1rtt_frame(receiver_nonce).await?;
-        let (accepted, rest) = self.adapter.accept_envelope_frame(
+        let (accepted, rest) = self.adapter.accept_envelope_frame_with_policy(
             principal,
             &wire_frame,
             replay_guard,
             current_time_secs,
             quota,
+            version_policy,
         )?;
         if !rest.is_empty() {
             return Err(IrohCarrierError::Carrier(
@@ -964,14 +1006,30 @@ mod tests {
             .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
             .with_cohort_allowlist(allowlist.clone());
 
-        // StrictOneToOne rejects relay link != originator WITHOUT mutating strict_replay!
+        // Default RequireV2 rejects legacy v1 envelopes cleanly without mutating strict_replay.
         assert!(matches!(
             strict_adapter.accept_envelope_frame(
-                relay_link,
+                direct_origin_link,
                 &wire_frame,
                 &mut strict_replay,
                 env.timestamp,
                 None
+            ),
+            Err(IrohCarrierError::Envelope(
+                VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+            ))
+        ));
+        assert_eq!(strict_replay.cache_size(), 0);
+
+        // StrictOneToOne rejects relay link != originator WITHOUT mutating strict_replay!
+        assert!(matches!(
+            strict_adapter.accept_envelope_frame_with_policy(
+                relay_link,
+                &wire_frame,
+                &mut strict_replay,
+                env.timestamp,
+                None,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
             ),
             Err(IrohCarrierError::Carrier(
                 CarrierError::StrictBindingMismatch { .. }
@@ -979,12 +1037,13 @@ mod tests {
         ));
         // Prove strict_replay remained clean: the exact same envelope succeeds over direct_origin_link!
         let (strict_direct, strict_rest) = strict_adapter
-            .accept_envelope_frame(
+            .accept_envelope_frame_with_policy(
                 direct_origin_link,
                 &wire_frame,
                 &mut strict_replay,
                 env.timestamp,
                 None,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
             )
             .unwrap();
         assert!(strict_rest.is_empty());
@@ -992,12 +1051,13 @@ mod tests {
 
         // DecoupledRelayAllowed admits and flags relayed_via_intermediary = true
         let (accepted_env, rest) = relay_adapter
-            .accept_envelope_frame(
+            .accept_envelope_frame_with_policy(
                 relay_link,
                 &wire_frame,
                 &mut relay_replay,
                 env.timestamp,
                 None,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
             )
             .unwrap();
         assert!(rest.is_empty());
@@ -1563,6 +1623,99 @@ mod tests {
         );
         s_next.unwrap();
         assert_eq!(r_next.unwrap().envelope.sequence, 2);
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn iroh_accept_envelope_over_quic_rejects_legacy_v0_and_v1_by_default_without_replay_mutation(
+    ) {
+        let origin_seed = [0x81; 32];
+        let server_seed = [0x82; 32];
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let scope = [0x61; 16];
+
+        let allowlist = CohortAllowlist::from_peers([origin_kp.peer_id()]);
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(allowlist);
+
+        // Legacy v0 rejected at frame level under RequireV2 without replay mutation.
+        let env_v0 = MessageEnvelope::new_legacy_v0(
+            *origin_kp.public_key(),
+            MessageType::Heartbeat,
+            vec![1],
+        )
+        .with_sequence(1)
+        .with_timestamp(1000)
+        .sign_with(&origin_auth);
+        let adapter = IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536);
+        let origin_link = attested_link(&adapter, &origin_auth, [0x19; 16]);
+        let v0_frame = adapter
+            .encode_wire_frame(&env_v0.serialize().unwrap())
+            .unwrap();
+        assert!(matches!(
+            adapter.accept_envelope_frame(origin_link, &v0_frame, &mut replay, 1000, None),
+            Err(IrohCarrierError::Envelope(
+                VerifyError::UnsupportedVersion { major: 0, minor: 1 }
+            ))
+        ));
+        assert_eq!(replay.cache_size(), 0);
+
+        // Live 1-RTT QUIC: default accept_envelope_over_quic rejects v1 without replay mutation,
+        // while accept_envelope_over_quic_with_policy(..., AllowLegacyV1AndV2) admits it!
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(server_seed, adapter)
+            .await
+            .unwrap();
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback(origin_seed, IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+
+        let env_v1 = MessageEnvelope::new_v1(
+            *origin_kp.public_key(),
+            scope,
+            1,
+            3,
+            MessageType::GradientUpdate,
+            vec![7, 8, 9],
+        )
+        .with_sequence(1)
+        .with_timestamp(1000)
+        .sign_with(&origin_auth);
+        let v1_bytes = env_v1.serialize().unwrap();
+        let addr = server_ep.addr();
+
+        let (s1, r1) = tokio::join!(
+            client_ep.send_frame_1rtt(addr.clone(), &v1_bytes),
+            server_ep.accept_envelope_over_quic([0x91; 16], &mut replay, 1000, None),
+        );
+        s1.unwrap();
+        assert!(matches!(
+            r1,
+            Err(IrohCarrierError::Envelope(
+                VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+            ))
+        ));
+        assert_eq!(replay.cache_size(), 0);
+
+        let (s2, r2) = tokio::join!(
+            client_ep.send_frame_1rtt(addr, &v1_bytes),
+            server_ep.accept_envelope_over_quic_with_policy(
+                [0x92; 16],
+                &mut replay,
+                1000,
+                None,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            ),
+        );
+        s2.unwrap();
+        let accepted = r2.unwrap();
+        assert_eq!(accepted.envelope.payload, vec![7, 8, 9]);
+        assert_eq!(replay.cache_size(), 1);
 
         client_ep.close().await;
         server_ep.close().await;

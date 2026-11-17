@@ -14,7 +14,9 @@ use swarm_torch_net::gossip::{
     BundledGossipDeliveryV1, BundledGossipDeliveryV2, GossipVerifyError,
     DEFAULT_MAX_GOSSIP_DELIVERY_BYTES,
 };
-use swarm_torch_net::protocol::{MessageEnvelope, VerifyError, DEFAULT_MAX_ENVELOPE_BYTES};
+use swarm_torch_net::protocol::{
+    EnvelopeVersionPolicyV1, MessageEnvelope, VerifyError, DEFAULT_MAX_ENVELOPE_BYTES,
+};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::Subscriber;
 use zenoh::sample::Sample;
@@ -127,7 +129,7 @@ impl ZenohCarrierAdapterV1 {
     /// 1. Strictly parses `key_expr` before inspecting `payload_bytes`,
     /// 2. Boundedly deserializes [`MessageEnvelope`],
     /// 3. Enforces topic `(scope, round_id, originator)` agreement BEFORE touching `replay_guard`,
-    /// 4. Runs full 6-stage [`MessageEnvelope::verify_authenticated`].
+    /// 4. Runs full 6-stage [`MessageEnvelope::verify_authenticated`] (strict `RequireV2`).
     pub fn receive_envelope(
         &self,
         key_expr: &str,
@@ -135,11 +137,30 @@ impl ZenohCarrierAdapterV1 {
         replay_guard: &mut ReplayProtection,
         current_time_secs: u32,
     ) -> Result<(ZenohTopicContractV1, MessageEnvelope), ZenohCarrierError> {
+        self.receive_envelope_with_policy(
+            key_expr,
+            payload_bytes,
+            replay_guard,
+            current_time_secs,
+            EnvelopeVersionPolicyV1::RequireV2,
+        )
+    }
+
+    /// Parse topic, deserialize envelope, bind topic identity, and verify with explicit
+    /// [`EnvelopeVersionPolicyV1`].
+    pub fn receive_envelope_with_policy(
+        &self,
+        key_expr: &str,
+        payload_bytes: &[u8],
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        version_policy: EnvelopeVersionPolicyV1,
+    ) -> Result<(ZenohTopicContractV1, MessageEnvelope), ZenohCarrierError> {
         let topic = ZenohTopicContractV1::parse_key_expr(key_expr)?;
         let env = MessageEnvelope::deserialize_bounded(payload_bytes, self.max_payload_bytes)
             .map_err(ZenohCarrierError::Envelope)?;
         topic.verify_matches_envelope(&env)?;
-        env.verify_authenticated(replay_guard, current_time_secs)
+        env.verify_authenticated_with_policy(replay_guard, current_time_secs, version_policy)
             .map_err(ZenohCarrierError::Envelope)?;
         Ok((topic, env))
     }
@@ -343,11 +364,27 @@ impl ZenohSessionBridgeV1 {
 
 impl ZenohValidatedSubscriberV1 {
     /// Wait for the next published sample and validate topic + signature + replay contract
-    /// before mutating `replay_guard`.
+    /// under strict [`EnvelopeVersionPolicyV1::RequireV2`] before mutating `replay_guard`.
     pub async fn recv_envelope(
         &self,
         replay_guard: &mut ReplayProtection,
         current_time_secs: u32,
+    ) -> Result<(ZenohTopicContractV1, MessageEnvelope), ZenohCarrierError> {
+        self.recv_envelope_with_policy(
+            replay_guard,
+            current_time_secs,
+            EnvelopeVersionPolicyV1::RequireV2,
+        )
+        .await
+    }
+
+    /// Wait for the next published sample and validate topic + signature + replay contract
+    /// under an explicit [`EnvelopeVersionPolicyV1`] before mutating `replay_guard`.
+    pub async fn recv_envelope_with_policy(
+        &self,
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        version_policy: EnvelopeVersionPolicyV1,
     ) -> Result<(ZenohTopicContractV1, MessageEnvelope), ZenohCarrierError> {
         let sample = self
             .subscriber
@@ -362,11 +399,12 @@ impl ZenohValidatedSubscriberV1 {
             }));
         }
         let payload = sample.payload().to_bytes();
-        self.adapter.receive_envelope(
+        self.adapter.receive_envelope_with_policy(
             sample.key_expr().as_str(),
             payload.as_ref(),
             replay_guard,
             current_time_secs,
+            version_policy,
         )
     }
 
@@ -481,9 +519,24 @@ mod tests {
             Err(ZenohCarrierError::Carrier(CarrierError::InvalidZenohTopic))
         ));
 
-        // Authentic canonical topic succeeds cleanly
+        // Default RequireV2 rejects legacy v1 cleanly without mutating replay state.
+        assert!(matches!(
+            adapter.receive_envelope(&canonical_topic, &payload, &mut replay, env.timestamp),
+            Err(ZenohCarrierError::Envelope(
+                VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+            ))
+        ));
+        assert_eq!(replay.cache_size(), 0);
+
+        // Authentic canonical topic succeeds cleanly under explicit legacy policy
         let (parsed, verified_env) = adapter
-            .receive_envelope(&canonical_topic, &payload, &mut replay, env.timestamp)
+            .receive_envelope_with_policy(
+                &canonical_topic,
+                &payload,
+                &mut replay,
+                env.timestamp,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            )
             .unwrap();
         assert_eq!(parsed.round_id, 7);
         assert_eq!(verified_env.sender_peer_id().unwrap(), orig_kp.peer_id());
@@ -807,6 +860,114 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(accepted_after_idle.sequence, 3);
+
+        drop(sub);
+        bridge_pub.close().await.unwrap();
+        bridge_sub.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zenoh_rejects_v0_topic_mismatch_and_live_recv_envelope_rejects_v1_by_default() {
+        let orig_kp = KeyPair::from_seed([0x91; 32]).unwrap();
+        let orig_auth = MessageAuth::new(orig_kp.clone());
+        let scope = [0x55; 16];
+        let adapter = ZenohCarrierAdapterV1::default();
+
+        let allowlist = CohortAllowlist::from_peers([orig_kp.peer_id()]);
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(allowlist);
+
+        // Legacy v0 rejected at topic binding even under AllowLegacyAll without touching replay.
+        let env_v0 =
+            MessageEnvelope::new_legacy_v0(*orig_kp.public_key(), MessageType::Heartbeat, vec![1])
+                .with_sequence(1)
+                .with_timestamp(1000)
+                .sign_with(&orig_auth);
+        let zero_topic = ZenohTopicContractV1::new([0u8; 16], 0, orig_kp.peer_id()).to_key_expr();
+        assert!(matches!(
+            adapter.receive_envelope_with_policy(
+                &zero_topic,
+                &env_v0.serialize().unwrap(),
+                &mut replay,
+                1000,
+                EnvelopeVersionPolicyV1::AllowLegacyAll,
+            ),
+            Err(ZenohCarrierError::Carrier(
+                CarrierError::TopicIdentityMismatch
+            ))
+        ));
+        assert_eq!(replay.cache_size(), 0);
+
+        // Live Zenoh pub/sub: default recv_envelope rejects v1 without replay mutation,
+        // while recv_envelope_with_policy(..., AllowLegacyV1AndV2) admits it!
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen = vec![format!("tcp/127.0.0.1:{port}")];
+
+        let bridge_sub = ZenohSessionBridgeV1::open_tcp_peer(&listen, &[], adapter)
+            .await
+            .unwrap();
+        let bridge_pub = ZenohSessionBridgeV1::open_tcp_peer(&[], &listen, adapter)
+            .await
+            .unwrap();
+        let sub = bridge_sub.subscribe_swarm(scope, Some(5)).await.unwrap();
+
+        let env_v1 = MessageEnvelope::new_v1(
+            *orig_kp.public_key(),
+            scope,
+            1,
+            5,
+            MessageType::GradientUpdate,
+            vec![3, 1, 4],
+        )
+        .with_sequence(1)
+        .with_timestamp(1000)
+        .sign_with(&orig_auth);
+        let env_topic = ZenohCarrierAdapterV1::topic_for_envelope(&env_v1).unwrap();
+        let readiness = bridge_pub
+            .session()
+            .declare_publisher(&env_topic)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !readiness.matching_status().await.unwrap().matching() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        drop(readiness);
+
+        bridge_pub.publish_envelope(&env_v1).await.unwrap();
+        let strict_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope(&mut replay, 1000),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            strict_res,
+            Err(ZenohCarrierError::Envelope(
+                VerifyError::UnsupportedVersion { major: 0, minor: 2 }
+            ))
+        ));
+        assert_eq!(replay.cache_size(), 0);
+
+        bridge_pub.publish_envelope(&env_v1).await.unwrap();
+        let (_, accepted) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope_with_policy(
+                &mut replay,
+                1000,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepted.payload, vec![3, 1, 4]);
+        assert_eq!(replay.cache_size(), 1);
 
         drop(sub);
         bridge_pub.close().await.unwrap();

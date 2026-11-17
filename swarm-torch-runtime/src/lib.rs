@@ -4,8 +4,8 @@
 //!
 //! Separates monotonic clock/timer progression from fallible task admission (`try_spawn`),
 //! clamps `u128` millisecond conversions without narrowing wraparound, aligns
-//! [`tokio_runtime::TokioRuntime`] to `tokio::time::Instant`, and gates 64-bit atomics
-//! behind `#[cfg(target_has_atomic = "64")]` for 32-bit MCU portability.
+//! [`tokio_runtime::TokioRuntime`] to `tokio::time::Instant`, and uses `portable-atomic`
+//! (`fallback` + `critical-section`) when `#[cfg(not(target_has_atomic = "64"))]` (`Decision A6`).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -334,11 +334,11 @@ pub mod embassy_runtime {
     }
 }
 
-/// Deterministic mock runtime for testing (`ADR-0003`, `W9-04`, `W10-03`).
+/// Mock runtime module for deterministic testing (`ADR-0003`, `W9-04`, `W10-03`).
 ///
-/// Uses `AtomicU64` when `target_has_atomic = "64"` is available, and falls back to
-/// `AtomicU32` pairs on 32-bit embedded targets (`thumbv6m`, `riscv32i`) so `MockRuntime`
-/// remains `Send + Sync` without requiring 64-bit hardware atomics.
+/// Uses `core::sync::atomic::AtomicU64` when `target_has_atomic = "64"` and
+/// `portable_atomic::AtomicU64` (`fallback` + `critical-section`) on 32-bit targets
+/// lacking hardware 64-bit atomics (`Decision A6`), avoiding non-atomic RMW races.
 ///
 /// When compiled with `feature = "std"`, `MockRuntime` also provides a bounded,
 /// deterministic FIFO task queue and deadline-ordered timer waker registry using
@@ -358,78 +358,43 @@ pub mod mock_runtime {
     /// Default maximum number of concurrent spawned tasks in [`MockRuntime`].
     pub const DEFAULT_MAX_MOCK_TASKS: usize = 256;
 
-    #[cfg(target_has_atomic = "64")]
-    #[derive(Debug, Default)]
-    struct PortableU64Clock {
-        ms: core::sync::atomic::AtomicU64,
-    }
+    /// Default maximum number of pending deterministic timers retained in [`MockRuntime`].
+    pub const DEFAULT_MAX_MOCK_TIMERS: usize = 4_096;
 
     #[cfg(target_has_atomic = "64")]
+    use core::sync::atomic::{AtomicU64 as InnerAtomicU64, Ordering as AtomicU64Ordering};
+    #[cfg(not(target_has_atomic = "64"))]
+    use portable_atomic::{AtomicU64 as InnerAtomicU64, Ordering as AtomicU64Ordering};
+
+    #[derive(Debug, Default)]
+    struct PortableU64Clock {
+        ms: InnerAtomicU64,
+    }
+
     impl PortableU64Clock {
         const fn new(initial: u64) -> Self {
             Self {
-                ms: core::sync::atomic::AtomicU64::new(initial),
+                ms: InnerAtomicU64::new(initial),
             }
         }
 
         fn load(&self) -> u64 {
-            use core::sync::atomic::Ordering;
-            self.ms.load(Ordering::SeqCst)
+            self.ms.load(AtomicU64Ordering::SeqCst)
         }
 
         fn saturating_add(&self, delta: u64) {
-            use core::sync::atomic::Ordering;
-            // Explicit CAS loop: `fetch_update` is deprecated in favour of
-            // `try_update` on newer toolchains, but `try_update` is unavailable
-            // on the 1.75 MSRV. This loop is semantically identical on both.
-            let mut cur = self.ms.load(Ordering::SeqCst);
+            let mut cur = self.ms.load(AtomicU64Ordering::SeqCst);
             loop {
                 match self.ms.compare_exchange_weak(
                     cur,
                     cur.saturating_add(delta),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
+                    AtomicU64Ordering::SeqCst,
+                    AtomicU64Ordering::SeqCst,
                 ) {
                     Ok(_) => break,
                     Err(observed) => cur = observed,
                 }
             }
-        }
-    }
-
-    #[cfg(not(target_has_atomic = "64"))]
-    #[derive(Debug, Default)]
-    struct PortableU64Clock {
-        lo: core::sync::atomic::AtomicU32,
-        hi: core::sync::atomic::AtomicU32,
-    }
-
-    #[cfg(not(target_has_atomic = "64"))]
-    impl PortableU64Clock {
-        const fn new(initial: u64) -> Self {
-            Self {
-                lo: core::sync::atomic::AtomicU32::new(initial as u32),
-                hi: core::sync::atomic::AtomicU32::new((initial >> 32) as u32),
-            }
-        }
-
-        fn load(&self) -> u64 {
-            use core::sync::atomic::Ordering;
-            loop {
-                let hi1 = self.hi.load(Ordering::Acquire);
-                let lo = self.lo.load(Ordering::Acquire);
-                let hi2 = self.hi.load(Ordering::Acquire);
-                if hi1 == hi2 {
-                    return ((hi1 as u64) << 32) | (lo as u64);
-                }
-            }
-        }
-
-        fn saturating_add(&self, delta: u64) {
-            use core::sync::atomic::Ordering;
-            let next = self.load().saturating_add(delta);
-            self.hi.store((next >> 32) as u32, Ordering::Release);
-            self.lo.store(next as u32, Ordering::Release);
         }
     }
 
@@ -439,11 +404,15 @@ pub mod mock_runtime {
     #[cfg(feature = "std")]
     struct MockSchedulerInner {
         max_tasks: usize,
+        max_timers: usize,
         deterministic_timers: bool,
         next_task_id: u64,
         next_timer_id: u64,
         active_task_count: usize,
+        rejected_timer_registrations: u64,
         tasks: BTreeMap<u64, BoxFuture>,
+        in_flight_tasks: BTreeSet<u64>,
+        rewake_pending: BTreeSet<u64>,
         runnable_queue: VecDeque<u64>,
         runnable_set: BTreeSet<u64>,
         timers: BTreeMap<(u64, u64), Waker>,
@@ -451,14 +420,18 @@ pub mod mock_runtime {
 
     #[cfg(feature = "std")]
     impl MockSchedulerInner {
-        fn new(max_tasks: usize, deterministic_timers: bool) -> Self {
+        fn new(max_tasks: usize, max_timers: usize, deterministic_timers: bool) -> Self {
             Self {
                 max_tasks,
+                max_timers,
                 deterministic_timers,
                 next_task_id: 1,
                 next_timer_id: 1,
                 active_task_count: 0,
+                rejected_timer_registrations: 0,
                 tasks: BTreeMap::new(),
+                in_flight_tasks: BTreeSet::new(),
+                rewake_pending: BTreeSet::new(),
                 runnable_queue: VecDeque::new(),
                 runnable_set: BTreeSet::new(),
                 timers: BTreeMap::new(),
@@ -466,6 +439,15 @@ pub mod mock_runtime {
         }
 
         fn enqueue_runnable(&mut self, task_id: u64) {
+            if self.in_flight_tasks.contains(&task_id) {
+                // Defer re-enqueue until the currently executing poll returns the future,
+                // preventing another worker thread from consuming the wake and dropping it.
+                self.rewake_pending.insert(task_id);
+                return;
+            }
+            if !self.tasks.contains_key(&task_id) {
+                return;
+            }
             if self.runnable_set.insert(task_id) {
                 self.runnable_queue.push_back(task_id);
             }
@@ -516,31 +498,38 @@ pub mod mock_runtime {
             }
             #[cfg(feature = "std")]
             if self.deterministic {
-                if self.runtime.now() >= self.deadline_ms {
-                    if let Some(tid) = self.timer_id.take() {
-                        if let Some(ref sched) = self.runtime.scheduler {
-                            if let Ok(mut guard) = sched.lock() {
-                                guard.timers.remove(&(self.deadline_ms, tid));
-                            }
-                        }
-                    }
-                    self.completed = true;
-                    return Poll::Ready(());
-                }
                 if let Some(ref sched) = self.runtime.scheduler {
                     if let Ok(mut guard) = sched.lock() {
-                        let tid = match self.timer_id {
-                            Some(id) => id,
-                            None => {
-                                let id = guard.next_timer_id;
-                                guard.next_timer_id = guard.next_timer_id.saturating_add(1);
-                                self.timer_id = Some(id);
-                                id
+                        // Lock `sched` BEFORE re-reading `runtime.now()` (`SeqCst`). Since
+                        // `advance()` stores `current_time_ms` BEFORE locking `sched` in
+                        // `wake_expired_timers()`, no wakeup can slip through TOCTOU between
+                        // reading `now` and inserting the timer.
+                        if self.runtime.now() >= self.deadline_ms {
+                            if let Some(tid) = self.timer_id.take() {
+                                guard.timers.remove(&(self.deadline_ms, tid));
                             }
-                        };
-                        guard
-                            .timers
-                            .insert((self.deadline_ms, tid), cx.waker().clone());
+                            drop(guard);
+                            self.completed = true;
+                            return Poll::Ready(());
+                        }
+                        if let Some(tid) = self.timer_id {
+                            guard
+                                .timers
+                                .insert((self.deadline_ms, tid), cx.waker().clone());
+                        } else if guard.timers.len() >= guard.max_timers {
+                            guard.rejected_timer_registrations =
+                                guard.rejected_timer_registrations.saturating_add(1);
+                        } else if let Some(next_id) = guard.next_timer_id.checked_add(1) {
+                            let tid = guard.next_timer_id;
+                            guard.next_timer_id = next_id;
+                            self.timer_id = Some(tid);
+                            guard
+                                .timers
+                                .insert((self.deadline_ms, tid), cx.waker().clone());
+                        } else {
+                            guard.rejected_timer_registrations =
+                                guard.rejected_timer_registrations.saturating_add(1);
+                        }
                     }
                 }
                 return Poll::Pending;
@@ -552,6 +541,21 @@ pub mod mock_runtime {
             }
             self.completed = true;
             core::task::Poll::Ready(())
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl Drop for MockSleepFuture<'_> {
+        fn drop(&mut self) {
+            if self.deterministic {
+                if let Some(tid) = self.timer_id.take() {
+                    if let Some(ref sched) = self.runtime.scheduler {
+                        if let Ok(mut guard) = sched.lock() {
+                            guard.timers.remove(&(self.deadline_ms, tid));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -584,6 +588,7 @@ pub mod mock_runtime {
                 current_time_ms: PortableU64Clock::new(0),
                 scheduler: Some(Arc::new(Mutex::new(MockSchedulerInner::new(
                     DEFAULT_MAX_MOCK_TASKS,
+                    DEFAULT_MAX_MOCK_TIMERS,
                     false,
                 )))),
             }
@@ -601,12 +606,37 @@ pub mod mock_runtime {
         /// configurable task queue capacity (`ADR-0003`, `W10-03`).
         #[cfg(feature = "std")]
         pub fn with_deterministic_scheduler(max_tasks: usize) -> Self {
+            Self::with_deterministic_scheduler_limits(max_tasks, DEFAULT_MAX_MOCK_TIMERS)
+        }
+
+        /// Create a mock runtime with deterministic deadline-ordered timer futures and explicit
+        /// bounded `max_tasks` and `max_timers` capacities.
+        #[cfg(feature = "std")]
+        pub fn with_deterministic_scheduler_limits(max_tasks: usize, max_timers: usize) -> Self {
             Self {
                 current_time_ms: PortableU64Clock::new(0),
                 scheduler: Some(Arc::new(Mutex::new(MockSchedulerInner::new(
-                    max_tasks, true,
+                    max_tasks, max_timers, true,
                 )))),
             }
+        }
+
+        /// Number of pending deterministic timers currently registered in the scheduler.
+        #[cfg(feature = "std")]
+        pub fn pending_timer_count(&self) -> usize {
+            self.scheduler
+                .as_ref()
+                .and_then(|s| s.lock().ok().map(|g| g.timers.len()))
+                .unwrap_or(0)
+        }
+
+        /// Total number of new timer registrations rejected due to timer capacity or ID limits.
+        #[cfg(feature = "std")]
+        pub fn rejected_timer_registrations(&self) -> u64 {
+            self.scheduler
+                .as_ref()
+                .and_then(|s| s.lock().ok().map(|g| g.rejected_timer_registrations))
+                .unwrap_or(0)
         }
 
         /// Advance the mock clock by `duration`, saturating at `u64::MAX` milliseconds,
@@ -620,11 +650,14 @@ pub mod mock_runtime {
 
         #[cfg(feature = "std")]
         fn wake_expired_timers(&self) {
-            let now = self.now();
             let Some(ref sched) = self.scheduler else {
                 return;
             };
             let wakers: std::vec::Vec<Waker> = if let Ok(mut guard) = sched.lock() {
+                if guard.timers.is_empty() {
+                    return;
+                }
+                let now = self.now();
                 let expired_keys: std::vec::Vec<(u64, u64)> = guard
                     .timers
                     .keys()
@@ -665,7 +698,15 @@ pub mod mock_runtime {
                         break;
                     };
                     guard.runnable_set.remove(&task_id);
-                    guard.tasks.remove(&task_id).map(|fut| (task_id, fut))
+                    if guard.in_flight_tasks.contains(&task_id) {
+                        guard.rewake_pending.insert(task_id);
+                        None
+                    } else if let Some(fut) = guard.tasks.remove(&task_id) {
+                        guard.in_flight_tasks.insert(task_id);
+                        Some((task_id, fut))
+                    } else {
+                        None
+                    }
                 };
                 let Some((task_id, mut fut)) = next_item else {
                     continue;
@@ -679,13 +720,19 @@ pub mod mock_runtime {
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(()) => {
                         if let Ok(mut guard) = sched.lock() {
+                            guard.in_flight_tasks.remove(&task_id);
+                            guard.rewake_pending.remove(&task_id);
                             guard.active_task_count = guard.active_task_count.saturating_sub(1);
                             guard.runnable_set.remove(&task_id);
                         }
                     }
                     Poll::Pending => {
                         if let Ok(mut guard) = sched.lock() {
+                            guard.in_flight_tasks.remove(&task_id);
                             guard.tasks.insert(task_id, fut);
+                            if guard.rewake_pending.remove(&task_id) {
+                                guard.enqueue_runnable(task_id);
+                            }
                         }
                     }
                 }
@@ -776,14 +823,16 @@ pub mod mock_runtime {
                 return Err(SpawnError::ExecutorSpawnerRequired);
             };
             let mut guard = sched.lock().map_err(|_| SpawnError::RuntimeUnavailable)?;
-            if guard.max_tasks == 0 {
+            if guard.max_tasks == 0 || guard.active_task_count >= guard.max_tasks {
+                drop(guard);
                 return Err(SpawnError::CapacityExhausted);
             }
-            if guard.active_task_count >= guard.max_tasks {
+            let Some(next_id) = guard.next_task_id.checked_add(1) else {
+                drop(guard);
                 return Err(SpawnError::CapacityExhausted);
-            }
+            };
             let task_id = guard.next_task_id;
-            guard.next_task_id = guard.next_task_id.saturating_add(1);
+            guard.next_task_id = next_id;
             guard.active_task_count += 1;
             guard.tasks.insert(task_id, Box::pin(future));
             guard.enqueue_runnable(task_id);
@@ -858,6 +907,462 @@ pub mod mock_runtime {
             rt.advance_and_run(Duration::from_millis(30));
             assert_eq!(*events.lock().unwrap(), std::vec![20, 50]);
             assert_eq!(rt.active_task_count(), 0);
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_sleep_future_drop_cancels_timer_and_enforces_max_timers() {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+
+            struct CountWake(AtomicUsize);
+            impl Wake for CountWake {
+                fn wake(self: Arc<Self>) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let rt = MockRuntime::with_deterministic_scheduler_limits(8, 2);
+            let woke = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&woke));
+            let mut cx = Context::from_waker(&waker);
+
+            let mut f1 = Box::pin(rt.sleep(Duration::from_millis(50)));
+            let mut f2 = Box::pin(rt.sleep(Duration::from_millis(50)));
+            let mut f3 = Box::pin(rt.sleep(Duration::from_millis(50)));
+
+            assert!(matches!(f1.as_mut().poll(&mut cx), Poll::Pending));
+            assert!(matches!(f2.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(rt.pending_timer_count(), 2);
+            assert_eq!(rt.rejected_timer_registrations(), 0);
+
+            // Re-polling an already registered future updates in place without consuming extra capacity.
+            assert!(matches!(f1.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(rt.pending_timer_count(), 2);
+            assert_eq!(rt.rejected_timer_registrations(), 0);
+
+            // A 3rd distinct sleep future exceeds `max_timers = 2` -> bounded reject!
+            assert!(matches!(f3.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(rt.pending_timer_count(), 2);
+            assert_eq!(rt.rejected_timer_registrations(), 1);
+
+            // Dropping `f1` before deadline cancels its timer and reclaims capacity immediately.
+            drop(f1);
+            assert_eq!(rt.pending_timer_count(), 1);
+
+            assert!(matches!(f3.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(rt.pending_timer_count(), 2);
+
+            rt.advance(Duration::from_millis(60));
+            assert_eq!(rt.pending_timer_count(), 0);
+            assert_eq!(woke.0.load(Ordering::SeqCst), 2);
+            assert!(matches!(f2.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert!(matches!(f3.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_runtime_preserves_mid_poll_and_concurrent_wakeups_without_toctou_loss() {
+            use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::Barrier;
+
+            struct SelfRewakeOnce {
+                polled: Arc<AtomicUsize>,
+                done: Arc<AtomicBool>,
+            }
+            impl Future for SelfRewakeOnce {
+                type Output = ();
+                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                    let prev = self.polled.fetch_add(1, Ordering::SeqCst);
+                    if prev == 0 {
+                        // Mid-poll wake: while another thread calls poll_ready_tasks(), this wake
+                        // MUST defer via `rewake_pending` and never be lost!
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        self.done.store(true, Ordering::SeqCst);
+                        Poll::Ready(())
+                    }
+                }
+            }
+
+            let rt = Arc::new(MockRuntime::with_deterministic_scheduler(32));
+            let polled = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicBool::new(false));
+            rt.try_spawn(SelfRewakeOnce {
+                polled: Arc::clone(&polled),
+                done: Arc::clone(&done),
+            })
+            .unwrap();
+
+            // Stress concurrent poll_ready_tasks() across two threads so a queued mid-poll wake cannot drop.
+            let barrier = Arc::new(Barrier::new(2));
+            let rt_bg = Arc::clone(&rt);
+            let b_bg = Arc::clone(&barrier);
+            let t = std::thread::spawn(move || {
+                b_bg.wait();
+                for _ in 0..8 {
+                    let _ = rt_bg.poll_ready_tasks();
+                }
+            });
+            barrier.wait();
+            for _ in 0..8 {
+                let _ = rt.poll_ready_tasks();
+            }
+            t.join().unwrap();
+            assert!(
+                done.load(Ordering::SeqCst),
+                "mid-poll wake must not be dropped across concurrent poll_ready_tasks"
+            );
+            assert_eq!(rt.active_task_count(), 0);
+
+            // Hammer `MockSleepFuture::poll` vs concurrent `advance(1ms)` after fixing `deadline_ms`
+            // to prove zero poll/advance TOCTOU wakeup loss across all thread interleavings.
+            let clock_rt = Arc::new(MockRuntime::with_deterministic_scheduler(64));
+            for i in 0..50u64 {
+                let c_rt = Arc::clone(&clock_rt);
+                let finished = Arc::new(AtomicBool::new(false));
+                let fin_task = Arc::clone(&finished);
+                let b2 = Arc::new(Barrier::new(2));
+                let b2_task = Arc::clone(&b2);
+                clock_rt
+                    .try_spawn(async move {
+                        let sleeper = c_rt.sleep(Duration::from_millis(1));
+                        b2_task.wait();
+                        sleeper.await;
+                        fin_task.store(true, Ordering::SeqCst);
+                    })
+                    .unwrap();
+
+                let adv_rt = Arc::clone(&clock_rt);
+                let b2_adv = Arc::clone(&b2);
+                let adv = std::thread::spawn(move || {
+                    b2_adv.wait();
+                    adv_rt.advance(Duration::from_millis(1));
+                });
+                let _ = clock_rt.poll_ready_tasks();
+                adv.join().unwrap();
+                let _ = clock_rt.poll_ready_tasks();
+                assert!(
+                    finished.load(Ordering::SeqCst),
+                    "iteration {i}: timer wakeup lost to advance/poll TOCTOU race"
+                );
+            }
+            assert_eq!(clock_rt.active_task_count(), 0);
+            assert_eq!(clock_rt.pending_timer_count(), 0);
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_runtime_clock_concurrent_saturating_add_preserves_all_increments() {
+            let rt = Arc::new(MockRuntime::new());
+            let mut handles = std::vec::Vec::new();
+            for _ in 0..4 {
+                let r = Arc::clone(&rt);
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..250 {
+                        r.advance(Duration::from_millis(1));
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(rt.now(), 1_000);
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_sleep_future_repoll_after_completion_zero_limits_and_same_deadline_fifo() {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+
+            struct NoopWake;
+            impl Wake for NoopWake {
+                fn wake(self: Arc<Self>) {}
+            }
+
+            let waker = Waker::from(Arc::new(NoopWake));
+            let mut cx = Context::from_waker(&waker);
+
+            // (0, 0) zero limits: non-zero sleep fails capacity check; zero sleep completes without slot.
+            let zero_rt = MockRuntime::with_deterministic_scheduler_limits(0, 0);
+            assert_eq!(
+                zero_rt.try_spawn(async {}),
+                Err(SpawnError::CapacityExhausted)
+            );
+            assert_eq!(zero_rt.active_task_count(), 0);
+
+            let mut pending_sleep = Box::pin(zero_rt.sleep(Duration::from_millis(10)));
+            assert!(matches!(
+                pending_sleep.as_mut().poll(&mut cx),
+                Poll::Pending
+            ));
+            assert_eq!(zero_rt.pending_timer_count(), 0);
+            assert_eq!(zero_rt.rejected_timer_registrations(), 1);
+            drop(pending_sleep);
+
+            let mut zero_sleep = Box::pin(zero_rt.sleep(Duration::ZERO));
+            assert!(matches!(zero_sleep.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert_eq!(zero_rt.pending_timer_count(), 0);
+            assert_eq!(zero_rt.rejected_timer_registrations(), 1);
+            // Re-polling after completion must stay Ready(()) without consuming timer capacity.
+            assert!(matches!(zero_sleep.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert_eq!(zero_rt.rejected_timer_registrations(), 1);
+
+            // Re-polling a completed timer when capacity = 1 is occupied by another pending timer.
+            let cap1_rt = MockRuntime::with_deterministic_scheduler_limits(4, 1);
+            let mut done_sleep = Box::pin(cap1_rt.sleep(Duration::from_millis(10)));
+            assert!(matches!(done_sleep.as_mut().poll(&mut cx), Poll::Pending));
+            cap1_rt.advance(Duration::from_millis(10));
+            assert!(matches!(done_sleep.as_mut().poll(&mut cx), Poll::Ready(())));
+
+            let mut occupier = Box::pin(cap1_rt.sleep(Duration::from_millis(50)));
+            assert!(matches!(occupier.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(cap1_rt.pending_timer_count(), 1);
+
+            assert!(matches!(done_sleep.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert_eq!(cap1_rt.pending_timer_count(), 1);
+            assert_eq!(cap1_rt.rejected_timer_registrations(), 0);
+            drop(occupier);
+            assert_eq!(cap1_rt.pending_timer_count(), 0);
+
+            // Shared deadline_ms uniqueness via `(deadline_ms, timer_id)` and FIFO order.
+            let order_rt = Arc::new(MockRuntime::with_deterministic_scheduler_limits(8, 8));
+            let order = Arc::new(Mutex::new(std::vec::Vec::<u32>::new()));
+            let completed = Arc::new(AtomicUsize::new(0));
+            for idx in 1..=3u32 {
+                let r = Arc::clone(&order_rt);
+                let o = Arc::clone(&order);
+                let c = Arc::clone(&completed);
+                order_rt
+                    .try_spawn(async move {
+                        r.sleep(Duration::from_millis(50)).await;
+                        o.lock().unwrap().push(idx);
+                        c.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+            }
+            assert_eq!(order_rt.poll_ready_tasks(), 3);
+            assert_eq!(order_rt.pending_timer_count(), 3);
+            order_rt.advance_and_run(Duration::from_millis(50));
+            assert_eq!(*order.lock().unwrap(), std::vec![1, 2, 3]);
+            assert_eq!(completed.load(Ordering::SeqCst), 3);
+            assert_eq!(order_rt.pending_timer_count(), 0);
+            assert_eq!(order_rt.active_task_count(), 0);
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_runtime_wake_during_ready_and_after_completion_and_rejected_drop() {
+            use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+            struct DropObserved {
+                rt: Arc<MockRuntime>,
+                drops: Arc<AtomicUsize>,
+            }
+            impl Drop for DropObserved {
+                fn drop(&mut self) {
+                    // Verify scheduler lock is NOT held when rejected future drops.
+                    let _ = self.rt.active_task_count();
+                    self.drops.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let rt = Arc::new(MockRuntime::with_deterministic_scheduler_limits(1, 4));
+            let drops = Arc::new(AtomicUsize::new(0));
+
+            // 1. Mid-poll wake right before returning Poll::Ready(()) must not leave zombie queue state.
+            let stashed_waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+            let sw_clone = Arc::clone(&stashed_waker);
+            let polls = Arc::new(AtomicUsize::new(0));
+            let p_clone = Arc::clone(&polls);
+            let gated = Arc::new(AtomicBool::new(false));
+            let g_clone = Arc::clone(&gated);
+
+            struct TwoPhaseSelfWake {
+                polls: Arc<AtomicUsize>,
+                gated: Arc<AtomicBool>,
+                stashed: Arc<Mutex<Option<Waker>>>,
+            }
+            impl Future for TwoPhaseSelfWake {
+                type Output = ();
+                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    *self.stashed.lock().unwrap() = Some(cx.waker().clone());
+                    if !self.gated.load(Ordering::SeqCst) {
+                        Poll::Pending
+                    } else {
+                        // Wake mid-poll AND immediately finish Ready(())!
+                        cx.waker().wake_by_ref();
+                        Poll::Ready(())
+                    }
+                }
+            }
+
+            let handle = rt
+                .try_spawn(TwoPhaseSelfWake {
+                    polls: p_clone,
+                    gated: g_clone,
+                    stashed: sw_clone,
+                })
+                .unwrap();
+            assert_eq!(handle.id(), 1);
+
+            // While task 1 is active (max_tasks = 1), spawning a 2nd task must reject and drop cleanly.
+            let d1 = DropObserved {
+                rt: Arc::clone(&rt),
+                drops: Arc::clone(&drops),
+            };
+            assert_eq!(
+                rt.try_spawn(async move {
+                    let _keep = d1;
+                }),
+                Err(SpawnError::CapacityExhausted)
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+            assert_eq!(rt.poll_ready_tasks(), 1);
+            assert_eq!(rt.active_task_count(), 1);
+
+            gated.store(true, Ordering::SeqCst);
+            let w = stashed_waker.lock().unwrap().take().unwrap();
+            w.wake_by_ref();
+            assert_eq!(rt.poll_ready_tasks(), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert_eq!(rt.active_task_count(), 0);
+            // Mid-poll wake before Poll::Ready must be cleared cleanly.
+            assert_eq!(rt.poll_ready_tasks(), 0);
+
+            // Firing a stashed Waker AFTER task completion must not enqueue dead task IDs.
+            w.wake();
+            {
+                let guard = rt.scheduler.as_ref().unwrap().lock().unwrap();
+                assert!(guard.runnable_queue.is_empty());
+                assert!(guard.runnable_set.is_empty());
+                assert!(guard.rewake_pending.is_empty());
+            }
+            assert_eq!(rt.poll_ready_tasks(), 0);
+        }
+
+        #[cfg(feature = "std")]
+        #[test]
+        fn mock_runtime_id_overflow_guards_reject_without_wraparound() {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+
+            struct NoopWake;
+            impl Wake for NoopWake {
+                fn wake(self: Arc<Self>) {}
+            }
+            struct DropFlag(Arc<AtomicUsize>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let rt = MockRuntime::with_deterministic_scheduler_limits(4, 4);
+            let waker = Waker::from(Arc::new(NoopWake));
+            let mut cx = Context::from_waker(&waker);
+
+            // Existing timer (id 1) and task (id 1) must stay intact when counters hit u64::MAX.
+            let mut first_timer = Box::pin(rt.sleep(Duration::from_millis(50)));
+            assert!(matches!(first_timer.as_mut().poll(&mut cx), Poll::Pending));
+            let first_task = rt
+                .try_spawn(async {})
+                .expect("first task id 1 must succeed");
+            assert_eq!(first_task.id(), 1);
+
+            {
+                let mut guard = rt.scheduler.as_ref().unwrap().lock().unwrap();
+                guard.next_timer_id = u64::MAX;
+                guard.next_task_id = u64::MAX;
+            }
+
+            let mut overflow_timer = Box::pin(rt.sleep(Duration::from_millis(50)));
+            assert!(matches!(
+                overflow_timer.as_mut().poll(&mut cx),
+                Poll::Pending
+            ));
+            assert_eq!(rt.pending_timer_count(), 1);
+            assert_eq!(rt.rejected_timer_registrations(), 1);
+
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let flag = DropFlag(Arc::clone(&drop_count));
+            assert_eq!(
+                rt.try_spawn(async move {
+                    let _keep = flag;
+                }),
+                Err(SpawnError::CapacityExhausted)
+            );
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            assert_eq!(rt.active_task_count(), 1);
+
+            {
+                let guard = rt.scheduler.as_ref().unwrap().lock().unwrap();
+                assert_eq!(guard.next_timer_id, u64::MAX);
+                assert_eq!(guard.next_task_id, u64::MAX);
+                assert!(guard.timers.contains_key(&(50, 1)));
+                assert!(guard.tasks.contains_key(&1));
+            }
+            drop(overflow_timer);
+            drop(first_timer);
+            assert_eq!(rt.pending_timer_count(), 0);
+        }
+
+        #[cfg(not(feature = "std"))]
+        #[test]
+        fn mock_runtime_no_std_try_spawn_fails_and_drops_cleanly() {
+            use core::pin::Pin;
+            use core::sync::atomic::{AtomicBool, Ordering};
+            use core::task::{Context, Poll};
+
+            static DROPPED: AtomicBool = AtomicBool::new(false);
+            struct DropFuture(&'static AtomicBool);
+            impl Future for DropFuture {
+                type Output = ();
+                fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                    Poll::Ready(())
+                }
+            }
+            impl Drop for DropFuture {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            DROPPED.store(false, Ordering::SeqCst);
+            let rt = MockRuntime::new();
+            let res = rt.try_spawn(DropFuture(&DROPPED));
+            assert_eq!(res, Err(SpawnError::ExecutorSpawnerRequired));
+            assert!(DROPPED.load(Ordering::SeqCst));
+        }
+
+        #[cfg(all(not(feature = "std"), feature = "alloc"))]
+        #[test]
+        fn mock_runtime_no_std_alloc_sleep_future_completes_once_and_idempotent_on_repoll() {
+            extern crate alloc;
+            use alloc::boxed::Box;
+            use alloc::sync::Arc;
+            use alloc::task::Wake;
+            use core::task::{Context, Poll, Waker};
+
+            struct NoopWake;
+            impl Wake for NoopWake {
+                fn wake(self: Arc<Self>) {}
+            }
+
+            let rt = MockRuntime::new();
+            let waker = Waker::from(Arc::new(NoopWake));
+            let mut cx = Context::from_waker(&waker);
+
+            let mut fut = Box::pin(rt.sleep(Duration::from_millis(25)));
+            assert_eq!(rt.now(), 25);
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(())));
+            assert_eq!(rt.now(), 25);
+
+            let mut max_fut = Box::pin(rt.sleep(Duration::MAX));
+            assert_eq!(rt.now(), u64::MAX);
+            assert!(matches!(max_fut.as_mut().poll(&mut cx), Poll::Ready(())));
         }
     }
 }

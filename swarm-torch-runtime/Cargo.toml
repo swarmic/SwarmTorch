@@ -28,6 +28,7 @@ embassy-std-test = ["embassy", "std", "embassy-executor/arch-std", "embassy-exec
 std = ["alloc", "embassy-time?/std"]
 alloc = []
 
+# Async runtime (Embassy/Tokio optional deps)
 [dependencies]
 # Tokio runtime (for std builds)
 tokio = { workspace = true, optional = true }
@@ -35,6 +36,11 @@ tokio = { workspace = true, optional = true }
 # Embassy runtime (for embedded builds)
 embassy-executor = { workspace = true, optional = true }
 embassy-time = { workspace = true, optional = true }
+
+# Race-free 64-bit atomics on 32-bit targets lacking native 64-bit hardware CAS/atomics (`Decision A6`).
+# Uses both `fallback` (32-bit CAS lock sharding, e.g. thumbv7em) and `critical-section` (e.g. thumbv6m / riscv32i).
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1.15", default-features = false, features = ["fallback", "critical-section"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }

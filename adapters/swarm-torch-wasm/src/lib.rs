@@ -1,30 +1,51 @@
 #![forbid(unsafe_code)]
-//! Isolated `wasmi 2.0` WebAssembly extension sandbox adapter for SwarmTorch (`ST-09`).
+//! Isolated `wasmi 2.0` WebAssembly extension sandbox adapter for SwarmTorch (`ST-09`, `Decision A2`).
 //!
-//! Implements [`swarm_torch::wasm_sandbox::WasmExtensionExecutor`] outside the core `swarm-torch`
-//! workspace so untrusted WebAssembly execution is isolated behind an explicit adapter boundary
-//! with:
-//! - SHA-256 module digest pinning and size/header validation via [`preflight_wasm_extension_v1`],
-//! - Zero host/WASI imports (`module.imports()` rejected fail-closed + empty [`wasmi::Linker`]),
-//! - Deterministic `wasmi` fuel metering across `start` and sliced resumable export calls,
-//! - Bounded wall-clock timeout enforcement (`WasmStoreLimitsV1::timeout_ms`) on every fuel slice,
-//! - Strict linear memory and table bounds via [`wasmi::StoreLimits`], and
-//! - Checked host-to-guest / guest-to-host linear memory transfers (`read_guest_slice`).
+//! **Maturity Tier:** `Integration verified` (scoped to `raw_mem0_v0`) — integrates `wasmi 2.0.0`
+//! behind [`swarm_torch::wasm_sandbox::WasmExtensionExecutor`] with end-to-end `Scheduler` +
+//! `NativeOpRunner` tests.
+//!
+//! **Guest ABI & `wasmi 2.0.0` Engine Scope (`Decision A2`):**
+//! - Byte-transform exports (`execute_byte_transform`) operate strictly under the `raw_mem0_v0`
+//!   contract: input payload bytes are written at linear memory offset `0` without a guest
+//!   `alloc` handshake, so modules with initialized `.data` segments at offset `0` are unsuitable
+//!   and must use scratch linear memory cleanly.
+//! - `wasmi 2.0.0` executes `Module::new` (eager compilation) and `Linker::instantiate_and_start`
+//!   synchronously without streaming compile interruption or resumable `start` ticks; `timeout_ms`
+//!   is checked pre-compile, post-compile, post-start, and between resumable `FUEL_SLICE_UNITS`
+//!   export slices, while synchronous `start` execution is bounded explicitly by
+//!   [`WasmStoreLimitsV1::max_start_fuel`](swarm_torch::wasm_sandbox::WasmStoreLimitsV1::max_start_fuel).
+//! - Both exported and un-exported internal tables/memories are enforced via `StoreLimits` + stack
+//!   depth (`DEFAULT_WASM_MAX_CALL_DEPTH`) and value-stack (`64 KiB`) engine hardening.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use swarm_torch::wasm_sandbox::{
     preflight_wasm_extension_v1, read_guest_slice, SandboxedExtensionPolicyV1,
-    WasmExecutionReceiptV1, WasmExtensionExecutor, WasmSandboxError, WASM_PAGE_BYTES,
+    WasmExecutionReceiptV1, WasmExtensionExecutor, WasmSandboxError, DEFAULT_WASM_MAX_CALL_DEPTH,
+    WASM_PAGE_BYTES,
 };
 use wasmi::{
-    errors::ErrorKind, CompilationMode, Config, EnforcedLimits, Engine, Extern, ExternType,
-    Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TrapCode,
-    TypedResumableCall,
+    errors::{EnforcedLimitsError, ErrorKind, InstantiationError},
+    CompilationMode, Config, EnforcedLimits, Engine, Extern, ExternType, Instance, Linker, Memory,
+    Module, Store, StoreLimits, StoreLimitsBuilder, TrapCode, TypedResumableCall,
 };
 
 /// Deterministic fuel slice charged between wall-clock timeout checks (`ST-09`).
 const FUEL_SLICE_UNITS: u64 = 10_000;
+
+/// Minimum initial `wasmi` value stack height (1 KiB).
+const DEFAULT_WASM_MIN_STACK_HEIGHT_BYTES: usize = 1_024;
+
+/// Maximum `wasmi` value stack height (64 KiB, tightened from wasmi's 1 MiB default).
+const DEFAULT_WASM_MAX_STACK_HEIGHT_BYTES: usize = 64 * 1024;
+
+static HARDENED_ENGINE: OnceLock<Engine> = OnceLock::new();
+
+fn shared_hardened_engine() -> &'static Engine {
+    HARDENED_ENGINE.get_or_init(build_hardened_engine)
+}
 
 /// Isolated `wasmi 2.0` implementation of [`WasmExtensionExecutor`] (`ST-09`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,8 +186,9 @@ fn prepare_instance(
     let started_at = Instant::now();
     check_timeout(started_at, policy.limits.timeout_ms)?;
 
-    let engine = build_hardened_engine();
-    let module = Module::new(&engine, wasm_bytes).map_err(map_compile_error)?;
+    let engine = shared_hardened_engine();
+    let module = Module::new(engine, wasm_bytes).map_err(map_compile_error)?;
+    check_timeout(started_at, policy.limits.timeout_ms)?;
 
     if let Some(import) = module.imports().next() {
         return Err(WasmSandboxError::ForbiddenImport {
@@ -228,17 +250,17 @@ fn prepare_instance(
         .trap_on_grow_failure(policy.limits.trap_on_grow_failure)
         .build();
 
-    let mut store = Store::new(&engine, store_limits);
+    let mut store = Store::new(engine, store_limits);
     store.limiter(|limits| limits);
-    let start_fuel_cap = policy.limits.max_fuel.min(FUEL_SLICE_UNITS);
+    let start_fuel_cap = policy.limits.max_fuel.min(policy.limits.max_start_fuel);
     store
         .set_fuel(start_fuel_cap)
         .map_err(|err| WasmSandboxError::ExecutionTrap(err.to_string()))?;
 
-    let linker = Linker::<StoreLimits>::new(&engine);
+    let linker = Linker::<StoreLimits>::new(engine);
     let instance = linker
         .instantiate_and_start(&mut store, &module)
-        .map_err(|err| map_instantiation_error(err, policy))?;
+        .map_err(|err| map_instantiation_error(err, policy, start_fuel_cap))?;
 
     check_timeout(started_at, policy.limits.timeout_ms)?;
     let unspent_start_fuel = store.get_fuel().unwrap_or(0);
@@ -347,40 +369,61 @@ fn build_hardened_engine() -> Engine {
     config.wasm_reference_types(false);
     config.wasm_tail_call(false);
     config.wasm_custom_page_sizes(false);
+    config.set_min_stack_height(DEFAULT_WASM_MIN_STACK_HEIGHT_BYTES);
+    config.set_max_stack_height(DEFAULT_WASM_MAX_STACK_HEIGHT_BYTES);
+    config.set_max_recursion_depth(DEFAULT_WASM_MAX_CALL_DEPTH);
     config.enforced_limits(EnforcedLimits::strict());
     Engine::new(&config)
 }
 
 fn map_compile_error(err: wasmi::Error) -> WasmSandboxError {
-    let msg = err.to_string();
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("multi-memory") || lower.contains("multiple memories") {
-        WasmSandboxError::MultipleMemoriesForbidden
-    } else if lower.contains("multiple tables") {
-        WasmSandboxError::MultipleTablesForbidden
-    } else {
-        WasmSandboxError::MalformedSectionOrLeb128
+    match err.kind() {
+        ErrorKind::UserLimits(EnforcedLimitsError::TooManyMemories { .. }) => {
+            WasmSandboxError::MultipleMemoriesForbidden
+        }
+        ErrorKind::UserLimits(EnforcedLimitsError::TooManyTables { .. }) => {
+            WasmSandboxError::MultipleTablesForbidden
+        }
+        _ => {
+            let msg = err.to_string();
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("multi-memory") || lower.contains("multiple memories") {
+                WasmSandboxError::MultipleMemoriesForbidden
+            } else if lower.contains("multiple tables") || lower.contains("tables count") {
+                WasmSandboxError::MultipleTablesForbidden
+            } else {
+                WasmSandboxError::MalformedSectionOrLeb128
+            }
+        }
     }
 }
 
 fn map_instantiation_error(
     err: wasmi::Error,
     policy: &SandboxedExtensionPolicyV1,
+    start_fuel_cap: u64,
 ) -> WasmSandboxError {
     match err.kind() {
         ErrorKind::TrapCode(TrapCode::OutOfFuel) | ErrorKind::Fuel(_) => {
             WasmSandboxError::OutOfFuel {
-                consumed: policy.limits.max_fuel,
-                limit: policy.limits.max_fuel,
+                consumed: start_fuel_cap,
+                limit: start_fuel_cap,
             }
         }
-        ErrorKind::TrapCode(TrapCode::GrowthOperationLimited) | ErrorKind::Memory(_) => {
-            WasmSandboxError::MemoryLimitExceeded {
-                requested_pages: policy.limits.max_memory_pages.saturating_add(1),
-                max_pages: policy.limits.max_memory_pages,
-            }
+        ErrorKind::Instantiation(InstantiationError::TooManyMemories) => {
+            WasmSandboxError::MultipleMemoriesForbidden
         }
-        ErrorKind::Table(_) => WasmSandboxError::TableLimitExceeded {
+        ErrorKind::Instantiation(InstantiationError::TooManyTables) => {
+            WasmSandboxError::MultipleTablesForbidden
+        }
+        ErrorKind::Instantiation(InstantiationError::FailedToInstantiateMemory(_))
+        | ErrorKind::TrapCode(TrapCode::GrowthOperationLimited)
+        | ErrorKind::Memory(_) => WasmSandboxError::MemoryLimitExceeded {
+            requested_pages: policy.limits.max_memory_pages.saturating_add(1),
+            max_pages: policy.limits.max_memory_pages,
+        },
+        ErrorKind::Instantiation(InstantiationError::FailedToInstantiateTable(_))
+        | ErrorKind::Table(_) => WasmSandboxError::TableLimitExceeded {
             requested: policy.limits.max_table_elements.saturating_add(1),
             max: policy.limits.max_table_elements,
         },
@@ -1046,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_start_section_loop_is_capped_at_fuel_slice_units() {
+    fn wasm_start_section_loop_is_capped_by_explicit_max_start_fuel_policy() {
         let mut start_loop = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
         push_section(&mut start_loop, 1, &[2, 0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f]);
         push_section(&mut start_loop, 3, &[2, 0, 1]);
@@ -1069,16 +1112,379 @@ mod tests {
             SandboxedExtensionPolicyV1::sha256_module(&start_loop),
         );
         policy.limits.max_fuel = 10_000_000;
+        policy.limits.max_start_fuel = 2_048;
         policy.limits.timeout_ms = 50;
 
         let started = Instant::now();
         let err = WasmiExtensionExecutorV1::new()
             .execute_scalar_i32(&policy, &start_loop, "run", 7)
             .unwrap_err();
-        assert!(
-            matches!(err, WasmSandboxError::OutOfFuel { .. }),
-            "expected OutOfFuel on start loop, got {err:?}"
+        assert_eq!(
+            err,
+            WasmSandboxError::OutOfFuel {
+                consumed: 2_048,
+                limit: 2_048,
+            }
         );
         assert!(started.elapsed().as_millis() < 500);
+
+        // Policy fingerprint must reflect max_start_fuel tightening.
+        let mut alt = policy.clone();
+        alt.limits.max_start_fuel = 1_024;
+        assert_ne!(
+            policy.policy_fingerprint_hex(),
+            alt.policy_fingerprint_hex()
+        );
+    }
+
+    #[test]
+    fn wasmi_enforces_private_internal_table_memory_and_stack_recursion_limits() {
+        let exec = WasmiExtensionExecutorV1::new();
+
+        // 1. Non-exported private table (`min=32`) exceeding `max_table_elements=8` must map cleanly.
+        let mut priv_table_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut priv_table_mod, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut priv_table_mod, 3, &[1, 0]);
+        let mut sec4 = vec![1, 0x70, 0x00];
+        push_leb_u32(&mut sec4, 32);
+        push_section(&mut priv_table_mod, 4, &sec4);
+        let mut sec7 = vec![1];
+        push_name(&mut sec7, "ok");
+        sec7.extend_from_slice(&[0x00, 0x00]);
+        push_section(&mut priv_table_mod, 7, &sec7);
+        push_section(&mut priv_table_mod, 10, &[1, 4, 0, 0x20, 0x00, 0x0b]);
+
+        let mut p_table = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&priv_table_mod),
+        );
+        p_table.limits.max_table_elements = 8;
+        assert_eq!(
+            exec.execute_scalar_i32(&p_table, &priv_table_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::TableLimitExceeded {
+                requested: 9,
+                max: 8,
+            }
+        );
+
+        // With `max_tables = 0`, any private internal table must fail `MultipleTablesForbidden`.
+        p_table.limits.max_table_elements = 64;
+        p_table.limits.max_tables = 0;
+        assert_eq!(
+            exec.execute_scalar_i32(&p_table, &priv_table_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::MultipleTablesForbidden
+        );
+
+        // 2. Non-exported private memory (`min=10`) exceeding `max_memory_pages=4` must map cleanly.
+        let mut priv_mem_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut priv_mem_mod, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut priv_mem_mod, 3, &[1, 0]);
+        let mut sec5 = vec![1, 0x00];
+        push_leb_u32(&mut sec5, 10);
+        push_section(&mut priv_mem_mod, 5, &sec5);
+        let mut sec7_m = vec![1];
+        push_name(&mut sec7_m, "ok");
+        sec7_m.extend_from_slice(&[0x00, 0x00]);
+        push_section(&mut priv_mem_mod, 7, &sec7_m);
+        push_section(&mut priv_mem_mod, 10, &[1, 4, 0, 0x20, 0x00, 0x0b]);
+
+        let mut p_mem = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&priv_mem_mod),
+        );
+        p_mem.limits.max_memory_pages = 4;
+        assert_eq!(
+            exec.execute_scalar_i32(&p_mem, &priv_mem_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::MemoryLimitExceeded {
+                requested_pages: 5,
+                max_pages: 4,
+            }
+        );
+
+        // 3. Unbounded recursion (`call 0` in fn 0) traps via narrowed recursion/stack limit
+        //    long before exhausting a huge 10M fuel allowance!
+        let rec_wasm = build_single_export_wasm(
+            &[0x7f],
+            &[0x7f],
+            None,
+            0,
+            "recurse",
+            &[0x20, 0x00, 0x10, 0x00],
+        );
+        let mut rec_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&rec_wasm),
+        );
+        rec_policy.limits.max_fuel = 10_000_000;
+        let rec_err = exec
+            .execute_scalar_i32(&rec_policy, &rec_wasm, "recurse", 1)
+            .unwrap_err();
+        assert!(
+            matches!(rec_err, WasmSandboxError::ExecutionTrap(_)),
+            "deep recursion must trap on call stack depth rather than OutOfFuel: got {rec_err:?}"
+        );
+    }
+
+    #[test]
+    fn wasmi_rejects_max_memories_zero_exported_multitable_table_grow_and_zero_fuel_edges() {
+        let exec = WasmiExtensionExecutorV1::new();
+
+        // 1. `max_memories = 0` with an un-exported private `(memory 1)` must fail `MultipleMemoriesForbidden`.
+        let mut priv_mem_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut priv_mem_mod, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut priv_mem_mod, 3, &[1, 0]);
+        push_section(&mut priv_mem_mod, 5, &[1, 0x00, 1]);
+        let mut sec7 = vec![1];
+        push_name(&mut sec7, "ok");
+        sec7.extend_from_slice(&[0x00, 0x00]);
+        push_section(&mut priv_mem_mod, 7, &sec7);
+        push_section(&mut priv_mem_mod, 10, &[1, 4, 0, 0x20, 0x00, 0x0b]);
+
+        let mut zero_mem_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&priv_mem_mod),
+        );
+        zero_mem_policy.limits.max_memories = 0;
+        assert_eq!(
+            exec.execute_scalar_i32(&zero_mem_policy, &priv_mem_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::MultipleMemoriesForbidden
+        );
+
+        // `max_memories = 0` with an exported `(memory 1)` also fails `MultipleMemoriesForbidden`.
+        let exp_mem_mod =
+            build_single_export_wasm(&[0x7f], &[0x7f], Some((1, Some(1))), 0, "ok", &[0x20, 0x00]);
+        let mut zero_exp_mem_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&exp_mem_mod),
+        );
+        zero_exp_mem_policy.limits.max_memories = 0;
+        assert_eq!(
+            exec.execute_scalar_i32(&zero_exp_mem_policy, &exp_mem_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::MultipleMemoriesForbidden
+        );
+
+        // 2. Exported multi-table module (2 exported funcref tables) must fail `MultipleTablesForbidden`.
+        let mut multi_table_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut multi_table_mod, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut multi_table_mod, 3, &[1, 0]);
+        push_section(&mut multi_table_mod, 4, &[2, 0x70, 0x00, 1, 0x70, 0x00, 1]);
+        let mut sec7_mt = vec![3];
+        push_name(&mut sec7_mt, "ok");
+        sec7_mt.extend_from_slice(&[0x00, 0x00]);
+        push_name(&mut sec7_mt, "t0");
+        sec7_mt.extend_from_slice(&[0x01, 0x00]);
+        push_name(&mut sec7_mt, "t1");
+        sec7_mt.extend_from_slice(&[0x01, 0x01]);
+        push_section(&mut multi_table_mod, 7, &sec7_mt);
+        push_section(&mut multi_table_mod, 10, &[1, 4, 0, 0x20, 0x00, 0x0b]);
+
+        let multi_table_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&multi_table_mod),
+        );
+        assert_eq!(
+            exec.execute_scalar_i32(&multi_table_policy, &multi_table_mod, "ok", 7)
+                .unwrap_err(),
+            WasmSandboxError::MultipleTablesForbidden
+        );
+
+        // 3. `table.grow` (`0xfc 0x0f 0x00`) is rejected at validation (`wasm_reference_types(false)`).
+        let mut table_grow_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut table_grow_mod, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut table_grow_mod, 3, &[1, 0]);
+        push_section(&mut table_grow_mod, 4, &[1, 0x70, 0x00, 1]);
+        let mut sec7_tg = vec![2];
+        push_name(&mut sec7_tg, "grow_tbl");
+        sec7_tg.extend_from_slice(&[0x00, 0x00]);
+        push_name(&mut sec7_tg, "tbl");
+        sec7_tg.extend_from_slice(&[0x01, 0x00]);
+        push_section(&mut table_grow_mod, 7, &sec7_tg);
+        // body: unreachable (polymorphic stack), table.grow 0, drop, i32.const 0, end
+        push_section(
+            &mut table_grow_mod,
+            10,
+            &[1, 9, 0, 0x00, 0xfc, 0x0f, 0x00, 0x1a, 0x41, 0x00, 0x0b],
+        );
+
+        let table_grow_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&table_grow_mod),
+        );
+        assert_eq!(
+            exec.execute_scalar_i32(&table_grow_policy, &table_grow_mod, "grow_tbl", 1)
+                .unwrap_err(),
+            WasmSandboxError::MalformedSectionOrLeb128
+        );
+
+        // 4. `policy.limits.max_fuel == 0` fails closed in preflight (`OutOfFuel { 0, 0 }`).
+        let ok_mod = build_single_export_wasm(&[0x7f], &[0x7f], None, 0, "id", &[0x20, 0x00]);
+        let mut zero_fuel_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&ok_mod),
+        );
+        zero_fuel_policy.limits.max_fuel = 0;
+        assert_eq!(
+            exec.execute_scalar_i32(&zero_fuel_policy, &ok_mod, "id", 9)
+                .unwrap_err(),
+            WasmSandboxError::OutOfFuel {
+                consumed: 0,
+                limit: 0,
+            }
+        );
+
+        let byte_mod = build_ascii_xor_wasm();
+        let mut zero_byte_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&byte_mod),
+        );
+        zero_byte_policy.limits.max_fuel = 0;
+        assert_eq!(
+            exec.execute_byte_transform(&zero_byte_policy, &byte_mod, "transform", b"ab")
+                .unwrap_err(),
+            WasmSandboxError::OutOfFuel {
+                consumed: 0,
+                limit: 0,
+            }
+        );
+
+        // 5. `max_start_fuel == 0` with `max_fuel > 0`:
+        //    - Module WITHOUT `start` section executes cleanly.
+        let mut zero_start_no_sec = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&ok_mod),
+        );
+        zero_start_no_sec.limits.max_start_fuel = 0;
+        let (val, _) = exec
+            .execute_scalar_i32(&zero_start_no_sec, &ok_mod, "id", 42)
+            .unwrap();
+        assert_eq!(val, 42);
+
+        //    - Module WITH a `start` section fails instantiation cleanly with OutOfFuel { 0, 0 }.
+        let mut with_start_mod = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(
+            &mut with_start_mod,
+            1,
+            &[2, 0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f],
+        );
+        push_section(&mut with_start_mod, 3, &[2, 0, 1]);
+        let mut sec7_s = vec![1];
+        push_name(&mut sec7_s, "run");
+        sec7_s.extend_from_slice(&[0x00, 0x01]);
+        push_section(&mut with_start_mod, 7, &sec7_s);
+        push_section(&mut with_start_mod, 8, &[0]);
+        // start fn 0: nop; end (non-infinite, still disallowed when max_start_fuel == 0)
+        // export fn 1: local.get 0; end
+        let body0 = [0x00u8, 0x01, 0x0b];
+        let body1 = [0x00u8, 0x20, 0x00, 0x0b];
+        let mut sec10_s = vec![2];
+        push_leb_u32(&mut sec10_s, body0.len() as u32);
+        sec10_s.extend_from_slice(&body0);
+        push_leb_u32(&mut sec10_s, body1.len() as u32);
+        sec10_s.extend_from_slice(&body1);
+        push_section(&mut with_start_mod, 10, &sec10_s);
+
+        let mut zero_start_with_sec = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&with_start_mod),
+        );
+        zero_start_with_sec.limits.max_fuel = 100_000;
+        zero_start_with_sec.limits.max_start_fuel = 0;
+        assert_eq!(
+            exec.execute_scalar_i32(&zero_start_with_sec, &with_start_mod, "run", 7)
+                .unwrap_err(),
+            WasmSandboxError::OutOfFuel {
+                consumed: 0,
+                limit: 0,
+            }
+        );
+
+        // When `max_start_fuel` allows `start` to finish, `start` fuel is charged against total `max_fuel`.
+        zero_start_with_sec.limits.max_start_fuel = 100;
+        let (run_ret, run_receipt) = exec
+            .execute_scalar_i32(&zero_start_with_sec, &with_start_mod, "run", 7)
+            .unwrap();
+        assert_eq!(run_ret, 7);
+        assert!(run_receipt.fuel_consumed >= 2);
+
+        // 6. `timeout_ms == 0` fails closed pre-compile with `ExecutionTimeout { limit_ms: 0, .. }`.
+        let mut zero_timeout_policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&ok_mod),
+        );
+        zero_timeout_policy.limits.timeout_ms = 0;
+        assert!(matches!(
+            exec.execute_scalar_i32(&zero_timeout_policy, &ok_mod, "id", 7),
+            Err(WasmSandboxError::ExecutionTimeout { limit_ms: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn wasmi_enforces_64kib_value_stack_height_below_call_depth_and_reuses_shared_engine() {
+        let exec = WasmiExtensionExecutorV1::new();
+
+        // Depth-8 recursion where each frame allocates 1,500 i64 locals (~12 KiB/frame):
+        // 8 * 12 KiB = 96 KiB > 64 KiB hardened max_stack_height (would succeed under wasmi's 1 MiB default!),
+        // while depth 8 < DEFAULT_WASM_MAX_CALL_DEPTH (64), isolating value-stack enforcement.
+        let mut stack_bomb = swarm_torch::wasm_sandbox::WASM_MAGIC_AND_VERSION_V1.to_vec();
+        push_section(&mut stack_bomb, 1, &[1, 0x60, 1, 0x7f, 1, 0x7f]);
+        push_section(&mut stack_bomb, 3, &[1, 0]);
+        let mut sec7 = vec![1];
+        push_name(&mut sec7, "deep_locals");
+        sec7.extend_from_slice(&[0x00, 0x00]);
+        push_section(&mut stack_bomb, 7, &sec7);
+
+        let mut body = Vec::new();
+        body.push(1); // 1 local decl group
+        push_leb_u32(&mut body, 1_500);
+        body.push(0x7e); // i64
+        body.extend_from_slice(&[
+            0x20, 0x00, // local.get 0
+            0x41, 0x00, // i32.const 0
+            0x4a, // i32.gt_s
+            0x04, 0x7f, // if (result i32)
+            0x20, 0x00, // local.get 0
+            0x41, 0x01, // i32.const 1
+            0x6b, // i32.sub
+            0x10, 0x00, // call 0
+            0x05, // else
+            0x41, 0x00, // i32.const 0
+            0x0b, // end if
+            0x0b, // end func
+        ]);
+        let mut sec10 = vec![1];
+        push_leb_u32(&mut sec10, body.len() as u32);
+        sec10.extend_from_slice(&body);
+        push_section(&mut stack_bomb, 10, &sec10);
+
+        let mut policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&stack_bomb),
+        );
+        policy.limits.max_fuel = 10_000_000;
+        let (ok_ret, _) = exec
+            .execute_scalar_i32(&policy, &stack_bomb, "deep_locals", 1)
+            .unwrap();
+        assert_eq!(ok_ret, 0);
+
+        let err = exec
+            .execute_scalar_i32(&policy, &stack_bomb, "deep_locals", 8)
+            .unwrap_err();
+        assert!(
+            matches!(err, WasmSandboxError::ExecutionTrap(ref msg) if msg.contains("call stack exhausted")),
+            "expected value stack overflow ExecutionTrap before fuel/recursion exhaustion, got {err:?}"
+        );
+
+        // Concurrent reuse of the shared OnceLock<Engine> across threads must remain isolated and deterministic.
+        let byte_mod = Arc::new(build_ascii_xor_wasm());
+        let byte_policy = Arc::new(SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&byte_mod),
+        ));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let m = Arc::clone(&byte_mod);
+                let p = Arc::clone(&byte_policy);
+                std::thread::spawn(move || {
+                    let r = WasmiExtensionExecutorV1::new()
+                        .execute_byte_transform(&p, &m, "transform", b"AbCdEf")
+                        .unwrap();
+                    assert_eq!(r.output_bytes, b"aBcDeF");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

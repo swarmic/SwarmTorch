@@ -23,6 +23,9 @@ pub const WASM_PAGE_BYTES: usize = 65_536;
 /// Default maximum call stack depth enforced against unbounded guest recursion.
 pub const DEFAULT_WASM_MAX_CALL_DEPTH: usize = 64;
 
+/// Default maximum instruction fuel budget allowed during synchronous Wasm `start` execution.
+pub const DEFAULT_WASM_MAX_START_FUEL: u64 = 10_000;
+
 /// Hard cap on total declared locals per function across all local declaration groups (`ST-09`).
 pub const DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION: usize = 4_096;
 
@@ -146,6 +149,10 @@ impl fmt::Display for WasmSandboxError {
 
 impl std::error::Error for WasmSandboxError {}
 
+fn default_max_start_fuel() -> u64 {
+    DEFAULT_WASM_MAX_START_FUEL
+}
+
 /// Hard resource and isolation limits enforced by [`WasmSandboxRunnerV1`] (`ADR-0018`, `W12-04`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WasmStoreLimitsV1 {
@@ -161,6 +168,9 @@ pub struct WasmStoreLimitsV1 {
     pub max_tables: u32,
     /// Deterministic instruction fuel budget per invocation.
     pub max_fuel: u64,
+    /// Maximum deterministic fuel allowed during synchronous `start` execution (`Decision A2`).
+    #[serde(default = "default_max_start_fuel")]
+    pub max_start_fuel: u64,
     /// Trap immediately instead of returning `-1` when `memory.grow` would exceed `max_memory_pages`.
     pub trap_on_grow_failure: bool,
     /// Advisory wall-clock execution limit matching `RunnerIsolationProfile`.
@@ -176,6 +186,7 @@ impl Default for WasmStoreLimitsV1 {
             max_memories: 1,
             max_tables: 1,
             max_fuel: 100_000,
+            max_start_fuel: DEFAULT_WASM_MAX_START_FUEL,
             trap_on_grow_failure: true,
             timeout_ms: 5_000,
         }
@@ -233,6 +244,7 @@ impl SandboxedExtensionPolicyV1 {
         hasher.update(self.limits.max_memories.to_be_bytes());
         hasher.update(self.limits.max_tables.to_be_bytes());
         hasher.update(self.limits.max_fuel.to_be_bytes());
+        hasher.update(self.limits.max_start_fuel.to_be_bytes());
         hasher.update([u8::from(self.limits.trap_on_grow_failure)]);
         hasher.update(self.limits.timeout_ms.to_be_bytes());
         crate::artifacts::hex_lower(&hasher.finalize())
@@ -2160,5 +2172,75 @@ mod tests {
             ),
             Err(WasmSandboxError::OutOfFuel { limit: 5, .. })
         ));
+    }
+
+    #[test]
+    fn wasm_store_limits_v1_json_backward_compat_defaults_max_start_fuel_and_binds_fingerprint() {
+        let legacy_limits_json = r#"{
+            "max_module_bytes": 1048576,
+            "max_memory_pages": 16,
+            "max_table_elements": 1024,
+            "max_memories": 1,
+            "max_tables": 1,
+            "max_fuel": 100000,
+            "trap_on_grow_failure": true,
+            "timeout_ms": 5000
+        }"#;
+        let parsed_limits: WasmStoreLimitsV1 = serde_json::from_str(legacy_limits_json).unwrap();
+        assert_eq!(parsed_limits.max_start_fuel, DEFAULT_WASM_MAX_START_FUEL);
+        assert_eq!(parsed_limits, WasmStoreLimitsV1::default());
+
+        let legacy_policy_json = r#"{
+            "allowed_module_hashes": [],
+            "allowed_exports": [],
+            "limits": {
+                "max_module_bytes": 1048576,
+                "max_memory_pages": 16,
+                "max_table_elements": 1024,
+                "max_memories": 1,
+                "max_tables": 1,
+                "max_fuel": 100000,
+                "trap_on_grow_failure": true,
+                "timeout_ms": 5000
+            }
+        }"#;
+        let parsed_policy: SandboxedExtensionPolicyV1 =
+            serde_json::from_str(legacy_policy_json).unwrap();
+        assert_eq!(
+            parsed_policy.limits.max_start_fuel,
+            DEFAULT_WASM_MAX_START_FUEL
+        );
+        assert_eq!(
+            parsed_policy.policy_fingerprint_hex(),
+            SandboxedExtensionPolicyV1::default().policy_fingerprint_hex()
+        );
+
+        let zero_start_json = legacy_limits_json.replace(
+            "\"trap_on_grow_failure\": true",
+            "\"max_start_fuel\": 0,\n            \"trap_on_grow_failure\": true",
+        );
+        let zero_start_limits: WasmStoreLimitsV1 = serde_json::from_str(&zero_start_json).unwrap();
+        assert_eq!(zero_start_limits.max_start_fuel, 0);
+
+        let ok_mod = build_single_export_wasm(&[0x7f], &[0x7f], None, 0, "id", &[0x20, 0x00]);
+        let mut policy = SandboxedExtensionPolicyV1::with_allowed_hash(
+            SandboxedExtensionPolicyV1::sha256_module(&ok_mod),
+        );
+        let default_fp = policy.policy_fingerprint_hex();
+        policy.limits.max_start_fuel = 0;
+        let zero_start_fp = policy.policy_fingerprint_hex();
+        assert_ne!(default_fp, zero_start_fp);
+
+        // `max_start_fuel == 0` with `max_fuel > 0` passes preflight so modules without `start` run,
+        // whereas `max_fuel == 0` fails preflight unconditionally.
+        assert!(preflight_wasm_extension_v1(&policy, &ok_mod, "id").is_ok());
+        policy.limits.max_fuel = 0;
+        assert_eq!(
+            preflight_wasm_extension_v1(&policy, &ok_mod, "id").unwrap_err(),
+            WasmSandboxError::OutOfFuel {
+                consumed: 0,
+                limit: 0,
+            }
+        );
     }
 }

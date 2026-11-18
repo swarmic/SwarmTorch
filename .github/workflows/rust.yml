@@ -193,6 +193,9 @@ jobs:
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/wasm.log"
+          # Declared rust-version = "1.86" (`wasmi 2.0`).
+          rustup toolchain install 1.86.0 --profile minimal --no-self-update
+          cargo +1.86.0 check --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --all-features --locked
 
       - name: Conformance (adapters/swarm-torch-mcp)
         id: mcp

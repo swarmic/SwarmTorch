@@ -10,6 +10,7 @@ description = "Isolated QUIC/Iroh 1-RTT stream carrier adapter for SwarmTorch"
 [workspace]
 
 [dependencies]
+getrandom = "0.4"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
 swarm-torch-core = { path = "../../swarm-torch-core" }
 swarm-torch-net = { path = "../../swarm-torch-net" }

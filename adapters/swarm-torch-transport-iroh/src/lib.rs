@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
-//! Isolated QUIC / `Iroh` 1-RTT carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`).
+//! Isolated QUIC / `Iroh` 1-RTT carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`, `15D-2`).
 //!
-//! **Maturity Tier:** `Simulation verified` — deterministic ALPN, 1-RTT stage gating, bounded
-//! framing, link-vs-originator binding (`StrictOneToOne` / `DecoupledRelayAllowed`), and bounded
-//! sliding-window pre-auth rate limiting are enforced and tested locally. Live `iroh` QUIC endpoint
-//! handshake integration is isolated for Phase `13D-2`.
+//! **Maturity Tier:** `Integration verified` — deterministic ALPN, 1-RTT stage gating,
+//! bounded framing, link-vs-originator binding (`StrictOneToOne` / `DecoupledRelayAllowed`),
+//! bounded sliding-window pre-auth quotas checked **before** variable-length body reads,
+//! CSPRNG fresh challenge nonces with reuse rejection, and bounded handshake/read timeouts
+//! are enforced end-to-end over live `iroh 1.4` 1-RTT QUIC connections.
 
 use core::fmt;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
@@ -50,6 +52,8 @@ pub enum IrohCarrierError {
     Envelope(VerifyError),
     /// Multi-hop gossip envelope verification failed.
     Gossip(GossipVerifyError),
+    /// QUIC accept, 1-RTT handshake, or stream I/O exceeded its bounded timeout (`15D-2`).
+    Timeout { stage: &'static str },
     /// Live `iroh` QUIC endpoint, dial, or stream I/O failure.
     Transport(String),
 }
@@ -65,6 +69,7 @@ impl fmt::Display for IrohCarrierError {
             ),
             Self::Envelope(e) => write!(f, "envelope verification failed: {e}"),
             Self::Gossip(e) => write!(f, "gossip verification failed: {e}"),
+            Self::Timeout { stage } => write!(f, "iroh operation timed out during {stage}"),
             Self::Transport(msg) => write!(f, "iroh transport error: {msg}"),
         }
     }
@@ -76,9 +81,10 @@ impl std::error::Error for IrohCarrierError {
             Self::Carrier(e) => Some(e),
             Self::Envelope(e) => Some(e),
             Self::Gossip(e) => Some(e),
-            Self::LinkRateLimited { .. } | Self::LinkQuotaTableFull { .. } | Self::Transport(_) => {
-                None
-            }
+            Self::LinkRateLimited { .. }
+            | Self::LinkQuotaTableFull { .. }
+            | Self::Timeout { .. }
+            | Self::Transport(_) => None,
         }
     }
 }
@@ -569,14 +575,70 @@ impl IrohCarrierAdapterV1 {
 /// `[att_pubkey(32) || att_sig(64)]`.
 const LINK_ATTESTATION_HEADER_BYTES: usize = 32 + 64;
 
+/// Default maximum time waiting for an incoming QUIC connection and 1-RTT TLS completion.
+pub const DEFAULT_IROH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default maximum time waiting for bi-stream open and attestation/frame reads/writes.
+pub const DEFAULT_IROH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default bounded capacity of recently accepted challenge nonces tracked against reuse.
+const DEFAULT_MAX_RECENT_NONCES: usize = 4_096;
+
+/// Explicit handshake and stream read/write deadlines enforced by [`IrohEndpointBridgeV1`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrohAcceptTimeoutsV1 {
+    /// Deadline wrapping `endpoint.accept()` / `endpoint.connect()` and 1-RTT TLS completion.
+    pub handshake_timeout: Duration,
+    /// Deadline wrapping `accept_bi()` / `open_bi()`, hello, nonce, attestation header, frame
+    /// reads, and the receiver's post-body ack write.
+    pub read_timeout: Duration,
+}
+
+impl Default for IrohAcceptTimeoutsV1 {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: DEFAULT_IROH_HANDSHAKE_TIMEOUT,
+            read_timeout: DEFAULT_IROH_READ_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecentNonceCache {
+    order: VecDeque<[u8; 16]>,
+    seen: BTreeSet<[u8; 16]>,
+}
+
+impl RecentNonceCache {
+    fn contains(&self, nonce: &[u8; 16]) -> bool {
+        self.seen.contains(nonce)
+    }
+
+    fn record_unique(&mut self, nonce: [u8; 16]) -> bool {
+        if !self.seen.insert(nonce) {
+            return false;
+        }
+        if self.order.len() >= DEFAULT_MAX_RECENT_NONCES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(nonce);
+        true
+    }
+}
+
 /// Live `iroh 1.4` 1-RTT QUIC transport bridge enforcing SwarmTorch link attestation,
 /// strict 1-RTT completion (zero 0-RTT fast-path), TLS-keyed link binding, bounded reads,
-/// pre-auth link quotas, and replay-safe admission (`ST-08`, `ADR-0022`).
+/// pre-auth header+quota gating before body allocation, bounded timeouts, CSPRNG nonces,
+/// and replay-safe admission (`ST-08`, `ADR-0022`, `15D-2`).
 pub struct IrohEndpointBridgeV1 {
     endpoint: Endpoint,
     link_auth: MessageAuth,
     link_peer_id: PeerId,
     adapter: IrohCarrierAdapterV1,
+    timeouts: IrohAcceptTimeoutsV1,
+    recent_nonces: Mutex<RecentNonceCache>,
 }
 
 impl IrohEndpointBridgeV1 {
@@ -645,7 +707,57 @@ impl IrohEndpointBridgeV1 {
             link_auth,
             link_peer_id,
             adapter,
+            timeouts: IrohAcceptTimeoutsV1::default(),
+            recent_nonces: Mutex::new(RecentNonceCache::default()),
         })
+    }
+
+    /// Override the bounded accept, 1-RTT handshake, and stream read/write deadlines.
+    pub const fn with_timeouts(mut self, timeouts: IrohAcceptTimeoutsV1) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Configured handshake and stream read/write deadlines.
+    pub const fn timeouts(&self) -> IrohAcceptTimeoutsV1 {
+        self.timeouts
+    }
+
+    /// Generate a fresh non-zero 128-bit challenge nonce backed by OS CSPRNG (`getrandom`).
+    pub fn generate_fresh_challenge_nonce(&self) -> Result<[u8; 16], IrohCarrierError> {
+        let guard = self
+            .recent_nonces
+            .lock()
+            .map_err(|_| IrohCarrierError::Transport("nonce cache poisoned".to_string()))?;
+        for _ in 0..8 {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce)
+                .map_err(|e| IrohCarrierError::Transport(format!("CSPRNG failed: {e}")))?;
+            if nonce != [0u8; 16] && !guard.contains(&nonce) {
+                return Ok(nonce);
+            }
+        }
+        Err(IrohCarrierError::Carrier(
+            CarrierError::InvalidLinkAttestation,
+        ))
+    }
+
+    fn reserve_unique_nonce(&self, nonce: [u8; 16]) -> Result<(), IrohCarrierError> {
+        if nonce == [0u8; 16] {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation,
+            ));
+        }
+        let mut guard = self
+            .recent_nonces
+            .lock()
+            .map_err(|_| IrohCarrierError::Transport("nonce cache poisoned".to_string()))?;
+        if !guard.record_unique(nonce) {
+            return Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation,
+            ));
+        }
+        Ok(())
     }
 
     /// Access the underlying `iroh::Endpoint`.
@@ -689,17 +801,26 @@ impl IrohEndpointBridgeV1 {
     /// Connect to `target` over a strictly completed `1-RTT` `iroh` QUIC connection (never 0-RTT),
     /// exchange the receiver's fresh challenge nonce, sign a [`LinkHandshakeAttestationV1`], and
     /// stream the bounded length-prefixed payload.
+    ///
+    /// `Ok(())` means the frame was written and the stream finished. It does not confirm that
+    /// the receiver admitted or verified the frame: the receiver's 1-byte ack is best-effort and
+    /// is sent before envelope/gossip verification, so admission is only observable receiver-side.
     pub async fn send_frame_1rtt(
         &self,
         target: impl Into<EndpointAddr>,
         payload: &[u8],
     ) -> Result<(), IrohCarrierError> {
         let wire_frame = self.adapter.encode_wire_frame(payload)?;
-        let conn = self
-            .endpoint
-            .connect(target, IrohCarrierAdapterV1::expected_alpn())
-            .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let conn = tokio::time::timeout(
+            self.timeouts.handshake_timeout,
+            self.endpoint
+                .connect(target, IrohCarrierAdapterV1::expected_alpn()),
+        )
+        .await
+        .map_err(|_| IrohCarrierError::Timeout {
+            stage: "quic_connect",
+        })?
+        .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
 
         let negotiated_alpn = conn.alpn();
         if negotiated_alpn != IrohCarrierAdapterV1::expected_alpn() {
@@ -707,20 +828,50 @@ impl IrohEndpointBridgeV1 {
             return Err(IrohCarrierError::Carrier(CarrierError::AlpnMismatch));
         }
 
-        let (mut send, mut recv) = conn
-            .open_bi()
+        let (mut send, mut recv) = tokio::time::timeout(self.timeouts.read_timeout, conn.open_bi())
             .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+            .map_err(|_| {
+                conn.close(2u32.into(), b"open_bi timeout");
+                IrohCarrierError::Timeout { stage: "open_bi" }
+            })?
+            .map_err(|e| {
+                conn.close(2u32.into(), b"open_bi failed");
+                IrohCarrierError::Transport(e.to_string())
+            })?;
 
         // Write 4-byte stream hello immediately so QUIC transmits client-initiated stream opening.
-        send.write_all(Self::STREAM_HELLO_V1)
-            .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        tokio::time::timeout(
+            self.timeouts.read_timeout,
+            send.write_all(Self::STREAM_HELLO_V1),
+        )
+        .await
+        .map_err(|_| {
+            conn.close(2u32.into(), b"write hello timeout");
+            IrohCarrierError::Timeout {
+                stage: "write_hello",
+            }
+        })?
+        .map_err(|e| {
+            conn.close(2u32.into(), b"write hello failed");
+            IrohCarrierError::Transport(e.to_string())
+        })?;
 
         let mut receiver_nonce = [0u8; 16];
-        recv.read_exact(&mut receiver_nonce)
-            .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        tokio::time::timeout(
+            self.timeouts.read_timeout,
+            recv.read_exact(&mut receiver_nonce),
+        )
+        .await
+        .map_err(|_| {
+            conn.close(2u32.into(), b"read nonce timeout");
+            IrohCarrierError::Timeout {
+                stage: "read_nonce",
+            }
+        })?
+        .map_err(|e| {
+            conn.close(2u32.into(), b"read nonce failed");
+            IrohCarrierError::Transport(e.to_string())
+        })?;
         if receiver_nonce == [0u8; 16] {
             conn.close(2u32.into(), b"zero challenge nonce");
             return Err(IrohCarrierError::Carrier(
@@ -734,13 +885,52 @@ impl IrohEndpointBridgeV1 {
         out.extend_from_slice(att.signature.as_bytes());
         out.extend_from_slice(&wire_frame);
 
-        send.write_all(&out)
+        tokio::time::timeout(self.timeouts.read_timeout, send.write_all(&out))
             .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
-        send.finish()
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
-        let _ = recv.read_to_end(1).await;
+            .map_err(|_| {
+                conn.close(2u32.into(), b"write frame timeout");
+                IrohCarrierError::Timeout {
+                    stage: "write_frame",
+                }
+            })?
+            .map_err(|e| {
+                conn.close(2u32.into(), b"write frame failed");
+                IrohCarrierError::Transport(e.to_string())
+            })?;
+        send.finish().map_err(|e| {
+            conn.close(2u32.into(), b"finish stream failed");
+            IrohCarrierError::Transport(e.to_string())
+        })?;
+        let _ = tokio::time::timeout(self.timeouts.read_timeout, recv.read_to_end(1)).await;
         Ok(())
+    }
+
+    /// Accept one incoming `iroh` connection strictly after `1-RTT` TLS completion (never 0-RTT),
+    /// issue a CSPRNG challenge nonce, enforce link attestation and optional pre-auth `quota`
+    /// **before** reading the variable-length payload, and return the sealed principal and frame.
+    pub async fn accept_1rtt_frame_fresh_nonce(
+        &self,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<(IrohVerifiedLinkPrincipalV1, Vec<u8>), IrohCarrierError> {
+        let nonce = self.generate_fresh_challenge_nonce()?;
+        self.accept_1rtt_frame_authenticated(nonce, current_time_secs, quota)
+            .await
+    }
+
+    /// Accept one incoming `iroh` connection strictly after `1-RTT` TLS completion using a
+    /// caller-supplied unique `receiver_nonce`, enforcing ALPN, handshake/read timeouts,
+    /// signature attestation, and `quota` BEFORE reading/allocating the variable-length body.
+    pub async fn accept_1rtt_frame_authenticated(
+        &self,
+        receiver_nonce: [u8; 16],
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<(IrohVerifiedLinkPrincipalV1, Vec<u8>), IrohCarrierError> {
+        let (principal, frame, _conn) = self
+            .accept_1rtt_frame_inner(receiver_nonce, current_time_secs, quota)
+            .await?;
+        Ok((principal, frame))
     }
 
     /// Accept one incoming `iroh` connection strictly after `1-RTT` TLS completion (never 0-RTT),
@@ -750,24 +940,47 @@ impl IrohEndpointBridgeV1 {
         &self,
         receiver_nonce: [u8; 16],
     ) -> Result<(IrohVerifiedLinkPrincipalV1, Vec<u8>), IrohCarrierError> {
-        if receiver_nonce == [0u8; 16] {
-            return Err(IrohCarrierError::Carrier(
-                CarrierError::InvalidLinkAttestation,
-            ));
-        }
-
-        let incoming = self
-            .endpoint
-            .accept()
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u32::try_from(d.as_secs()).ok())
+            .unwrap_or(0);
+        self.accept_1rtt_frame_authenticated(receiver_nonce, now_secs, None)
             .await
-            .ok_or_else(|| IrohCarrierError::Transport("iroh endpoint closed".to_string()))?;
+    }
+
+    async fn accept_1rtt_frame_inner(
+        &self,
+        receiver_nonce: [u8; 16],
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<
+        (
+            IrohVerifiedLinkPrincipalV1,
+            Vec<u8>,
+            iroh::endpoint::Connection,
+        ),
+        IrohCarrierError,
+    > {
+        self.reserve_unique_nonce(receiver_nonce)?;
+
+        let incoming =
+            tokio::time::timeout(self.timeouts.handshake_timeout, self.endpoint.accept())
+                .await
+                .map_err(|_| IrohCarrierError::Timeout {
+                    stage: "endpoint_accept",
+                })?
+                .ok_or_else(|| IrohCarrierError::Transport("iroh endpoint closed".to_string()))?;
 
         // Strictly require full 1-RTT QUIC/TLS completion (never call `.into_0rtt()`).
         let accepting = incoming
             .accept()
             .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
-        let conn = accepting
+        let conn = tokio::time::timeout(self.timeouts.handshake_timeout, accepting)
             .await
+            .map_err(|_| IrohCarrierError::Timeout {
+                stage: "quic_1rtt_handshake",
+            })?
             .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
 
         let negotiated_alpn = conn.alpn().to_vec();
@@ -777,48 +990,75 @@ impl IrohEndpointBridgeV1 {
         }
         let remote_id_bytes: [u8; 32] = *conn.remote_id().as_bytes();
 
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(self.timeouts.read_timeout, conn.accept_bi())
+                .await
+                .map_err(|_| {
+                    conn.close(2u32.into(), b"accept_bi timeout");
+                    IrohCarrierError::Timeout { stage: "accept_bi" }
+                })?
+                .map_err(|e| {
+                    conn.close(2u32.into(), b"accept_bi failed");
+                    IrohCarrierError::Transport(e.to_string())
+                })?;
 
         let mut hello = [0u8; 4];
-        recv.read_exact(&mut hello)
+        tokio::time::timeout(self.timeouts.read_timeout, recv.read_exact(&mut hello))
             .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+            .map_err(|_| {
+                conn.close(3u32.into(), b"read hello timeout");
+                IrohCarrierError::Timeout {
+                    stage: "read_hello",
+                }
+            })?
+            .map_err(|e| {
+                conn.close(3u32.into(), b"read hello failed");
+                IrohCarrierError::Transport(e.to_string())
+            })?;
         if &hello != Self::STREAM_HELLO_V1 {
+            conn.close(3u32.into(), b"invalid stream hello");
             return Err(IrohCarrierError::Carrier(
                 CarrierError::EmptyOrTruncatedFrame,
             ));
         }
 
-        send.write_all(&receiver_nonce)
+        tokio::time::timeout(self.timeouts.read_timeout, send.write_all(&receiver_nonce))
             .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
+            .map_err(|_| {
+                conn.close(3u32.into(), b"write challenge timeout");
+                IrohCarrierError::Timeout {
+                    stage: "write_nonce",
+                }
+            })?
+            .map_err(|e| {
+                conn.close(3u32.into(), b"write challenge failed");
+                IrohCarrierError::Transport(e.to_string())
+            })?;
 
-        let max_read = LINK_ATTESTATION_HEADER_BYTES
-            .saturating_add(4)
-            .saturating_add(self.adapter.codec.max_frame_bytes);
-        let buf = recv
-            .read_to_end(max_read)
+        // Step 1: Read ONLY the fixed 96-byte link attestation header (`pubkey[32] || sig[64]`)
+        // under a bounded timeout BEFORE allocating or reading any variable-length payload!
+        let mut header = [0u8; LINK_ATTESTATION_HEADER_BYTES];
+        tokio::time::timeout(self.timeouts.read_timeout, recv.read_exact(&mut header))
             .await
-            .map_err(|e| IrohCarrierError::Transport(e.to_string()))?;
-        let _ = send.write_all(&[0x01]).await;
-        let _ = send.finish();
-
-        if buf.len() < LINK_ATTESTATION_HEADER_BYTES {
-            return Err(IrohCarrierError::Carrier(
-                CarrierError::EmptyOrTruncatedFrame,
-            ));
-        }
+            .map_err(|_| {
+                conn.close(4u32.into(), b"read attestation header timeout");
+                IrohCarrierError::Timeout {
+                    stage: "read_attestation_header",
+                }
+            })?
+            .map_err(|_| {
+                conn.close(4u32.into(), b"truncated attestation header");
+                IrohCarrierError::Carrier(CarrierError::EmptyOrTruncatedFrame)
+            })?;
 
         let mut att_pubkey = [0u8; 32];
-        att_pubkey.copy_from_slice(&buf[..32]);
+        att_pubkey.copy_from_slice(&header[..32]);
         let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&buf[32..LINK_ATTESTATION_HEADER_BYTES]);
+        sig_bytes.copy_from_slice(&header[32..LINK_ATTESTATION_HEADER_BYTES]);
 
-        // Cryptographic binding between QUIC TLS 1.3 `EndpointId` and SwarmTorch attestation key.
+        // Step 2: Cryptographic binding between QUIC TLS 1.3 `EndpointId` and attestation key.
         if att_pubkey != remote_id_bytes {
+            conn.close(5u32.into(), b"link key mismatch");
             return Err(IrohCarrierError::Carrier(
                 CarrierError::InvalidLinkAttestation,
             ));
@@ -830,12 +1070,67 @@ impl IrohEndpointBridgeV1 {
             receiver_nonce,
             signature: Signature::from_bytes(sig_bytes),
         };
-        let principal = self.adapter.accept_attested_link(
+        let principal = match self.adapter.accept_attested_link(
             &receiver_nonce,
             QuicHandshakeStageV1::OneRttComplete,
             &att,
-        )?;
-        Ok((principal, buf[LINK_ATTESTATION_HEADER_BYTES..].to_vec()))
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                conn.close(5u32.into(), b"invalid link attestation");
+                return Err(err);
+            }
+        };
+
+        // Step 3: Enforce per-link quota BEFORE reading or allocating the variable-length body!
+        if let Some(tracker) = quota {
+            if let Err(err) = tracker.record_frame_at(&principal, u64::from(current_time_secs)) {
+                conn.close(6u32.into(), b"link quota exceeded");
+                return Err(err);
+            }
+        }
+
+        // Step 4: Only authenticated, quota-admitted links may stream `wire_frame` up to cap.
+        let max_body = 4usize.saturating_add(self.adapter.codec.max_frame_bytes);
+        let wire_frame =
+            tokio::time::timeout(self.timeouts.read_timeout, recv.read_to_end(max_body))
+                .await
+                .map_err(|_| {
+                    conn.close(7u32.into(), b"read frame body timeout");
+                    IrohCarrierError::Timeout {
+                        stage: "read_frame_body",
+                    }
+                })?
+                .map_err(|e| {
+                    conn.close(7u32.into(), b"frame body too large or aborted");
+                    if matches!(e, iroh::endpoint::ReadToEndError::TooLong) {
+                        IrohCarrierError::Carrier(CarrierError::FrameTooLarge {
+                            len: self.adapter.codec.max_frame_bytes.saturating_add(1),
+                            max: self.adapter.codec.max_frame_bytes,
+                        })
+                    } else {
+                        IrohCarrierError::Transport(e.to_string())
+                    }
+                })?;
+        // Best-effort ack, bounded like every other stage: a peer that withholds stream
+        // credit must not be able to park this accept forever after its body was read.
+        let _ = tokio::time::timeout(self.timeouts.read_timeout, send.write_all(&[0x01])).await;
+        let _ = send.finish();
+
+        Ok((principal, wire_frame, conn))
+    }
+
+    /// Accept one live `1-RTT` QUIC frame using a CSPRNG challenge nonce and admit a direct
+    /// [`MessageEnvelope`] under strict [`EnvelopeVersionPolicyV1::RequireV2`].
+    pub async fn accept_envelope_over_quic_fresh_nonce(
+        &self,
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<AcceptedIrohEnvelopeV1, IrohCarrierError> {
+        let nonce = self.generate_fresh_challenge_nonce()?;
+        self.accept_envelope_over_quic(nonce, replay_guard, current_time_secs, quota)
+            .await
     }
 
     /// Accept one live `1-RTT` QUIC frame and admit a direct [`MessageEnvelope`] under
@@ -867,21 +1162,50 @@ impl IrohEndpointBridgeV1 {
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
         version_policy: EnvelopeVersionPolicyV1,
     ) -> Result<AcceptedIrohEnvelopeV1, IrohCarrierError> {
-        let (principal, wire_frame) = self.accept_1rtt_frame(receiver_nonce).await?;
-        let (accepted, rest) = self.adapter.accept_envelope_frame_with_policy(
-            principal,
-            &wire_frame,
-            replay_guard,
-            current_time_secs,
-            quota,
-            version_policy,
-        )?;
+        // Quota is already checked and charged inside `accept_1rtt_frame_inner` prior to body read.
+        let (principal, wire_frame, conn) = self
+            .accept_1rtt_frame_inner(receiver_nonce, current_time_secs, quota)
+            .await?;
+        let (accepted, rest) = self
+            .adapter
+            .accept_envelope_frame_with_policy(
+                principal,
+                &wire_frame,
+                replay_guard,
+                current_time_secs,
+                None,
+                version_policy,
+            )
+            .inspect_err(|_| {
+                conn.close(8u32.into(), b"envelope verification failed");
+            })?;
         if !rest.is_empty() {
+            conn.close(8u32.into(), b"trailing stream bytes");
             return Err(IrohCarrierError::Carrier(
                 CarrierError::EmptyOrTruncatedFrame,
             ));
         }
         Ok(accepted)
+    }
+
+    /// Accept one live `1-RTT` QUIC frame using a CSPRNG challenge nonce and admit a v2 gossip
+    /// [`BundledGossipDeliveryV2`].
+    pub async fn accept_gossip_v2_over_quic_fresh_nonce(
+        &self,
+        recipient_peer: PeerId,
+        replay_guard: &mut ReplayProtection,
+        current_time_secs: u32,
+        quota: Option<&mut LinkFrameQuotaTrackerV1>,
+    ) -> Result<AcceptedIrohGossipV2, IrohCarrierError> {
+        let nonce = self.generate_fresh_challenge_nonce()?;
+        self.accept_gossip_v2_over_quic(
+            nonce,
+            recipient_peer,
+            replay_guard,
+            current_time_secs,
+            quota,
+        )
+        .await
     }
 
     /// Accept one live `1-RTT` QUIC frame and admit a v2 gossip [`BundledGossipDeliveryV2`].
@@ -893,16 +1217,25 @@ impl IrohEndpointBridgeV1 {
         current_time_secs: u32,
         quota: Option<&mut LinkFrameQuotaTrackerV1>,
     ) -> Result<AcceptedIrohGossipV2, IrohCarrierError> {
-        let (principal, wire_frame) = self.accept_1rtt_frame(receiver_nonce).await?;
-        let (accepted, rest) = self.adapter.accept_gossip_v2_frame(
-            principal,
-            recipient_peer,
-            &wire_frame,
-            replay_guard,
-            current_time_secs,
-            quota,
-        )?;
+        // Quota is already checked and charged inside `accept_1rtt_frame_inner` prior to body read.
+        let (principal, wire_frame, conn) = self
+            .accept_1rtt_frame_inner(receiver_nonce, current_time_secs, quota)
+            .await?;
+        let (accepted, rest) = self
+            .adapter
+            .accept_gossip_v2_frame(
+                principal,
+                recipient_peer,
+                &wire_frame,
+                replay_guard,
+                current_time_secs,
+                None,
+            )
+            .inspect_err(|_| {
+                conn.close(8u32.into(), b"gossip verification failed");
+            })?;
         if !rest.is_empty() {
+            conn.close(8u32.into(), b"trailing stream bytes");
             return Err(IrohCarrierError::Carrier(
                 CarrierError::EmptyOrTruncatedFrame,
             ));
@@ -1718,6 +2051,1228 @@ mod tests {
         assert_eq!(replay.cache_size(), 1);
 
         client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn iroh_accept_and_slowloris_stream_enforce_bounded_timeouts() {
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xA1; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap()
+        .with_timeouts(IrohAcceptTimeoutsV1 {
+            handshake_timeout: Duration::from_millis(80),
+            read_timeout: Duration::from_millis(80),
+        });
+
+        let start = std::time::Instant::now();
+        let idle_res = server_ep.accept_1rtt_frame_fresh_nonce(1000, None).await;
+        assert!(matches!(
+            idle_res,
+            Err(IrohCarrierError::Timeout {
+                stage: "endpoint_accept"
+            })
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let client_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xA2; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+        let addr = server_ep.addr();
+
+        // Slowloris 1: send STQ1 + read nonce, then stall without sending attestation header.
+        let slow_header_client = async {
+            let conn = client_ep
+                .endpoint
+                .connect(addr.clone(), IrohCarrierAdapterV1::expected_alpn())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(IrohEndpointBridgeV1::STREAM_HELLO_V1)
+                .await
+                .unwrap();
+            let mut nonce = [0u8; 16];
+            recv.read_exact(&mut nonce).await.unwrap();
+            // Hold stream open until server's read_timeout closes the QUIC connection.
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            drop(send);
+        };
+        let ((), srv_header_timeout) = tokio::join!(
+            slow_header_client,
+            server_ep.accept_1rtt_frame_fresh_nonce(1001, None),
+        );
+        assert!(matches!(
+            srv_header_timeout,
+            Err(IrohCarrierError::Timeout {
+                stage: "read_attestation_header"
+            })
+        ));
+
+        // Slowloris 2: send valid 96-byte attestation header, then stall before finishing body.
+        let slow_body_client = async {
+            let conn = client_ep
+                .endpoint
+                .connect(addr, IrohCarrierAdapterV1::expected_alpn())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(IrohEndpointBridgeV1::STREAM_HELLO_V1)
+                .await
+                .unwrap();
+            let mut nonce = [0u8; 16];
+            recv.read_exact(&mut nonce).await.unwrap();
+            let att = sign_link_attestation(
+                &client_ep.link_auth,
+                IrohCarrierAdapterV1::expected_alpn(),
+                nonce,
+            )
+            .unwrap();
+            let mut header = [0u8; LINK_ATTESTATION_HEADER_BYTES];
+            header[..32].copy_from_slice(&att.endpoint_public_key);
+            header[32..].copy_from_slice(att.signature.as_bytes());
+            send.write_all(&header).await.unwrap();
+            // Partial body stall: server must time out cleanly and close connection.
+            send.write_all(&[0u8; 2]).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            drop(send);
+        };
+        let ((), srv_body_timeout) = tokio::join!(
+            slow_body_client,
+            server_ep.accept_1rtt_frame_fresh_nonce(1002, None),
+        );
+        assert!(matches!(
+            srv_body_timeout,
+            Err(IrohCarrierError::Timeout {
+                stage: "read_frame_body"
+            })
+        ));
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn iroh_pre_body_quota_enforced_before_oversized_body_read() {
+        let origin_seed = [0xA3; 32];
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let receiver_kp = KeyPair::from_seed([0xA4; 32]).unwrap();
+
+        let client_ep = IrohEndpointBridgeV1::bind_loopback(
+            origin_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xA4; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 256),
+        )
+        .await
+        .unwrap();
+        let addr = server_ep.addr();
+
+        let scope = [0x11; 16];
+        let run_id = [0x22; 16];
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: scope,
+            run_id,
+            policy_digest: [0x55; 32],
+            receiver_peer: receiver_kp.peer_id(),
+            sender_peer: origin_kp.peer_id(),
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x91; 32],
+            issued_at_secs: 900,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        let hs_sig = origin_auth.sign_session_handshake_v2(&challenge).unwrap();
+        let mut env = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![1, 2, 3],
+        );
+        env.sequence = 1;
+        env.timestamp = 1000;
+        let frame_bytes = env.sign_with(&origin_auth).serialize().unwrap();
+
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(CohortAllowlist::from_peers([origin_kp.peer_id()]));
+        replay.register_recovery_challenge_v2(challenge).unwrap();
+        replay
+            .complete_recovery_handshake_v2(scope, run_id, origin_kp.public_key(), &hs_sig, 900)
+            .unwrap();
+        let mut quota = LinkFrameQuotaTrackerV1::with_limits(1, 60, 8, 16);
+
+        // Consume the single allowed frame in the quota window.
+        let (s1, r1) = tokio::join!(
+            client_ep.send_frame_1rtt(addr.clone(), &frame_bytes),
+            server_ep.accept_envelope_over_quic_fresh_nonce(&mut replay, 1000, Some(&mut quota)),
+        );
+        s1.unwrap();
+        r1.unwrap();
+
+        // Helper sending an attested but oversized raw body (> 256 bytes).
+        let send_oversized_body = || async {
+            let conn = client_ep
+                .endpoint
+                .connect(addr.clone(), IrohCarrierAdapterV1::expected_alpn())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(IrohEndpointBridgeV1::STREAM_HELLO_V1)
+                .await
+                .unwrap();
+            let mut nonce = [0u8; 16];
+            recv.read_exact(&mut nonce).await.unwrap();
+            let att = sign_link_attestation(
+                &client_ep.link_auth,
+                IrohCarrierAdapterV1::expected_alpn(),
+                nonce,
+            )
+            .unwrap();
+            let oversized = vec![0x5Au8; 512];
+            let mut buf = Vec::with_capacity(LINK_ATTESTATION_HEADER_BYTES + 4 + oversized.len());
+            buf.extend_from_slice(&att.endpoint_public_key);
+            buf.extend_from_slice(att.signature.as_bytes());
+            buf.extend_from_slice(&(oversized.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&oversized);
+            let _ = send.write_all(&buf).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+        };
+
+        // Pre-body quota must fail BEFORE body read/size check returns FrameTooLarge.
+        let ((), r2) = tokio::join!(
+            send_oversized_body(),
+            server_ep.accept_1rtt_frame_fresh_nonce(1001, Some(&mut quota)),
+        );
+        assert!(matches!(r2, Err(IrohCarrierError::LinkRateLimited { .. })));
+
+        // Without quota throttling, oversized body triggers bounded FrameTooLarge.
+        let ((), r3) = tokio::join!(
+            send_oversized_body(),
+            server_ep.accept_1rtt_frame_fresh_nonce(1002, None),
+        );
+        assert!(matches!(
+            r3,
+            Err(IrohCarrierError::Carrier(CarrierError::FrameTooLarge {
+                max: 256,
+                ..
+            }))
+        ));
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn iroh_fresh_csprng_nonces_and_static_nonce_reuse_rejected() {
+        let origin_seed = [0xA5; 32];
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let receiver_kp = KeyPair::from_seed([0xA6; 32]).unwrap();
+
+        let client_ep = IrohEndpointBridgeV1::bind_loopback(
+            origin_seed,
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap();
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xA6; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 65_536),
+        )
+        .await
+        .unwrap()
+        .with_timeouts(IrohAcceptTimeoutsV1 {
+            handshake_timeout: Duration::from_millis(2000),
+            read_timeout: Duration::from_millis(2000),
+        });
+        let addr = server_ep.addr();
+        let scope = [0x44; 16];
+        let run_id = [0x55; 16];
+        let challenge = SessionHandshakeChallengeV2 {
+            swarm_instance_id: scope,
+            run_id,
+            policy_digest: [0x66; 32],
+            receiver_peer: receiver_kp.peer_id(),
+            sender_peer: origin_kp.peer_id(),
+            requested_epoch: 1,
+            initial_sequence: 0,
+            receiver_nonce: [0x92; 32],
+            issued_at_secs: 900,
+        };
+        let session_id = challenge.derive_session_id().unwrap();
+        let hs_sig = origin_auth.sign_session_handshake_v2(&challenge).unwrap();
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_cohort_allowlist(CohortAllowlist::from_peers([origin_kp.peer_id()]));
+        replay.register_recovery_challenge_v2(challenge).unwrap();
+        replay
+            .complete_recovery_handshake_v2(scope, run_id, origin_kp.public_key(), &hs_sig, 900)
+            .unwrap();
+
+        for seq in 1..=2u64 {
+            let mut env = MessageEnvelope::new_v2(
+                *origin_kp.public_key(),
+                scope,
+                run_id,
+                1,
+                session_id,
+                1,
+                MessageType::GradientUpdate,
+                vec![seq as u8],
+            );
+            env.sequence = seq;
+            env.timestamp = 1000 + seq as u32;
+            let bytes = env.sign_with(&origin_auth).serialize().unwrap();
+            let (s, r) = tokio::join!(
+                client_ep.send_frame_1rtt(addr.clone(), &bytes),
+                server_ep.accept_envelope_over_quic_fresh_nonce(
+                    &mut replay,
+                    1000 + seq as u32,
+                    None
+                ),
+            );
+            s.unwrap();
+            let accepted = r.unwrap();
+            assert_eq!(accepted.envelope.payload, vec![seq as u8]);
+        }
+
+        // Static non-zero nonce succeeds once and is rejected immediately on reuse.
+        let mut env3 = MessageEnvelope::new_v2(
+            *origin_kp.public_key(),
+            scope,
+            run_id,
+            1,
+            session_id,
+            1,
+            MessageType::GradientUpdate,
+            vec![3],
+        );
+        env3.sequence = 3;
+        env3.timestamp = 1003;
+        let bytes3 = env3.sign_with(&origin_auth).serialize().unwrap();
+        let static_nonce = [0xA7; 16];
+        let (s3, r3) = tokio::join!(
+            client_ep.send_frame_1rtt(addr, &bytes3),
+            server_ep.accept_1rtt_frame(static_nonce),
+        );
+        s3.unwrap();
+        r3.unwrap();
+
+        let reuse_res = server_ep.accept_1rtt_frame(static_nonce).await;
+        assert!(matches!(
+            reuse_res,
+            Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation
+            ))
+        ));
+
+        let zero_res = server_ep.accept_1rtt_frame([0u8; 16]).await;
+        assert!(matches!(
+            zero_res,
+            Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation
+            ))
+        ));
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Independent clean-context T-Agent adversarial regressions (`15D-2`).
+    // -------------------------------------------------------------------------------------------
+
+    /// Attestation header variants a scripted raw peer sends after reading the receiver challenge.
+    #[derive(Debug, Clone, Copy)]
+    enum TAgentHeaderV1 {
+        /// Valid attestation signed by the TLS-bound link key.
+        Valid,
+        /// Valid signature by a key that differs from the TLS `remote_id`.
+        ForeignKey,
+        /// Correct TLS-bound public key with a corrupted signature.
+        CorruptSig,
+    }
+
+    /// Scripted raw-peer behaviours driven directly through an `iroh` endpoint.
+    #[derive(Debug, Clone, Copy)]
+    enum TAgentPeerScriptV1<'a> {
+        /// Completes the 1-RTT handshake but never opens a bi-stream.
+        ConnectOnly,
+        /// Opens a bi-stream and writes only 2 of the 4 stream-hello bytes.
+        PartialHello,
+        /// Writes a wrong 4-byte stream hello.
+        BadHello,
+        /// Reads the challenge nonce, then never sends the attestation header.
+        StallAfterNonce,
+        /// Reads the challenge nonce, writes 50 of the 96 header bytes, then FIN.
+        TruncatedHeader,
+        /// Reads the challenge, writes a 96-byte header (`kind`), then `body`, then optional FIN.
+        Header {
+            kind: TAgentHeaderV1,
+            body: &'a [u8],
+            finish: bool,
+        },
+    }
+
+    fn t_agent_app_close_code(reason: &Option<iroh::endpoint::ConnectionError>) -> Option<u64> {
+        match reason {
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+                Some(close.error_code.into_inner())
+            }
+            _ => None,
+        }
+    }
+
+    fn t_agent_is_invalid_attestation<T>(res: &Result<T, IrohCarrierError>) -> bool {
+        matches!(
+            res,
+            Err(IrohCarrierError::Carrier(
+                CarrierError::InvalidLinkAttestation
+            ))
+        )
+    }
+
+    async fn t_agent_timed<F: std::future::Future>(fut: F) -> (F::Output, Duration) {
+        let start = std::time::Instant::now();
+        let out = fut.await;
+        (out, start.elapsed())
+    }
+
+    /// Drive `script` against `addr` and return the close reason this peer observed within `hold`
+    /// (`None` if the server never closed the connection in time).
+    async fn t_agent_raw_peer(
+        client: &IrohEndpointBridgeV1,
+        addr: EndpointAddr,
+        script: TAgentPeerScriptV1<'_>,
+        hold: Duration,
+    ) -> Option<iroh::endpoint::ConnectionError> {
+        let alpn = IrohCarrierAdapterV1::expected_alpn();
+        let conn = client.endpoint.connect(addr, alpn).await.ok()?;
+        if matches!(script, TAgentPeerScriptV1::ConnectOnly) {
+            return tokio::time::timeout(hold, conn.closed()).await.ok();
+        }
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        let hello = IrohEndpointBridgeV1::STREAM_HELLO_V1;
+        match script {
+            TAgentPeerScriptV1::ConnectOnly => {}
+            TAgentPeerScriptV1::PartialHello => {
+                let _ = send.write_all(&hello[..2]).await;
+            }
+            TAgentPeerScriptV1::BadHello => {
+                let _ = send.write_all(b"XXXX").await;
+            }
+            TAgentPeerScriptV1::StallAfterNonce | TAgentPeerScriptV1::TruncatedHeader => {
+                send.write_all(hello).await.ok()?;
+                let mut nonce = [0u8; 16];
+                recv.read_exact(&mut nonce).await.ok()?;
+                if matches!(script, TAgentPeerScriptV1::TruncatedHeader) {
+                    let _ = send.write_all(&[0x33; 50]).await;
+                    let _ = send.finish();
+                }
+            }
+            TAgentPeerScriptV1::Header { kind, body, finish } => {
+                send.write_all(hello).await.ok()?;
+                let mut nonce = [0u8; 16];
+                recv.read_exact(&mut nonce).await.ok()?;
+                let foreign = MessageAuth::new(KeyPair::from_seed([0xEE; 32]).unwrap());
+                let signer = match kind {
+                    TAgentHeaderV1::ForeignKey => &foreign,
+                    TAgentHeaderV1::Valid | TAgentHeaderV1::CorruptSig => &client.link_auth,
+                };
+                let att = sign_link_attestation(signer, alpn, nonce).unwrap();
+                let mut header = [0u8; LINK_ATTESTATION_HEADER_BYTES];
+                header[..32].copy_from_slice(&att.endpoint_public_key);
+                header[32..].copy_from_slice(att.signature.as_bytes());
+                if matches!(kind, TAgentHeaderV1::CorruptSig) {
+                    header[40] ^= 0xFF;
+                }
+                let _ = send.write_all(&header).await;
+                if !body.is_empty() {
+                    let _ = send.write_all(body).await;
+                }
+                if finish {
+                    let _ = send.finish();
+                }
+            }
+        }
+        // Keep both halves alive: dropping `SendStream` implicitly finishes it and dropping
+        // `RecvStream` implicitly sends STOP_SENDING.
+        let reason = tokio::time::timeout(hold, conn.closed()).await.ok();
+        drop(send);
+        drop(recv);
+        reason
+    }
+
+    async fn t_agent_bind_raw_endpoint(
+        seed: [u8; 32],
+        stream_receive_window: Option<u32>,
+    ) -> Endpoint {
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&seed))
+            .relay_mode(RelayMode::Disabled)
+            .clear_address_lookup()
+            .clear_addr_filter();
+        if let Some(window) = stream_receive_window {
+            builder = builder.transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .stream_receive_window(iroh::endpoint::VarInt::from_u32(window))
+                    .build(),
+            );
+        }
+        builder
+            .bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// Peer that never reads the receiver challenge (it pre-signs a caller-supplied static nonce),
+    /// so its QUIC stack never extends `MAX_STREAM_DATA` past its initial `stream_receive_window`.
+    async fn t_agent_presigned_non_reading_peer(
+        ep: &Endpoint,
+        addr: EndpointAddr,
+        auth: &MessageAuth,
+        nonce: [u8; 16],
+        wire_frame: &[u8],
+        hold: Duration,
+    ) -> Option<iroh::endpoint::ConnectionError> {
+        let alpn = IrohCarrierAdapterV1::expected_alpn();
+        let conn = ep.connect(addr, alpn).await.ok()?;
+        let (mut send, recv_never_read) = conn.open_bi().await.ok()?;
+        let att = sign_link_attestation(auth, alpn, nonce).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(IrohEndpointBridgeV1::STREAM_HELLO_V1);
+        out.extend_from_slice(&att.endpoint_public_key);
+        out.extend_from_slice(att.signature.as_bytes());
+        out.extend_from_slice(wire_frame);
+        send.write_all(&out).await.ok()?;
+        send.finish().ok()?;
+        let reason = tokio::time::timeout(hold, conn.closed()).await.ok();
+        drop(recv_never_read);
+        drop(send);
+        reason
+    }
+
+    /// Invariant 1: every receiver-side stream write/read in `accept_1rtt_frame_inner` must be
+    /// bounded. A peer that grants exactly 16 bytes of stream credit (the challenge nonce) and
+    /// never extends it must not be able to wedge the accept call on the post-body ack write.
+    #[tokio::test]
+    async fn t_agent_post_body_ack_write_is_bounded_against_credit_starving_peer() {
+        let handshake_timeout = Duration::from_secs(1);
+        let read_timeout = Duration::from_millis(250);
+        // Strictly larger than the sum of every bounded stage (accept + 1-RTT + 7 stream stages
+        // incl. the ack), so exceeding it can only mean an await with no timeout at all.
+        let outer_deadline = handshake_timeout * 2 + read_timeout * 8 + Duration::from_secs(1);
+        let hold = outer_deadline + Duration::from_millis(500);
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xB1; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 1024),
+        )
+        .await
+        .unwrap()
+        .with_timeouts(IrohAcceptTimeoutsV1 {
+            handshake_timeout,
+            read_timeout,
+        });
+        let addr = server_ep.addr();
+        let wire_frame = server_ep.adapter().encode_wire_frame(&[0x42; 8]).unwrap();
+
+        // Control: identical pre-signed, non-reading peer with default stream credit completes.
+        let control_seed = [0xB2; 32];
+        let control_auth = MessageAuth::new(KeyPair::from_seed(control_seed).unwrap());
+        let control_ep = t_agent_bind_raw_endpoint(control_seed, None).await;
+        let (_, control) = tokio::join!(
+            t_agent_presigned_non_reading_peer(
+                &control_ep,
+                addr.clone(),
+                &control_auth,
+                [0xB3; 16],
+                &wire_frame,
+                hold,
+            ),
+            tokio::time::timeout(
+                outer_deadline,
+                server_ep.accept_1rtt_frame_authenticated([0xB3; 16], 1000, None),
+            ),
+        );
+        let (principal, frame) = control
+            .expect("control accept must not hang")
+            .expect("control accept must succeed");
+        assert_eq!(
+            principal.link_peer_id(),
+            KeyPair::from_seed(control_seed).unwrap().peer_id()
+        );
+        assert_eq!(frame, wire_frame);
+        control_ep.close().await;
+
+        // Attack: peer advertises a 16-byte stream receive window and never reads it.
+        let attack_seed = [0xB5; 32];
+        let attack_auth = MessageAuth::new(KeyPair::from_seed(attack_seed).unwrap());
+        let starving_ep = t_agent_bind_raw_endpoint(attack_seed, Some(16)).await;
+        let (_, attack) = tokio::join!(
+            t_agent_presigned_non_reading_peer(
+                &starving_ep,
+                addr,
+                &attack_auth,
+                [0xB4; 16],
+                &wire_frame,
+                hold,
+            ),
+            tokio::time::timeout(
+                outer_deadline,
+                server_ep.accept_1rtt_frame_authenticated([0xB4; 16], 1000, None),
+            ),
+        );
+        starving_ep.close().await;
+        server_ep.close().await;
+        assert!(
+            attack.is_ok(),
+            "accept_1rtt_frame_authenticated did not return within {outer_deadline:?} \
+             (read_timeout = {read_timeout:?}): the post-body `send.write_all(&[0x01])` ack \
+             is not bounded by `IrohAcceptTimeoutsV1`"
+        );
+    }
+
+    /// Invariant 2: a quota-exhausted or unattested peer's body is never awaited; quota is charged
+    /// only after attestation, exactly once, and BEFORE the bounded body read.
+    #[tokio::test]
+    async fn t_agent_unadmitted_peer_body_never_awaited_and_quota_charged_only_after_attestation() {
+        let read_timeout = Duration::from_millis(1500);
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xC1; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 256),
+        )
+        .await
+        .unwrap()
+        .with_timeouts(IrohAcceptTimeoutsV1 {
+            handshake_timeout: Duration::from_secs(3),
+            read_timeout,
+        });
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xC2; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        let addr = server_ep.addr();
+        let link = client_ep.link_peer_id();
+        let hold = Duration::from_secs(4);
+        let stall = |kind: TAgentHeaderV1| TAgentPeerScriptV1::Header {
+            kind,
+            body: &[],
+            finish: false,
+        };
+
+        // (a) Validly attested but quota-exhausted peer that never sends a body nor FIN.
+        let principal = attested_link(
+            &IrohCarrierAdapterV1::default(),
+            &client_ep.link_auth,
+            [0x01; 16],
+        );
+        let mut exhausted = LinkFrameQuotaTrackerV1::with_limits(1, 60, 8, 16);
+        exhausted.record_frame_at(&principal, 1000).unwrap();
+        let (close_a, (res_a, elapsed_a)) = tokio::join!(
+            t_agent_raw_peer(&client_ep, addr.clone(), stall(TAgentHeaderV1::Valid), hold),
+            t_agent_timed(server_ep.accept_1rtt_frame_fresh_nonce(1001, Some(&mut exhausted))),
+        );
+        assert!(
+            matches!(res_a, Err(IrohCarrierError::LinkRateLimited { .. })),
+            "{res_a:?}"
+        );
+        assert!(
+            elapsed_a < read_timeout,
+            "quota rejection waited on the body: {elapsed_a:?}"
+        );
+        assert_eq!(exhausted.active_window_count(&link), 1);
+        assert_eq!(t_agent_app_close_code(&close_a), Some(6));
+
+        // (b)/(c) Link-key mismatch and corrupted signature: rejected before quota and body.
+        let mut open = LinkFrameQuotaTrackerV1::with_limits(4, 60, 8, 16);
+        for kind in [TAgentHeaderV1::ForeignKey, TAgentHeaderV1::CorruptSig] {
+            let (close, (res, elapsed)) = tokio::join!(
+                t_agent_raw_peer(&client_ep, addr.clone(), stall(kind), hold),
+                t_agent_timed(server_ep.accept_1rtt_frame_fresh_nonce(1002, Some(&mut open))),
+            );
+            assert!(t_agent_is_invalid_attestation(&res), "{kind:?}: {res:?}");
+            assert!(
+                elapsed < read_timeout,
+                "{kind:?} rejection waited on the body: {elapsed:?}"
+            );
+            assert_eq!(
+                open.tracked_link_count(),
+                0,
+                "{kind:?} charged quota before attestation"
+            );
+            assert_eq!(t_agent_app_close_code(&close), Some(5), "{kind:?}");
+        }
+
+        // (d) Neighbouring valid case: admitted peer is charged once pre-body, then its stalled
+        //     body read is bounded by `read_timeout` and the connection is closed (code 7).
+        let (close_d, (res_d, elapsed_d)) = tokio::join!(
+            t_agent_raw_peer(&client_ep, addr, stall(TAgentHeaderV1::Valid), hold),
+            t_agent_timed(server_ep.accept_1rtt_frame_fresh_nonce(1003, Some(&mut open))),
+        );
+        assert!(
+            matches!(
+                res_d,
+                Err(IrohCarrierError::Timeout {
+                    stage: "read_frame_body"
+                })
+            ),
+            "{res_d:?}"
+        );
+        assert!(
+            elapsed_d >= read_timeout && elapsed_d < read_timeout * 3,
+            "{elapsed_d:?}"
+        );
+        assert_eq!(open.active_window_count(&link), 1);
+        assert_eq!(t_agent_app_close_code(&close_d), Some(7));
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Invariant 1: each receiver stage is individually bounded and closes the connection with a
+    /// stage-specific application code on timeout or malformed preamble.
+    #[tokio::test]
+    async fn t_agent_receiver_stage_timeouts_and_malformed_preambles_close_with_stage_codes() {
+        let read_timeout = Duration::from_millis(200);
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xC5; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 256),
+        )
+        .await
+        .unwrap()
+        .with_timeouts(IrohAcceptTimeoutsV1 {
+            handshake_timeout: Duration::from_secs(2),
+            read_timeout,
+        });
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xC6; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        let addr = server_ep.addr();
+        let hold = Duration::from_secs(3);
+        let partial_body = [0x01u8, 0x00];
+        // (script, expected timeout stage or `None` for `EmptyOrTruncatedFrame`, close code)
+        let cases: [(TAgentPeerScriptV1<'_>, Option<&str>, u64); 6] = [
+            (TAgentPeerScriptV1::ConnectOnly, Some("accept_bi"), 2),
+            (TAgentPeerScriptV1::PartialHello, Some("read_hello"), 3),
+            (TAgentPeerScriptV1::BadHello, None, 3),
+            (
+                TAgentPeerScriptV1::StallAfterNonce,
+                Some("read_attestation_header"),
+                4,
+            ),
+            (TAgentPeerScriptV1::TruncatedHeader, None, 4),
+            (
+                TAgentPeerScriptV1::Header {
+                    kind: TAgentHeaderV1::Valid,
+                    body: &partial_body,
+                    finish: false,
+                },
+                Some("read_frame_body"),
+                7,
+            ),
+        ];
+        for (i, (script, expected_stage, expected_code)) in cases.into_iter().enumerate() {
+            let (close, (res, elapsed)) = tokio::join!(
+                t_agent_raw_peer(&client_ep, addr.clone(), script, hold),
+                t_agent_timed(server_ep.accept_1rtt_frame_fresh_nonce(1000 + i as u32, None)),
+            );
+            let stage_ok = match (expected_stage, &res) {
+                (Some(want), Err(IrohCarrierError::Timeout { stage })) => *stage == want,
+                (None, Err(IrohCarrierError::Carrier(CarrierError::EmptyOrTruncatedFrame))) => true,
+                _ => false,
+            };
+            assert!(
+                stage_ok,
+                "{script:?}: expected {expected_stage:?}, got {res:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{script:?} not bounded: {elapsed:?}"
+            );
+            assert_eq!(
+                t_agent_app_close_code(&close),
+                Some(expected_code),
+                "{script:?} close reason {close:?}"
+            );
+        }
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Invariant 1 / sibling parity: `send_frame_1rtt` bounds dial+1-RTT completion and the nonce
+    /// read, rejects a zero challenge, and closes the connection on every failure.
+    #[tokio::test]
+    async fn t_agent_sender_stage_timeouts_zero_challenge_and_cleanup() {
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xD1; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap()
+                .with_timeouts(IrohAcceptTimeoutsV1 {
+                    handshake_timeout: Duration::from_millis(300),
+                    read_timeout: Duration::from_millis(300),
+                });
+
+        // (a) Listener that never calls `accept()`: dial + 1-RTT completion bounded.
+        let silent_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xD2; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        let (res_a, elapsed_a) =
+            t_agent_timed(client_ep.send_frame_1rtt(silent_ep.addr(), b"payload")).await;
+        assert!(
+            matches!(
+                res_a,
+                Err(IrohCarrierError::Timeout {
+                    stage: "quic_connect"
+                })
+            ),
+            "{res_a:?}"
+        );
+        assert!(elapsed_a < Duration::from_secs(2), "{elapsed_a:?}");
+        silent_ep.close().await;
+
+        // (b) Server reads the hello but never issues a challenge; (c) server issues a zero nonce.
+        let raw_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xD3; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        for zero_nonce in [false, true] {
+            let raw_server = async {
+                let incoming = raw_ep.endpoint.accept().await?;
+                let conn = incoming.accept().ok()?.await.ok()?;
+                let (mut send, mut recv) = conn.accept_bi().await.ok()?;
+                let mut hello = [0u8; 4];
+                recv.read_exact(&mut hello).await.ok()?;
+                if zero_nonce {
+                    send.write_all(&[0u8; 16]).await.ok()?;
+                }
+                let reason = tokio::time::timeout(Duration::from_secs(3), conn.closed())
+                    .await
+                    .ok();
+                drop(send);
+                drop(recv);
+                reason
+            };
+            let (reason, (res, elapsed)) = tokio::join!(
+                raw_server,
+                t_agent_timed(client_ep.send_frame_1rtt(raw_ep.addr(), b"payload")),
+            );
+            if zero_nonce {
+                assert!(t_agent_is_invalid_attestation(&res), "{res:?}");
+            } else {
+                assert!(
+                    matches!(
+                        res,
+                        Err(IrohCarrierError::Timeout {
+                            stage: "read_nonce"
+                        })
+                    ),
+                    "{res:?}"
+                );
+            }
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            assert_eq!(
+                t_agent_app_close_code(&reason),
+                Some(2),
+                "zero_nonce={zero_nonce}: {reason:?}"
+            );
+        }
+
+        raw_ep.close().await;
+        client_ep.close().await;
+    }
+
+    /// Invariant 2: quota is charged exactly once per frame through every bridge entry point
+    /// (raw, fresh-nonce, envelope, envelope-with-policy, gossip v2), on failure and on success.
+    #[tokio::test]
+    async fn t_agent_quota_charged_exactly_once_per_frame_across_all_bridge_entry_points() {
+        let origin_seed = [0xE1; 32];
+        let origin_kp = KeyPair::from_seed(origin_seed).unwrap();
+        let origin_auth = MessageAuth::new(origin_kp.clone());
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xE2; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, 4096),
+        )
+        .await
+        .unwrap();
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback(origin_seed, IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        let addr = server_ep.addr();
+        let link = client_ep.link_peer_id();
+        let recipient = KeyPair::from_seed([0xE3; 32]).unwrap().peer_id();
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([origin_kp.peer_id()]));
+        let mut quota = LinkFrameQuotaTrackerV1::with_limits(32, 60, 8, 64);
+        let garbage = [0xABu8; 8];
+
+        macro_rules! assert_charged_once {
+            ($expected:expr, $payload:expr, $accept:expr, $pat:pat) => {{
+                let (sent, res) =
+                    tokio::join!(client_ep.send_frame_1rtt(addr.clone(), $payload), $accept);
+                sent.unwrap();
+                #[allow(clippy::redundant_pattern_matching)]
+                let matched = matches!(res, $pat);
+                assert!(matched, "entry point #{}: {:?}", $expected, res);
+                assert_eq!(
+                    quota.active_window_count(&link),
+                    $expected,
+                    "entry point #{} did not charge quota exactly once",
+                    $expected
+                );
+            }};
+        }
+
+        assert_charged_once!(
+            1,
+            &garbage,
+            server_ep.accept_1rtt_frame_authenticated([0x11; 16], 1000, Some(&mut quota)),
+            Ok(_)
+        );
+        assert_charged_once!(
+            2,
+            &garbage,
+            server_ep.accept_1rtt_frame_fresh_nonce(1000, Some(&mut quota)),
+            Ok(_)
+        );
+        assert_charged_once!(
+            3,
+            &garbage,
+            server_ep.accept_envelope_over_quic([0x12; 16], &mut replay, 1000, Some(&mut quota)),
+            Err(IrohCarrierError::Envelope(_))
+        );
+        assert_charged_once!(
+            4,
+            &garbage,
+            server_ep.accept_envelope_over_quic_fresh_nonce(&mut replay, 1000, Some(&mut quota)),
+            Err(IrohCarrierError::Envelope(_))
+        );
+        assert_charged_once!(
+            5,
+            &garbage,
+            server_ep.accept_envelope_over_quic_with_policy(
+                [0x13; 16],
+                &mut replay,
+                1000,
+                Some(&mut quota),
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            ),
+            Err(IrohCarrierError::Envelope(_))
+        );
+        assert_charged_once!(
+            6,
+            &garbage,
+            server_ep.accept_gossip_v2_over_quic(
+                [0x14; 16],
+                recipient,
+                &mut replay,
+                1000,
+                Some(&mut quota),
+            ),
+            Err(IrohCarrierError::Gossip(_))
+        );
+        assert_charged_once!(
+            7,
+            &garbage,
+            server_ep.accept_gossip_v2_over_quic_fresh_nonce(
+                recipient,
+                &mut replay,
+                1000,
+                Some(&mut quota),
+            ),
+            Err(IrohCarrierError::Gossip(_))
+        );
+        assert_eq!(replay.cache_size(), 0);
+
+        // Successful admission is also charged exactly once (no second adapter-level charge).
+        let env_v1 = MessageEnvelope::new_v1(
+            *origin_kp.public_key(),
+            [0x61; 16],
+            1,
+            3,
+            MessageType::GradientUpdate,
+            vec![7, 8, 9],
+        )
+        .with_sequence(1)
+        .with_timestamp(1000)
+        .sign_with(&origin_auth);
+        let v1_bytes = env_v1.serialize().unwrap();
+        assert_charged_once!(
+            8,
+            &v1_bytes,
+            server_ep.accept_envelope_over_quic_with_policy(
+                [0x15; 16],
+                &mut replay,
+                1000,
+                Some(&mut quota),
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            ),
+            Ok(_)
+        );
+        assert_eq!(replay.cache_size(), 1);
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Invariant 2 boundary: `4 + max_frame_bytes` is admitted byte-exact, one more byte maps the
+    /// typed `ReadToEndError::TooLong` to `FrameTooLarge`, and both attempts are charged pre-body.
+    #[tokio::test]
+    async fn t_agent_body_cap_boundary_exact_admitted_plus_one_rejected_and_charged() {
+        let max = 64usize;
+        let server_ep = IrohEndpointBridgeV1::bind_loopback(
+            [0xF1; 32],
+            IrohCarrierAdapterV1::new(LinkBindingPolicyV1::StrictOneToOne, max),
+        )
+        .await
+        .unwrap();
+        let client_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xF2; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap();
+        let addr = server_ep.addr();
+        let link = client_ep.link_peer_id();
+        let hold = Duration::from_secs(3);
+        let mut quota = LinkFrameQuotaTrackerV1::with_limits(8, 60, 8, 16);
+        let exact = server_ep.adapter().encode_wire_frame(&[0x5A; 64]).unwrap();
+        assert_eq!(exact.len(), 4 + max);
+        let mut over = exact.clone();
+        over.push(0x00);
+
+        let (_, res_exact) = tokio::join!(
+            t_agent_raw_peer(
+                &client_ep,
+                addr.clone(),
+                TAgentPeerScriptV1::Header {
+                    kind: TAgentHeaderV1::Valid,
+                    body: &exact,
+                    finish: true,
+                },
+                hold,
+            ),
+            server_ep.accept_1rtt_frame_fresh_nonce(1000, Some(&mut quota)),
+        );
+        let (principal, frame) = res_exact.unwrap();
+        assert_eq!(principal.link_peer_id(), link);
+        assert_eq!(frame, exact);
+        assert_eq!(quota.active_window_count(&link), 1);
+
+        let (close_over, res_over) = tokio::join!(
+            t_agent_raw_peer(
+                &client_ep,
+                addr,
+                TAgentPeerScriptV1::Header {
+                    kind: TAgentHeaderV1::Valid,
+                    body: &over,
+                    finish: true,
+                },
+                hold,
+            ),
+            server_ep.accept_1rtt_frame_fresh_nonce(1001, Some(&mut quota)),
+        );
+        assert!(
+            matches!(
+                res_over,
+                Err(IrohCarrierError::Carrier(CarrierError::FrameTooLarge {
+                    max: 64,
+                    ..
+                }))
+            ),
+            "{res_over:?}"
+        );
+        assert_eq!(quota.active_window_count(&link), 2);
+        assert_eq!(t_agent_app_close_code(&close_over), Some(7));
+
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Invariant 3: bounded FIFO nonce window, CSPRNG nonces, zero/duplicate rejection shared
+    /// across every sibling entry point (even after an accept timeout), and fail-closed poison.
+    #[tokio::test]
+    async fn t_agent_nonce_cache_bounded_shared_across_siblings_burned_on_timeout_and_poison_fail_closed(
+    ) {
+        let nonce_n = |i: u64| {
+            let mut n = [0u8; 16];
+            n[..8].copy_from_slice(&(i + 1).to_le_bytes());
+            n
+        };
+        let cap = DEFAULT_MAX_RECENT_NONCES as u64;
+        let mut cache = RecentNonceCache::default();
+        for i in 0..cap {
+            assert!(cache.record_unique(nonce_n(i)));
+        }
+        assert!(!cache.record_unique(nonce_n(0)));
+        assert!(!cache.record_unique(nonce_n(cap - 1)));
+        assert_eq!(
+            (cache.order.len(), cache.seen.len()),
+            (DEFAULT_MAX_RECENT_NONCES, DEFAULT_MAX_RECENT_NONCES)
+        );
+        assert!(cache.record_unique(nonce_n(cap)));
+        assert_eq!(
+            (cache.order.len(), cache.seen.len()),
+            (DEFAULT_MAX_RECENT_NONCES, DEFAULT_MAX_RECENT_NONCES)
+        );
+        assert!(
+            !cache.contains(&nonce_n(0)),
+            "oldest nonce must be evicted at capacity"
+        );
+        assert!(cache.contains(&nonce_n(1)) && cache.contains(&nonce_n(cap)));
+
+        let server_ep =
+            IrohEndpointBridgeV1::bind_loopback([0xA9; 32], IrohCarrierAdapterV1::default())
+                .await
+                .unwrap()
+                .with_timeouts(IrohAcceptTimeoutsV1 {
+                    handshake_timeout: Duration::from_millis(100),
+                    read_timeout: Duration::from_millis(100),
+                });
+        let recipient = KeyPair::from_seed([0xAA; 32]).unwrap().peer_id();
+        let mut replay = ReplayProtection::try_with_config(64, 120).unwrap();
+        let mut quota = LinkFrameQuotaTrackerV1::with_limits(4, 60, 4, 4);
+        let policy = EnvelopeVersionPolicyV1::AllowLegacyV1AndV2;
+
+        // CSPRNG nonces are non-zero and pairwise distinct; generation alone reserves nothing.
+        let mut drawn = BTreeSet::new();
+        for _ in 0..256 {
+            let n = server_ep.generate_fresh_challenge_nonce().unwrap();
+            assert_ne!(n, [0u8; 16]);
+            assert!(drawn.insert(n));
+        }
+        assert!(server_ep.recent_nonces.lock().unwrap().order.is_empty());
+
+        // Zero caller nonce rejected by every sibling entry point BEFORE `endpoint.accept()`
+        // (otherwise these would surface as `Timeout { stage: "endpoint_accept" }`).
+        let zero = [0u8; 16];
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep.accept_1rtt_frame(zero).await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_1rtt_frame_authenticated(zero, 1000, Some(&mut quota))
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_envelope_over_quic(zero, &mut replay, 1000, Some(&mut quota))
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_envelope_over_quic_with_policy(
+                    zero,
+                    &mut replay,
+                    1000,
+                    Some(&mut quota),
+                    policy
+                )
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_gossip_v2_over_quic(zero, recipient, &mut replay, 1000, Some(&mut quota))
+                .await
+        ));
+
+        // A reserved static nonce stays burned after an accept timeout, and the reservation is
+        // shared across every sibling wrapper (fail-closed reuse rejection).
+        let static_nonce = [0xA7; 16];
+        assert!(matches!(
+            server_ep
+                .accept_envelope_over_quic(static_nonce, &mut replay, 1000, Some(&mut quota))
+                .await,
+            Err(IrohCarrierError::Timeout {
+                stage: "endpoint_accept"
+            })
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_gossip_v2_over_quic(
+                    static_nonce,
+                    recipient,
+                    &mut replay,
+                    1000,
+                    Some(&mut quota)
+                )
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_envelope_over_quic_with_policy(
+                    static_nonce,
+                    &mut replay,
+                    1000,
+                    Some(&mut quota),
+                    policy
+                )
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep
+                .accept_1rtt_frame_authenticated(static_nonce, 1000, Some(&mut quota))
+                .await
+        ));
+        assert!(t_agent_is_invalid_attestation(
+            &server_ep.accept_1rtt_frame(static_nonce).await
+        ));
+        assert_eq!(quota.tracked_link_count(), 0);
+        assert_eq!(replay.cache_size(), 0);
+
+        // A poisoned nonce-cache mutex fails closed with a typed error (no panic, no accept).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = server_ep.recent_nonces.lock().unwrap();
+            panic!("t-agent: deliberately poisoning recent_nonces");
+        }));
+        assert!(server_ep.recent_nonces.is_poisoned());
+        assert!(matches!(
+            server_ep.generate_fresh_challenge_nonce(),
+            Err(IrohCarrierError::Transport(_))
+        ));
+        assert!(matches!(
+            server_ep.accept_1rtt_frame_fresh_nonce(1000, None).await,
+            Err(IrohCarrierError::Transport(_))
+        ));
+        assert!(matches!(
+            server_ep
+                .accept_1rtt_frame_authenticated([0xA8; 16], 1000, None)
+                .await,
+            Err(IrohCarrierError::Transport(_))
+        ));
+        assert!(matches!(
+            server_ep
+                .accept_envelope_over_quic_fresh_nonce(&mut replay, 1000, None)
+                .await,
+            Err(IrohCarrierError::Transport(_))
+        ));
+        assert!(matches!(
+            server_ep
+                .accept_gossip_v2_over_quic_fresh_nonce(recipient, &mut replay, 1000, None)
+                .await,
+            Err(IrohCarrierError::Transport(_))
+        ));
+
         server_ep.close().await;
     }
 }

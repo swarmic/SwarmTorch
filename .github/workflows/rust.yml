@@ -209,6 +209,9 @@ jobs:
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-targets --all-features --locked -- -D warnings
           cargo test --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/iroh.log"
+          # Declared rust-version = "1.91" (`iroh 1.4`).
+          rustup toolchain install 1.91.0 --profile minimal --no-self-update
+          cargo +1.91.0 check --manifest-path adapters/swarm-torch-transport-iroh/Cargo.toml --all-targets --all-features --locked
 
       - name: Conformance (adapters/swarm-torch-transport-zenoh)
         id: zenoh

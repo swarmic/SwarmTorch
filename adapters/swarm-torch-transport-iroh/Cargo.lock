@@ -2741,6 +2741,7 @@ dependencies = [
 name = "swarm-torch-transport-iroh"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "iroh",
  "swarm-torch-core",
  "swarm-torch-net",

@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
-//! Isolated `Zenoh` topic contract carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`).
+//! Isolated `Zenoh` topic contract carrier adapter (`ADR-0022` §4, `W12-02`, `ST-08`, `15D-3`).
 //!
-//! **Maturity Tier:** `Simulation verified` — strict topic key-expression parsing and pre-replay
-//! `(scope, round_id, originator)` enforcement are tested against serialized wire frames. Live `zenoh`
-//! SDK session / pub-sub integration is deferred to Phase `13D-3`.
+//! **Maturity Tier:** `Integration verified` — strict topic key-expression parsing and pre-replay
+//! `(scope, round_id, originator)` enforcement are tested against serialized wire frames and over
+//! live `zenoh 1.10` TCP peer pub/sub sessions ([`ZenohSessionBridgeV1`]); a peer opened with
+//! scouting disabled and no explicit endpoints is rejected instead of running isolated.
 
 use core::fmt;
 
@@ -227,6 +228,10 @@ pub struct ZenohValidatedSubscriberV1 {
 
 impl ZenohSessionBridgeV1 {
     /// Open a live Zenoh session from a caller-provided [`zenoh::Config`].
+    ///
+    /// The config is used as given: no isolation or endpoint check is performed, so a config
+    /// with scouting off and no endpoints opens an unreachable session. Prefer
+    /// [`Self::open_tcp_peer`] unless a custom config is required.
     pub async fn open(
         config: zenoh::Config,
         adapter: ZenohCarrierAdapterV1,
@@ -239,33 +244,19 @@ impl ZenohSessionBridgeV1 {
 
     /// Open a deterministic peer-mode Zenoh session over explicit TCP endpoints with multicast
     /// scouting and gossip disabled (recommended for isolated/reproducible deployments and CI tests).
+    ///
+    /// Because scouting is disabled, at least one listen or connect endpoint is required; an
+    /// empty pair would open a peer that can never reach anyone and is rejected up front.
     pub async fn open_tcp_peer(
         listen_endpoints: &[String],
         connect_endpoints: &[String],
         adapter: ZenohCarrierAdapterV1,
     ) -> Result<Self, ZenohCarrierError> {
-        let mut cfg = zenoh::Config::default();
-        cfg.insert_json5("mode", "\"peer\"")
-            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
-        cfg.insert_json5("scouting/multicast/enabled", "false")
-            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
-        cfg.insert_json5("scouting/gossip/enabled", "false")
-            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
-        if !listen_endpoints.is_empty() {
-            cfg.insert_json5(
-                "listen/endpoints",
-                &encode_json5_string_array(listen_endpoints)?,
-            )
-            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
-        }
-        if !connect_endpoints.is_empty() {
-            cfg.insert_json5(
-                "connect/endpoints",
-                &encode_json5_string_array(connect_endpoints)?,
-            )
-            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
-        }
-        Self::open(cfg, adapter).await
+        Self::open(
+            tcp_peer_config(listen_endpoints, connect_endpoints)?,
+            adapter,
+        )
+        .await
     }
 
     /// Access the underlying `zenoh::Session`.
@@ -443,6 +434,39 @@ impl ZenohValidatedSubscriberV1 {
     }
 }
 
+/// Peer-mode config for [`ZenohSessionBridgeV1::open_tcp_peer`]: scouting off and both endpoint
+/// lists written explicitly, so an empty `listen_endpoints` means no listener at all rather than
+/// zenoh's peer default `tcp/[::]:0` on every interface.
+fn tcp_peer_config(
+    listen_endpoints: &[String],
+    connect_endpoints: &[String],
+) -> Result<zenoh::Config, ZenohCarrierError> {
+    if listen_endpoints.is_empty() && connect_endpoints.is_empty() {
+        return Err(ZenohCarrierError::Transport(
+            "open_tcp_peer requires at least one listen or connect endpoint when multicast              and gossip scouting are disabled"
+                .to_string(),
+        ));
+    }
+    let mut cfg = zenoh::Config::default();
+    for (key, value) in [
+        ("mode", "\"peer\"".to_string()),
+        ("scouting/multicast/enabled", "false".to_string()),
+        ("scouting/gossip/enabled", "false".to_string()),
+        (
+            "listen/endpoints",
+            encode_json5_string_array(listen_endpoints)?,
+        ),
+        (
+            "connect/endpoints",
+            encode_json5_string_array(connect_endpoints)?,
+        ),
+    ] {
+        cfg.insert_json5(key, &value)
+            .map_err(|e| ZenohCarrierError::Transport(e.to_string()))?;
+    }
+    Ok(cfg)
+}
+
 fn encode_json5_string_array(items: &[String]) -> Result<String, ZenohCarrierError> {
     let mut out = String::from("[");
     for (idx, item) in items.iter().enumerate() {
@@ -472,6 +496,311 @@ mod tests {
     use swarm_torch_core::replay::{CohortAllowlist, ReplayStartupPolicyV1};
     use swarm_torch_net::gossip::{InnerUpdateV2, PayloadKindV1};
     use swarm_torch_net::protocol::MessageType;
+
+    #[test]
+    fn tcp_peer_config_never_falls_back_to_zenoh_default_listener() {
+        let ep = vec!["tcp/127.0.0.1:7447".to_string()];
+        // Control: zenoh's own peer default listens on every interface.
+        let default_listen = zenoh::Config::default()
+            .get_json("listen/endpoints")
+            .unwrap();
+        assert!(default_listen.contains("[::]:0"), "{default_listen}");
+
+        // A connect-only peer must not inherit that hidden listener (and vice versa).
+        let connect_only = tcp_peer_config(&[], &ep).unwrap();
+        assert_eq!(connect_only.get_json("listen/endpoints").unwrap(), "[]");
+        assert!(connect_only
+            .get_json("connect/endpoints")
+            .unwrap()
+            .contains("127.0.0.1:7447"));
+        let listen_only = tcp_peer_config(&ep, &[]).unwrap();
+        assert_eq!(listen_only.get_json("connect/endpoints").unwrap(), "[]");
+        assert!(listen_only
+            .get_json("listen/endpoints")
+            .unwrap()
+            .contains("127.0.0.1:7447"));
+    }
+
+    #[tokio::test]
+    async fn open_tcp_peer_rejects_isolated_peer_without_endpoints() {
+        // Scouting is disabled, so no listen and no connect endpoint would yield a silently
+        // unreachable peer; it must fail before any session is opened.
+        match ZenohSessionBridgeV1::open_tcp_peer(&[], &[], ZenohCarrierAdapterV1::default()).await
+        {
+            Err(ZenohCarrierError::Transport(msg)) => {
+                assert!(
+                    msg.contains("at least one listen or connect endpoint"),
+                    "{msg}"
+                );
+            }
+            Err(other) => panic!("expected Transport error, got {other:?}"),
+            Ok(_) => panic!("isolated zenoh peer must be rejected"),
+        }
+    }
+
+    fn free_loopback_tcp_endpoint() -> String {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        format!("tcp/127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn open_tcp_peer_rejects_blank_endpoint_strings_instead_of_opening_isolated_peer() {
+        // A non-empty slice of blank strings must not slip past the emptiness guard and open a
+        // scouting-disabled peer with no usable endpoint; it fails as a Transport error before
+        // any session exists, in both the listen and the connect position.
+        let adapter = ZenohCarrierAdapterV1::default();
+        for (listen, connect) in [
+            (vec![String::new()], vec![]),
+            (vec![], vec![String::new()]),
+            (vec![" ".to_string()], vec![]),
+            (vec![], vec![" ".to_string()]),
+        ] {
+            match ZenohSessionBridgeV1::open_tcp_peer(&listen, &connect, adapter).await {
+                Err(ZenohCarrierError::Transport(_)) => {}
+                Err(other) => panic!("expected Transport error, got {other:?}"),
+                Ok(_) => panic!("blank endpoints {listen:?}/{connect:?} must be rejected"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_tcp_peer_connect_only_peer_links_up_when_listener_starts_later() {
+        // Connect-only is a valid neighbour of the rejected empty pair even when the target is
+        // not up yet: the open succeeds and the peer links once the listener appears.
+        let endpoint = free_loopback_tcp_endpoint();
+        let adapter = ZenohCarrierAdapterV1::default();
+        let bridge_pub =
+            ZenohSessionBridgeV1::open_tcp_peer(&[], std::slice::from_ref(&endpoint), adapter)
+                .await
+                .unwrap();
+        let bridge_sub = ZenohSessionBridgeV1::open_tcp_peer(&[endpoint], &[], adapter)
+            .await
+            .unwrap();
+        let scope = [0x43; 16];
+        let _sub = bridge_sub.subscribe_swarm(scope, None).await.unwrap();
+        let topic =
+            ZenohTopicContractV1::new(scope, 1, KeyPair::from_seed([0x01; 32]).unwrap().peer_id())
+                .to_key_expr();
+        let readiness = bridge_pub
+            .session()
+            .declare_publisher(&topic)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !readiness.matching_status().await.unwrap().matching() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connect-only peer opened before its listener never linked up"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        drop(readiness);
+        bridge_pub.close().await.unwrap();
+        bridge_sub.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_session_surfaces_transport_errors_not_empty_success() {
+        // Sibling parity for the live helpers: once the session is gone, both subscriber receive
+        // paths and both publish paths fail as Transport errors (never Ok, never a hang), and the
+        // replay guard is untouched.
+        let adapter = ZenohCarrierAdapterV1::default();
+        let bridge =
+            ZenohSessionBridgeV1::open_tcp_peer(&[free_loopback_tcp_endpoint()], &[], adapter)
+                .await
+                .unwrap();
+        let sub = bridge.subscribe_swarm([0x42; 16], None).await.unwrap();
+        bridge.session().clone().close().await.unwrap();
+
+        let orig_kp = KeyPair::from_seed([0x45; 32]).unwrap();
+        let orig_auth = MessageAuth::new(orig_kp.clone());
+        let env = MessageEnvelope::new_v1(
+            *orig_kp.public_key(),
+            [0x42; 16],
+            1,
+            3,
+            MessageType::GradientUpdate,
+            vec![1, 2],
+        )
+        .sign_with(&orig_auth);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            bridge.publish_envelope(&env),
+        )
+        .await
+        .expect("publish_envelope on a closed session hung");
+        assert!(
+            matches!(res, Err(ZenohCarrierError::Transport(_))),
+            "publish_envelope on a closed session: {res:?}"
+        );
+        let gossip = BundledGossipDeliveryV2::new_signed(
+            &orig_auth,
+            InnerUpdateV2 {
+                originator_public_key: *orig_kp.public_key(),
+                swarm_instance_id: [0x42; 16],
+                run_id: [0x46; 16],
+                round_id: 3,
+                contribution_id: 1,
+                base_checkpoint_digest: [0x11; 32],
+                context_policy_digest: [0x47; 32],
+                payload_kind: PayloadKindV1::ModelDeltaV1,
+                compression_schema_version: 0,
+                num_elements: 2,
+                reported_examples: 8,
+                encoded_payload: vec![1, 2, 3, 4],
+                originator_signature: Vec::new(),
+            },
+            KeyPair::from_seed([0x48; 32]).unwrap().peer_id(),
+            [0x49; 32],
+            1,
+            1,
+            1000,
+        );
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            bridge.publish_gossip_v2(&gossip),
+        )
+        .await
+        .expect("publish_gossip_v2 on a closed session hung");
+        assert!(
+            matches!(res, Err(ZenohCarrierError::Transport(_))),
+            "publish_gossip_v2 on a closed session: {res:?}"
+        );
+
+        let mut replay = ReplayProtection::try_with_config(64, 120).unwrap();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope(&mut replay, 1000),
+        )
+        .await
+        .expect("recv_envelope on a closed session hung");
+        assert!(
+            matches!(res, Err(ZenohCarrierError::Transport(_))),
+            "recv_envelope on a closed session: {res:?}"
+        );
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_gossip_v2(orig_kp.peer_id(), &mut replay, 1000),
+        )
+        .await
+        .expect("recv_gossip_v2 on a closed session hung");
+        assert!(
+            matches!(res, Err(ZenohCarrierError::Transport(_))),
+            "recv_gossip_v2 on a closed session: {res:?}"
+        );
+        assert_eq!(replay.cache_size(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_zenoh_rejects_scope_and_originator_spoof_before_replay_mutation() {
+        // The live tests above only spoof `round_id`; this covers the `scope` and `originator`
+        // legs of the topic binding over a real TCP peer link. A validly signed envelope from
+        // swarm B (or from peer X) re-published under swarm A's (or peer Y's) topic must be
+        // rejected before replay admission, and the canonical publication still admitted.
+        let orig_kp = KeyPair::from_seed([0x71; 32]).unwrap();
+        let other_kp = KeyPair::from_seed([0x72; 32]).unwrap();
+        let orig_auth = MessageAuth::new(orig_kp.clone());
+        let scope_a = [0x0a; 16];
+        let scope_b = [0x0b; 16];
+        let adapter = ZenohCarrierAdapterV1::default();
+        let mut replay = ReplayProtection::try_with_config(64, 120)
+            .unwrap()
+            .with_startup_policy(ReplayStartupPolicyV1::GenesisRosterBootstrap)
+            .with_cohort_allowlist(CohortAllowlist::from_peers([
+                orig_kp.peer_id(),
+                other_kp.peer_id(),
+            ]));
+
+        let listen = vec![free_loopback_tcp_endpoint()];
+        let bridge_sub = ZenohSessionBridgeV1::open_tcp_peer(&listen, &[], adapter)
+            .await
+            .unwrap();
+        let bridge_pub = ZenohSessionBridgeV1::open_tcp_peer(&[], &listen, adapter)
+            .await
+            .unwrap();
+        let sub = bridge_sub.subscribe_swarm(scope_a, Some(4)).await.unwrap();
+
+        let sign = |scope: [u8; 16]| {
+            MessageEnvelope::new_v1(
+                *orig_kp.public_key(),
+                scope,
+                1,
+                4,
+                MessageType::GradientUpdate,
+                vec![7, 7],
+            )
+            .with_sequence(1)
+            .with_timestamp(1000)
+            .sign_with(&orig_auth)
+        };
+        let env_a = sign(scope_a);
+        let env_b = sign(scope_b);
+        let topic_a = ZenohCarrierAdapterV1::topic_for_envelope(&env_a).unwrap();
+        let topic_a_other_peer =
+            ZenohTopicContractV1::new(scope_a, 4, other_kp.peer_id()).to_key_expr();
+
+        let readiness = bridge_pub
+            .session()
+            .declare_publisher(&topic_a)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !readiness.matching_status().await.unwrap().matching() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        drop(readiness);
+
+        for (topic, env) in [(&topic_a, &env_b), (&topic_a_other_peer, &env_a)] {
+            bridge_pub
+                .session()
+                .put(topic.as_str(), env.serialize().unwrap())
+                .await
+                .unwrap();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                sub.recv_envelope_with_policy(
+                    &mut replay,
+                    1000,
+                    EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    res,
+                    Err(ZenohCarrierError::Carrier(
+                        CarrierError::TopicIdentityMismatch
+                    ))
+                ),
+                "spoofed publication on {topic}: {res:?}"
+            );
+            assert_eq!(replay.cache_size(), 0);
+        }
+
+        assert_eq!(bridge_pub.publish_envelope(&env_a).await.unwrap(), topic_a);
+        let (parsed, accepted) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sub.recv_envelope_with_policy(
+                &mut replay,
+                1000,
+                EnvelopeVersionPolicyV1::AllowLegacyV1AndV2,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.swarm_instance_id, scope_a);
+        assert_eq!(accepted.sequence, 1);
+        assert_eq!(replay.cache_size(), 1);
+
+        drop(sub);
+        bridge_pub.close().await.unwrap();
+        bridge_sub.close().await.unwrap();
+    }
 
     #[test]
     fn zenoh_carrier_rejects_topic_spoofing_before_replay_mutation() {

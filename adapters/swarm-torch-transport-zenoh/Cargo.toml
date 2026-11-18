@@ -12,5 +12,15 @@ description = "Isolated Zenoh pub/sub topic contract carrier adapter for SwarmTo
 [dependencies]
 swarm-torch-core = { path = "../../swarm-torch-core" }
 swarm-torch-net = { path = "../../swarm-torch-net" }
+# MSRV resolution pin (Wave 15 decision A5), not a code dependency: `zenoh-link-commons`
+# accepts `time ^0.3.41`, but `time 0.3.55` needs edition 2024 / Rust 1.88. The pin alone is
+# not enough (tokio, indexmap, toml_edit, pest also drift past 1.75), so the committed
+# Cargo.lock is resolved MSRV-aware; regenerate it only with
+# `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile` and re-run
+# `cargo +1.75 check --all-targets --all-features --locked`.
+# Accepted advisory: RUSTSEC-2026-0009 (CVE-2026-25727, time < 0.3.47, stack exhaustion in
+# RFC 2822 parsing) is unreachable here because time's `parsing` feature is off; the CI zenoh
+# lane fails if anything enables it. Every patched time release needs Rust 1.88.
+time = { version = "=0.3.41", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
 zenoh = { version = "1.10.2", default-features = false, features = ["transport_tcp"] }

@@ -237,6 +237,9 @@ jobs:
           cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/backends.log"
           cargo clippy --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --all-features --locked -- -D warnings
           cargo test --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-features --locked 2>&1 | tee -a "$RUNNER_TEMP/backends.log"
+          # Declared rust-version = "1.92" (`burn 0.21`, Wave 15 decision A5).
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          cargo +1.92.0 check --manifest-path adapters/swarm-torch-backends/Cargo.toml --all-targets --all-features --locked
 
       - name: Require all five adapter lanes executed
         if: ${{ always() }}

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
-//! Workspace-excluded tensor backend bridges for `Burn` and `Candle` (`ADR-0024` §4, `W12-01`, `13D-4`, `14B`).
+//! Workspace-excluded tensor backend bridges for `Burn` and `Candle` (`ADR-0024` §4, `W12-01`, `13D-4`, `14B`, `15D-4`).
 //!
 //! **Maturity Tier:** `Integration verified` — live `burn 0.21` (`Autodiff<NdArray<f32>>`) and
 //! `candle 0.10` (`VarMap` / `Linear`) linear (`[W | b]`) and 2-layer ReLU MLP (`[W_1 | b_1 | W_2 | b_2]`)
 //! bridges enforce canonical [`ModelTensorSchemaV1`] (`model_schema_hash`), [`ModelFlatTensorLayoutV1`]
 //! parameter/gradient alignment with `SwarmTorch::LinearModel` and `SwarmTorch::MlpModel`, and
-//! transactional `.is_finite()` verification across device synchronization and SafeTensors checkpoints.
+//! transactional `.is_finite()` verification on every import, export, forward, and gradient path.
+//! Live bridges run on CPU only (`DevicePlacementV1::Cpu`); `Wgpu` / `Cuda` placements are reserved
+//! and untested until GPU device matrices are scoped (Wave 15 decision A5).
 
 use swarm_torch_models::backend_bridge::{
     BackendBridgeError, BackendModelHandleV1, BackendTensorBridge, DevicePlacementV1,
@@ -177,25 +179,34 @@ impl ReferenceLinearModule {
         })
     }
 
+    /// Batched affine evaluation over `[batch, in_dim]` row-major input, returning
+    /// `[batch, out_dim]`, with the same finiteness and shape checks as the live bridges.
     fn eval_affine(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
-        if input.len() != self.in_dim {
-            return Err(BackendBridgeError::ParameterCountMismatch {
-                expected: self.in_dim,
-                got: input.len(),
-            });
-        }
+        let batch = validate_batch_input(input, self.in_dim)?;
         let weight_len = self.out_dim * self.in_dim;
         let weight = &self.params[..weight_len];
         let bias = &self.params[weight_len..];
-        let mut out = Vec::with_capacity(self.out_dim);
-        for row in 0..self.out_dim {
-            let mut acc = bias[row] as f64;
-            for col in 0..self.in_dim {
-                acc += (weight[row * self.in_dim + col] as f64) * (input[col] as f64);
+        let mut out = Vec::with_capacity(batch * self.out_dim);
+        for x in input.chunks_exact(self.in_dim) {
+            for row in 0..self.out_dim {
+                // `f32` in the live bridges' order (dot product, then bias) so the reference
+                // overflows exactly where Burn and Candle do.
+                let mut dot = 0.0f32;
+                for col in 0..self.in_dim {
+                    dot += weight[row * self.in_dim + col] * x[col];
+                }
+                out.push(dot + bias[row]);
             }
-            out.push(acc as f32);
         }
+        validate_finite_f32_slice(&out, Some(batch * self.out_dim))?;
         Ok(out)
+    }
+
+    /// Validate length and finiteness completely before replacing any parameter.
+    fn set_params(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+        validate_finite_f32_slice(flat_params, Some(self.params.len()))?;
+        self.params.copy_from_slice(flat_params);
+        Ok(())
     }
 }
 
@@ -213,14 +224,7 @@ impl BurnModuleOps for ReferenceLinearModule {
     }
 
     fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
-        if flat_params.len() != self.params.len() {
-            return Err(BackendBridgeError::ParameterCountMismatch {
-                expected: self.params.len(),
-                got: flat_params.len(),
-            });
-        }
-        self.params.copy_from_slice(flat_params);
-        Ok(())
+        self.set_params(flat_params)
     }
 
     fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
@@ -242,14 +246,7 @@ impl CandleModuleOps for ReferenceLinearModule {
     }
 
     fn write_varmap_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
-        if flat_params.len() != self.params.len() {
-            return Err(BackendBridgeError::ParameterCountMismatch {
-                expected: self.params.len(),
-                got: flat_params.len(),
-            });
-        }
-        self.params.copy_from_slice(flat_params);
-        Ok(())
+        self.set_params(flat_params)
     }
 
     fn eval_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
@@ -257,7 +254,6 @@ impl CandleModuleOps for ReferenceLinearModule {
     }
 }
 
-#[cfg(any(feature = "real-burn", feature = "real-candle"))]
 fn validate_finite_f32_slice(
     values: &[f32],
     expected_len: Option<usize>,
@@ -276,9 +272,8 @@ fn validate_finite_f32_slice(
     Ok(())
 }
 
-#[cfg(any(feature = "real-burn", feature = "real-candle"))]
 fn validate_batch_input(input: &[f32], in_dim: usize) -> Result<usize, BackendBridgeError> {
-    if in_dim == 0 || input.is_empty() || input.len() % in_dim != 0 {
+    if in_dim == 0 || input.is_empty() || !input.len().is_multiple_of(in_dim) {
         return Err(BackendBridgeError::ParameterCountMismatch {
             expected: in_dim,
             got: input.len(),
@@ -303,6 +298,12 @@ pub mod real_burn {
     use swarm_torch_models::safetensors_v1::ModelTensorSchemaV1;
 
     use crate::{validate_batch_input, validate_finite_f32_slice, BurnModuleOps};
+
+    // The bridge mutex is deliberately held across graph construction and `backward()`
+    // (`15D-4` T-Agent review). Computing on a `Module::clone` snapshot instead lets concurrent
+    // calls share `Param` autodiff leaves, which deadlocks burn-autodiff 0.21 (its global `STATE`
+    // and per-graph locks are taken in opposite orders), and cloning a not-yet-initialized lazy
+    // `Param` re-draws independent random weights per clone. Concurrent calls therefore serialize.
 
     /// CPU autodiff Burn backend used by [`BurnLinearBridgeV1`] and [`BurnMlpBridgeV1`].
     pub type BurnNdArrayBackend = Autodiff<NdArray<f32>>;
@@ -792,12 +793,33 @@ pub mod real_burn {
 /// Live `Candle 0.10` CPU `VarMap` / `Linear` and 2-layer MLP backend bridges (`ST-08`, `AR-14-07`, `14B-1`).
 #[cfg(feature = "real-candle")]
 pub mod real_candle {
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::{DType, Device, Tensor, Var};
     use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
     use swarm_torch_models::backend_bridge::{BackendBridgeError, DevicePlacementV1};
     use swarm_torch_models::safetensors_v1::ModelTensorSchemaV1;
 
     use crate::{validate_batch_input, validate_finite_f32_slice, CandleModuleOps};
+
+    /// Reject every condition under which `Var::set` could fail after an earlier `Var` in the
+    /// same write was already committed: non-contiguous layout, shape, dtype (`F32`), or device
+    /// mismatch (`15D-4`). Call it for all `Var`s before the first `set`. `set`'s remaining
+    /// shared-storage check cannot trigger here: every source is a fresh `Tensor::from_slice`.
+    pub(crate) fn check_var_assignable(
+        var: &Var,
+        src: &Tensor,
+        device: &Device,
+    ) -> Result<(), BackendBridgeError> {
+        if !var.is_contiguous()
+            || var.shape() != src.shape()
+            || var.dtype() != DType::F32
+            || src.dtype() != DType::F32
+            || !var.device().same_device(device)
+            || !src.device().same_device(device)
+        {
+            return Err(BackendBridgeError::SchemaMismatch);
+        }
+        Ok(())
+    }
 
     /// Live `Candle` affine module (`y = x @ W^T + b`) synchronized transactionally via [`VarMap`]
     /// in canonical `[weight(out_dim * in_dim) | bias(out_dim)]` layout (`AR-14-07`).
@@ -952,7 +974,7 @@ pub mod real_candle {
             let bias_t = Tensor::from_slice(&flat_params[weight_len..], self.out_dim, &self.device)
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
 
-            // Validate both VarMap keys and shapes BEFORE committing either write.
+            // Validate every VarMap key and `Var::set` precondition BEFORE committing any write.
             let data = self
                 .varmap
                 .data()
@@ -964,9 +986,8 @@ pub mod real_candle {
             let weight_var = data
                 .get("linear.weight")
                 .ok_or(BackendBridgeError::SchemaMismatch)?;
-            if bias_var.shape() != bias_t.shape() || weight_var.shape() != weight_t.shape() {
-                return Err(BackendBridgeError::SchemaMismatch);
-            }
+            check_var_assignable(weight_var, &weight_t, &self.device)?;
+            check_var_assignable(bias_var, &bias_t, &self.device)?;
             weight_var
                 .set(&weight_t)
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
@@ -1228,13 +1249,10 @@ pub mod real_candle {
             let b2_var = data
                 .get("mlp.fc2.bias")
                 .ok_or(BackendBridgeError::SchemaMismatch)?;
-            if w1_var.shape() != w1_t.shape()
-                || b1_var.shape() != b1_t.shape()
-                || w2_var.shape() != w2_t.shape()
-                || b2_var.shape() != b2_t.shape()
-            {
-                return Err(BackendBridgeError::SchemaMismatch);
-            }
+            check_var_assignable(w1_var, &w1_t, &self.device)?;
+            check_var_assignable(b1_var, &b1_t, &self.device)?;
+            check_var_assignable(w2_var, &w2_t, &self.device)?;
+            check_var_assignable(b2_var, &b2_t, &self.device)?;
             w1_var
                 .set(&w1_t)
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
@@ -1313,6 +1331,94 @@ mod tests {
         // NaN parameters are rejected before device write, preserving prior parameters
         assert!(burn_handle.load_parameters(&[f32::NAN, 1.0, 1.0]).is_err());
         assert_eq!(burn_handle.parameters(), &weights);
+    }
+
+    #[test]
+    fn reference_linear_module_fails_closed_and_batches_like_live_bridges() {
+        let mut m = ReferenceLinearModule::new(2, 1, DevicePlacementV1::Cpu).unwrap();
+        let weights = [2.0_f32, -1.0, 0.5];
+        BurnModuleOps::import_flat_f32(&mut m, &weights).unwrap();
+
+        // Module-level writes reject non-finite values on both trait paths without mutating.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                BurnModuleOps::import_flat_f32(&mut m, &[bad, 1.0, 1.0]).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+            assert_eq!(
+                CandleModuleOps::write_varmap_f32(&mut m, &[1.0, bad, 1.0]).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+            assert_eq!(BurnModuleOps::export_flat_f32(&m).unwrap(), weights);
+        }
+        assert_eq!(
+            CandleModuleOps::write_varmap_f32(&mut m, &[1.0, 2.0]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 3,
+                got: 2
+            }
+        );
+        assert_eq!(CandleModuleOps::read_varmap_f32(&m).unwrap(), weights);
+
+        // `[batch, in_dim]` input evaluates row by row into `[batch, out_dim]`.
+        assert_eq!(BurnModuleOps::forward_flat(&m, &[3.0, 1.0]).unwrap(), [5.5]);
+        assert_eq!(
+            BurnModuleOps::forward_flat(&m, &[3.0, 1.0, 0.0, 2.0]).unwrap(),
+            [5.5, -1.5]
+        );
+        assert_eq!(
+            CandleModuleOps::eval_flat(&m, &[3.0, 1.0, 0.0, 2.0]).unwrap(),
+            [5.5, -1.5]
+        );
+
+        // Ragged, empty, and non-finite inputs fail closed.
+        assert!(matches!(
+            BurnModuleOps::forward_flat(&m, &[1.0, 2.0, 3.0]),
+            Err(BackendBridgeError::ParameterCountMismatch { .. })
+        ));
+        assert!(matches!(
+            BurnModuleOps::forward_flat(&m, &[]),
+            Err(BackendBridgeError::ParameterCountMismatch { .. })
+        ));
+        assert_eq!(
+            BurnModuleOps::forward_flat(&m, &[f32::NAN, 1.0]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+
+        // Finite inputs whose result overflows `f32` are rejected instead of returned as `inf`.
+        BurnModuleOps::import_flat_f32(&mut m, &[f32::MAX, f32::MAX, 0.0]).unwrap();
+        assert_eq!(
+            BurnModuleOps::forward_flat(&m, &[f32::MAX, f32::MAX]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+    }
+
+    #[cfg(feature = "real-candle")]
+    #[test]
+    fn candle_var_preflight_rejects_each_set_failure_mode_before_any_write() {
+        use crate::real_candle::check_var_assignable;
+        use candle_core::{DType, Device, Tensor, Var};
+
+        let dev = Device::Cpu;
+        let var = Var::zeros((2, 3), DType::F32, &dev).unwrap();
+        let ok = Tensor::ones((2, 3), DType::F32, &dev).unwrap();
+        assert!(check_var_assignable(&var, &ok, &dev).is_ok());
+
+        let f64_src = Tensor::ones((2, 3), DType::F64, &dev).unwrap();
+        let f64_var = Var::zeros((2, 3), DType::F64, &dev).unwrap();
+        let wrong_shape = Tensor::ones((3, 2), DType::F32, &dev).unwrap();
+        for (var, src) in [(&var, &f64_src), (&f64_var, &ok), (&var, &wrong_shape)] {
+            assert_eq!(
+                check_var_assignable(var, src, &dev).unwrap_err(),
+                BackendBridgeError::SchemaMismatch
+            );
+        }
+
+        // These are genuine `Var::set` failure modes, which is why they must be checked for
+        // every `Var` before the first write commits.
+        assert!(var.set(&f64_src).is_err());
+        assert!(var.set(&wrong_shape).is_err());
+        assert!(var.set(&ok).is_ok());
     }
 
     #[cfg(feature = "real-burn")]
@@ -1665,5 +1771,283 @@ mod tests {
             "expected MSE loss decrease after federated MLP step: before={burn_loss}, after={burn_loss_after}"
         );
         assert!((burn_loss_after - candle_loss_after).abs() < 1e-5);
+    }
+
+    /// `15D-4` T-Agent: the reference module must agree with both live bridges on every import
+    /// and forward boundary (same `Ok` values within tolerance, or the same error variant).
+    #[cfg(all(feature = "real-burn", feature = "real-candle"))]
+    #[test]
+    fn reference_linear_module_matches_live_bridges_on_import_and_forward_boundaries() {
+        type Outcome = Result<Vec<f32>, BackendBridgeError>;
+        // (case, in_dim, out_dim, canonical `[W | b]` params, input)
+        type Case = (&'static str, usize, usize, Vec<f32>, Vec<f32>);
+        fn agree(case: &str, r: &Outcome, b: &Outcome, c: &Outcome) {
+            match (r, b, c) {
+                (Ok(r), Ok(b), Ok(c)) => {
+                    assert_eq!(
+                        (r.len(), b.len()),
+                        (c.len(), c.len()),
+                        "{case}: output length"
+                    );
+                    for i in 0..r.len() {
+                        assert!(
+                            (r[i] - b[i]).abs() <= 1e-5 && (r[i] - c[i]).abs() <= 1e-5,
+                            "{case}: value {i} reference={} burn={} candle={}",
+                            r[i],
+                            b[i],
+                            c[i]
+                        );
+                    }
+                }
+                (Err(r), Err(b), Err(c)) => {
+                    assert!(
+                        r == b && r == c,
+                        "{case}: ref={r:?} burn={b:?} candle={c:?}"
+                    )
+                }
+                _ => panic!("{case}: reference={r:?} burn={b:?} candle={c:?}"),
+            }
+        }
+
+        let max = f32::MAX;
+        let cases: Vec<Case> = vec![
+            (
+                "batched [2, 3] -> [2, 2]",
+                3,
+                2,
+                vec![0.5, -1.25, 0.75, -0.3, 1.4, -0.8, 0.25, -0.65],
+                vec![1.2, -0.4, 2.5, -0.7, 0.3, 1.1],
+            ),
+            ("ragged", 2, 1, vec![2.0, -1.0, 0.5], vec![1.0, 2.0, 3.0]),
+            ("empty", 2, 1, vec![2.0, -1.0, 0.5], vec![]),
+            ("nan input", 2, 1, vec![2.0, -1.0, 0.5], vec![f32::NAN, 1.0]),
+            (
+                "inf input",
+                2,
+                1,
+                vec![2.0, -1.0, 0.5],
+                vec![1.0, f32::INFINITY],
+            ),
+            (
+                "final result overflows f32",
+                2,
+                1,
+                vec![max, max, 0.0],
+                vec![max, max],
+            ),
+            // `x * W` overflows to `inf` in f32 before the bias brings it back into range.
+            ("f32 product overflow", 1, 1, vec![max, -max], vec![2.0]),
+            // `inf + -inf = NaN` in f32 although the exact dot product is 0.
+            (
+                "f32 partial-sum overflow",
+                2,
+                1,
+                vec![max, max, 0.0],
+                vec![2.0, -2.0],
+            ),
+        ];
+
+        for (case, in_dim, out_dim, params, input) in cases {
+            let mut reference = ReferenceLinearModule::new(in_dim, out_dim, DevicePlacementV1::Cpu)
+                .expect("reference module");
+            let mut burn = real_burn::BurnLinearBridgeV1::new(in_dim, out_dim).unwrap();
+            let mut candle = real_candle::CandleLinearBridgeV1::new(in_dim, out_dim).unwrap();
+            BurnModuleOps::import_flat_f32(&mut reference, &params).unwrap();
+            BurnModuleOps::import_flat_f32(&mut burn, &params).unwrap();
+            CandleModuleOps::write_varmap_f32(&mut candle, &params).unwrap();
+
+            // Rejected imports fail with the same variant on every path and leave params intact.
+            let mut nan_params = params.clone();
+            nan_params[0] = f32::NAN;
+            let mut short_params = params.clone();
+            short_params.pop();
+            for bad in [&nan_params, &short_params] {
+                let r = BurnModuleOps::import_flat_f32(&mut reference, bad).unwrap_err();
+                let rc = CandleModuleOps::write_varmap_f32(&mut reference, bad).unwrap_err();
+                let b = BurnModuleOps::import_flat_f32(&mut burn, bad).unwrap_err();
+                let c = CandleModuleOps::write_varmap_f32(&mut candle, bad).unwrap_err();
+                assert!(
+                    r == rc && r == b && r == c,
+                    "{case}: import {r:?} {rc:?} {b:?} {c:?}"
+                );
+            }
+            assert_eq!(BurnModuleOps::export_flat_f32(&reference).unwrap(), params);
+            assert_eq!(BurnModuleOps::export_flat_f32(&burn).unwrap(), params);
+            assert_eq!(CandleModuleOps::read_varmap_f32(&candle).unwrap(), params);
+
+            agree(
+                case,
+                &BurnModuleOps::forward_flat(&reference, &input),
+                &BurnModuleOps::forward_flat(&burn, &input),
+                &CandleModuleOps::eval_flat(&candle, &input),
+            );
+            agree(
+                case,
+                &CandleModuleOps::eval_flat(&reference, &input),
+                &BurnModuleOps::forward_flat(&burn, &input),
+                &CandleModuleOps::eval_flat(&candle, &input),
+            );
+        }
+    }
+
+    /// `15D-4` T-Agent: a freshly constructed Burn bridge (lazily initialized `Param`s, no import
+    /// or export yet) must evaluate one stable parameter set: the one `export_flat_f32` reports.
+    #[cfg(feature = "real-burn")]
+    #[test]
+    fn real_burn_fresh_bridges_evaluate_the_parameters_they_export() {
+        fn close(a: &[f32], b: &[f32]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-5)
+        }
+        let x = [1.2f32, -0.4, 2.5];
+        let t = [0.0f32, 0.0];
+
+        let lin = real_burn::BurnLinearBridgeV1::new(3, 2).unwrap();
+        let y1 = BurnModuleOps::forward_flat(&lin, &x).unwrap();
+        let y2 = BurnModuleOps::forward_flat(&lin, &x).unwrap();
+        let (l1, g1) = lin.backward_mse(&x, &t).unwrap();
+        let (l2, g2) = lin.backward_mse(&x, &t).unwrap();
+        assert_eq!(y1, y2, "linear forward drew a new parameter set");
+        assert_eq!(
+            (l1, &g1),
+            (l2, &g2),
+            "linear backward drew a new parameter set"
+        );
+        let params = BurnModuleOps::export_flat_f32(&lin).unwrap();
+        let mut reference = ReferenceLinearModule::new(3, 2, DevicePlacementV1::Cpu).unwrap();
+        BurnModuleOps::import_flat_f32(&mut reference, &params).unwrap();
+        let y_ref = BurnModuleOps::forward_flat(&reference, &x).unwrap();
+        assert!(close(&y1, &y_ref), "forward {y1:?} vs exported {y_ref:?}");
+        // MSE against a zero target: bias gradient is `y` itself (2/N with N = 2).
+        assert!(
+            close(&g1[6..], &y_ref),
+            "bias grad {:?} vs {y_ref:?}",
+            &g1[6..]
+        );
+        assert_eq!(BurnModuleOps::export_flat_f32(&lin).unwrap(), params);
+
+        let mlp = real_burn::BurnMlpBridgeV1::new(3, 4, 2).unwrap();
+        let m1 = BurnModuleOps::forward_flat(&mlp, &x).unwrap();
+        let m2 = BurnModuleOps::forward_flat(&mlp, &x).unwrap();
+        let (ml1, mg1) = mlp.backward_mse(&x, &t).unwrap();
+        let (ml2, mg2) = mlp.backward_mse(&x, &t).unwrap();
+        assert_eq!(m1, m2, "mlp forward drew a new parameter set");
+        assert_eq!(
+            (ml1, &mg1),
+            (ml2, &mg2),
+            "mlp backward drew a new parameter set"
+        );
+        let mlp_params = BurnModuleOps::export_flat_f32(&mlp).unwrap();
+        let mut native = swarm_torch_models::mlp::MlpModel::new(3, 4, 2).unwrap();
+        native.load_parameters(&mlp_params).unwrap();
+        let m_ref = native.forward(&x).unwrap();
+        assert!(
+            close(&m1, m_ref.as_slice()),
+            "mlp forward {m1:?} vs exported {m_ref:?}"
+        );
+    }
+
+    /// `15D-4` T-Agent: `forward_flat` / `backward_mse` now snapshot the module under the mutex and
+    /// run the autodiff graph outside it, so concurrent readers share `Param` autodiff nodes.
+    /// Readers racing each other and a writer alternating two parameter sets must only ever
+    /// observe one complete set, with forward, loss, and gradients all from that same set, and
+    /// must never deadlock (a watchdog turns a hang into a failure instead of stalling CI).
+    #[cfg(feature = "real-burn")]
+    #[test]
+    fn real_burn_concurrent_forward_backward_and_import_observe_whole_parameter_sets() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::Duration;
+
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            race_whole_parameter_sets();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().unwrap_err())
+            }
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "concurrent forward_flat/backward_mse/import did not finish within 60 s \
+                 (deadlock in burn-autodiff graph locking)"
+            ),
+        }
+    }
+
+    #[cfg(feature = "real-burn")]
+    fn race_whole_parameter_sets() {
+        use std::sync::RwLock;
+
+        type Snapshot = (Vec<f32>, f32, Vec<f32>);
+        fn snapshot<M: BurnModuleOps>(
+            m: &M,
+            backward: impl Fn(&M) -> (f32, Vec<f32>),
+            x: &[f32],
+        ) -> Snapshot {
+            let y = m.forward_flat(x).unwrap();
+            let (loss, grads) = backward(m);
+            (y, loss, grads)
+        }
+        fn race<M: BurnModuleOps>(
+            mut bridge: M,
+            backward: impl Fn(&M) -> (f32, Vec<f32>) + Sync,
+            params_a: &[f32],
+            params_b: &[f32],
+            x: &[f32],
+        ) {
+            const READERS: usize = 4;
+            const ROUNDS: usize = 150;
+            bridge.import_flat_f32(params_b).unwrap();
+            let expect_b = snapshot(&bridge, &backward, x);
+            bridge.import_flat_f32(params_a).unwrap();
+            let expect_a = snapshot(&bridge, &backward, x);
+            assert_ne!(expect_a, expect_b);
+
+            let shared = RwLock::new(bridge);
+            std::thread::scope(|s| {
+                for _ in 0..READERS {
+                    s.spawn(|| {
+                        for _ in 0..ROUNDS {
+                            let got = snapshot(&*shared.read().unwrap(), &backward, x);
+                            assert!(
+                                got == expect_a || got == expect_b,
+                                "torn or foreign snapshot: {got:?}"
+                            );
+                            std::thread::yield_now();
+                        }
+                    });
+                }
+                s.spawn(|| {
+                    for round in 0..ROUNDS {
+                        let next = if round % 2 == 0 { params_b } else { params_a };
+                        shared.write().unwrap().import_flat_f32(next).unwrap();
+                        let exported = shared.read().unwrap().export_flat_f32().unwrap();
+                        assert_eq!(exported, next);
+                        std::thread::yield_now();
+                    }
+                });
+            });
+        }
+
+        let x = [1.2f32, -0.4, 2.5];
+        let lin_a = [0.5f32, -1.25, 0.75, -0.3, 1.4, -0.8, 0.25, -0.65];
+        let lin_b: Vec<f32> = lin_a.iter().map(|v| -2.0 * v + 0.125).collect();
+        race(
+            real_burn::BurnLinearBridgeV1::new(3, 2).unwrap(),
+            |m: &real_burn::BurnLinearBridgeV1| m.backward_mse(&x, &[1.0, -1.0]).unwrap(),
+            &lin_a,
+            &lin_b,
+            &x,
+        );
+
+        let mlp_a: Vec<f32> = (0..26).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
+        let mlp_b: Vec<f32> = (0..26).map(|i| ((i as f32) * 0.91).cos() * 0.4).collect();
+        race(
+            real_burn::BurnMlpBridgeV1::new(3, 4, 2).unwrap(),
+            |m: &real_burn::BurnMlpBridgeV1| m.backward_mse(&x, &[0.5, -0.25]).unwrap(),
+            &mlp_a,
+            &mlp_b,
+            &x,
+        );
     }
 }

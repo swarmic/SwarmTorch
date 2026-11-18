@@ -2,7 +2,8 @@
 name = "swarm-torch-backends"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# `burn 0.21` (`real-burn`) declares edition 2024 / Rust 1.92 (Wave 15 decision A5).
+rust-version = "1.92"
 license = "MPL-2.0"
 publish = false
 description = "Isolated external DL framework adapter bridges (Burn / Candle) for SwarmTorch"

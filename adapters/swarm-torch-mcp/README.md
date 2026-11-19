@@ -1,7 +1,8 @@
-# swarm-torch-mcp
+# `swarm-torch-mcp`
 
-Isolated zero-port read-only strict Model Context Protocol (MCP) adapter wrapping `swarm_torch::mcp_inspector::McpInspectorServerV1`.
+Isolated zero-port read-only strict Model Context Protocol (MCP) adapter integrating the official `rmcp 3.11` Rust SDK (`ServerHandler`, `AsyncRwTransport`, `stdio_pipes`) over `swarm_torch::mcp_inspector::McpInspectorServerV1` (`ADR-0016`, Wave 15 decision `A3`).
 
-- Operates strictly over JSON-RPC 2.0 `stdio` (zero HTTP/TCP ports).
-- Fails closed unless configured with `TrustPolicy::Strict` and valid Ed25519 signed run bundles.
-- Kept isolated from the core workspace `Cargo.lock` until external MCP SDK crates are introduced and audited.
+- **Protocol & Transport:** Operates strictly over line-delimited JSON-RPC 2.0 `stdio` (zero HTTP/TCP ports). `serve_rmcp_stdio` uses `rmcp::transport::stdio_pipes()` (non-blocking Linux FIFO pipes with cross-platform fallback) and caps incoming lines at `MAX_JSONRPC_LINE_BYTES` (1 MiB) before buffering; oversized lines are dropped without closing the session on the `rmcp` transport (the legacy synchronous `serve_stdio` path returns JSON-RPC error `-32002`).
+- **Fail-Closed Trust Policy:** Refuses `TrustPolicy::LegacyPermissive` and empty keysets at construction, and re-verifies Ed25519 manifest signatures and SHA-256 artifact digests on every bundle-reading request (`resources/list`, `resources/templates/list`, `resources/read`, and `tools/call`, returning `-32001` on tampering or key mismatch); `tools/list` returns static read-only tool metadata without touching disk.
+- **Bounded Concurrency & Cancellation:** Bounds concurrent blocking bundle-verification tasks via a semaphore (`DEFAULT_MAX_IN_FLIGHT_REQUESTS = 8`) and honors `RequestContext` cancellation tokens before launching disk I/O.
+- **MSRV Isolation:** Declares `rust-version = "1.88"` (matching `rmcp 3.11`) and remains excluded from the root workspace (`exclude = ["adapters/*"]`) with its own committed, MSRV-verified `Cargo.lock` so core `swarm-torch` (`1.81`) and `swarm-torch-core` (`1.75`) keep their lower MSRVs.

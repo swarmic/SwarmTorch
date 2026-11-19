@@ -368,3 +368,93 @@ fn report_and_mcp_clis_fail_closed_on_tampered_bundle_and_bad_flags() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn mcp_cli_rejects_missing_run_dir_oversized_line_32002_and_serves_tools_call_over_pipes() {
+    let mcp_bin = env!("CARGO_BIN_EXE_swarm_torch_mcp");
+    let (base, run_dir, pk_hex) = create_signed_test_bundle("mcp_pipes_bounds", 0x54);
+
+    // Missing --run-dir -> exit 2.
+    let missing_run_dir = Command::new(mcp_bin)
+        .arg("--public-key-hex")
+        .arg(&pk_hex)
+        .output()
+        .unwrap();
+    assert_eq!(missing_run_dir.status.code(), Some(2));
+
+    let mut child = Command::new(mcp_bin)
+        .arg("--run-dir")
+        .arg(&run_dir)
+        .arg("--public-key-hex")
+        .arg(&pk_hex)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let run_id_hex = hex_lower(&[0x54; 16]);
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // 1. Oversized JSON-RPC line (> 1 MiB) -> must yield -32002 and keep serving.
+        let pad = "a".repeat(swarm_torch::mcp_inspector::MAX_JSONRPC_LINE_BYTES + 64);
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{{"pad":"{pad}"}}}}"#
+        )
+        .unwrap();
+        // 2. Subsequent resources/list, resources/read, tools/call, and unknown tool over the same pipe.
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{{\"uri\":\"swarmtorch://runs/{run_id_hex}/report\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"trace_aggregation_budget","arguments":{{}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"mutate_bundle","arguments":{{}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let lines: Vec<String> = BufReader::new(stdout).lines().map(|l| l.unwrap()).collect();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "mcp child exited with {status:?}");
+    assert_eq!(lines.len(), 5, "expected 5 JSON-RPC lines: {lines:?}");
+
+    let r0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(r0["error"]["code"], -32002);
+
+    let r1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(r1["id"], 1);
+    assert_eq!(r1["result"]["resources"].as_array().unwrap().len(), 4);
+
+    let r2: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+    assert_eq!(r2["id"], 2);
+    assert!(r2["result"]["contents"][0]["text"].is_string());
+
+    let r3: serde_json::Value = serde_json::from_str(&lines[3]).unwrap();
+    assert_eq!(r3["id"], 3);
+    assert_eq!(
+        r3["result"]["structuredContent"]["accounting_classification"],
+        "experimental_hypothetical_budget_only"
+    );
+
+    let r4: serde_json::Value = serde_json::from_str(&lines[4]).unwrap();
+    assert_eq!(r4["id"], 4);
+    assert_eq!(r4["error"]["code"], -32602);
+
+    let _ = fs::remove_dir_all(&base);
+}

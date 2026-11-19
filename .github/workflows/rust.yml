@@ -202,8 +202,11 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          cargo clippy --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-targets --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-mcp/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/mcp.log"
+          cargo clippy --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/mcp.log"
+          # Declared rust-version = "1.88" (`rmcp 3.11`, Wave 15 decision A3).
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          cargo +1.88.0 check --manifest-path adapters/swarm-torch-mcp/Cargo.toml --all-targets --all-features --locked
 
       - name: Conformance (adapters/swarm-torch-transport-iroh)
         id: iroh

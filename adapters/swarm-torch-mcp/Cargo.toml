@@ -2,12 +2,27 @@
 name = "swarm-torch-mcp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+# `rmcp 3.11` declares rust-version 1.88 (Wave 15 decision A3).
+# Regenerate Cargo.lock only with MSRV-aware resolution (`CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback`)
+# and re-verify `cargo +1.88.0 check --all-targets --all-features --locked`.
+rust-version = "1.88"
 license = "MPL-2.0"
 publish = false
-description = "Isolated zero-port read-only strict MCP inspector adapter for SwarmTorch"
+description = "Isolated read-only strict MCP inspector adapter for SwarmTorch on the official rmcp SDK"
 
 [workspace]
 
 [dependencies]
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "1", default-features = false }
+serde_json = "1"
 swarm-torch = { path = "../../swarm-torch", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "io-std", "io-util"] }
+
+[dev-dependencies]
+rmcp = { version = "3.11", default-features = false, features = ["client", "server", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "time"] }
+
+[[test]]
+name = "rmcp_stdio_subprocess"
+harness = false

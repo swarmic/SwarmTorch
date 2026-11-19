@@ -194,9 +194,10 @@ impl McpInspectorServerV1 {
         let result = match method {
             "initialize" => Ok(handle_initialize()),
             "ping" => Ok(json!({})),
-            "resources/list" => self.handle_resources_list(),
+            "resources/list" => self.handle_resources_list(&params),
+            "resources/templates/list" => self.handle_resources_templates_list(&params),
             "resources/read" => self.handle_resources_read(&params),
-            "tools/list" => Ok(handle_tools_list()),
+            "tools/list" => handle_tools_list(&params),
             "tools/call" => self.handle_tools_call(&params),
             _ => Err((
                 JSONRPC_METHOD_NOT_FOUND,
@@ -250,7 +251,8 @@ impl McpInspectorServerV1 {
         Ok((verified, report, warnings))
     }
 
-    fn handle_resources_list(&self) -> Result<Value, (i64, String)> {
+    fn handle_resources_list(&self, params: &Value) -> Result<Value, (i64, String)> {
+        reject_unsupported_pagination_cursor(params)?;
         let (verified, _, _) = self.verify_and_load()?;
         let run_id_hex = hex_lower(verified.run_id().as_bytes());
         let resources = vec![
@@ -276,6 +278,12 @@ impl McpInspectorServerV1 {
             ),
         ];
         Ok(json!({ "resources": resources }))
+    }
+
+    fn handle_resources_templates_list(&self, params: &Value) -> Result<Value, (i64, String)> {
+        reject_unsupported_pagination_cursor(params)?;
+        let (_verified, _, _) = self.verify_and_load()?;
+        Ok(json!({ "resourceTemplates": [] }))
     }
 
     fn handle_resources_read(&self, params: &Value) -> Result<Value, (i64, String)> {
@@ -321,17 +329,35 @@ impl McpInspectorServerV1 {
             JSONRPC_INVALID_PARAMS,
             "tools/call missing params.name string".to_string(),
         ))?;
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let arguments = match params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(v @ Value::Object(_)) => v.clone(),
+            Some(_) => {
+                return Err((
+                    JSONRPC_INVALID_PARAMS,
+                    "tools/call params.arguments must be a JSON object".to_string(),
+                ));
+            }
+        };
         let (verified, report, warnings) = self.verify_and_load()?;
 
         let structured = match name {
-            "inspect_run_report" => tool_inspect_run_report(&verified, &report, &warnings),
-            "audit_graph_trust_and_cycles" => tool_audit_graph_trust_and_cycles(&verified, &report),
-            "predict_node_outputs" => tool_predict_node_outputs(&report, &arguments)?,
-            "trace_aggregation_budget" => tool_trace_aggregation_budget(&verified, &report)?,
+            "inspect_run_report" => {
+                validate_allowed_argument_keys(name, &arguments, &[])?;
+                tool_inspect_run_report(&verified, &report, &warnings)
+            }
+            "audit_graph_trust_and_cycles" => {
+                validate_allowed_argument_keys(name, &arguments, &[])?;
+                tool_audit_graph_trust_and_cycles(&verified, &report)
+            }
+            "predict_node_outputs" => {
+                validate_allowed_argument_keys(name, &arguments, &["node_key"])?;
+                tool_predict_node_outputs(&report, &arguments)?
+            }
+            "trace_aggregation_budget" => {
+                validate_allowed_argument_keys(name, &arguments, &[])?;
+                tool_trace_aggregation_budget(&verified, &report)?
+            }
             _ => {
                 return Err((
                     JSONRPC_INVALID_PARAMS,
@@ -375,14 +401,60 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list() -> Value {
+fn reject_unsupported_pagination_cursor(params: &Value) -> Result<(), (i64, String)> {
+    let obj = match params {
+        Value::Object(obj) => obj,
+        Value::Null => return Ok(()),
+        _ => {
+            return Err((
+                JSONRPC_INVALID_PARAMS,
+                "list request params must be a JSON object or null".to_string(),
+            ));
+        }
+    };
+    if let Some(cursor) = obj.get("cursor") {
+        if !cursor.is_null() {
+            return Err((
+                JSONRPC_INVALID_PARAMS,
+                "pagination cursors are not supported by read-only strict MCP inspector"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_allowed_argument_keys(
+    tool_name: &str,
+    arguments: &Value,
+    allowed_keys: &[&str],
+) -> Result<(), (i64, String)> {
+    let Some(obj) = arguments.as_object() else {
+        return Err((
+            JSONRPC_INVALID_PARAMS,
+            format!("{tool_name} arguments must be a JSON object"),
+        ));
+    };
+    for key in obj.keys() {
+        if !allowed_keys.contains(&key.as_str()) {
+            return Err((
+                JSONRPC_INVALID_PARAMS,
+                format!("unexpected argument '{key}' for tool '{tool_name}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn handle_tools_list(params: &Value) -> Result<Value, (i64, String)> {
+    reject_unsupported_pagination_cursor(params)?;
     let ro_annotations = json!({
         "readOnlyHint": true,
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
     });
-    json!({
+    Ok(json!({
         "tools": [
             {
                 "name": "inspect_run_report",
@@ -430,7 +502,7 @@ fn handle_tools_list() -> Value {
                 "annotations": ro_annotations,
             },
         ]
-    })
+    }))
 }
 
 fn resource_entry(uri: &str, name: &str, description: &str) -> Value {
@@ -1180,6 +1252,37 @@ mod tests {
             lines[3]["result"]["structuredContent"]["committed_rounds"],
             1
         );
+
+        // Enforce declared `additionalProperties: false` schema and reject unsupported pagination cursors
+        // and non-object list params (`15D-5`).
+        let tpl_resp: Value = serde_json::from_str(
+            &server
+                .handle_jsonrpc_line(
+                    r#"{"jsonrpc":"2.0","id":19,"method":"resources/templates/list","params":{}}"#,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tpl_resp["result"]["resourceTemplates"], json!([]));
+
+        for bad_req in [
+            json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"inspect_run_report","arguments":{"extra":true}}}).to_string(),
+            json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"predict_node_outputs","arguments":{"node_key":"ext/normalize","extra":1}}}).to_string(),
+            json!({"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"inspect_run_report","arguments":["not-an-object"]}}).to_string(),
+            json!({"jsonrpc":"2.0","id":23,"method":"tools/list","params":{"cursor":"page-2"}}).to_string(),
+            json!({"jsonrpc":"2.0","id":24,"method":"resources/list","params":{"cursor":"page-2"}}).to_string(),
+            json!({"jsonrpc":"2.0","id":25,"method":"resources/templates/list","params":{"cursor":"page-2"}}).to_string(),
+            json!({"jsonrpc":"2.0","id":26,"method":"tools/list","params":["bad"]}).to_string(),
+            json!({"jsonrpc":"2.0","id":27,"method":"resources/list","params":123}).to_string(),
+            json!({"jsonrpc":"2.0","id":28,"method":"resources/templates/list","params":"bad"}).to_string(),
+        ] {
+            let resp: Value =
+                serde_json::from_str(&server.handle_jsonrpc_line(&bad_req).unwrap()).unwrap();
+            assert_eq!(
+                resp["error"]["code"], JSONRPC_INVALID_PARAMS,
+                "expected -32602 for {bad_req}, got {resp}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&base);
     }

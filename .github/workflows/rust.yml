@@ -223,13 +223,9 @@ jobs:
         run: |
           cargo clippy --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-targets --all-features --locked -- -D warnings
           cargo test --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/zenoh.log"
-          # Declared rust-version = "1.75" (Cargo.lock is resolved MSRV-aware).
-          rustup toolchain install 1.75.0 --profile minimal --no-self-update
-          cargo +1.75.0 check --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-targets --all-features --locked
-          # The 1.75 pin keeps time < 0.3.47 (RUSTSEC-2026-0009), unreachable only while `parsing` is off.
-          if cargo tree --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --locked -e features -i time | grep -q 'time feature "parsing"'; then
-            echo "::error::time 'parsing' feature is enabled; RUSTSEC-2026-0009 is now reachable"; exit 1
-          fi
+          # Declared rust-version = "1.88" (keeps `time` patched for RUSTSEC-2026-0009).
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          cargo +1.88.0 check --manifest-path adapters/swarm-torch-transport-zenoh/Cargo.toml --all-targets --all-features --locked
 
       - name: Conformance (adapters/swarm-torch-backends default + all-features)
         id: backends

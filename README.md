@@ -34,12 +34,12 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 
 | Surface | Maturity Tier | Notes |
 |---------|---------------|-------|
-| `adapters/swarm-torch-wasm` | `Adversarial conformance passed` | Isolated `wasmi 2.0.0` executor (`WasmiExtensionExecutorV1`), fuel + timeout slicing, memory/table bombs, physical CAS E2E (`ST-09`, `13D-1`) |
-| `adapters/swarm-torch-transport-iroh` | `Integration verified` | Live `iroh 1.4.1` 1-RTT QUIC (`IrohEndpointBridgeV1`), ALPN + `remote_id` attestation, pre-replay quota & binding checks (`ST-08`, `13D-2`) |
-| `adapters/swarm-torch-transport-zenoh` | `Integration verified` | Live `zenoh 1.10.2` TCP peer pub/sub (`ZenohSessionBridgeV1`), bounded `ZBytes` reads, strict topic parity (`ST-08`, `13D-3`) |
-| `adapters/swarm-torch-backends` | `Integration verified` | Live `burn 0.21.0` (`real-burn`) & `candle 0.10.2` (`real-candle`) bridges + cross-framework SafeTensors `[W | b]` forward/grad parity (`ST-08`, `13D-4`) |
-| `adapters/swarm-torch-mcp` | `Simulation verified` | Zero-port read-only stdio inspector; honest experimental DP notice (`ST-02`) |
-| `ble-transport` / `lora-transport` | Placeholder flag only | Feature flag reservations; no radio drivers implemented yet |
+| `adapters/swarm-torch-wasm` | `Integration verified` | Isolated `wasmi 2.0.0` executor (`WasmiExtensionExecutorV1`, MSRV `1.86`, scoped to `raw_mem0_v0` per Wave 15 Decision `A2`), stack/table/start-fuel limits, timeout slicing, physical CAS E2E (`ST-09`, `15D-1`) |
+| `adapters/swarm-torch-transport-iroh` | `Integration verified` | Live `iroh 1.4.1` 1-RTT QUIC (`IrohEndpointBridgeV1`, MSRV `1.91`), bounded accept/stream timeouts, pre-body quota gating, CSPRNG nonces, ALPN + `remote_id` attestation (`ST-08`, `15D-2`) |
+| `adapters/swarm-torch-transport-zenoh` | `Integration verified` | Live `zenoh 1.10.2` TCP peer pub/sub (`ZenohSessionBridgeV1`, MSRV `1.88`, `time` patched for `RUSTSEC-2026-0009`), isolated-peer rejection, bounded `ZBytes` reads, strict topic parity (`ST-08`, `15D-3`) |
+| `adapters/swarm-torch-backends` | `Integration verified` | CPU-only live `burn 0.21.0` (`real-burn`) & `candle 0.10.2` (`real-candle`) bridges (MSRV `1.92`, Decision `A5`), linear & 2-layer ReLU MLP SafeTensors parity (`ST-08`, `15D-4`) |
+| `adapters/swarm-torch-mcp` | `Integration verified` | Zero-port read-only strict MCP inspector on the official `rmcp 3.11` SDK (`SwarmTorchMcpAdapterV1`, MSRV `1.88`, Decision `A3`) over `stdio_pipes`, bounded 1 MiB line cap, semaphore + cancellation-safe dispatch, honest experimental DP notice (`ADR-0016`, `15D-5`) |
+| `ble-transport` / `lora-transport` | Placeholder flag only | Feature flag reservations; no hardware radio drivers implemented yet |
 
 > **6-Tier Scale:** `Contract defined` < `Simulation verified` < `SDK integrated` < `Integration verified` < `Adversarial conformance passed` < `Deployment supported`.
 
@@ -63,7 +63,7 @@ The Rust ML ecosystem has excellent tools for specific problems:
 |**Asynchronous participation** |✅ Core design            |⚠️ Limited           |⚠️ Experimental          |
 |**Byzantine robustness**       |✅ Pluggable aggregators  |❌ No defense        |⚠️ Research only         |
 |**Heterogeneous networks**     |✅ Low-MTU chunking + TCP/UDP/Gossip|❌ Assumes datacenter|❌ Assumes reliable links|
-|**Memory footprint**           |✅ <256KB for participants|❌ GBs required      |❌ GBs required          |
+|**Memory footprint**           |🎯 <256KB target for participants (`no_std + alloc` today; `embedded_min` planned)|❌ GBs required      |❌ GBs required          |
 |**Zero Python runtime**        |✅ Pure Rust              |❌ Python required   |❌ Python required       |
 
 -----
@@ -245,8 +245,8 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`tokio-runtime`     |Use Tokio runtime adapter                |✅ Yes       |
 |`embassy-runtime`   |Enable Embassy runtime adapter (`no_std`)|❌ No        |
 |`robust-aggregation`|Enable robust aggregation strategies (`krum`, `bulyan`)|✅ Yes|
-|`tcp-transport`     |Enable Tokio TCP length-prefixed packet transport (`TcpPacketTransport`)|❌ No|
-|`udp-transport`     |Enable Tokio UDP chunk-multiplexed packet transport (`UdpPacketTransport`)|❌ No|
+|`tcp-transport`     |Enable Tokio TCP length-prefixed transport (`TcpTransport`)|❌ No|
+|`udp-transport`     |Enable Tokio UDP chunk-multiplexed gossip/packet transport (`UdpGossipTransport` / `StdUdpPacketTransport`)|❌ No|
 |`ble-transport`     |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
 |`lora-transport`    |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
 |`telemetry`         |Core telemetry module re-exports         |❌ No        |
@@ -344,9 +344,9 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 |**Krum / Multi-Krum**     |✅ High           |Medium ($\mathcal{O}(n^2 d)$)|Small-medium fleets ($n \ge 2f + 3$)|
 |**Bulyan (`IterativeKrumV1`)**|✅ Very High  |Medium-High ($\mathcal{O}(n^2 d)$)|High-resilience cohorts ($n \ge 4f + 3$)|
 |**Centered Clipping (`CClip`)**|✅ High (Non-IID)|Low ($\mathcal{O}(L n d)$)|Stateful momentum/history clipping (`W11-01`)|
-|**`SBucketingTransformer`**|✅ Variance Reduction|Low ($\mathcal{O}(n d)$)|Pre-aggregation Non-IID $s$-bucketing (`W11-01`)|
+|**`BucketingConfig` / `aggregate_with_bucketing_v1`**|✅ Variance Reduction|Low ($\mathcal{O}(n d)$)|Pre-aggregation Non-IID $s$-bucketing (`W11-01`)|
 
-Stateful `CenteredClippingAggregator` (`CClip`) and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`SBucketingTransformer`) are implemented in `swarm-torch-core::aggregation` per [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) (`W11-01`).
+Stateful `CenteredClipping` (`CClip`) and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`) are implemented in `swarm-torch-core::aggregation` per [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) (`W11-01`).
 
 **Important caveat:** Research shows that all robust aggregators can degrade under specific attack strategies, especially in high-dimensional settings. SwarmTorch provides:
 
@@ -367,12 +367,12 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust
 
 ## Network Transports
 
-SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), `LoopbackPacketTransport`, and `MockTransport`. Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) are roadmap work.
+SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), and `MockTransport`. Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) are roadmap work.
 
 ```rust,ignore
 pub trait SwarmTransport {
     async fn send(&self, peer: PeerId, msg: &[u8]) -> Result<()>;
-    async fn recv(&self) -> Result<(PeerId, Vec<u8>)>;
+    async fn recv(&self) -> Result<ObservedTransportMessage>;
     async fn broadcast(&self, msg: &[u8]) -> Result<()>;
     fn reliability_class(&self) -> ReliabilityClass; // BestEffort | AtLeastOnce | Reliable
 }
@@ -449,8 +449,8 @@ cargo run -p swarm-torch --example byzantine_federated_round
 - ✅ Sequential execution engine MVP & artifact/report bundle pipeline (Waves 6–8)
 - ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`EnvelopeV1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
 - ✅ Wave 10 (`v0.1.0-beta.1`): Unified `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock (`BundleLockGuard`), Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`), and deterministic multi-node simulation
-- ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClippingAggregator` (`CClip`), Non-IID $s$-bucketing (`SBucketingTransformer`), verifiable `SharedSeedSparse` projection (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpPacketTransport` / `UdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
-- ✅ Wave 12 & Wave 13 (`v0.2.0` + `13-0`–`13D`): Isolated `adapters/*` SDKs (`wasmi 2.0.0`, `iroh 1.4.1`, `zenoh 1.10.2`, `burn 0.21.0` + `candle 0.10.2`, `stdio` MCP inspector), LoRA/FLoRA updates, `FedAsync` + experimental accounting ledger (`ST-02`), 3-stage Ed25519/v2-replay admission, atomic `CommittedHeadV1` storage + `fs4` locks, `PhysicalStrict` columnar runner, evented transport/runtime (`EmbassyRuntime` + ARM CI), Q9 `Bulyan` Stage 2, two-phase collective `SharedSeedSparse`, and `[W | b]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`)
+- ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClipping` (`CClip`), Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`), verifiable `SharedSeedSparse` projection (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpTransport` / `UdpGossipTransport` / `StdUdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
+- ✅ Wave 12–15 (`v0.2.0` + `13-0`–`15E`): Isolated `adapters/*` SDKs (`wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, CPU-only `burn 0.21.0` + `candle 0.10.2` — all `Integration verified` with committed MSRV-checked lockfiles), LoRA/FLoRA updates, `FedAsync` + experimental accounting ledger (`ST-02`), 3-stage Ed25519/v2-replay admission (`MessageEnvelope::VERSION_V2` `(0, 3)` default), atomic `CommittedHeadV1` storage + `fs4` locks, `PhysicalStrict` columnar runner, evented transport/runtime (`EmbassyRuntime`, `portable-atomic` on 32-bit ARM/RISC-V), Q9 `Bulyan` Stage 2, two-phase collective `SharedSeedSparse`, and `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`)
 
 ### v0.2.0 - Edge ML & Hardware Fleet Expansion
 

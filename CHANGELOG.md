@@ -5,7 +5,32 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-17 (Wave 14 Phases `14A`, `14B`, `14C`, & `14D` — Full-Spectrum Wave 13 Audit Remediations `AR-14-01`..`AR-14-09`)
+## [Unreleased] - 2026-11-19 (Wave 15 `15A`–`15E` — Full-Spectrum Audit Remediation & Honesty Reset)
+
+### CLI Auth, Bundle Integrity, Coordinator Admission, & Cache Trust (`15A`)
+- Fixed `swarm_torch_report` CLI trust-flag XNOR inversion (`parse_report_cli_args` strict mutual exclusion) and added end-to-end `swarm_torch_report` / `swarm_torch_mcp` subprocess CLI tests (`swarm-torch/tests/cli_binaries.rs`).
+- Hardened `RunArtifactBundle` (`bundle.rs`, `cas.rs`, `io.rs`, `dp_ledger.rs`, `report/{load,render}.rs`) with OS-independent lexical `validate_manifest_path`, full entry SHA-256 verification on `verify_committed_head`, symlink and lowercase-hex guards, atomic report writes, and manifest-bound DP ledger reconstruction (failing closed in `restore_weights_only` when a DP ledger/profile exists).
+- Closed Stage B/C ingress asymmetry across `FedAsync`, `LoRA`, and sparse rounds (`coordinator.rs`), failed closed on deprecated unauthenticated `from_resume_state`, persisted `equivocated_peers` across rounds and crash recovery (`Decision A9`), and replaced `saturating_add` on generation counters with `checked_add`.
+
+### DataOps Scheduler, Native Runner, & JSON Schema Conformance (`15B`)
+- Hardened `scheduler.rs` / `session.rs` pre-cache isolation, trust-laundering prevention, atomic CAS bindings, and failure invalidation (`15B-1`), `native_runner.rs` columnar row/duplicate/digest/`i64` predicate bounds (`15B-2`), and `schema_check.rs` Unicode char lengths + `regex 1.12` pattern checks (`Decision A7`, `15B-3`) alongside strict `artifact_pipeline`.
+
+### Core, Models, Net, & Runtime Hardening (`15C`)
+- Unified `TrimmedMean`/Top-$k$ precision, expired challenge purge, finite `MetricRecord`, and `DatasetEntryV1` bounds (`15C-1`); hardened LoRA duplicate-peer / FLoRA bounds, `SgdOptimizer` stack/backend sync, and SafeTensors custom limits + RFC 8259 escapes (`15C-2`).
+- Promoted `MessageEnvelope::CURRENT_VERSION` to `VERSION_V2` (`(0, 3)`) with gated legacy fallback (`Decision A10`), hardened `TcpTransport` against Slowloris stalls, isolated `UdpGossipTransport` from Windows `WSAECONNRESET` noise, and added bounded security audit ring emission (`Decision A8`, `15C-3`).
+- Adopted `portable-atomic 1.15.0` (`fallback` + `critical-section`, audited in `supply-chain/audits.toml`, `Decision A6`) for 32-bit targets (`thumbv6m`, `thumbv7em`, `riscv32imc`) and hardened `MockRuntime` timer `Drop` / waker lifecycles (`15C-4`).
+
+### Standalone Adapter Remediation & Official `rmcp 3.11` Integration (`15D`)
+- `adapters/swarm-torch-wasm` (`15D-1`, MSRV `1.86`, `Integration verified`, scoped to `raw_mem0_v0` per `Decision A2`): hardened `wasmi` stack depth/size, `WasmStoreLimitsV1::max_start_fuel`, cached `Engine`, and un-exported internal table/memory checks.
+- `adapters/swarm-torch-transport-iroh` (`15D-2`, MSRV `1.91`, `Integration verified`): bounded every accept/handshake/stream/ack stage with `IrohAcceptTimeoutsV1`, gated pre-auth quotas before body reads/allocation, and added CSPRNG nonces with reuse rejection.
+- `adapters/swarm-torch-transport-zenoh` (`15D-3`, MSRV `1.88`, `Integration verified`): rejected isolated peers without explicit endpoints, disabled hidden default wildcard listeners, and bumped MSRV to `1.88` (founder decision superseding `A5`) so `time` stays patched for `RUSTSEC-2026-0009`.
+- `adapters/swarm-torch-backends` (`15D-4`, MSRV `1.92`, `Integration verified`, `Decision A5`): achieved `ReferenceLinearModule` finiteness/batching/overflow parity, pre-validated Candle `VarMap` dtype/device/contiguity before mutation, documented Burn mutex requirement, and scoped docs to CPU-only.
+- `adapters/swarm-torch-mcp` (`15D-5`, MSRV `1.88`, `Integration verified`, `Decision A3`): integrated the official `rmcp 3.11` SDK (`ServerHandler`, `AsyncRwTransport::with_max_line_length`, `stdio_pipes`) with bounded semaphore concurrency, cancellation awareness, canonical `additionalProperties: false` & pagination validation in `McpInspectorServerV1`, `resources/templates/list` parity, real OS pipe subprocess conformance (`rmcp_stdio_subprocess`), and MSRV-aware `1.88` `Cargo.lock`.
+
+### Lockfiles, CI Matrix, Supply-Chain Honesty, & Docs Sync (`15E`)
+- Committed all 5 standalone `adapters/*/Cargo.lock` files + `.github/scripts/check-locked-lockfiles.sh` + `.gitattributes` + `adapters/deny.toml`, expanded `.github/workflows/rust.yml` (`--all-features`, `--doc`, `RUSTDOCFLAGS="-D warnings"`, workspace `1.75`/`1.81` + all 5 adapter MSRV lanes, `riscv32imc`, and adapter `cargo deny`), replaced `rust,ignore` doctests in `swarm-torch/src/lib.rs`, corrected local vs CI supply-chain status in `supply-chain/exemption-rationale.md`, and aligned public docs (`README.md`, `ROADMAP.md`, `SECURITY.md`, `ADRs.md`, `CHANGELOG.md`, whitepaper) to verified live Rust symbols and capability tiers.
+
+## [0.3.0-alpha.14] - 2026-11-17 (Wave 14 Phases `14A`, `14B`, `14C`, & `14D` — Full-Spectrum Wave 13 Audit Remediations `AR-14-01`..`AR-14-09`)
 
 ### Replay Hardening, Cryptographic DP Resume, & Verified Reports (`Phase 14A` — `AR-14-05`, `AR-14-01`, `AR-14-02`)
 - **Active-Session Monotonicity Across Idle Windows (`AR-14-05`):**
@@ -29,13 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `DEFAULT_MAX_ACTIVE_TCP_CONNECTIONS = 256` (`TcpTransport::bind_with_limits` and `TcpFrameReaderState::is_idle`) to evict oldest idle connections at capacity and prevent Slowloris connection growth.
 - **Live `Iroh` & `Zenoh` Post-Idle Sequence Rollback Conformance & Adapter CI (`14C-1`, `AR-14-03`):**
   - Added post-idle-expiry sequence rollback rejection and monotonic continuation tests over live `Iroh` 1-RTT QUIC (`adapters/swarm-torch-transport-iroh`) and live `Zenoh` TCP pub/sub (`adapters/swarm-torch-transport-zenoh`).
-  - Added the `standalone_adapters` CI job to `.github/workflows/rust.yml` covering all 5 standalone adapters and completed the scheduled Wave 14 `cargo-vet` review in `supply-chain/exemption-rationale.md`.
+  - Wired the initial `standalone_adapters` CI job in `.github/workflows/rust.yml` (reopened as `AR-14-03R` and completed in Wave 15 with committed per-adapter `Cargo.lock` files, MSRV lanes, and corrected CI-verified supply-chain rationale in `supply-chain/exemption-rationale.md`).
 
 ### Wasm `(start)` Fuel Slice Cap, Bounded NDJSON & `filter_rows` Validation, & MCP Subprocess Conformance (`Phase 14D` — `AR-14-06`, `AR-14-04`, `AR-14-08`)
 - **Wasm `(start)` Instantiation Fuel Slicing (`AR-14-06`):**
   - Capped initial fuel during `linker.instantiate_and_start` in `adapters/swarm-torch-wasm` to `policy.limits.max_fuel.min(FUEL_SLICE_UNITS)` (`10,000` units) before checking `timeout_ms` and refilling the remaining budget for resumable export execution.
 - **Bounded NDJSON Parsing, Strict `filter_rows` Validation, & MCP Child-Process Test (`AR-14-04`, `AR-14-08`):**
-  - Wired `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) to `parse_and_validate_dp_ledger_slice` and added an OS child-process (`std::process::Command` stdio pipe) JSON-RPC conformance test in `adapters/swarm-torch-mcp` (promoting `swarm-torch-mcp` to **`Integration verified`**).
+  - Wired `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) to `parse_and_validate_dp_ledger_slice` and added an OS child-process (`std::process::Command` stdio pipe) JSON-RPC conformance test in `adapters/swarm-torch-mcp` (official `rmcp 3.11` SDK integration and `Integration verified` promotion landed in Wave 15 `15D-5`).
   - Enforced `MAX_NDJSON_LINE_BYTES` / `MAX_NDJSON_LINES` in `NativeOpRunner::parse_ndjson_rows` and fail-closed validation on partial `column`/`value` pairs or unknown `op` strings in `NativeOpRunner::physical_filter_rows` (`swarm-torch::native_runner`).
 
 ## [0.3.0-alpha.13] - 2026-11-16 (Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D`)
@@ -80,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added public canonical update payload encoders `encode_{dense,compressed,lora}_update_payload_v2` matching compression schema versions `0`, `1`, and `2`.
 - **Receiver-Nonce `session_id` V2 Replay Recovery & Default Fail-Closed Restart (`ST-03`):**
   - Defaulted `ReplayProtection` startup/recovery policy to `ReplayStartupPolicyV1::RequireSessionHandshake` (`ReplayProtection::try_with_config`) and wired `SwarmRoundCoordinator::from_resume_state` to enforce `RequireSessionHandshake` plus monotonic `TimestampFloor` (`committed_unix_nanos / 1e9`).
-  - Added `SessionHandshakeChallengeV2` with 256-bit `receiver_nonce` and deterministic domain-separated `session_id`, `ProtocolVersion::V0_3` (`(0, 3)`), `InnerUpdateV2`, `RecipientWrapperV2`, `BundledGossipDeliveryV2`, `BTreeMap` v2 replay tracking keyed by `(SwarmInstanceId, RunId, PeerId, SessionEpoch, SessionId)`, atomic `complete_recovery_handshake_v2` (capacity validated prior to mutating pending challenges), and read-only `check_v2_admission_readonly` + `commit_prepared_admission`.
+  - Added `SessionHandshakeChallengeV2` with 256-bit `receiver_nonce` and deterministic domain-separated `session_id`, `MessageEnvelope::VERSION_V2` (`(0, 3)`), `InnerUpdateV2`, `RecipientWrapperV2`, `BundledGossipDeliveryV2`, `BTreeMap` v2 replay tracking keyed by `(SwarmInstanceId, RunId, PeerId, SessionEpoch, SessionId)`, atomic `complete_recovery_handshake_v2` (capacity validated prior to mutating pending challenges), and read-only `check_v2_admission_readonly` + `commit_prepared_admission`.
 - **Non-Forged Transport Attribution & Sealed Carrier Proofs (`ST-06` Identity, `ST-08`):**
   - Replaced `SwarmTransport::recv() -> (PeerId, Vec<u8>)` (and sentinel `PeerId([0xFF; 32])` fallbacks in `UdpGossipTransport` / `TcpTransport`) with `ObservedTransportMessage` carrying transport-observed `ObservedSourceRef` (`SocketAddr`, `MockNodeId`, `LinkLabel`, `Opaque`), preventing pre-auth sender forgery across all transports and multi-node simulations.
   - Sealed `VerifiedLinkPrincipalV1` in `swarm-torch-net::carrier` (private fields constructible only via adapter minting / link validation paths, rejecting external raw `[u8; 32]` construction).
@@ -131,17 +156,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Non-IID Byzantine Resilience (`W11-01`, `ADR-0019`):**
-  - Stateful `CenteredClippingAggregator` (`CClip`) with explicit reference-iterate contract (`step_from_reference`), $\tau$-scaled empty-round stability, and `f64` norm/update accumulation.
-  - Deterministic `SBucketingTransformer` using `ChaCha8Rng` Fisher-Yates shuffling (`domain: "swarmtorch.sbucket.v1"`) with `f64` bucket averaging.
+  - Stateful `CenteredClipping` (`CClip`) with explicit reference-iterate contract (`step_from_reference`), $\tau$-scaled empty-round stability, and `f64` norm/update accumulation.
+  - Deterministic `BucketingConfig` / `aggregate_with_bucketing_v1` using `ChaCha8Rng` Fisher-Yates shuffling (`domain: "swarmtorch.sbucket.v1"`) with `f64` bucket averaging.
 - **Verifiable `SharedSeedSparse` Co-Design (`W11-02`, `ADR-0021`):**
   - `SharedSeedSparseCompressor` (`ChaCha8Rng` partial Fisher-Yates index derivation from `(round_id, peer_id, session_nonce)` under `"swarmtorch.shared_seed_sparse.v1"`), eliminating per-index wire overhead (`4k` bytes vs `8k` bytes).
   - `SharedSeedCoordinateVerifier` (`UpdateTransform`) verifying canonical strictly-ascending PRNG coordinate indices prior to Byzantine distance evaluation.
 - **Low-MTU Chunked Framing & Concrete Transports (`W11-03`, `ADR-0004`, `ADR-0022`):**
   - 16-byte `ChunkHeaderV1` (`CRC-16/IBM-3740` CCITT-FALSE) and `ChunkedFrameCodec` reassembly pool (`MAX_CONCURRENT_REASSEMBLIES = 32`, `MAX_CHUNKS_PER_MESSAGE = 256`, bitmap deduplication, conflict eviction, and lazy TTL sweep) for LoRa/BLE/UDP links.
-  - Feature-gated `TcpPacketTransport` (`tcp-transport`) with 4-byte length prefixing and `MAX_FRAME_BYTES` pre-allocation gating.
-  - Feature-gated `UdpPacketTransport` (`udp-transport`) multiplexing single-datagram and `ChunkedFrameCodec`-fragmented frames.
+  - Feature-gated `TcpTransport` (`tcp-transport`) with 4-byte length prefixing and `MAX_FRAME_BYTES` pre-allocation gating.
+  - Feature-gated `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`) multiplexing single-datagram and `ChunkedFrameCodec`-fragmented frames.
 - **SafeTensors v1 Checkpoint Persistence (`W11-04`, `ADR-0023`, `ADR-0024`):**
-  - Zero-dependency `SwarmTorchCheckpointV1` reader/writer in `swarm-torch-models::safetensors_v1` with `HEADER_SIZE_LIMIT = 65_536`, strict `F32` contiguous interval validation, 8-byte alignment padding, and `SwarmModel` round-trip helpers.
+  - Zero-dependency `SwarmTorchCheckpointV1` reader/writer in `swarm-torch-models::safetensors_v1` with `SafeTensorsLimitsV1::default().max_header_bytes = 1_048_576`, strict `F32` contiguous interval validation, 8-byte alignment padding, and `SwarmModel` round-trip helpers.
   - Coordinator checkpoint export/import hooks (`save_safetensors_checkpoint_v1`, `load_safetensors_checkpoint_v1`).
 - **Examples & Benchmarks (`W10-03` / `W11`):**
   - `byzantine_federated_round` end-to-end example and `swarm_bench` Criterion benchmark suite.
@@ -164,7 +189,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pre-aggregation finiteness/shape validation (`validate_gradient_batch`, `MAX_COHORT_SIZE = 1024`), `f64` accumulation across `FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, and `Bulyan` (`BulyanProfile::IterativeKrumV1`).
   - `ClassicResidualCompressor` and `Ef21Compressor` + `Ef21ServerAccumulator` error-feedback codecs.
 - **Safe `BTreeMap` Replay Protection & Envelope v1 (`W9-02`, `ADR-0020`, `ADR-0021`):**
-  - Replaced `lru` with a 100% safe dual-tree `BTreeMap` replay store (`entries_by_peer` + `expiry_index`), added `CohortAllowlist`, `RecoveryRequired` startup challenge (`SessionHandshakeChallenge`), and 6-stage `MessageEnvelope::decode_and_verify_payload` (`ProtocolVersion::V1_0`, `MAX_FRAME_BYTES = 65_536`).
+  - Replaced `lru` with a 100% safe dual-tree `BTreeMap` replay store (`entries_by_peer` + `expiry_index`), added `CohortAllowlist`, `RecoveryRequired` startup challenge (`SessionHandshakeChallenge`), and 6-stage `MessageEnvelope::decode_and_verify_payload` (`MessageEnvelope::VERSION_V1` `(0, 2)`, `MAX_FRAME_BYTES = 65_536`).
 - **Models, Losses, & Dependency Diet (`W9-04`..`W9-06`, `ADR-0002`, `ADR-0022`, `ADR-0024`):**
   - Added `LinearModelWithCapacity`, contiguous `MlpModelWithCapacity`, analytical `MseLoss`, `CrossEntropyLoss` (`no_std` IEEE-754 `exp_f64`/`ln_f64`), `HuberLoss`, `FedProxRegularizer`, and `SgdOptimizer`.
   - Removed unused `burn`, `burn-ndarray`, `bincode`, `async-trait`, and `lru` dependencies from the core workspace.

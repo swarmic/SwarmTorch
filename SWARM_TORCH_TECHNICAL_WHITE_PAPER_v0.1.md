@@ -51,9 +51,9 @@ This matrix prevents aspirational scope creep. It is grounded against `ADRs.md` 
 | Extensibility | Sandboxed-by-default extensions | Evidence: ADR-0018, ADR-0025 | Planned | WASM-first `wasmi` host (`W12-04`) |
 | Telemetry | Canonical IDs + span/event/metric record types + emitter trait | Evidence: ADR-0012, ADR-0016, swarm-torch-core/src/observe.rs | Partial | `swarmtorch.*` canonical namespace enforced; external OTLP export planned |
 | Threat model | Threat model + trust boundaries defined | Evidence: ADR-0008, ADR-0008A | Implemented | Documented; enforced across protocol, coordinator, and artifact boundaries |
-| Robustness | Robust aggregation + Non-IID bucketing | Evidence: ADR-0007, ADR-0019, swarm-torch-core/src/aggregation.rs | Implemented | `FedAvg`, `CoordinateMedian`, `TrimmedMean`, `Krum`/`Multi-Krum`, `Bulyan IterativeKrumV1`, `CenteredClippingAggregator`, and `SBucketingTransformer` implemented |
+| Robustness | Robust aggregation + Non-IID bucketing | Evidence: ADR-0007, ADR-0019, swarm-torch-core/src/aggregation.rs | Implemented | `FedAvg`, `CoordinateMedian`, `TrimmedMean`, `Krum`/`Multi-Krum`, `Bulyan IterativeKrumV1`, `CenteredClipping`, and `BucketingConfig` / `aggregate_with_bucketing_v1` implemented |
 | Compression | Update compression + error feedback + verifiable sparse projection | Evidence: ADR-0021, swarm-torch-core/src/compression.rs | Implemented | `TopK`, `RandomK`, `Quantized`, `ClassicResidual`, `EF21`, and `SharedSeedSparse` (`SharedSeedCoordinateVerifier`) implemented |
-| Networking | Message envelope + transport traits + low-MTU chunked framing + TCP/UDP | Evidence: ADR-0004, ADR-0022, swarm-torch-net/src/ | Implemented | `PacketTransport`, `SwarmTransport`, `ChunkedFrameCodec` (16B `CRC-16/IBM-3740`), `TcpPacketTransport`, `UdpPacketTransport`, and gossip wrappers implemented |
+| Networking | Message envelope + transport traits + low-MTU chunked framing + TCP/UDP | Evidence: ADR-0004, ADR-0022, swarm-torch-net/src/ | Implemented | `PacketTransport`, `SwarmTransport`, `ChunkedFrameCodec` (16B `CRC-16/IBM-3740`), `TcpTransport`, `UdpGossipTransport` / `StdUdpPacketTransport`, and gossip wrappers implemented |
 | Replay protection | Sequence/timestamp validation enforced (memory-only cache) | Evidence: swarm-torch-core/src/replay.rs, swarm-torch-net/src/protocol.rs, ADR-0008B | Implemented | LRU cache, ┬▒60s skew window, 16-message out-of-order tolerance |
 | Message auth | Ed25519 signing/verification with domain-separated preimage | Evidence: ADR-0008, ADR-0008B, ADR-0021, swarm-torch-core/src/crypto.rs | Implemented | 6-stage `MessageEnvelope::decode_and_verify_payload` under `"swarmtorch.envelope.v1"` |
 | Gradient validation | Bounds checking (NaN/Inf/L2/coordinate) | Evidence: swarm-torch-core/src/crypto.rs, swarm-torch-core/src/aggregation.rs | Implemented | Pre-aggregation finiteness/shape validation (`MAX_COHORT_SIZE = 1024`) |
@@ -136,7 +136,7 @@ Evidence: ADR-0022, swarm-torch-net/src/traits.rs
 
 Current status:
 
-- `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpPacketTransport` (`tcp-transport`), `UdpPacketTransport` (`udp-transport`), `LoopbackPacketTransport`, and `MockTransport`/`MockNetworkHub` are implemented.
+- `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), and `MockTransport`/`MockNetworkHub` are implemented.
 - Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) and optional `Zenoh`/`Iroh` adapter crates (`W12-02`) are planned for `v0.2.0`.
 
 Evidence: swarm-torch-net/src/chunked.rs, swarm-torch-net/src/tcp.rs, swarm-torch-net/src/udp.rs, swarm-torch-net/src/mock.rs

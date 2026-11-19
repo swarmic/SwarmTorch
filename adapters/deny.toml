@@ -1,0 +1,42 @@
+# cargo-deny configuration for standalone `adapters/*` crates.
+#
+# Workspace-excluded adapters pull external SDK ecosystems (`wasmi`, `rmcp`, `iroh`, `zenoh`,
+# `burn`, `candle`). This policy keeps the same hard security and source boundaries as root
+# `deny.toml` (blocking RustSec vulnerability advisories, wildcard dependencies, unknown
+# registries/git sources, and all strong-copyleft GPL/AGPL/LGPL licenses) while permitting the
+# verified permissive SPDX licenses used by those upstream SDK dependency graphs and scoping
+# `unmaintained` enforcement to direct adapter dependencies (`workspace`).
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "MPL-2.0",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

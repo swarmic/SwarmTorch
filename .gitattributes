@@ -1,0 +1,2 @@
+# Enforce LF line endings on shell scripts so CI helper scripts run cleanly on Windows and Unix.
+*.sh text eol=lf

@@ -8,29 +8,22 @@
 //!
 //! ## Quick Start
 //!
-//! The snippet below is an illustrative design-target example; current high-level training/transport APIs are still evolving.
+//! Configure and validate a [`SwarmCluster`] using real crate APIs:
 //!
-//! ```rust,ignore
+//! ```rust
 //! use swarm_torch::prelude::*;
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     // Define swarm cluster with 3 nodes
-//!     let swarm = SwarmCluster::builder()
-//!         .topology(Topology::gossip(fanout: 2))
-//!         .consensus(RobustAggregation::trimmed_mean(trim_ratio: 0.2))
-//!         .transport(TcpTransport::local_cluster(num_nodes: 3))
-//!         .build()
-//!         .await?;
+//! let config = SwarmCluster::builder()
+//!     .topology(Topology::gossip(2))
+//!     .consensus(RobustAggregation::TrimmedMean { trim_ratio: 0.2 })
+//!     .max_rounds(50)
+//!     .convergence_threshold(0.01)
+//!     .try_build()
+//!     .expect("valid SwarmConfig");
 //!
-//!     // Train across swarm
-//!     let trained_model = swarm
-//!         .train(model, optimizer, data)
-//!         .max_rounds(100)
-//!         .await?;
-//!
-//!     Ok(())
-//! }
+//! let cluster = SwarmCluster::new(config, PeerId::new([1u8; 32]));
+//! assert_eq!(cluster.config().max_rounds, 50);
+//! assert_eq!(cluster.local_peer().as_bytes(), &[1u8; 32]);
 //! ```
 //!
 //! ## Feature Flags
@@ -105,10 +98,13 @@ pub mod wasm_sandbox;
 #[cfg(feature = "std")]
 pub mod mcp_inspector;
 
-/// Prelude module for convenient imports
+/// Prelude module for convenient imports.
 ///
-/// ```rust,ignore
+/// ```rust
 /// use swarm_torch::prelude::*;
+///
+/// let cfg = SwarmConfig::default();
+/// assert!(cfg.validate().is_ok());
 /// ```
 pub mod prelude {
     pub use crate::core::prelude::*;

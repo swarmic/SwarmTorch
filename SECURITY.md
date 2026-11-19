@@ -30,13 +30,13 @@
 SwarmTorch is pre-1.0 and enforces fail-closed security contracts across its implemented layers:
 
 - **Domain-Separated Message Authentication & V2 Session Binding (`ADR-0008B`, `ADR-0020`, `ADR-0021`, `W9-02`, `13A-2`, `15C-3`):**
-  - `MessageEnvelope` defaults to `MessageEnvelope::CURRENT_VERSION = MessageEnvelope::VERSION_V2` (`(0, 3)`) with explicit gated compatibility for `VERSION_V0` (`(0, 1)`) and `VERSION_V1` (`(0, 2)`), alongside `InnerUpdateV2` / `RecipientWrapperV2` / `BundledGossipDeliveryV2` binding `swarm_id`, `run_id`, `round_id`, `session_id` (derived from 256-bit receiver nonce), compression schema version, sender Ed25519 verifying key (`[u8; 32]`), sequence, timestamp, and `SHA-256(payload)` under domain tag `"swarmtorch.envelope.v1"` (`KeyPair::sign_with_domain` / `verify_with_domain`).
+  - `MessageEnvelope` defaults to `MessageEnvelope::CURRENT_VERSION = MessageEnvelope::VERSION_V2` (`(0, 3)`) with explicit gated compatibility for `VERSION_V0` (`(0, 1)`) and `VERSION_V1` (`(0, 2)`), alongside `InnerUpdateV2` / `RecipientWrapperV2` / `BundledGossipDeliveryV2` binding `swarm_id`, `run_id`, `round_id`, `session_id` (derived from 256-bit receiver nonce), compression schema version, sender Ed25519 verifying key (`[u8; 32]`), sequence, timestamp, and `SHA-256(payload)` under domain tag `"swarmtorch.envelope.v1"` (`MessageAuth::{sign_v1, sign_v2, verify, sign_prehashed_domain, verify_prehashed_domain}`).
 - **3-Stage Coordinator Admission, Non-Forged Transport Sources, & Bounded Reassembly (`ADR-0022`, `ADR-0023`, `13A-1`, `13A-3`):**
   - `SwarmRoundCoordinator` fails closed on legacy unverified `PeerRoundSubmissionV1` ingress without state mutation and enforces 3-stage authentication (`PreparedSubmissionV1` -> `ExpectedRoundContextV1` -> sealed `VerifiedRoundSubmissionV1` / `VerifiedFedAsyncSubmissionV1` / `VerifiedLoraSubmissionV1`) across synchronous, FedAsync, and LoRA paths.
   - `SwarmTransport::recv` returns `ObservedTransportMessage { observed_source: ObservedSourceRef, payload }` (no sentinel `PeerId([0xFF; 32])` attribution), and `carrier::VerifiedLinkPrincipalV1` seals link-layer peer principals behind private fields.
   - `ObservedSourceReassembler<E>` (`CRC-16/IBM-3740`) enforces pre-allocation bounds across payload, dimensioned `Vec<u64>` bitmaps, and per-transfer/source/tombstone overhead (`max_total_bytes`), contiguous `Vec<u8>` buffer storage, non-evicting quarantine tombstones, and $O(\log S)$ source quarantine escalation.
-- **Safe `BTreeMap` Replay Protection, Default `RequireSessionHandshake`, & `TimestampFloor` (`ADR-0020`, `W9-02`, `13A-2`):**
-  - Replay state uses a 100% safe, deterministic dual-tree `BTreeMap` store (`entries_by_peer` + `expiry_index` plus v2 session-scoped tables) with explicit `CohortAllowlist` admission and default `ReplayStartupPolicyV1::RequireSessionHandshake` gating cleared atomically via receiver-issued `SessionHandshakeChallengeV2` (`complete_recovery_handshake_v2` validates capacity before clearing pending challenges), plus monotonic `TimestampFloor` enforcement on coordinator resume.
+- **Safe `BTreeMap` Replay Protection, Default `RequireSessionHandshake`, & Monotonic Timestamp Floor (`ADR-0020`, `W9-02`, `13A-2`):**
+  - Replay state uses a 100% safe, deterministic dual-tree `BTreeMap` store (`entries_by_peer` + `expiry_index` plus v2 session-scoped tables) with explicit `CohortAllowlist` admission and default `ReplayStartupPolicyV1::RequireSessionHandshake` gating cleared atomically via receiver-issued `SessionHandshakeChallengeV2` (`complete_recovery_handshake_v2` validates capacity before clearing pending challenges), plus monotonic timestamp floor enforcement (`with_timestamp_floor`) on coordinator resume.
 - **Evented Async Transport & Runtime Starvation Hardening (`ADR-0022`, `ST-06`, `ST-07`, `13C-1`):**
   - `swarm-torch-net` (`WaiterQueue`, `MockTransport`, `TcpTransport`, `UdpGossipTransport`) and `swarm-torch-runtime` (`TokioRuntime`, `EmbassyRuntime`, `MockRuntime`) eliminate busy-yield polling loops in favor of waker-driven readiness notifications (`poll_recv_os_async` / `recv_os_async`, `tokio::time::sleep`, `embassy_time::Timer::after`, `EmbassyRuntime::try_spawn_task`), preventing single-task executor starvation.
 - **Byzantine Aggregation, Non-IID Bucketing, & Collective Verifiable Sparse Co-Design (`ADR-0019`, `ADR-0020`, `ADR-0021`, `W9-01`, `W9-03`, `W11-01`, `W11-02`, `13C-2`, `13C-3`):**
@@ -67,7 +67,7 @@ CI enforces supply-chain checks on every push and pull request:
 
 | Tool | Purpose | Config | Mode |
 |------|---------|--------|------|
-| `cargo deny` (`0.19.0`) | License, ban, and advisory enforcement | [`deny.toml`](deny.toml) | **Blocking** |
+| `cargo deny` (`0.19.0`) | License, ban, and advisory enforcement (workspace + standalone adapters) | [`deny.toml`](deny.toml), [`adapters/deny.toml`](adapters/deny.toml) | **Blocking** |
 | `cargo audit` (`0.22.1`) | RustSec advisory database | Built-in | **Blocking** |
 | `cargo vet` (`0.10.2`) | Human audit & exemption tracking | [`supply-chain/`](supply-chain/) | **Blocking** |
 

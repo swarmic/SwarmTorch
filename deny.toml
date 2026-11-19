@@ -4,11 +4,15 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# cargo-deny 0.19 expects scope selection for unmaintained checks.
-# Use full graph coverage; lint level is handled by cargo-deny's advisory output policy.
+# cargo-deny 0.19 expects scope selection for unmaintained and unsound checks.
+# Use full graph coverage for unmaintained and workspace scope for unsound.
 unmaintained = "all"
+unsound = "workspace"
 # RUSTSEC-2025-0141 (bincode 2.0.0-rc.3 via burn-core) retired in Wave 9 (W9-05 / P2-11).
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0386", reason = "Affects only tokio::io::unix::AsyncFd safe constructors, which SwarmTorch never calls (0 references across workspace/adapters); tokio 1.49.0 remains pinned in root Cargo.lock for cargo-vet and Rust 1.81 MSRV continuity until the next audited tokio bump." },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 is archived upstream and pulled only transitively via optional embassy-time -> futures-util (no direct workspace dependency)." },
+]
 
 [licenses]
 # Allow-list policy: only SPDX IDs listed below are accepted.

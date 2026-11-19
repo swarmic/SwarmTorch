@@ -18,17 +18,17 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md) (public reference bibliography)
 - [`ADRs.md`](ADRs.md) (architecture decisions)
-- [`ROADMAP.md`](ROADMAP.md) (milestone history & active Wave 13 remediation)
+- [`ROADMAP.md`](ROADMAP.md) (milestone history & Wave 13–15 remediation)
 - [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
 - [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 12 + Wave 13 `13-0` .. `13D` Complete)
+## Implementation Reality (Wave 12–15 `13-0` .. `15E` Complete)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
 - `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`, and `swarm-torch-runtime` `EmbassyRuntime`).
-- **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-13 work, and `VerifiedMechanismProtected` fails closed.
+- **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-15 work, and `VerifiedMechanismProtected` fails closed.
 - **Wasm Sandbox Containment (`ST-09`, `13D-1`):** Default `NativeOpRunner::new()`, `WasmSandboxRunnerV1`, and `Scheduler` fail closed (`UnsupportedUntrustedWasmSandbox`) unless configured with a `WasmExtensionExecutor`; `adapters/swarm-torch-wasm` provides `WasmiExtensionExecutorV1` (`wasmi 2.0.0`, `EnforcedLimits::strict()`, fuel + wall-clock timeout slicing, zero imports, SHA-256 pinning, and end-to-end physical CAS DAG execution), while the legacy bespoke interpreter is gated under `#[cfg(test)]`.
-- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, Collective Sparse, & Live Adapters (`13A`–`13D`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + `TimestampFloor`; `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O; `SwarmRuntime::try_spawn` is primary fallible alongside `EmbassyRuntime` & ARM CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation; and standalone adapters run live `iroh 1.4.1`, `zenoh 1.10.2`, and `burn 0.21.0`/`candle 0.10.2` integrations with `[W | b]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`).
+- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, Collective Sparse, & Live Adapters (`13A`–`15D`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + monotonic timestamp floor (`with_timestamp_floor`); `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O; `SwarmRuntime::try_spawn` is primary fallible alongside `EmbassyRuntime` & ARM/RISC-V CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation; and standalone adapters run live `wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, and CPU-only `burn 0.21.0`/`candle 0.10.2` integrations with `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`).
 
 ### Adapter & Capability Maturity Matrix
 
@@ -370,11 +370,17 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust
 SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), and `MockTransport`. Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) are roadmap work.
 
 ```rust,ignore
-pub trait SwarmTransport {
-    async fn send(&self, peer: PeerId, msg: &[u8]) -> Result<()>;
-    async fn recv(&self) -> Result<ObservedTransportMessage>;
-    async fn broadcast(&self, msg: &[u8]) -> Result<()>;
-    fn reliability_class(&self) -> ReliabilityClass; // BestEffort | AtLeastOnce | Reliable
+pub trait SwarmTransport: Send + Sync {
+    type SendFuture<'a>: Future<Output = Result<()>> + Send + 'a where Self: 'a;
+    type RecvFuture<'a>: Future<Output = Result<ObservedTransportMessage>> + Send + 'a where Self: 'a;
+    type BroadcastFuture<'a>: Future<Output = Result<BroadcastStats>> + Send + 'a where Self: 'a;
+    type DiscoverFuture<'a>: Future<Output = Result<Vec<PeerId>>> + Send + 'a where Self: 'a;
+
+    fn send<'a>(&'a self, peer: PeerId, msg: &'a [u8]) -> Self::SendFuture<'a>;
+    fn recv(&self) -> Self::RecvFuture<'_>;
+    fn broadcast<'a>(&'a self, msg: &'a [u8]) -> Self::BroadcastFuture<'a>;
+    fn discover(&self) -> Self::DiscoverFuture<'_>;
+    fn capabilities(&self) -> TransportCapabilities; // includes ReliabilityClass
 }
 ```
 
@@ -397,7 +403,7 @@ let transport = MultiTransport::new()
     .fallback_policy(FallbackPolicy::PreferLowLatency);
 ```
 
-Envelope serialization (`postcard` + Ed25519 `MessageEnvelope` v1) and 16-byte `ChunkedFrameCodec` low-MTU fragmentation/reassembly (`W11-03`) are implemented in `swarm-torch-net`.  
+Envelope serialization (`postcard` + Ed25519 `MessageEnvelope` v2, `VERSION_V2` `(0, 3)` default) and 16-byte `ChunkedFrameCodec` low-MTU fragmentation/reassembly (`W11-03`) are implemented in `swarm-torch-net`.  
 See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)** and **[ADR-0022: Transport Trait Split & Low-MTU Framing](ADRs.md#adr-0022-transport-trait-split-gossip-recipient-authentication-and-low-mtu-chunked-framing)**.
 
 -----
@@ -444,12 +450,12 @@ cargo run -p swarm-torch --example byzantine_federated_round
 
 ## Roadmap
 
-### v0.1.0 - Swarm Learning Core & Coordinator (Active — Wave 11 RC Complete)
+### v0.1.0–v0.2.0 - Swarm Learning Core, Coordinator, & Isolated Adapters (Waves 6–15 Complete)
 
 - ✅ Sequential execution engine MVP & artifact/report bundle pipeline (Waves 6–8)
-- ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`EnvelopeV1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
+- ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`VERSION_V1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
 - ✅ Wave 10 (`v0.1.0-beta.1`): Unified `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock (`BundleLockGuard`), Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`), and deterministic multi-node simulation
-- ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClipping` (`CClip`), Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`), verifiable `SharedSeedSparse` projection (`SharedSeedSparseCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpTransport` / `UdpGossipTransport` / `StdUdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
+- ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClipping` (`CClip`), Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`), verifiable `SharedSeedSparse` projection (`SharedSeedSparsePayloadV1` / `SharedSeedResidualCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpTransport` / `UdpGossipTransport` / `StdUdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
 - ✅ Wave 12–15 (`v0.2.0` + `13-0`–`15E`): Isolated `adapters/*` SDKs (`wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, CPU-only `burn 0.21.0` + `candle 0.10.2` — all `Integration verified` with committed MSRV-checked lockfiles), LoRA/FLoRA updates, `FedAsync` + experimental accounting ledger (`ST-02`), 3-stage Ed25519/v2-replay admission (`MessageEnvelope::VERSION_V2` `(0, 3)` default), atomic `CommittedHeadV1` storage + `fs4` locks, `PhysicalStrict` columnar runner, evented transport/runtime (`EmbassyRuntime`, `portable-atomic` on 32-bit ARM/RISC-V), Q9 `Bulyan` Stage 2, two-phase collective `SharedSeedSparse`, and `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`)
 
 ### v0.2.0 - Edge ML & Hardware Fleet Expansion

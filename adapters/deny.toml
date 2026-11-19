@@ -11,7 +11,25 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "workspace"
-ignore = []
+unsound = "workspace"
+# Shared across all five standalone adapters; an advisory scoped to zenoh or backends
+# is absent from wasm/mcp/iroh by design.
+unused-ignored-advisory = "allow"
+ignore = [
+    # adapters/swarm-torch-transport-zenoh (zenoh 1.10.2 -> zenoh-transport 1.10.2 -> lz4_flex 0.10.0)
+    { id = "RUSTSEC-2026-0041", reason = "lz4_flex 0.10.0 block decompression bug via zenoh-transport 1.10.2; transport_compression feature is disabled (only transport_tcp enabled)." },
+    # adapters/swarm-torch-backends (candle-core 0.10.2 -> zip 7.4.0; inactive optional burn-tch -> zip 0.6.6)
+    { id = "RUSTSEC-2026-0367", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0368", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0369", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0429", reason = "zip < 9.0.0 ZipArchive::extract symlink OOM abort via candle-core 0.10.2 and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0545", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0546", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support); SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0547", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support); SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    { id = "RUSTSEC-2026-0548", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
+    # adapters/swarm-torch-backends (inactive optional burn-tch -> tch -> zip 0.6.6 -> zstd -> zstd-safe 5.0.2)
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 legacy streaming decompression bug appears only via disabled optional burn-tch feature; adapters/swarm-torch-backends enables only burn std/ndarray/autodiff." },
+]
 
 [licenses]
 allow = [
@@ -34,6 +52,8 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# All standalone adapters are `publish = false` and depend on local workspace crates via `path = "../../swarm-torch-*"`.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

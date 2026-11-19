@@ -10,17 +10,17 @@ This directory is the `cargo vet` store for this workspace.
 
 ## CI Enforcement Policy
 
-- `cargo deny`, `cargo audit`, and `cargo vet` all run as **blocking** gates in CI (`.github/workflows/rust.yml`).
+- `cargo deny` (root `deny.toml` + standalone adapter policy `adapters/deny.toml`), `cargo audit`, and `cargo vet` all run as **blocking** gates in CI (`.github/workflows/rust.yml`).
 - CI pins supply-chain tool versions:
   - `cargo-deny` `0.19.0`
   - `cargo-audit` `0.22.1`
   - `cargo-vet` `0.10.2`
-- First-party `safe-to-deploy` audits exist for critical crates:
+- First-party `safe-to-deploy` audits exist in `audits.toml` for:
   - `ed25519-dalek 2.1.1`
-  - `sha2 0.10.9`
+  - `fs4 1.1.0`
+  - `portable-atomic 1.15.0`
   - `postcard 1.1.3`
-  - `rand_chacha 0.3.1`
-  - `ppv-lite86 0.2.21`
+  - `sha2 0.10.9`
 
 ## Exemption Policy
 

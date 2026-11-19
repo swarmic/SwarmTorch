@@ -90,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security & Reliability (`Phase 13B` — Transactional Learning, Durable Storage, & `PhysicalStrict` Execution)
 - **Transactional Coordinator Commits & Resumable Training State (`ST-04`, `13B-1`):**
   - Added signed head promotion via `checkpoints/committed_head.json` (`CommittedHeadV1`, verified by `RunArtifactBundle::verify_committed_head`), staging `CoordinatorResumeStateV2`, `OptimizerStateSnapshotV1`, `CenteredClippingCenterBlobV1`, and `HistoricalAnchorsBlobV1` in write-once CAS prior to head swap so mid-commit failures roll back without advancing model weights, round IDs, or replay/epoch state.
-  - Added `SwarmRoundCoordinator::{resume_exact_training_state, restore_weights_only, restore_with_mode}` (`RestoreModeV1`), persisting optimizer momentum/velocity, Centered Clipping centers, FedAsync historical anchors, and monotonic replay `TimestampFloor` across restarts.
+  - Added `SwarmRoundCoordinator::{resume_exact_training_state, restore_weights_only, restore_with_mode}` (`RestoreModeV1`), persisting optimizer momentum/velocity, Centered Clipping centers, FedAsync historical anchors, and a monotonic replay timestamp floor (`with_timestamp_floor`) across restarts.
 - **Persistent `fs4` Kernel Bundle Locks, Write-Once CAS Verification, & Durability Policies (`ST-05`, `13B-2`):**
   - Replaced `create_new`/unlink `.bundle.lock` handling in `swarm-torch::artifacts::lock` with persistent inode-safe `fs4` kernel locks (`flock` on Unix, `LockFileEx` on Windows, zero unlink races and automatic OS release on crash) and added supply-chain exemption `EX-2026-11-14-01` for `fs4`'s transitive graph.
   - Added `DurabilityPolicyV1::{SyncEachAppend, SyncAtCommit}` defaulting `dp/ledger.ndjson` and DataOps state streams to `SyncEachAppend` (`write + flush + sync_all` + POSIX `sync_parent_dir`), verified write-once CAS SHA-256 digests in `VerifiedBundleV1` / `verify_committed_head`, and added `RunArtifactSink::write_graph_unlocked` to eliminate self-lock re-entrancy.
@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Replaced unauthenticated `PeerRoundSubmissionV1` ingress (`#[deprecated]`, failing closed with `RoundError::UnverifiedSubmissionRejected` and zero state mutation) with a strict prepare -> validate -> commit pipeline in `swarm-torch::coordinator`: **Stage A** `prepare_verified_delivery` / `prepare_verified_delivery_struct` (`&self`, read-only Ed25519 + v2 replay preflight + `InnerUpdateV2` schema decode into `PreparedSubmissionV1`), **Stage B** `ExpectedRoundContextV1::validate_{sync,fedasync,lora}_submission` (read-only binding of `swarm_instance_id`, `context_policy_digest`, `run_id`, `round_id`, `base_checkpoint_digest`, update kind/dimension, allowlist, and active cohort epoch), and **Stage C** atomic replay commit & admission returning sealed private-field proof tokens (`VerifiedRoundSubmissionV1`, `VerifiedFedAsyncSubmissionV1`, `VerifiedLoraSubmissionV1`).
   - Added public canonical update payload encoders `encode_{dense,compressed,lora}_update_payload_v2` matching compression schema versions `0`, `1`, and `2`.
 - **Receiver-Nonce `session_id` V2 Replay Recovery & Default Fail-Closed Restart (`ST-03`):**
-  - Defaulted `ReplayProtection` startup/recovery policy to `ReplayStartupPolicyV1::RequireSessionHandshake` (`ReplayProtection::try_with_config`) and wired `SwarmRoundCoordinator::from_resume_state` to enforce `RequireSessionHandshake` plus monotonic `TimestampFloor` (`committed_unix_nanos / 1e9`).
+  - Defaulted `ReplayProtection` startup/recovery policy to `ReplayStartupPolicyV1::RequireSessionHandshake` (`ReplayProtection::try_with_config`) and wired coordinator resume paths to enforce `RequireSessionHandshake` plus a monotonic timestamp floor (`with_timestamp_floor`, `committed_unix_nanos / 1e9`).
   - Added `SessionHandshakeChallengeV2` with 256-bit `receiver_nonce` and deterministic domain-separated `session_id`, `MessageEnvelope::VERSION_V2` (`(0, 3)`), `InnerUpdateV2`, `RecipientWrapperV2`, `BundledGossipDeliveryV2`, `BTreeMap` v2 replay tracking keyed by `(SwarmInstanceId, RunId, PeerId, SessionEpoch, SessionId)`, atomic `complete_recovery_handshake_v2` (capacity validated prior to mutating pending challenges), and read-only `check_v2_admission_readonly` + `commit_prepared_admission`.
 - **Non-Forged Transport Attribution & Sealed Carrier Proofs (`ST-06` Identity, `ST-08`):**
   - Replaced `SwarmTransport::recv() -> (PeerId, Vec<u8>)` (and sentinel `PeerId([0xFF; 32])` fallbacks in `UdpGossipTransport` / `TcpTransport`) with `ObservedTransportMessage` carrying transport-observed `ObservedSourceRef` (`SocketAddr`, `MockNodeId`, `LinkLabel`, `Opaque`), preventing pre-auth sender forgery across all transports and multi-node simulations.
@@ -156,18 +156,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Non-IID Byzantine Resilience (`W11-01`, `ADR-0019`):**
-  - Stateful `CenteredClipping` (`CClip`) with explicit reference-iterate contract (`step_from_reference`), $\tau$-scaled empty-round stability, and `f64` norm/update accumulation.
+  - Stateful `CenteredClipping` (`CClip`) with explicit reference-iterate contract (`aggregate_with_center` / `aggregate_with_center_bounded`), $\tau$-scaled empty-round stability, and `f64` norm/update accumulation.
   - Deterministic `BucketingConfig` / `aggregate_with_bucketing_v1` using `ChaCha8Rng` Fisher-Yates shuffling (`domain: "swarmtorch.sbucket.v1"`) with `f64` bucket averaging.
 - **Verifiable `SharedSeedSparse` Co-Design (`W11-02`, `ADR-0021`):**
-  - `SharedSeedSparseCompressor` (`ChaCha8Rng` partial Fisher-Yates index derivation from `(round_id, peer_id, session_nonce)` under `"swarmtorch.shared_seed_sparse.v1"`), eliminating per-index wire overhead (`4k` bytes vs `8k` bytes).
+  - `SharedSeedSparsePayloadV1` / `SharedSeedResidualCompressor` (`ChaCha8Rng` partial Fisher-Yates index derivation from `(round_id, peer_id, session_nonce)` under `"swarmtorch.shared_seed_sparse.v1"`), eliminating per-index wire overhead (`4k` bytes vs `8k` bytes).
   - `SharedSeedCoordinateVerifier` (`UpdateTransform`) verifying canonical strictly-ascending PRNG coordinate indices prior to Byzantine distance evaluation.
 - **Low-MTU Chunked Framing & Concrete Transports (`W11-03`, `ADR-0004`, `ADR-0022`):**
   - 16-byte `ChunkHeaderV1` (`CRC-16/IBM-3740` CCITT-FALSE) and `ChunkedFrameCodec` reassembly pool (`MAX_CONCURRENT_REASSEMBLIES = 32`, `MAX_CHUNKS_PER_MESSAGE = 256`, bitmap deduplication, conflict eviction, and lazy TTL sweep) for LoRa/BLE/UDP links.
-  - Feature-gated `TcpTransport` (`tcp-transport`) with 4-byte length prefixing and `MAX_FRAME_BYTES` pre-allocation gating.
+  - Feature-gated `TcpTransport` (`tcp-transport`) with 4-byte length prefixing and pre-allocation frame-size gating (`DEFAULT_MAX_ENVELOPE_BYTES` / per-transport cap).
   - Feature-gated `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`) multiplexing single-datagram and `ChunkedFrameCodec`-fragmented frames.
 - **SafeTensors v1 Checkpoint Persistence (`W11-04`, `ADR-0023`, `ADR-0024`):**
   - Zero-dependency `SwarmTorchCheckpointV1` reader/writer in `swarm-torch-models::safetensors_v1` with `SafeTensorsLimitsV1::default().max_header_bytes = 1_048_576`, strict `F32` contiguous interval validation, 8-byte alignment padding, and `SwarmModel` round-trip helpers.
-  - Coordinator checkpoint export/import hooks (`save_safetensors_checkpoint_v1`, `load_safetensors_checkpoint_v1`).
+  - CAS checkpoint export/import helpers (`put_safetensors_checkpoint_v1`, `get_verified_safetensors_checkpoint_v1`).
 - **Examples & Benchmarks (`W10-03` / `W11`):**
   - `byzantine_federated_round` end-to-end example and `swarm_bench` Criterion benchmark suite.
 
@@ -186,10 +186,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Byzantine Aggregation & Compression Hardening (`W9-01`, `W9-03`, `ADR-0019`, `ADR-0021`):**
-  - Pre-aggregation finiteness/shape validation (`validate_gradient_batch`, `MAX_COHORT_SIZE = 1024`), `f64` accumulation across `FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, and `Bulyan` (`BulyanProfile::IterativeKrumV1`).
-  - `ClassicResidualCompressor` and `Ef21Compressor` + `Ef21ServerAccumulator` error-feedback codecs.
+  - Pre-aggregation finiteness/shape validation (`MAX_COHORT_SIZE = 1024`), `f64` accumulation across `FedAvg`, `CoordinateMedian`, `TrimmedMean`, one-pass `Multi-Krum`, and `Bulyan` (`BulyanProfile::IterativeKrumV1`).
+  - `ClassicResidualCompressor` and `Ef21SenderState` + `Ef21ReceiverState` error-feedback codecs.
 - **Safe `BTreeMap` Replay Protection & Envelope v1 (`W9-02`, `ADR-0020`, `ADR-0021`):**
-  - Replaced `lru` with a 100% safe dual-tree `BTreeMap` replay store (`entries_by_peer` + `expiry_index`), added `CohortAllowlist`, `RecoveryRequired` startup challenge (`SessionHandshakeChallenge`), and 6-stage `MessageEnvelope::decode_and_verify_payload` (`MessageEnvelope::VERSION_V1` `(0, 2)`, `MAX_FRAME_BYTES = 65_536`).
+  - Replaced `lru` with a 100% safe dual-tree `BTreeMap` replay store (`entries_by_peer` + `expiry_index`), added `CohortAllowlist`, `RecoveryRequired` startup challenge (`SessionHandshakeChallenge`), and 6-stage `MessageEnvelope::verify_and_decode_payload` (`MessageEnvelope::VERSION_V1` `(0, 2)`, `DEFAULT_MAX_ENVELOPE_BYTES = 1_048_576`).
 - **Models, Losses, & Dependency Diet (`W9-04`..`W9-06`, `ADR-0002`, `ADR-0022`, `ADR-0024`):**
   - Added `LinearModelWithCapacity`, contiguous `MlpModelWithCapacity`, analytical `MseLoss`, `CrossEntropyLoss` (`no_std` IEEE-754 `exp_f64`/`ln_f64`), `HuberLoss`, `FedProxRegularizer`, and `SgdOptimizer`.
   - Removed unused `burn`, `burn-ndarray`, `bincode`, `async-trait`, and `lru` dependencies from the core workspace.

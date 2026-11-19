@@ -116,7 +116,7 @@ SwarmTorch is designed for:
 
 Evidence: ADR-0004B, ADR-0006A
 
-Tracked follow-up: `P2-12` (`Status: Planned`, Wave 8.2) defines normative vs profiled assumptions (timeouts, quorum ratios, staleness thresholds) in an enforceable matrix.
+Normative vs. profiled assumptions (timeouts, quorum ratios, staleness thresholds) are closed in §1 of the Post-Wave 8.1 chapter below (`P2-12`, `Status: Closed`).
 
 ### Coordination Model (Design Target vs Current)
 
@@ -285,8 +285,8 @@ SwarmTorch is a Rust workspace with these crates:
 
 - `swarm-torch-core`: core traits + algorithms (`no_std`-compatible).  
   Evidence: swarm-torch-core/src/lib.rs
-- `swarm-torch-net`: transport traits + message envelope (currently includes a mock transport; real transports are placeholders).  
-  Evidence: swarm-torch-net/src/lib.rs
+- `swarm-torch-net`: `PacketTransport` & GAT `SwarmTransport` traits, `MessageEnvelope` (`VERSION_V2` `(0, 3)` default), 16-byte `ChunkedFrameCodec` reassembly, `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), `MockTransport`/`MockNetworkHub`, and carrier contracts (`ble-transport`, `lora-transport`, and `wifi-transport` remain placeholder feature flags).  
+  Evidence: swarm-torch-net/src/lib.rs, swarm-torch-net/src/{tcp,udp,chunked,mock}.rs
 - `swarm-torch-runtime`: runtime abstraction (`tokio` and `embassy` feature-gated implementations).  
   Evidence: swarm-torch-runtime/src/lib.rs
 - `swarm-torch-models`: reference models + backend integration scaffolding.  
@@ -318,8 +318,9 @@ Grounding: SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md#Cargo-Features, SWA
 
 SwarmTorch defines a `SwarmRuntime` trait and feature-gated implementations:
 
-- `tokio` runtime wrapper (usable today)
-- `embassy` runtime wrapper (placeholder; not yet complete and not part of Rust 1.75 conformance)
+- `tokio` runtime wrapper (`TokioRuntime`, usable today)
+- `MockRuntime` deterministic task/timer scheduler (`no_std + alloc` / `std`)
+- `embassy` runtime wrapper (`EmbassyRuntime` backed by `embassy_time::{Instant, Timer}` and `EmbassyRuntime::try_spawn_task` over `embassy_executor::SendSpawner`, verified on `thumbv6m`/`thumbv7em` and `embassy_executor_integration`; gated on `embassy` feature and outside the Rust 1.75 `embassy` feature check)
 
 Evidence: swarm-torch-runtime/src/lib.rs
 
@@ -371,13 +372,13 @@ Evidence: ADR-0007, ADR-0007A, ADR-0019
 
 ### Compression (Current)
 
-Compression primitives include `TopK`, `RandomSparse`, and `Quantized` modes.
+Compression primitives include `TopK`, `RandomK` (seeded reservoir sampling), `Quantized`, `ClassicResidual`, `EF21`, and verifiable `SharedSeedSparse` (`CompressionMethod::RandomSparse` explicitly returns `UnsupportedMethod` in v0.1).
 
 Evidence: swarm-torch-core/src/compression.rs
 
-Tracked follow-up: `P2-15` (`Status: Planned`, Wave 8.3) specifies default compression profiles and convergence/accuracy expectations.
+Compression profiles and qualified convergence contracts are closed in §4 of the Post-Wave 8.1 chapter below (`P2-15`, `Status: Closed`).
 
-Evidence: ADR-0007, ADR-0007A.
+Evidence: ADR-0007, ADR-0007A, ADR-0021.
 
 ## Security Engineering (Current + Planned)
 
@@ -398,7 +399,7 @@ SwarmTorch includes a `GradientValidator` for basic bounds checking (NaN/Inf/coo
 
 Evidence: swarm-torch-core/src/crypto.rs
 
-Tracked follow-up: `P2-13` (`Status: Planned`, Wave 8.2) maps threat model requirements to concrete enforcement hooks (protocol parsing fuzzing, signature verification, byzantine harness, supply-chain gates).
+Threat-model-to-enforcement mapping is closed in §2 of the Post-Wave 8.1 chapter below (`P2-13`, `Status: Closed`; protocol parsing fuzzing remains planned in Appendix B).
 
 Evidence: ADR-0008, ADR-0008A, `SECURITY.md`, `deny.toml`, `supply-chain/`.
 
@@ -430,7 +431,7 @@ Fingerprint v0 (metadata-first) is defined so it can be computed without raw row
 
 Evidence: ADR-0017, swarm-torch-core/src/dataops.rs
 
-Tracked follow-up: `P2-14` (`Status: Planned`, Wave 8.2) publishes standalone `graph.json` schema docs with explicit compatibility/migration guidance for typed optional policy/resource fields.
+Standalone `graph.json` schema compatibility and migration guidance is closed in §3 of the Post-Wave 8.1 chapter below (`P2-14`, `Status: Closed`).
 
 Evidence: ADR-0017.
 
@@ -463,9 +464,12 @@ Evidence: ADR-0016.
 
 ### MSRV (Current)
 
-Workspace `rust-version` is currently set to **1.75**.
+MSRV is tiered by crate and enforced in `.github/workflows/rust.yml`:
+- Workspace `[workspace.package].rust-version` is **1.75** (`swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` `no_std`/`alloc` verified on `1.75`).
+- Top-level `swarm-torch` declares `rust-version = "1.81"` (verified on `1.81`).
+- Standalone `adapters/*` declare per-adapter MSRVs verified in CI (`wasm`: `1.86`, `mcp`: `1.88`, `zenoh`: `1.88`, `iroh`: `1.91`, `backends`: `1.92`).
 
-Evidence: Cargo.toml
+Evidence: Cargo.toml, swarm-torch/Cargo.toml, adapters/*/Cargo.toml, .github/workflows/rust.yml
 
 ### docs.rs (Operational Constraints)
 
@@ -488,7 +492,7 @@ Evidence: ADR-0011, ADR-0013, ADR-0014, `SECURITY.md`.
 
 ### Swarmic Network Provider Profile (Secondary)
 
-Tracked follow-up: `P2-18` (`Status: Planned`, Wave 8.3) defines integration-only mapping without importing mission-plane semantics into SwarmTorch core.
+Mission-plane integration boundaries (without importing mission-plane semantics into SwarmTorch core) are closed in §5 of the Post-Wave 8.1 chapter below (`P2-18`, `Status: Closed`).
 
 Evidence: `ADR-0008A`, `CONTRIBUTING.md`.
 
@@ -573,17 +577,17 @@ These are blocking gates for releases once implemented in CI:
 
 | Gate | Hook (intended) | Status | Evidence |
 |------|------------------|--------|----------|
-| Convergence benchmark | `cargo bench -p swarm-torch --bench swarm_bench` (or dedicated benchmark harness) | Planned | Evidence: ADR-0014 |
+| Convergence benchmark | `cargo bench -p swarm-torch --bench swarm_bench` (Criterion microbenchmarks compiled in CI; convergence regression threshold runner planned) | Partial | Evidence: ADR-0014, swarm-torch/benches/swarm_bench.rs |
 | Topology A/B test | Dedicated benchmark runner outputs comms + convergence curves for >=3 topologies | Planned | Evidence: ADR-0004A, ADR-0014 |
 | Staleness + dropout | Simulation test (>=30% dropout) must not diverge under bounded staleness | Planned | Evidence: ADR-0004B, ADR-0014 |
-| Robustness harness | Attack harness scenarios must pass; publish robustness report | Planned | Evidence: ADR-0007A, ADR-0014 |
-| Embedded build | Embedded target build must pass | Planned | Evidence: ADR-0002, ADR-0014 |
+| Robustness harness | `cargo test -p swarm-torch-core --test robustness_harness` & `cargo test -p swarm-torch --test federated_round_simulation` | Implemented | Evidence: ADR-0007A, ADR-0014, swarm-torch-core/tests/robustness_harness.rs, swarm-torch/tests/federated_round_simulation.rs |
+| Embedded build | `cargo check` across `thumbv6m-none-eabi`, `thumbv7em-none-eabihf`, and `riscv32imc-unknown-none-elf` (`embedded_targets` CI job) | Implemented | Evidence: ADR-0002, ADR-0014, .github/workflows/rust.yml |
 
 #### Artifact Contract Conformance (ADR-0016/0017/0018)
 
 | Gate | Hook (intended) | Status | Evidence |
 |------|------------------|--------|----------|
-| Artifact bundle schema | Validate bundle layout + required files + schema versions | Planned | Evidence: ADR-0016 |
+| Artifact bundle schema | `cargo test -p swarm-torch --test schema_conformance --locked` (10 Draft 2020-12 schemas in `schemas/v1/`) | Implemented | Evidence: ADR-0016, schemas/v1/, swarm-torch/src/artifacts/schema_check.rs, swarm-torch/tests/schema_conformance.rs |
 | Manifest integrity | `cargo test -p swarm-torch artifacts::tests::bundle_manifest_roundtrip` (recompute SHA-256 for manifest entries) | Implemented | Evidence: swarm-torch/src/artifacts/bundle.rs |
 | Graph hash normalization | `cargo test -p swarm-torch artifacts::tests::graph_write_normalizes_ids_and_hashes` | Implemented | Evidence: swarm-torch/src/artifacts/bundle.rs |
 | Dataset fingerprint determinism | `cargo test -p swarm-torch-core dataops::tests::dataset_fingerprint_is_deterministic` | Implemented | Evidence: swarm-torch-core/src/dataops.rs |
@@ -600,7 +604,7 @@ These are blocking gates for releases once implemented in CI:
 
 ### Appendix C: Artifact Schema References
 
-Tracked follow-up: `P2-20` (`Status: Planned`, Wave 8.3) publishes versioned JSON schema definitions and Parquet schema notes.
+Versioned Draft 2020-12 JSON Schema definitions (`P2-20a` + `P2-20b`, 10 files including `columnar_table.schema.json`) are published in `schemas/v1/*.schema.json` and mirrored byte-identically inside `swarm-torch/schemas/v1/` (verified by `swarm-torch/tests/schema_conformance.rs`); optional Parquet/Arrow export remains planned.
 
 ### Appendix D: Glossary
 
@@ -670,7 +674,7 @@ Evidence: ADR-0002, ADR-0003, ADR-0019..ADR-0025, `SECURITY.md`.
 - **Additive Operational Metadata Fields (Excluded from `node_def_hash_v1`):**
   - `node_id` (`Option<NodeId>`, derived via `node_id_from_key`), `node_def_hash` (`Option<String>`), `execution_hint` (`Option<ExecutionHint>`), `cache_policy` (`Option<CachePolicyV0>`), `materialization_policy` (`Option<MaterializationPolicyV0>`), `resources` (`Option<ResourceHintsV0>`), and `op_hash` (`Option<String>`).
   - **Compatibility & Cache Rule (`C2`):** Modifying operational metadata fields does not mutate `node_def_hash_v1` or `recipe_hash_v0`. However, a valid training/checkpoint cache hit in `scheduler.rs` requires both recipe-key equality AND verified physical CAS payload presence, digest match, `TrustPolicy::Strict` satisfaction, and state restoration (`CachePolicyV0::Bypass` forces execution).
-- **Schema Deliverables (`P2-20a` / `P2-20b`):** Versioned JSON Schema 2020-12 contracts (with streaming size bounds and lossless `u64` encodings) ship in `W10-02` (`P2-20a`), while Arrow/Parquet columnar schemas ship in `W12-04` (`P2-20b`).
+- **Schema Deliverables (`P2-20a` / `P2-20b`):** Versioned JSON Schema 2020-12 contracts (with streaming size bounds and lossless `u64` encodings) shipped in `W10-02` (`P2-20a`, 9 schemas), and `schemas/v1/columnar_table.schema.json` (JSON Schema Draft 2020-12 for physical columnar/NDJSON tables) shipped in `W12-04` (`P2-20b`); Arrow/Parquet export remains planned.
 
 Evidence: ADR-0016, ADR-0017, ADR-0023, ADR-0025, `swarm-torch-core/src/run_graph.rs`.
 

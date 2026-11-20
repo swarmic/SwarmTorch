@@ -13,12 +13,16 @@ default = []
 burn = []
 candle = []
 real-burn = ["dep:burn"]
+real-burn-wgpu = ["real-burn", "dep:burn-wgpu", "dep:cubecl", "dep:wgpu"]
 real-candle = ["dep:candle-core", "dep:candle-nn"]
 
 [workspace]
 
 [dependencies]
 burn = { version = "0.21.0", optional = true, default-features = false, features = ["std", "ndarray", "autodiff"] }
+burn-wgpu = { version = "0.21.0", optional = true, default-features = false, features = ["std"] }
+cubecl = { version = "0.10.0", optional = true, default-features = false, features = ["std", "wgpu"] }
+wgpu = { version = "29.0.4", optional = true }
 candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 swarm-torch-core = { path = "../../swarm-torch-core" }

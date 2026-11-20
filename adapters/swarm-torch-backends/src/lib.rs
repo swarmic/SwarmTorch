@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
-//! Workspace-excluded tensor backend bridges for `Burn` and `Candle` (`ADR-0024` §4, `W12-01`, `13D-4`, `14B`, `15D-4`).
+//! Workspace-excluded tensor backend bridges for `Burn` (CPU `NdArray` and GPU `Wgpu`) and `Candle`
+//! (`ADR-0015`, `ADR-0024` §4, `W12-01`, `13D-4`, `14B`, `15D-4`, `Wave 16D`).
 //!
-//! **Maturity Tier:** `Integration verified` — live `burn 0.21` (`Autodiff<NdArray<f32>>`) and
-//! `candle 0.10` (`VarMap` / `Linear`) linear (`[W | b]`) and 2-layer ReLU MLP (`[W_1 | b_1 | W_2 | b_2]`)
-//! bridges enforce canonical [`ModelTensorSchemaV1`] (`model_schema_hash`), [`ModelFlatTensorLayoutV1`]
-//! parameter/gradient alignment with `SwarmTorch::LinearModel` and `SwarmTorch::MlpModel`, and
+//! **Maturity Tier:** `Integration verified` — live `burn 0.21` (`Autodiff<NdArray<f32>>` CPU and
+//! `Autodiff<burn_wgpu::Wgpu<f32, i32, u32>>` GPU under `real-burn-wgpu`) and `candle 0.10`
+//! (`VarMap` / `Linear` CPU) linear (`[W | b]`) and 2-layer ReLU MLP (`[W_1 | b_1 | W_2 | b_2]`)
+//! bridges enforce canonical [`ModelTensorSchemaV1`] (`model_schema_hash`),
+//! [`swarm_torch_models::safetensors_v1::ModelFlatTensorLayoutV1`] parameter/gradient alignment with `SwarmTorch::LinearModel` and `SwarmTorch::MlpModel`, and
 //! transactional `.is_finite()` verification on every import, export, forward, and gradient path.
-//! Live bridges run on CPU only (`DevicePlacementV1::Cpu`); `Wgpu` / `Cuda` placements are reserved
-//! and untested until GPU device matrices are scoped (Wave 15 decision A5).
+//! `real-burn-wgpu` enumerates per-type WGPU adapters using a serialized, backend-scoped
+//! `wgpu::Instance` matching `AutoGraphicsApi::backend()` (avoiding both `cubecl-wgpu 0.10.0`'s
+//! mixed-GPU global-index panic bug in `enumerate_all_devices` and its `Backends::all()` WGL
+//! thread-crash hazard in `enumerate_devices`) and fails closed with
+//! [`BackendBridgeError::DeviceUnavailable`] when no matching adapter is available; `Cuda` placement
+//! remains reserved for future CUDA-runner verification.
 
 use swarm_torch_models::backend_bridge::{
     BackendBridgeError, BackendModelHandleV1, BackendTensorBridge, DevicePlacementV1,
@@ -283,21 +289,20 @@ fn validate_batch_input(input: &[f32], in_dim: usize) -> Result<usize, BackendBr
     Ok(input.len() / in_dim)
 }
 
-/// Live `Burn 0.21` (`Autodiff<NdArray<f32>>`) linear and 2-layer MLP backend bridges (`ST-08`, `AR-14-07`, `14B-1`).
 #[cfg(feature = "real-burn")]
-pub mod real_burn {
+mod burn_generic {
     use std::sync::Mutex;
 
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::{Autodiff, NdArray};
+    use burn::backend::Autodiff;
     use burn::module::Param;
     use burn::nn::{Linear, LinearConfig};
     use burn::tensor::activation::relu;
+    use burn::tensor::backend::Backend;
     use burn::tensor::{Tensor, TensorData};
     use swarm_torch_models::backend_bridge::{BackendBridgeError, DevicePlacementV1};
     use swarm_torch_models::safetensors_v1::ModelTensorSchemaV1;
 
-    use crate::{validate_batch_input, validate_finite_f32_slice, BurnModuleOps};
+    use crate::{validate_batch_input, validate_finite_f32_slice};
 
     // The bridge mutex is deliberately held across graph construction and `backward()`
     // (`15D-4` T-Agent review). Computing on a `Module::clone` snapshot instead lets concurrent
@@ -305,62 +310,79 @@ pub mod real_burn {
     // and per-graph locks are taken in opposite orders), and cloning a not-yet-initialized lazy
     // `Param` re-draws independent random weights per clone. Concurrent calls therefore serialize.
 
-    /// CPU autodiff Burn backend used by [`BurnLinearBridgeV1`] and [`BurnMlpBridgeV1`].
-    pub type BurnNdArrayBackend = Autodiff<NdArray<f32>>;
-    type BurnInnerBackend = NdArray<f32>;
-
-    /// Live `Burn` affine module (`y = x @ W_t + b`) synchronized transactionally in canonical
-    /// `[weight(out_dim * in_dim) | bias(out_dim)]` layout matching [`swarm_torch_models::simple::LinearModel`] (`AR-14-07`).
     #[derive(Debug)]
-    pub struct BurnLinearBridgeV1 {
+    pub(crate) struct BurnLinearCore<B: Backend> {
         schema: ModelTensorSchemaV1,
+        placement: DevicePlacementV1,
         in_dim: usize,
         out_dim: usize,
-        device: NdArrayDevice,
-        linear: Mutex<Linear<BurnNdArrayBackend>>,
+        device: B::Device,
+        linear: Mutex<Linear<Autodiff<B>>>,
     }
 
-    impl BurnLinearBridgeV1 {
-        /// Construct a new CPU autodiff `Burn` linear module matching `for_linear(in_dim, out_dim)`.
-        pub fn new(in_dim: usize, out_dim: usize) -> Result<Self, BackendBridgeError> {
-            if in_dim == 0 || out_dim == 0 {
-                return Err(BackendBridgeError::SchemaMismatch);
-            }
+    impl<B: Backend> BurnLinearCore<B> {
+        pub(crate) fn new(
+            in_dim: usize,
+            out_dim: usize,
+            device: B::Device,
+            placement: DevicePlacementV1,
+        ) -> Result<Self, BackendBridgeError> {
             let schema = ModelTensorSchemaV1::for_linear(in_dim, out_dim)
                 .map_err(|_| BackendBridgeError::SchemaMismatch)?;
-            let device = NdArrayDevice::Cpu;
+            Ok(Self::new_with_schema(
+                schema, in_dim, out_dim, device, placement,
+            ))
+        }
+
+        pub(crate) fn new_with_schema(
+            schema: ModelTensorSchemaV1,
+            in_dim: usize,
+            out_dim: usize,
+            device: B::Device,
+            placement: DevicePlacementV1,
+        ) -> Self {
             let linear = LinearConfig::new(in_dim, out_dim)
                 .with_bias(true)
-                .init::<BurnNdArrayBackend>(&device);
-            Ok(Self {
+                .init::<Autodiff<B>>(&device);
+            Self {
                 schema,
+                placement,
                 in_dim,
                 out_dim,
                 device,
                 linear: Mutex::new(linear),
-            })
+            }
         }
 
-        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients
-        /// in canonical `[weight_grad(out_dim * in_dim) | bias_grad(out_dim)]` order (`AR-14-07`).
-        pub fn backward_mse(
+        pub(crate) fn device_placement(&self) -> DevicePlacementV1 {
+            self.placement
+        }
+
+        pub(crate) fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            &self.schema
+        }
+
+        pub(crate) fn backward_mse(
             &self,
             input: &[f32],
             target: &[f32],
         ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
             let batch = validate_batch_input(input, self.in_dim)?;
-            validate_finite_f32_slice(target, Some(batch * self.out_dim))?;
+            let expected_out = batch
+                .checked_mul(self.out_dim)
+                .ok_or(BackendBridgeError::SchemaMismatch)?;
+            validate_finite_f32_slice(target, Some(expected_out))?;
 
             let guard = self
                 .linear
                 .lock()
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
 
-            let x = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let x = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(input.to_vec(), [batch, self.in_dim]),
                 &self.device,
             );
-            let t = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let t = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(target.to_vec(), [batch, self.out_dim]),
                 &self.device,
             );
@@ -412,18 +434,8 @@ pub mod real_burn {
             validate_finite_f32_slice(&flat_grads, Some(expected))?;
             Ok((loss_scalar, flat_grads))
         }
-    }
 
-    impl BurnModuleOps for BurnLinearBridgeV1 {
-        fn device_placement(&self) -> DevicePlacementV1 {
-            DevicePlacementV1::Cpu
-        }
-
-        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
-            &self.schema
-        }
-
-        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+        pub(crate) fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
             let guard = self
                 .linear
                 .lock()
@@ -453,13 +465,16 @@ pub mod real_burn {
             Ok(out)
         }
 
-        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+        pub(crate) fn import_flat_f32(
+            &mut self,
+            flat_params: &[f32],
+        ) -> Result<(), BackendBridgeError> {
             let weight_len = self.out_dim * self.in_dim;
             let expected = weight_len + self.out_dim;
             validate_finite_f32_slice(flat_params, Some(expected))?;
 
             // Prepare leaf tensors completely before acquiring lock or replacing parameters.
-            let inner_weight_t = Tensor::<BurnInnerBackend, 2>::from_data(
+            let inner_weight_t = Tensor::<B, 2>::from_data(
                 TensorData::new(
                     flat_params[..weight_len].to_vec(),
                     [self.out_dim, self.in_dim],
@@ -467,17 +482,16 @@ pub mod real_burn {
                 &self.device,
             )
             .transpose();
-            let inner_bias = Tensor::<BurnInnerBackend, 1>::from_data(
+            let inner_bias = Tensor::<B, 1>::from_data(
                 TensorData::new(flat_params[weight_len..].to_vec(), [self.out_dim]),
                 &self.device,
             );
 
             let new_weight = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 2>::from_inner(inner_weight_t).require_grad(),
+                Tensor::<Autodiff<B>, 2>::from_inner(inner_weight_t).require_grad(),
             );
-            let new_bias = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 1>::from_inner(inner_bias).require_grad(),
-            );
+            let new_bias =
+                Param::from_tensor(Tensor::<Autodiff<B>, 1>::from_inner(inner_bias).require_grad());
 
             let mut guard = self
                 .linear
@@ -488,13 +502,16 @@ pub mod real_burn {
             Ok(())
         }
 
-        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+        pub(crate) fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
             let batch = validate_batch_input(input, self.in_dim)?;
+            let expected_out = batch
+                .checked_mul(self.out_dim)
+                .ok_or(BackendBridgeError::SchemaMismatch)?;
             let guard = self
                 .linear
                 .lock()
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
-            let x = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let x = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(input.to_vec(), [batch, self.in_dim]),
                 &self.device,
             );
@@ -503,50 +520,62 @@ pub mod real_burn {
                 .to_data()
                 .to_vec::<f32>()
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(format!("{e:?}")))?;
-            validate_finite_f32_slice(&out, Some(batch * self.out_dim))?;
+            validate_finite_f32_slice(&out, Some(expected_out))?;
             Ok(out)
         }
     }
 
-    /// Live `Burn` 2-layer ReLU MLP (`y = fc2(relu(fc1(x)))`) synchronized transactionally in
-    /// canonical `[W_1 | b_1 | W_2 | b_2]` layout matching [`swarm_torch_models::mlp::MlpModel`] (`14B-1`).
+    type MlpLayerPair<B> = (Linear<Autodiff<B>>, Linear<Autodiff<B>>);
+
     #[derive(Debug)]
-    pub struct BurnMlpBridgeV1 {
+    pub(crate) struct BurnMlpCore<B: Backend> {
         schema: ModelTensorSchemaV1,
+        placement: DevicePlacementV1,
         in_dim: usize,
         hidden_dim: usize,
         out_dim: usize,
-        device: NdArrayDevice,
-        layers: Mutex<(Linear<BurnNdArrayBackend>, Linear<BurnNdArrayBackend>)>,
+        device: B::Device,
+        layers: Mutex<MlpLayerPair<B>>,
     }
 
-    impl BurnMlpBridgeV1 {
-        /// Construct a new CPU autodiff `Burn` 2-layer ReLU MLP matching `for_mlp(in_dim, hidden_dim, out_dim)`.
-        pub fn new(
+    impl<B: Backend> BurnMlpCore<B> {
+        pub(crate) fn new(
             in_dim: usize,
             hidden_dim: usize,
             out_dim: usize,
+            device: B::Device,
+            placement: DevicePlacementV1,
         ) -> Result<Self, BackendBridgeError> {
-            if in_dim == 0 || hidden_dim == 0 || out_dim == 0 {
-                return Err(BackendBridgeError::SchemaMismatch);
-            }
             let schema = ModelTensorSchemaV1::for_mlp(in_dim, hidden_dim, out_dim)
                 .map_err(|_| BackendBridgeError::SchemaMismatch)?;
-            let device = NdArrayDevice::Cpu;
+            Ok(Self::new_with_schema(
+                schema, in_dim, hidden_dim, out_dim, device, placement,
+            ))
+        }
+
+        pub(crate) fn new_with_schema(
+            schema: ModelTensorSchemaV1,
+            in_dim: usize,
+            hidden_dim: usize,
+            out_dim: usize,
+            device: B::Device,
+            placement: DevicePlacementV1,
+        ) -> Self {
             let fc1 = LinearConfig::new(in_dim, hidden_dim)
                 .with_bias(true)
-                .init::<BurnNdArrayBackend>(&device);
+                .init::<Autodiff<B>>(&device);
             let fc2 = LinearConfig::new(hidden_dim, out_dim)
                 .with_bias(true)
-                .init::<BurnNdArrayBackend>(&device);
-            Ok(Self {
+                .init::<Autodiff<B>>(&device);
+            Self {
                 schema,
+                placement,
                 in_dim,
                 hidden_dim,
                 out_dim,
                 device,
                 layers: Mutex::new((fc1, fc2)),
-            })
+            }
         }
 
         fn total_elements(&self) -> usize {
@@ -556,15 +585,24 @@ pub mod real_burn {
                 + self.out_dim
         }
 
-        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients
-        /// in canonical `[dW_1 | db_1 | dW_2 | db_2]` order matching [`swarm_torch_models::mlp::MlpModel`].
-        pub fn backward_mse(
+        pub(crate) fn device_placement(&self) -> DevicePlacementV1 {
+            self.placement
+        }
+
+        pub(crate) fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            &self.schema
+        }
+
+        pub(crate) fn backward_mse(
             &self,
             input: &[f32],
             target: &[f32],
         ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
             let batch = validate_batch_input(input, self.in_dim)?;
-            validate_finite_f32_slice(target, Some(batch * self.out_dim))?;
+            let expected_out = batch
+                .checked_mul(self.out_dim)
+                .ok_or(BackendBridgeError::SchemaMismatch)?;
+            validate_finite_f32_slice(target, Some(expected_out))?;
 
             let guard = self
                 .layers
@@ -572,11 +610,11 @@ pub mod real_burn {
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
             let (ref fc1, ref fc2) = *guard;
 
-            let x = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let x = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(input.to_vec(), [batch, self.in_dim]),
                 &self.device,
             );
-            let t = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let t = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(target.to_vec(), [batch, self.out_dim]),
                 &self.device,
             );
@@ -652,18 +690,8 @@ pub mod real_burn {
             validate_finite_f32_slice(&flat_grads, Some(expected))?;
             Ok((loss_scalar, flat_grads))
         }
-    }
 
-    impl BurnModuleOps for BurnMlpBridgeV1 {
-        fn device_placement(&self) -> DevicePlacementV1 {
-            DevicePlacementV1::Cpu
-        }
-
-        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
-            &self.schema
-        }
-
-        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+        pub(crate) fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
             let guard = self
                 .layers
                 .lock()
@@ -711,14 +739,17 @@ pub mod real_burn {
             Ok(out)
         }
 
-        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+        pub(crate) fn import_flat_f32(
+            &mut self,
+            flat_params: &[f32],
+        ) -> Result<(), BackendBridgeError> {
             let w1_len = self.hidden_dim * self.in_dim;
             let b1_end = w1_len + self.hidden_dim;
             let w2_end = b1_end + self.out_dim * self.hidden_dim;
             let expected = w2_end + self.out_dim;
             validate_finite_f32_slice(flat_params, Some(expected))?;
 
-            let inner_w1_t = Tensor::<BurnInnerBackend, 2>::from_data(
+            let inner_w1_t = Tensor::<B, 2>::from_data(
                 TensorData::new(
                     flat_params[..w1_len].to_vec(),
                     [self.hidden_dim, self.in_dim],
@@ -726,11 +757,11 @@ pub mod real_burn {
                 &self.device,
             )
             .transpose();
-            let inner_b1 = Tensor::<BurnInnerBackend, 1>::from_data(
+            let inner_b1 = Tensor::<B, 1>::from_data(
                 TensorData::new(flat_params[w1_len..b1_end].to_vec(), [self.hidden_dim]),
                 &self.device,
             );
-            let inner_w2_t = Tensor::<BurnInnerBackend, 2>::from_data(
+            let inner_w2_t = Tensor::<B, 2>::from_data(
                 TensorData::new(
                     flat_params[b1_end..w2_end].to_vec(),
                     [self.out_dim, self.hidden_dim],
@@ -738,23 +769,19 @@ pub mod real_burn {
                 &self.device,
             )
             .transpose();
-            let inner_b2 = Tensor::<BurnInnerBackend, 1>::from_data(
+            let inner_b2 = Tensor::<B, 1>::from_data(
                 TensorData::new(flat_params[w2_end..].to_vec(), [self.out_dim]),
                 &self.device,
             );
 
-            let new_w1 = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 2>::from_inner(inner_w1_t).require_grad(),
-            );
-            let new_b1 = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 1>::from_inner(inner_b1).require_grad(),
-            );
-            let new_w2 = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 2>::from_inner(inner_w2_t).require_grad(),
-            );
-            let new_b2 = Param::from_tensor(
-                Tensor::<BurnNdArrayBackend, 1>::from_inner(inner_b2).require_grad(),
-            );
+            let new_w1 =
+                Param::from_tensor(Tensor::<Autodiff<B>, 2>::from_inner(inner_w1_t).require_grad());
+            let new_b1 =
+                Param::from_tensor(Tensor::<Autodiff<B>, 1>::from_inner(inner_b1).require_grad());
+            let new_w2 =
+                Param::from_tensor(Tensor::<Autodiff<B>, 2>::from_inner(inner_w2_t).require_grad());
+            let new_b2 =
+                Param::from_tensor(Tensor::<Autodiff<B>, 1>::from_inner(inner_b2).require_grad());
 
             let mut guard = self
                 .layers
@@ -767,13 +794,16 @@ pub mod real_burn {
             Ok(())
         }
 
-        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+        pub(crate) fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
             let batch = validate_batch_input(input, self.in_dim)?;
+            let expected_out = batch
+                .checked_mul(self.out_dim)
+                .ok_or(BackendBridgeError::SchemaMismatch)?;
             let guard = self
                 .layers
                 .lock()
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(e.to_string()))?;
-            let x = Tensor::<BurnNdArrayBackend, 2>::from_data(
+            let x = Tensor::<Autodiff<B>, 2>::from_data(
                 TensorData::new(input.to_vec(), [batch, self.in_dim]),
                 &self.device,
             );
@@ -784,8 +814,549 @@ pub mod real_burn {
                 .to_data()
                 .to_vec::<f32>()
                 .map_err(|e| BackendBridgeError::BackendOperationFailed(format!("{e:?}")))?;
-            validate_finite_f32_slice(&out, Some(batch * self.out_dim))?;
+            validate_finite_f32_slice(&out, Some(expected_out))?;
             Ok(out)
+        }
+    }
+}
+
+/// Live `Burn 0.21` (`Autodiff<NdArray<f32>>`) CPU linear and 2-layer MLP backend bridges (`ST-08`, `AR-14-07`, `14B-1`).
+#[cfg(feature = "real-burn")]
+pub mod real_burn {
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::{Autodiff, NdArray};
+    use swarm_torch_models::backend_bridge::{BackendBridgeError, DevicePlacementV1};
+    use swarm_torch_models::safetensors_v1::ModelTensorSchemaV1;
+
+    use crate::burn_generic::{BurnLinearCore, BurnMlpCore};
+    use crate::BurnModuleOps;
+
+    /// CPU autodiff Burn backend used by [`BurnLinearBridgeV1`] and [`BurnMlpBridgeV1`].
+    pub type BurnNdArrayBackend = Autodiff<NdArray<f32>>;
+
+    /// Live `Burn` CPU affine module (`y = x @ W_t + b`) synchronized transactionally in canonical
+    /// `[weight(out_dim * in_dim) | bias(out_dim)]` layout matching [`swarm_torch_models::simple::LinearModel`] (`AR-14-07`).
+    #[derive(Debug)]
+    pub struct BurnLinearBridgeV1 {
+        core: BurnLinearCore<NdArray<f32>>,
+    }
+
+    impl BurnLinearBridgeV1 {
+        /// Construct a new CPU autodiff `Burn` linear module matching `for_linear(in_dim, out_dim)`.
+        pub fn new(in_dim: usize, out_dim: usize) -> Result<Self, BackendBridgeError> {
+            Ok(Self {
+                core: BurnLinearCore::new(
+                    in_dim,
+                    out_dim,
+                    NdArrayDevice::Cpu,
+                    DevicePlacementV1::Cpu,
+                )?,
+            })
+        }
+
+        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients
+        /// in canonical `[weight_grad(out_dim * in_dim) | bias_grad(out_dim)]` order (`AR-14-07`).
+        pub fn backward_mse(
+            &self,
+            input: &[f32],
+            target: &[f32],
+        ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
+            self.core.backward_mse(input, target)
+        }
+    }
+
+    impl BurnModuleOps for BurnLinearBridgeV1 {
+        fn device_placement(&self) -> DevicePlacementV1 {
+            self.core.device_placement()
+        }
+
+        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            self.core.tensor_schema()
+        }
+
+        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.export_flat_f32()
+        }
+
+        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+            self.core.import_flat_f32(flat_params)
+        }
+
+        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.forward_flat(input)
+        }
+    }
+
+    /// Live `Burn` CPU 2-layer ReLU MLP (`y = fc2(relu(fc1(x)))`) synchronized transactionally in
+    /// canonical `[W_1 | b_1 | W_2 | b_2]` layout matching [`swarm_torch_models::mlp::MlpModel`] (`14B-1`).
+    #[derive(Debug)]
+    pub struct BurnMlpBridgeV1 {
+        core: BurnMlpCore<NdArray<f32>>,
+    }
+
+    impl BurnMlpBridgeV1 {
+        /// Construct a new CPU autodiff `Burn` 2-layer ReLU MLP matching `for_mlp(in_dim, hidden_dim, out_dim)`.
+        pub fn new(
+            in_dim: usize,
+            hidden_dim: usize,
+            out_dim: usize,
+        ) -> Result<Self, BackendBridgeError> {
+            Ok(Self {
+                core: BurnMlpCore::new(
+                    in_dim,
+                    hidden_dim,
+                    out_dim,
+                    NdArrayDevice::Cpu,
+                    DevicePlacementV1::Cpu,
+                )?,
+            })
+        }
+
+        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients
+        /// in canonical `[dW_1 | db_1 | dW_2 | db_2]` order matching [`swarm_torch_models::mlp::MlpModel`].
+        pub fn backward_mse(
+            &self,
+            input: &[f32],
+            target: &[f32],
+        ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
+            self.core.backward_mse(input, target)
+        }
+    }
+
+    impl BurnModuleOps for BurnMlpBridgeV1 {
+        fn device_placement(&self) -> DevicePlacementV1 {
+            self.core.device_placement()
+        }
+
+        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            self.core.tensor_schema()
+        }
+
+        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.export_flat_f32()
+        }
+
+        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+            self.core.import_flat_f32(flat_params)
+        }
+
+        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.forward_flat(input)
+        }
+    }
+}
+
+/// Live `Burn 0.21` (`Autodiff<burn_wgpu::Wgpu<f32, i32, u32>>`) GPU backend bridges & fail-closed
+/// per-type WGPU device selector (`ADR-0015`, `Wave 16D`).
+#[cfg(feature = "real-burn-wgpu")]
+pub mod real_burn_wgpu {
+    use std::collections::BTreeSet;
+    #[cfg(not(target_family = "wasm"))]
+    use std::sync::Mutex;
+
+    use burn::backend::Autodiff;
+    use burn_wgpu::graphics::{AutoGraphicsApi, GraphicsApi};
+    use burn_wgpu::Wgpu;
+    pub use burn_wgpu::WgpuDevice;
+    #[cfg(target_family = "wasm")]
+    use burn_wgpu::WgpuRuntime;
+    use cubecl::device::DeviceId;
+    #[cfg(target_family = "wasm")]
+    use cubecl::Runtime;
+    use swarm_torch_models::backend_bridge::{BackendBridgeError, DevicePlacementV1};
+    use swarm_torch_models::safetensors_v1::ModelTensorSchemaV1;
+
+    use crate::burn_generic::{BurnLinearCore, BurnMlpCore};
+    use crate::BurnModuleOps;
+
+    /// Inner WGPU Burn backend (`f32` float, `i32` int, `u32` bool).
+    pub type BurnWgpuInnerBackend = Wgpu<f32, i32, u32>;
+
+    /// Autodiff WGPU Burn backend used by [`BurnWgpuLinearBridgeV1`] and [`BurnWgpuMlpBridgeV1`].
+    pub type BurnWgpuBackend = Autodiff<BurnWgpuInnerBackend>;
+
+    /// WGPU adapter hardware classification in deterministic preference order (`ADR-0015`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum WgpuDeviceKindV1 {
+        /// Dedicated discrete GPU (`type_id = 0` in `cubecl-wgpu`).
+        DiscreteGpu,
+        /// Integrated GPU (`type_id = 1` in `cubecl-wgpu`).
+        IntegratedGpu,
+        /// Virtual GPU (`type_id = 2` in `cubecl-wgpu`).
+        VirtualGpu,
+        /// Software CPU WGPU adapter (`type_id = 3` in `cubecl-wgpu`).
+        Cpu,
+    }
+
+    /// Validated per-type WGPU adapter descriptor produced by [`enumerate_wgpu_devices`] (`Wave 16D`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WgpuDeviceDescriptorV1 {
+        /// Deterministic logical device index mapped to [`DevicePlacementV1::Wgpu`].
+        pub device_index: u32,
+        /// Hardware class of the adapter.
+        pub kind: WgpuDeviceKindV1,
+        /// Per-type adapter ordinal valid for `cubecl-wgpu`'s `select_from_adapter_list`.
+        pub type_ordinal: usize,
+        /// Exact `burn_wgpu::WgpuDevice` ready to pass to Burn tensor initialization.
+        pub wgpu_device: WgpuDevice,
+    }
+
+    /// Explicit selector for targeting a validated WGPU adapter (`Wave 16D`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum WgpuDeviceSelectorV1 {
+        /// Select the `device_index`-th device in deterministic preference order
+        /// (`DiscreteGpu` -> `IntegratedGpu` -> `VirtualGpu` -> `Cpu`).
+        LogicalIndex(u32),
+        /// Select an explicit discrete GPU per-type ordinal (`WgpuDevice::DiscreteGpu(ordinal)`).
+        DiscreteGpu(usize),
+        /// Select an explicit integrated GPU per-type ordinal (`WgpuDevice::IntegratedGpu(ordinal)`).
+        IntegratedGpu(usize),
+        /// Select an explicit virtual GPU per-type ordinal (`WgpuDevice::VirtualGpu(ordinal)`).
+        VirtualGpu(usize),
+        /// Select the WGPU CPU software adapter (`WgpuDevice::Cpu`).
+        Cpu,
+    }
+
+    /// Build a deterministic, per-type-validated WGPU device inventory from the four per-type
+    /// `WgpuRuntime::enumerate_devices(type_id, &backend)` buckets (`type_id` `0..=3`).
+    ///
+    /// **Why per-type buckets (`Wave 16D`):** `cubecl-wgpu 0.10.0`'s `enumerate_all_devices`
+    /// places the global adapter index into per-type `DeviceId(type_id, global_index)`, causing
+    /// `select_from_adapter_list` to panic on mixed-GPU hosts (e.g., `DiscreteGpu(0)` +
+    /// `IntegratedGpu(0)`). Per-type enumeration via `enumerate_devices(type_id, &backend)`
+    /// filters by `type_id` prior to `.enumerate()`, preserving exact per-type ordinals.
+    pub fn build_wgpu_device_inventory_from_type_buckets(
+        discrete_ids: &[DeviceId],
+        integrated_ids: &[DeviceId],
+        virtual_ids: &[DeviceId],
+        cpu_ids: &[DeviceId],
+    ) -> Vec<WgpuDeviceDescriptorV1> {
+        let mut out = Vec::new();
+
+        let mut push_bucket = |ids: &[DeviceId], expected_type_id: u16, kind: WgpuDeviceKindV1| {
+            if expected_type_id == 3 {
+                if ids.iter().any(|id| id.type_id == 3) {
+                    let device_index = u32::try_from(out.len())
+                        .expect("total enumerated WGPU adapters bounded by 3 * 65536 + 1");
+                    out.push(WgpuDeviceDescriptorV1 {
+                        device_index,
+                        kind: WgpuDeviceKindV1::Cpu,
+                        type_ordinal: 0,
+                        wgpu_device: WgpuDevice::Cpu,
+                    });
+                }
+                return;
+            }
+            let unique_ordinals: BTreeSet<u16> = ids
+                .iter()
+                .filter(|id| id.type_id == expected_type_id)
+                .map(|id| id.index_id)
+                .collect();
+            for ord in unique_ordinals {
+                let device_index = u32::try_from(out.len())
+                    .expect("total enumerated WGPU adapters bounded by 3 * 65536 + 1");
+                let type_ordinal = usize::from(ord);
+                let wgpu_device = match kind {
+                    WgpuDeviceKindV1::DiscreteGpu => WgpuDevice::DiscreteGpu(type_ordinal),
+                    WgpuDeviceKindV1::IntegratedGpu => WgpuDevice::IntegratedGpu(type_ordinal),
+                    WgpuDeviceKindV1::VirtualGpu => WgpuDevice::VirtualGpu(type_ordinal),
+                    WgpuDeviceKindV1::Cpu => WgpuDevice::Cpu,
+                };
+                out.push(WgpuDeviceDescriptorV1 {
+                    device_index,
+                    kind,
+                    type_ordinal,
+                    wgpu_device,
+                });
+            }
+        };
+
+        push_bucket(discrete_ids, 0, WgpuDeviceKindV1::DiscreteGpu);
+        push_bucket(integrated_ids, 1, WgpuDeviceKindV1::IntegratedGpu);
+        push_bucket(virtual_ids, 2, WgpuDeviceKindV1::VirtualGpu);
+        push_bucket(cpu_ids, 3, WgpuDeviceKindV1::Cpu);
+        out
+    }
+
+    /// Resolve a [`WgpuDeviceSelectorV1`] against a previously built device inventory, failing
+    /// closed with [`BackendBridgeError::DeviceUnavailable`] when absent or out of range.
+    pub fn resolve_wgpu_device_from_inventory(
+        inventory: &[WgpuDeviceDescriptorV1],
+        selector: WgpuDeviceSelectorV1,
+    ) -> Result<WgpuDeviceDescriptorV1, BackendBridgeError> {
+        let found = match selector {
+            WgpuDeviceSelectorV1::LogicalIndex(idx) => {
+                inventory.iter().find(|d| d.device_index == idx)
+            }
+            WgpuDeviceSelectorV1::DiscreteGpu(ord) => inventory
+                .iter()
+                .find(|d| d.kind == WgpuDeviceKindV1::DiscreteGpu && d.type_ordinal == ord),
+            WgpuDeviceSelectorV1::IntegratedGpu(ord) => inventory
+                .iter()
+                .find(|d| d.kind == WgpuDeviceKindV1::IntegratedGpu && d.type_ordinal == ord),
+            WgpuDeviceSelectorV1::VirtualGpu(ord) => inventory
+                .iter()
+                .find(|d| d.kind == WgpuDeviceKindV1::VirtualGpu && d.type_ordinal == ord),
+            WgpuDeviceSelectorV1::Cpu => inventory.iter().find(|d| d.kind == WgpuDeviceKindV1::Cpu),
+        };
+        found.cloned().ok_or(BackendBridgeError::DeviceUnavailable)
+    }
+
+    /// Enumerate available WGPU adapters for `AutoGraphicsApi::backend()` with exact per-type
+    /// ordinals matching `cubecl-wgpu`'s `select_from_adapter_list`.
+    ///
+    /// On native targets, serializes enumeration behind a process-wide mutex and restricts
+    /// `wgpu::Instance` strictly to `backends: AutoGraphicsApi::backend().into()` (matching
+    /// `cubecl-wgpu`'s `request_adapter`), avoiding both `enumerate_all_devices`'s mixed-GPU
+    /// global-index mismatch and `enumerate_devices`'s `Backends::all()` WGL thread-crash hazard
+    /// on Windows (`Wave 16D`).
+    pub fn enumerate_wgpu_devices() -> Vec<WgpuDeviceDescriptorV1> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static WGPU_ENUMERATE_LOCK: Mutex<()> = Mutex::new(());
+            let _guard = WGPU_ENUMERATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let backend = AutoGraphicsApi::backend();
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: backend.into(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapters = cubecl::future::block_on(instance.enumerate_adapters(backend.into()));
+            let mut discrete = Vec::new();
+            let mut integrated = Vec::new();
+            let mut virtual_gpu = Vec::new();
+            let mut cpu = Vec::new();
+            for adapter in adapters {
+                match adapter.get_info().device_type {
+                    wgpu::DeviceType::DiscreteGpu => {
+                        if let Ok(ord) = u16::try_from(discrete.len()) {
+                            discrete.push(DeviceId::new(0, ord));
+                        }
+                    }
+                    wgpu::DeviceType::IntegratedGpu => {
+                        if let Ok(ord) = u16::try_from(integrated.len()) {
+                            integrated.push(DeviceId::new(1, ord));
+                        }
+                    }
+                    wgpu::DeviceType::VirtualGpu => {
+                        if let Ok(ord) = u16::try_from(virtual_gpu.len()) {
+                            virtual_gpu.push(DeviceId::new(2, ord));
+                        }
+                    }
+                    wgpu::DeviceType::Cpu => {
+                        cpu.push(DeviceId::new(3, 0));
+                    }
+                    wgpu::DeviceType::Other => {}
+                }
+            }
+            build_wgpu_device_inventory_from_type_buckets(
+                &discrete,
+                &integrated,
+                &virtual_gpu,
+                &cpu,
+            )
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            let backend = AutoGraphicsApi::backend();
+            let discrete = <WgpuRuntime as Runtime>::enumerate_devices(0, &backend);
+            let integrated = <WgpuRuntime as Runtime>::enumerate_devices(1, &backend);
+            let virtual_gpu = <WgpuRuntime as Runtime>::enumerate_devices(2, &backend);
+            let cpu = <WgpuRuntime as Runtime>::enumerate_devices(3, &backend);
+            build_wgpu_device_inventory_from_type_buckets(
+                &discrete,
+                &integrated,
+                &virtual_gpu,
+                &cpu,
+            )
+        }
+    }
+
+    /// Probe live WGPU adapters and resolve `selector`, returning
+    /// [`BackendBridgeError::DeviceUnavailable`] without panicking if no matching adapter exists.
+    pub fn resolve_wgpu_device(
+        selector: WgpuDeviceSelectorV1,
+    ) -> Result<WgpuDeviceDescriptorV1, BackendBridgeError> {
+        let inventory = enumerate_wgpu_devices();
+        resolve_wgpu_device_from_inventory(&inventory, selector)
+    }
+
+    /// Probe live WGPU adapters for logical `device_index` (`DevicePlacementV1::Wgpu { device_index }`).
+    pub fn probe_wgpu_device(
+        device_index: u32,
+    ) -> Result<WgpuDeviceDescriptorV1, BackendBridgeError> {
+        resolve_wgpu_device(WgpuDeviceSelectorV1::LogicalIndex(device_index))
+    }
+
+    /// Live `Burn` WGPU GPU affine module (`y = x @ W_t + b`) synchronized transactionally in
+    /// canonical `[weight(out_dim * in_dim) | bias(out_dim)]` layout (`ADR-0015`, `Wave 16D`).
+    #[derive(Debug)]
+    pub struct BurnWgpuLinearBridgeV1 {
+        descriptor: WgpuDeviceDescriptorV1,
+        core: BurnLinearCore<BurnWgpuInnerBackend>,
+    }
+
+    impl BurnWgpuLinearBridgeV1 {
+        /// Construct a WGPU linear bridge targeting logical `device_index`, failing closed with
+        /// [`BackendBridgeError::DeviceUnavailable`] if no matching WGPU adapter exists.
+        pub fn new(
+            in_dim: usize,
+            out_dim: usize,
+            device_index: u32,
+        ) -> Result<Self, BackendBridgeError> {
+            Self::new_with_selector(
+                in_dim,
+                out_dim,
+                WgpuDeviceSelectorV1::LogicalIndex(device_index),
+            )
+        }
+
+        /// Construct a WGPU linear bridge targeting an explicit [`WgpuDeviceSelectorV1`].
+        pub fn new_with_selector(
+            in_dim: usize,
+            out_dim: usize,
+            selector: WgpuDeviceSelectorV1,
+        ) -> Result<Self, BackendBridgeError> {
+            let schema = ModelTensorSchemaV1::for_linear(in_dim, out_dim)
+                .map_err(|_| BackendBridgeError::SchemaMismatch)?;
+            let descriptor = resolve_wgpu_device(selector)?;
+            let placement = DevicePlacementV1::Wgpu {
+                device_index: descriptor.device_index,
+            };
+            let core = BurnLinearCore::new_with_schema(
+                schema,
+                in_dim,
+                out_dim,
+                descriptor.wgpu_device.clone(),
+                placement,
+            );
+            Ok(Self { descriptor, core })
+        }
+
+        /// Borrow the validated WGPU device descriptor bound to this bridge.
+        pub const fn device_descriptor(&self) -> &WgpuDeviceDescriptorV1 {
+            &self.descriptor
+        }
+
+        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients on
+        /// the WGPU device in canonical `[weight_grad | bias_grad]` order.
+        pub fn backward_mse(
+            &self,
+            input: &[f32],
+            target: &[f32],
+        ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
+            self.core.backward_mse(input, target)
+        }
+    }
+
+    impl BurnModuleOps for BurnWgpuLinearBridgeV1 {
+        fn device_placement(&self) -> DevicePlacementV1 {
+            self.core.device_placement()
+        }
+
+        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            self.core.tensor_schema()
+        }
+
+        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.export_flat_f32()
+        }
+
+        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+            self.core.import_flat_f32(flat_params)
+        }
+
+        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.forward_flat(input)
+        }
+    }
+
+    /// Live `Burn` WGPU GPU 2-layer ReLU MLP (`y = fc2(relu(fc1(x)))`) synchronized transactionally
+    /// in canonical `[W_1 | b_1 | W_2 | b_2]` layout (`ADR-0015`, `Wave 16D`).
+    #[derive(Debug)]
+    pub struct BurnWgpuMlpBridgeV1 {
+        descriptor: WgpuDeviceDescriptorV1,
+        core: BurnMlpCore<BurnWgpuInnerBackend>,
+    }
+
+    impl BurnWgpuMlpBridgeV1 {
+        /// Construct a WGPU 2-layer ReLU MLP bridge targeting logical `device_index`, failing
+        /// closed with [`BackendBridgeError::DeviceUnavailable`] if no matching WGPU adapter exists.
+        pub fn new(
+            in_dim: usize,
+            hidden_dim: usize,
+            out_dim: usize,
+            device_index: u32,
+        ) -> Result<Self, BackendBridgeError> {
+            Self::new_with_selector(
+                in_dim,
+                hidden_dim,
+                out_dim,
+                WgpuDeviceSelectorV1::LogicalIndex(device_index),
+            )
+        }
+
+        /// Construct a WGPU 2-layer ReLU MLP bridge targeting an explicit [`WgpuDeviceSelectorV1`].
+        pub fn new_with_selector(
+            in_dim: usize,
+            hidden_dim: usize,
+            out_dim: usize,
+            selector: WgpuDeviceSelectorV1,
+        ) -> Result<Self, BackendBridgeError> {
+            let schema = ModelTensorSchemaV1::for_mlp(in_dim, hidden_dim, out_dim)
+                .map_err(|_| BackendBridgeError::SchemaMismatch)?;
+            let descriptor = resolve_wgpu_device(selector)?;
+            let placement = DevicePlacementV1::Wgpu {
+                device_index: descriptor.device_index,
+            };
+            let core = BurnMlpCore::new_with_schema(
+                schema,
+                in_dim,
+                hidden_dim,
+                out_dim,
+                descriptor.wgpu_device.clone(),
+                placement,
+            );
+            Ok(Self { descriptor, core })
+        }
+
+        /// Borrow the validated WGPU device descriptor bound to this bridge.
+        pub const fn device_descriptor(&self) -> &WgpuDeviceDescriptorV1 {
+            &self.descriptor
+        }
+
+        /// Compute MSE loss `(1/N) * sum((y - target)^2)` and reverse-mode autodiff gradients on
+        /// the WGPU device in canonical `[dW_1 | db_1 | dW_2 | db_2]` order.
+        pub fn backward_mse(
+            &self,
+            input: &[f32],
+            target: &[f32],
+        ) -> Result<(f32, Vec<f32>), BackendBridgeError> {
+            self.core.backward_mse(input, target)
+        }
+    }
+
+    impl BurnModuleOps for BurnWgpuMlpBridgeV1 {
+        fn device_placement(&self) -> DevicePlacementV1 {
+            self.core.device_placement()
+        }
+
+        fn tensor_schema(&self) -> &ModelTensorSchemaV1 {
+            self.core.tensor_schema()
+        }
+
+        fn export_flat_f32(&self) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.export_flat_f32()
+        }
+
+        fn import_flat_f32(&mut self, flat_params: &[f32]) -> Result<(), BackendBridgeError> {
+            self.core.import_flat_f32(flat_params)
+        }
+
+        fn forward_flat(&self, input: &[f32]) -> Result<Vec<f32>, BackendBridgeError> {
+            self.core.forward_flat(input)
         }
     }
 }
@@ -2049,5 +2620,712 @@ mod tests {
             &mlp_b,
             &x,
         );
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_wgpu_device_topology_mapping_avoids_global_index_panic_and_rejects_unavailable() {
+        use cubecl::device::DeviceId;
+        use real_burn_wgpu::{
+            build_wgpu_device_inventory_from_type_buckets, resolve_wgpu_device_from_inventory,
+            WgpuDevice, WgpuDeviceKindV1, WgpuDeviceSelectorV1,
+        };
+
+        // 1. Mixed GPU host: 1 DiscreteGpu(0) + 1 IntegratedGpu(0).
+        //    LogicalIndex(1) MUST resolve to IntegratedGpu(0) (per-type ordinal 0, NOT global index 1!).
+        let mixed = build_wgpu_device_inventory_from_type_buckets(
+            &[DeviceId::new(0, 0)],
+            &[DeviceId::new(1, 0)],
+            &[],
+            &[],
+        );
+        assert_eq!(mixed.len(), 2);
+        let d0 = resolve_wgpu_device_from_inventory(&mixed, WgpuDeviceSelectorV1::LogicalIndex(0))
+            .unwrap();
+        assert_eq!(d0.device_index, 0);
+        assert_eq!(d0.kind, WgpuDeviceKindV1::DiscreteGpu);
+        assert_eq!(d0.type_ordinal, 0);
+        assert_eq!(d0.wgpu_device, WgpuDevice::DiscreteGpu(0));
+
+        let d1 = resolve_wgpu_device_from_inventory(&mixed, WgpuDeviceSelectorV1::LogicalIndex(1))
+            .unwrap();
+        assert_eq!(d1.device_index, 1);
+        assert_eq!(d1.kind, WgpuDeviceKindV1::IntegratedGpu);
+        assert_eq!(d1.type_ordinal, 0);
+        assert_eq!(d1.wgpu_device, WgpuDevice::IntegratedGpu(0));
+
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&mixed, WgpuDeviceSelectorV1::IntegratedGpu(0))
+                .unwrap(),
+            d1
+        );
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&mixed, WgpuDeviceSelectorV1::IntegratedGpu(1))
+                .unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&mixed, WgpuDeviceSelectorV1::LogicalIndex(2))
+                .unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+
+        // 2. Integrated-only host: LogicalIndex(0) -> IntegratedGpu(0); DiscreteGpu(0) -> DeviceUnavailable.
+        let igpu_only =
+            build_wgpu_device_inventory_from_type_buckets(&[], &[DeviceId::new(1, 0)], &[], &[]);
+        assert_eq!(igpu_only.len(), 1);
+        let ig0 =
+            resolve_wgpu_device_from_inventory(&igpu_only, WgpuDeviceSelectorV1::LogicalIndex(0))
+                .unwrap();
+        assert_eq!(ig0.kind, WgpuDeviceKindV1::IntegratedGpu);
+        assert_eq!(ig0.wgpu_device, WgpuDevice::IntegratedGpu(0));
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&igpu_only, WgpuDeviceSelectorV1::DiscreteGpu(0))
+                .unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+
+        // 3. Multi-discrete (unsorted + dup) + virtual + duplicate CPU + foreign type_id ignored.
+        let complex = build_wgpu_device_inventory_from_type_buckets(
+            &[
+                DeviceId::new(0, 1),
+                DeviceId::new(0, 0),
+                DeviceId::new(0, 1),
+                DeviceId::new(9, 0),
+            ],
+            &[],
+            &[DeviceId::new(2, 0)],
+            &[DeviceId::new(3, 0), DeviceId::new(3, 1)],
+        );
+        assert_eq!(complex.len(), 4);
+        assert_eq!(complex[0].wgpu_device, WgpuDevice::DiscreteGpu(0));
+        assert_eq!(complex[1].wgpu_device, WgpuDevice::DiscreteGpu(1));
+        assert_eq!(complex[2].wgpu_device, WgpuDevice::VirtualGpu(0));
+        assert_eq!(complex[3].wgpu_device, WgpuDevice::Cpu);
+        assert_eq!(complex[3].device_index, 3);
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&complex, WgpuDeviceSelectorV1::Cpu).unwrap(),
+            complex[3]
+        );
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(&complex, WgpuDeviceSelectorV1::LogicalIndex(4))
+                .unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+
+        // 4. Empty inventory -> every selector fails closed with DeviceUnavailable.
+        let empty = build_wgpu_device_inventory_from_type_buckets(&[], &[], &[], &[]);
+        assert!(empty.is_empty());
+        for sel in [
+            WgpuDeviceSelectorV1::LogicalIndex(0),
+            WgpuDeviceSelectorV1::DiscreteGpu(0),
+            WgpuDeviceSelectorV1::IntegratedGpu(0),
+            WgpuDeviceSelectorV1::VirtualGpu(0),
+            WgpuDeviceSelectorV1::Cpu,
+        ] {
+            assert_eq!(
+                resolve_wgpu_device_from_inventory(&empty, sel).unwrap_err(),
+                BackendBridgeError::DeviceUnavailable
+            );
+        }
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_real_burn_wgpu_linear_and_mlp_match_cpu_forward_backward_and_safetensors() {
+        use real_burn_wgpu::{
+            enumerate_wgpu_devices, probe_wgpu_device, BurnWgpuLinearBridgeV1, BurnWgpuMlpBridgeV1,
+        };
+        use swarm_torch_core::traits::SwarmModel;
+        use swarm_torch_models::safetensors_v1::{
+            export_safetensors_checkpoint_with_layout_v1,
+            import_safetensors_checkpoint_with_layout_v1, ModelFlatTensorLayoutV1,
+            SafeTensorsLimitsV1,
+        };
+
+        // Out-of-range device index and zero-dimension schemas MUST ALWAYS fail closed without panic.
+        assert_eq!(
+            probe_wgpu_device(u32::MAX).unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+        assert_eq!(
+            BurnWgpuLinearBridgeV1::new(0, 2, 0).unwrap_err(),
+            BackendBridgeError::SchemaMismatch
+        );
+        assert_eq!(
+            BurnWgpuMlpBridgeV1::new(2, 0, 1, 0).unwrap_err(),
+            BackendBridgeError::SchemaMismatch
+        );
+        assert_eq!(
+            BurnWgpuLinearBridgeV1::new(2, 1, u32::MAX).unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+
+        let devices = enumerate_wgpu_devices();
+        if devices.is_empty() {
+            // Headless / no-Vulkan host: constructor must fail closed cleanly with DeviceUnavailable.
+            assert_eq!(
+                BurnWgpuLinearBridgeV1::new(2, 1, 0).unwrap_err(),
+                BackendBridgeError::DeviceUnavailable
+            );
+            assert_eq!(
+                BurnWgpuMlpBridgeV1::new(2, 3, 1, 0).unwrap_err(),
+                BackendBridgeError::DeviceUnavailable
+            );
+            return;
+        }
+
+        let desc = probe_wgpu_device(0).unwrap();
+        assert_eq!(desc, devices[0]);
+
+        // 1. Linear bridge parity: WGPU GPU vs CPU Burn & SafeTensors roundtrip
+        let lin_params = [0.5f32, -1.25, 0.75, -0.3, 1.4, -0.8, 0.25, -0.65];
+        let x_batch = [1.2f32, -0.4, 2.5, -0.7, 1.1, 0.3];
+        let t_batch = [0.8f32, -0.5, -1.2, 0.9];
+
+        let mut cpu_lin = real_burn::BurnLinearBridgeV1::new(3, 2).unwrap();
+        cpu_lin.import_flat_f32(&lin_params).unwrap();
+        let cpu_lin_y = cpu_lin.forward_flat(&x_batch).unwrap();
+        let (cpu_lin_loss, cpu_lin_grads) = cpu_lin.backward_mse(&x_batch, &t_batch).unwrap();
+
+        let mut gpu_lin = BurnWgpuLinearBridgeV1::new(3, 2, desc.device_index).unwrap();
+        assert_eq!(
+            gpu_lin.device_placement(),
+            DevicePlacementV1::Wgpu {
+                device_index: desc.device_index
+            }
+        );
+        assert_eq!(gpu_lin.device_descriptor(), &desc);
+        gpu_lin.import_flat_f32(&lin_params).unwrap();
+        assert_eq!(gpu_lin.export_flat_f32().unwrap(), lin_params);
+
+        // Transactional NaN/Inf rejection preserves prior GPU parameters
+        let mut bad_lin = lin_params;
+        bad_lin[3] = f32::NAN;
+        assert_eq!(
+            gpu_lin.import_flat_f32(&bad_lin).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        assert_eq!(gpu_lin.export_flat_f32().unwrap(), lin_params);
+
+        let gpu_lin_y = gpu_lin.forward_flat(&x_batch).unwrap();
+        let (gpu_lin_loss, gpu_lin_grads) = gpu_lin.backward_mse(&x_batch, &t_batch).unwrap();
+        for (g, c) in gpu_lin_y.iter().zip(cpu_lin_y.iter()) {
+            assert!(
+                (g - c).abs() < 1e-4,
+                "linear forward mismatch: gpu={g} cpu={c}"
+            );
+        }
+        assert!(
+            (gpu_lin_loss - cpu_lin_loss).abs() < 1e-4,
+            "linear loss mismatch: gpu={gpu_lin_loss} cpu={cpu_lin_loss}"
+        );
+        for (g, c) in gpu_lin_grads.iter().zip(cpu_lin_grads.iter()) {
+            assert!(
+                (g - c).abs() < 1e-4,
+                "linear grad mismatch: gpu={g} cpu={c}"
+            );
+        }
+
+        // SafeTensors v1 export/import roundtrip through BackendModelHandleV1
+        let expected_hash = cpu_lin.tensor_schema().schema_hash();
+        let linear_layout = ModelFlatTensorLayoutV1::for_linear(3, 2).unwrap();
+        let limits = SafeTensorsLimitsV1::default();
+        let gpu_handle = BurnModuleBridgeV1::new(gpu_lin)
+            .into_handle(Some(expected_hash))
+            .unwrap();
+        let st_bytes =
+            export_safetensors_checkpoint_with_layout_v1(&gpu_handle, &linear_layout, &limits)
+                .unwrap();
+        let mut gpu_lin_reload = BurnWgpuLinearBridgeV1::new(3, 2, desc.device_index).unwrap();
+        gpu_lin_reload.import_flat_f32(&[0.0; 8]).unwrap();
+        let mut reload_handle = BurnModuleBridgeV1::new(gpu_lin_reload)
+            .into_handle(Some(expected_hash))
+            .unwrap();
+        import_safetensors_checkpoint_with_layout_v1(
+            &mut reload_handle,
+            &linear_layout,
+            &st_bytes,
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(reload_handle.parameters(), gpu_handle.parameters());
+        assert_eq!(
+            reload_handle.backend().placement(),
+            DevicePlacementV1::Wgpu {
+                device_index: desc.device_index
+            }
+        );
+
+        // 2. 2-layer ReLU MLP parity: WGPU GPU vs CPU Burn + concurrent multi-threaded serialization
+        let mlp_params: Vec<f32> = (0..26).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
+        let mut cpu_mlp = real_burn::BurnMlpBridgeV1::new(3, 4, 2).unwrap();
+        cpu_mlp.import_flat_f32(&mlp_params).unwrap();
+        let cpu_mlp_y = cpu_mlp.forward_flat(&x_batch).unwrap();
+        let (cpu_mlp_loss, cpu_mlp_grads) = cpu_mlp.backward_mse(&x_batch, &t_batch).unwrap();
+
+        let mut gpu_mlp = BurnWgpuMlpBridgeV1::new(3, 4, 2, desc.device_index).unwrap();
+        gpu_mlp.import_flat_f32(&mlp_params).unwrap();
+        let gpu_mlp_y = gpu_mlp.forward_flat(&x_batch).unwrap();
+        let (gpu_mlp_loss, gpu_mlp_grads) = gpu_mlp.backward_mse(&x_batch, &t_batch).unwrap();
+        for (g, c) in gpu_mlp_y.iter().zip(cpu_mlp_y.iter()) {
+            assert!(
+                (g - c).abs() < 1e-4,
+                "mlp forward mismatch: gpu={g} cpu={c}"
+            );
+        }
+        assert!(
+            (gpu_mlp_loss - cpu_mlp_loss).abs() < 1e-4,
+            "mlp loss mismatch: gpu={gpu_mlp_loss} cpu={cpu_mlp_loss}"
+        );
+        for (g, c) in gpu_mlp_grads.iter().zip(cpu_mlp_grads.iter()) {
+            assert!((g - c).abs() < 1e-4, "mlp grad mismatch: gpu={g} cpu={c}");
+        }
+
+        // Concurrent readers on WGPU MLP must serialize safely without burn-autodiff deadlock
+        let mlp_ref = &gpu_mlp;
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| {
+                    for _ in 0..8 {
+                        let y = mlp_ref.forward_flat(&x_batch).unwrap();
+                        let (l, g) = mlp_ref.backward_mse(&x_batch, &t_batch).unwrap();
+                        assert_eq!(y, gpu_mlp_y);
+                        assert_eq!(l, gpu_mlp_loss);
+                        assert_eq!(g, gpu_mlp_grads);
+                    }
+                });
+            }
+        });
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_t_agent_wgpu_filtered_inventory_matches_logical_device_index() {
+        use cubecl::device::DeviceId;
+        use real_burn_wgpu::{
+            build_wgpu_device_inventory_from_type_buckets, resolve_wgpu_device_from_inventory,
+            WgpuDevice, WgpuDeviceKindV1, WgpuDeviceSelectorV1,
+        };
+
+        // Foreign type_ids (including DeviceType::Other = 4) are ignored in every bucket,
+        // and non-zero Cpu index_ids normalize to type_ordinal = 0 with a single Cpu entry.
+        let filtered_buckets = build_wgpu_device_inventory_from_type_buckets(
+            &[DeviceId::new(4, 0), DeviceId::new(1, 0)],
+            &[
+                DeviceId::new(0, 0),
+                DeviceId::new(1, 2),
+                DeviceId::new(1, 0),
+            ],
+            &[
+                DeviceId::new(4, 0),
+                DeviceId::new(2, 1),
+                DeviceId::new(2, 0),
+            ],
+            &[
+                DeviceId::new(0, 0),
+                DeviceId::new(3, 7),
+                DeviceId::new(3, 2),
+            ],
+        );
+        assert_eq!(filtered_buckets.len(), 5);
+        assert_eq!(
+            filtered_buckets[0].wgpu_device,
+            WgpuDevice::IntegratedGpu(0)
+        );
+        assert_eq!(filtered_buckets[0].device_index, 0);
+        assert_eq!(
+            filtered_buckets[1].wgpu_device,
+            WgpuDevice::IntegratedGpu(2)
+        );
+        assert_eq!(filtered_buckets[1].device_index, 1);
+        assert_eq!(filtered_buckets[2].wgpu_device, WgpuDevice::VirtualGpu(0));
+        assert_eq!(filtered_buckets[2].device_index, 2);
+        assert_eq!(filtered_buckets[3].wgpu_device, WgpuDevice::VirtualGpu(1));
+        assert_eq!(filtered_buckets[3].device_index, 3);
+        assert_eq!(filtered_buckets[4].wgpu_device, WgpuDevice::Cpu);
+        assert_eq!(filtered_buckets[4].type_ordinal, 0);
+        assert_eq!(filtered_buckets[4].device_index, 4);
+
+        // Filtered/subset inventory MUST match LogicalIndex against descriptor.device_index,
+        // never silently returning a descriptor with a different device_index by slice offset.
+        let mixed = build_wgpu_device_inventory_from_type_buckets(
+            &[DeviceId::new(0, 0)],
+            &[DeviceId::new(1, 0)],
+            &[],
+            &[],
+        );
+        let integrated_subset = &mixed[1..]; // contains only device_index == 1
+        assert_eq!(
+            resolve_wgpu_device_from_inventory(
+                integrated_subset,
+                WgpuDeviceSelectorV1::LogicalIndex(0),
+            )
+            .unwrap_err(),
+            BackendBridgeError::DeviceUnavailable
+        );
+        let resolved_sub = resolve_wgpu_device_from_inventory(
+            integrated_subset,
+            WgpuDeviceSelectorV1::LogicalIndex(1),
+        )
+        .unwrap();
+        assert_eq!(resolved_sub.device_index, 1);
+        assert_eq!(resolved_sub.kind, WgpuDeviceKindV1::IntegratedGpu);
+        assert_eq!(resolved_sub.wgpu_device, WgpuDevice::IntegratedGpu(0));
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_t_agent_wgpu_constructor_validates_full_schema_before_device_probe() {
+        use real_burn_wgpu::{BurnWgpuLinearBridgeV1, BurnWgpuMlpBridgeV1, WgpuDeviceSelectorV1};
+
+        // All zero-dimension permutations AND schema overflow / >256 MiB schemas MUST fail closed
+        // with SchemaMismatch BEFORE probing WGPU adapters (even with unavailable device_index).
+        for (in_dim, out_dim) in [(0, 2), (2, 0), (usize::MAX, 2), (10_000, 10_000)] {
+            assert_eq!(
+                BurnWgpuLinearBridgeV1::new(in_dim, out_dim, u32::MAX).unwrap_err(),
+                BackendBridgeError::SchemaMismatch,
+                "linear ({in_dim}, {out_dim}) should reject SchemaMismatch before device probe"
+            );
+        }
+        for (in_dim, hidden_dim, out_dim) in [
+            (0, 2, 1),
+            (2, 0, 1),
+            (2, 3, 0),
+            (usize::MAX, 2, 1),
+            (10_000, 10_000, 1),
+        ] {
+            assert_eq!(
+                BurnWgpuMlpBridgeV1::new(in_dim, hidden_dim, out_dim, u32::MAX).unwrap_err(),
+                BackendBridgeError::SchemaMismatch,
+                "mlp ({in_dim}, {hidden_dim}, {out_dim}) should reject SchemaMismatch before device probe"
+            );
+        }
+
+        // Absent explicit selectors and out-of-range LogicalIndex MUST fail closed with
+        // DeviceUnavailable on BOTH Linear and MLP without touching WgpuServer::init.
+        for sel in [
+            WgpuDeviceSelectorV1::LogicalIndex(u32::MAX),
+            WgpuDeviceSelectorV1::DiscreteGpu(9_999),
+            WgpuDeviceSelectorV1::IntegratedGpu(9_999),
+            WgpuDeviceSelectorV1::VirtualGpu(9_999),
+        ] {
+            assert_eq!(
+                BurnWgpuLinearBridgeV1::new_with_selector(2, 1, sel).unwrap_err(),
+                BackendBridgeError::DeviceUnavailable
+            );
+            assert_eq!(
+                BurnWgpuMlpBridgeV1::new_with_selector(2, 3, 1, sel).unwrap_err(),
+                BackendBridgeError::DeviceUnavailable
+            );
+        }
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_t_agent_wgpu_live_boundaries_fresh_overflow_safetensors_sgd_and_concurrency() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::sync::RwLock;
+        use std::time::Duration;
+
+        use real_burn_wgpu::{
+            enumerate_wgpu_devices, BurnWgpuLinearBridgeV1, BurnWgpuMlpBridgeV1, WgpuDeviceKindV1,
+            WgpuDeviceSelectorV1,
+        };
+        use swarm_torch_core::traits::{SwarmModel, SwarmOptimizer};
+        use swarm_torch_models::mlp::MlpModel;
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_models::safetensors_v1::{
+            export_safetensors_checkpoint_with_layout_v1,
+            import_safetensors_checkpoint_with_layout_v1, ModelFlatTensorLayoutV1,
+            SafeTensorsLimitsV1,
+        };
+
+        let devices = enumerate_wgpu_devices();
+        if devices.is_empty() {
+            return;
+        }
+        let desc = devices[0].clone();
+        let explicit_selector = match desc.kind {
+            WgpuDeviceKindV1::DiscreteGpu => WgpuDeviceSelectorV1::DiscreteGpu(desc.type_ordinal),
+            WgpuDeviceKindV1::IntegratedGpu => {
+                WgpuDeviceSelectorV1::IntegratedGpu(desc.type_ordinal)
+            }
+            WgpuDeviceKindV1::VirtualGpu => WgpuDeviceSelectorV1::VirtualGpu(desc.type_ordinal),
+            WgpuDeviceKindV1::Cpu => WgpuDeviceSelectorV1::Cpu,
+        };
+
+        // 1. Explicit selector construction binds the exact descriptor & placement.
+        let fresh_lin = BurnWgpuLinearBridgeV1::new_with_selector(3, 2, explicit_selector).unwrap();
+        assert_eq!(fresh_lin.device_descriptor(), &desc);
+        assert_eq!(
+            fresh_lin.device_placement(),
+            DevicePlacementV1::Wgpu {
+                device_index: desc.device_index
+            }
+        );
+
+        // 2. Fresh lazily-initialized WGPU Linear & MLP bridges evaluate one stable parameter set
+        //    matching export_flat_f32().
+        let x = [1.2f32, -0.4, 2.5];
+        let t = [0.0f32, 0.0];
+        let y1 = fresh_lin.forward_flat(&x).unwrap();
+        let y2 = fresh_lin.forward_flat(&x).unwrap();
+        let (l1, g1) = fresh_lin.backward_mse(&x, &t).unwrap();
+        let (l2, g2) = fresh_lin.backward_mse(&x, &t).unwrap();
+        assert_eq!(y1, y2);
+        assert_eq!((l1, &g1), (l2, &g2));
+        let lin_exported = fresh_lin.export_flat_f32().unwrap();
+        let mut ref_lin = ReferenceLinearModule::new(3, 2, DevicePlacementV1::Cpu).unwrap();
+        BurnModuleOps::import_flat_f32(&mut ref_lin, &lin_exported).unwrap();
+        let y_ref = BurnModuleOps::forward_flat(&ref_lin, &x).unwrap();
+        for (a, b) in y1.iter().zip(y_ref.iter()) {
+            assert!((a - b).abs() < 1e-4, "fresh wgpu lin {a} vs ref {b}");
+        }
+
+        let fresh_mlp = BurnWgpuMlpBridgeV1::new_with_selector(3, 4, 2, explicit_selector).unwrap();
+        let m1 = fresh_mlp.forward_flat(&x).unwrap();
+        let m2 = fresh_mlp.forward_flat(&x).unwrap();
+        let (ml1, mg1) = fresh_mlp.backward_mse(&x, &t).unwrap();
+        let (ml2, mg2) = fresh_mlp.backward_mse(&x, &t).unwrap();
+        assert_eq!(m1, m2);
+        assert_eq!((ml1, &mg1), (ml2, &mg2));
+        let mlp_exported = fresh_mlp.export_flat_f32().unwrap();
+        let mut native_mlp = MlpModel::new(3, 4, 2).unwrap();
+        native_mlp.load_parameters(&mlp_exported).unwrap();
+        let m_ref = native_mlp.forward(&x).unwrap();
+        for (a, b) in m1.iter().zip(m_ref.as_slice().iter()) {
+            assert!((a - b).abs() < 1e-4, "fresh wgpu mlp {a} vs ref {b}");
+        }
+
+        // 3. Negative & overflow boundaries on live WGPU Linear & MLP.
+        let mut lin = BurnWgpuLinearBridgeV1::new(2, 1, desc.device_index).unwrap();
+        let init_lin = [2.0f32, -1.0, 0.5];
+        lin.import_flat_f32(&init_lin).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                lin.import_flat_f32(&[bad, 1.0, 0.5]).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+            assert_eq!(
+                lin.forward_flat(&[bad, 1.0]).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+            assert_eq!(
+                lin.backward_mse(&[1.0, 2.0], &[bad]).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+        }
+        assert_eq!(
+            lin.import_flat_f32(&[1.0, 2.0]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 3,
+                got: 2
+            }
+        );
+        assert_eq!(
+            lin.forward_flat(&[]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 2,
+                got: 0
+            }
+        );
+        assert_eq!(
+            lin.forward_flat(&[1.0, 2.0, 3.0]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 2,
+                got: 3
+            }
+        );
+        assert_eq!(
+            lin.backward_mse(&[1.0, 2.0], &[1.0, 2.0]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 1,
+                got: 2
+            }
+        );
+        assert_eq!(lin.export_flat_f32().unwrap(), init_lin);
+
+        // GPU forward f32 overflow must fail closed with NonFiniteValue.
+        lin.import_flat_f32(&[f32::MAX, f32::MAX, 0.0]).unwrap();
+        assert_eq!(
+            lin.forward_flat(&[f32::MAX, f32::MAX]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        // Partial-sum overflow (`inf + -inf = NaN`) on GPU must also fail closed.
+        assert_eq!(
+            lin.forward_flat(&[2.0, -2.0]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        // Product overflow before bias on GPU (`f32::MAX * 2.0 + (-f32::MAX) = +Inf`).
+        let mut lin1 = BurnWgpuLinearBridgeV1::new(1, 1, desc.device_index).unwrap();
+        lin1.import_flat_f32(&[f32::MAX, -f32::MAX]).unwrap();
+        assert_eq!(
+            lin1.forward_flat(&[2.0]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        // GPU backward loss overflow (finite input/pred/target, squared diff overflows f32).
+        lin.import_flat_f32(&[0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            lin.backward_mse(&[1.0, 0.0], &[1e25]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+        // GPU backward gradient overflow even when pred (= 0) AND loss (= 1e38) are finite!
+        // dL/dW0 = 2 * (-1e19) * 1e25 = -2e44 -> -Inf.
+        assert_eq!(
+            lin.backward_mse(&[1e25, 0.0], &[1e19]).unwrap_err(),
+            BackendBridgeError::NonFiniteValue
+        );
+
+        // WGPU MLP transactional import rejection & SafeTensors roundtrip + SgdOptimizer::step.
+        let mut mlp = BurnWgpuMlpBridgeV1::new(3, 4, 2, desc.device_index).unwrap();
+        let mlp_params: Vec<f32> = (0..26).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
+        mlp.import_flat_f32(&mlp_params).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut bad_p = mlp_params.clone();
+            bad_p[25] = bad;
+            assert_eq!(
+                mlp.import_flat_f32(&bad_p).unwrap_err(),
+                BackendBridgeError::NonFiniteValue
+            );
+        }
+        assert_eq!(
+            mlp.import_flat_f32(&mlp_params[..25]).unwrap_err(),
+            BackendBridgeError::ParameterCountMismatch {
+                expected: 26,
+                got: 25
+            }
+        );
+        assert_eq!(mlp.export_flat_f32().unwrap(), mlp_params);
+
+        let mlp_schema = ModelTensorSchemaV1::for_mlp(3, 4, 2).unwrap();
+        let mlp_layout = ModelFlatTensorLayoutV1::for_mlp(3, 4, 2).unwrap();
+        let limits = SafeTensorsLimitsV1::default();
+        let mut mlp_handle = BurnModuleBridgeV1::new(mlp)
+            .into_handle(Some(mlp_schema.schema_hash()))
+            .unwrap();
+        let st_mlp =
+            export_safetensors_checkpoint_with_layout_v1(&mlp_handle, &mlp_layout, &limits)
+                .unwrap();
+        let mut mlp_reload =
+            BurnModuleBridgeV1::new(BurnWgpuMlpBridgeV1::new(3, 4, 2, desc.device_index).unwrap())
+                .into_handle(Some(mlp_schema.schema_hash()))
+                .unwrap();
+        import_safetensors_checkpoint_with_layout_v1(
+            &mut mlp_reload,
+            &mlp_layout,
+            &st_mlp,
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(mlp_reload.parameters(), mlp_handle.parameters());
+
+        // Live SgdOptimizer::step on WGPU BackendModelHandleV1 reduces MSE loss.
+        let x_train = [0.8f32, -0.5, 1.1];
+        let y_train = [0.5f32, -0.25];
+        let (loss_before, grads_before) = mlp_handle
+            .backend()
+            .inner()
+            .backward_mse(&x_train, &y_train)
+            .unwrap();
+        let mut opt = SgdOptimizer::<
+            BackendModelHandleV1<BurnModuleBridgeV1<BurnWgpuMlpBridgeV1>>,
+            64,
+        >::with_hyperparams(0.1, 0.0, 0.0)
+        .unwrap();
+        opt.step(&mut mlp_handle, &grads_before).unwrap();
+        let (loss_after, _) = mlp_handle
+            .backend()
+            .inner()
+            .backward_mse(&x_train, &y_train)
+            .unwrap();
+        assert!(
+            loss_after < loss_before,
+            "expected WGPU SgdOptimizer::step to decrease loss: before={loss_before} after={loss_after}"
+        );
+
+        // 4. Concurrent readers + writer on live WGPU Linear & MLP with deadlock watchdog.
+        let device_index = desc.device_index;
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            let x_race = [1.2f32, -0.4, 2.5];
+            let t_race = [1.0f32, -1.0];
+            let lin_a = [0.5f32, -1.25, 0.75, -0.3, 1.4, -0.8, 0.25, -0.65];
+            let lin_b: Vec<f32> = lin_a.iter().map(|v| -2.0 * v + 0.125).collect();
+
+            let mut lin_bridge = BurnWgpuLinearBridgeV1::new(3, 2, device_index).unwrap();
+            lin_bridge.import_flat_f32(&lin_b).unwrap();
+            let expect_b = (
+                lin_bridge.forward_flat(&x_race).unwrap(),
+                lin_bridge.backward_mse(&x_race, &t_race).unwrap(),
+            );
+            lin_bridge.import_flat_f32(&lin_a).unwrap();
+            let expect_a = (
+                lin_bridge.forward_flat(&x_race).unwrap(),
+                lin_bridge.backward_mse(&x_race, &t_race).unwrap(),
+            );
+            assert_ne!(expect_a, expect_b);
+
+            let shared = RwLock::new(lin_bridge);
+            std::thread::scope(|s| {
+                for _ in 0..3 {
+                    s.spawn(|| {
+                        for _ in 0..12 {
+                            let g = shared.read().unwrap();
+                            let got = (
+                                g.forward_flat(&x_race).unwrap(),
+                                g.backward_mse(&x_race, &t_race).unwrap(),
+                            );
+                            assert!(got == expect_a || got == expect_b, "torn WGPU linear state");
+                            std::thread::yield_now();
+                        }
+                    });
+                }
+                s.spawn(|| {
+                    for r in 0..12 {
+                        let next = if r % 2 == 0 { &lin_b[..] } else { &lin_a[..] };
+                        shared.write().unwrap().import_flat_f32(next).unwrap();
+                        assert_eq!(shared.read().unwrap().export_flat_f32().unwrap(), next);
+                        std::thread::yield_now();
+                    }
+                });
+            });
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().unwrap_err())
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("concurrent WGPU readers+writer timed out (possible burn-autodiff deadlock)")
+            }
+        }
+    }
+
+    #[cfg(feature = "real-burn-wgpu")]
+    #[test]
+    fn wave16d_concurrent_wgpu_enumeration_and_probes_never_crash() {
+        use real_burn_wgpu::{enumerate_wgpu_devices, probe_wgpu_device, BurnWgpuLinearBridgeV1};
+
+        let baseline = enumerate_wgpu_devices();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..16 {
+                        let got = enumerate_wgpu_devices();
+                        assert_eq!(got, baseline);
+                        assert_eq!(
+                            probe_wgpu_device(u32::MAX).unwrap_err(),
+                            BackendBridgeError::DeviceUnavailable
+                        );
+                        assert_eq!(
+                            BurnWgpuLinearBridgeV1::new(2, 1, u32::MAX).unwrap_err(),
+                            BackendBridgeError::DeviceUnavailable
+                        );
+                    }
+                });
+            }
+        });
     }
 }

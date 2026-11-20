@@ -28,7 +28,7 @@ ignore = [
     { id = "RUSTSEC-2026-0547", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support); SwarmTorch uses SafeTensors only and never calls zip extraction." },
     { id = "RUSTSEC-2026-0548", reason = "zip < 9.0.0 extraction bug via candle-core 0.10.2 (.npz support) and inactive optional burn-tch; SwarmTorch uses SafeTensors only and never calls zip extraction." },
     # adapters/swarm-torch-backends (inactive optional burn-tch -> tch -> zip 0.6.6 -> zstd -> zstd-safe 5.0.2)
-    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 legacy streaming decompression bug appears only via disabled optional burn-tch feature; adapters/swarm-torch-backends enables only burn std/ndarray/autodiff." },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 legacy streaming decompression bug appears only via disabled optional burn-tch feature; adapters/swarm-torch-backends enables only burn std/ndarray/autodiff plus burn-wgpu/cubecl under real-burn-wgpu (none of which depend on zstd-safe)." },
 ]
 
 [licenses]

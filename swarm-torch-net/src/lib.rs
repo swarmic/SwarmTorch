@@ -6,7 +6,7 @@
 //! - Unified `SwarmTransport` trait for all transports
 //! - Originator-authenticated gossip inner updates and recipient wrappers (`gossip`)
 //! - Mock transport/network implementations for integration testing
-//! - Placeholder feature flags for TCP/UDP/BLE/LoRa/WiFi backends (planned)
+//! - TCP, UDP, and `no_std` LoRa (`lora-transport`) packet transports (BLE and WiFi follow)
 //! - Multi-transport policy surface with fallback error semantics
 //! - Message framing and serialization
 
@@ -21,6 +21,8 @@ pub mod audit;
 pub mod carrier;
 pub mod chunked;
 pub mod gossip;
+#[cfg(feature = "lora-transport")]
+pub mod lora;
 pub mod protocol;
 #[cfg(feature = "std")]
 pub mod tcp;
@@ -43,6 +45,8 @@ pub mod prelude {
     pub use crate::carrier::*;
     pub use crate::chunked::*;
     pub use crate::gossip::*;
+    #[cfg(feature = "lora-transport")]
+    pub use crate::lora::*;
     pub use crate::protocol::*;
     #[cfg(feature = "std")]
     pub use crate::tcp::*;

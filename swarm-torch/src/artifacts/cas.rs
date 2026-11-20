@@ -297,6 +297,8 @@ pub struct CoordinatorResumeStateV2 {
     #[serde(default)]
     pub dp_profile: Option<swarm_torch_core::dp::DpMechanismProfileV1>,
     #[serde(default)]
+    pub dp_certified_subsampling_q: Option<f64>,
+    #[serde(default)]
     pub equivocated_peers: Vec<PeerId>,
     pub committed_unix_nanos: u64,
 }

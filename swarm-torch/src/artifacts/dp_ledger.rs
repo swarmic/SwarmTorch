@@ -1,9 +1,11 @@
-//! Experimental hypothetical Rényi Differential Privacy (`RDP`) accounting ledger
-//! (`ADR-0023` §4.2, `W12-03`, `ST-02`).
+//! Rényi Differential Privacy (`RDP`) durable pre-release ledger (`ADR-0023` §4.2, `W12-03`, `ST-02`, `Wave 16B`).
 //!
-//! > **Security Notice (`ST-02` Containment):** Records written here track **hypothetical budget
-//! > consumption only**; no Poisson client subsampling or calibrated Gaussian noise injection is
-//! > performed in `v0.2`, so `guarantees_differential_privacy` is `false`.
+//! Supports two strictly segregated, non-mixable run classifications:
+//! - [`EXPERIMENTAL_DP_CLASSIFICATION_V1`] (`guarantees_differential_privacy = false`):
+//!   hypothetical RDP budget tracking only (no noise injection claimed).
+//! - [`VERIFIED_DP_CLASSIFICATION_V1`] (`guarantees_differential_privacy = true`):
+//!   certified `DpFedAvgV1` mechanism rounds backed by a sealed
+//!   [`swarm_torch_core::dp::VerifiedDpMechanismRoundV1`] proof token with OS CSPRNG provenance.
 //!
 //! Enforces strict fail-closed **pre-release debit**:
 //! - Every round/step privacy debit is appended and `fsync`ed (`sync_all()`) to `dp/ledger.ndjson`
@@ -11,6 +13,7 @@
 //! - A crash between durable ledger debit and checkpoint publication leaves the spent accounting budget
 //!   debited and **non-refundable**.
 //! - Idempotent retries keyed on `receipt_id` observe the persisted debit without double-charging.
+//! - Mixing experimental and certified classifications within the same run ledger fails closed.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -19,8 +22,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use swarm_torch_core::crypto::{sha256_slices, CryptoError, PrivacyAccountantHook};
 use swarm_torch_core::dp::{
-    DpAdjacencyV1, DpConversionFormulaV1, DpMechanismProfileV1, DpUnitV1,
-    PrivacyAccountingClassificationV1, RdpAccountantV1, RDP_GRID_LEN,
+    compute_discrete_sigma_z_v1, convert_rdp_to_approx_dp_v1, DpAdjacencyV1, DpConversionFormulaV1,
+    DpMechanismProfileV1, DpUnitV1, PrivacyAccountingClassificationV1, RdpAccountantV1,
+    VerifiedDpMechanismRoundV1, RDP_GRID_LEN,
 };
 use swarm_torch_core::observe::RunId;
 
@@ -37,8 +41,11 @@ pub const DP_LEDGER_REL_PATH: &str = "dp/ledger.ndjson";
 /// Schema identifier embedded in durable DP ledger entries.
 pub const DP_LEDGER_SCHEMA_V1: &str = "swarmtorch.dp_ledger.v1";
 
-/// Explicit accounting classification string emitted into `dp/ledger.ndjson` (`ST-02`).
+/// Explicit accounting classification string emitted for experimental budget-only ledgers (`ST-02`).
 pub const EXPERIMENTAL_DP_CLASSIFICATION_V1: &str = "experimental_hypothetical_budget_only";
+
+/// Explicit accounting classification string emitted for certified `DpFedAvgV1` ledgers (`ST-02`, `Wave 16B`).
+pub const VERIFIED_DP_CLASSIFICATION_V1: &str = "verified_mechanism_protected";
 
 fn default_accounting_classification() -> String {
     EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string()
@@ -79,10 +86,11 @@ pub struct DpLedgerEntryV1 {
     pub committed_rounds: u64,
     /// Monotonic Unix nanosecond timestamp when the pre-release debit was sealed.
     pub ts_unix_ns: u64,
-    /// Whether genuine Differential Privacy protection was executed (`false` in `v0.2` experimental accounting mode).
+    /// Whether genuine certified `DpFedAvgV1` Differential Privacy protection was executed
+    /// (`true` only for [`VERIFIED_DP_CLASSIFICATION_V1`]; `false` for [`EXPERIMENTAL_DP_CLASSIFICATION_V1`]).
     #[serde(default)]
     pub guarantees_differential_privacy: bool,
-    /// Explicit accounting classification (`"experimental_hypothetical_budget_only"`).
+    /// Explicit accounting classification (`"verified_mechanism_protected"` or `"experimental_hypothetical_budget_only"`).
     #[serde(default = "default_accounting_classification")]
     pub accounting_classification: String,
 }
@@ -105,10 +113,21 @@ pub fn derive_dp_receipt_id(
 }
 
 fn validate_single_dp_ledger_entry(entry: &DpLedgerEntryV1) -> io::Result<()> {
+    let valid_classification = match (
+        entry.guarantees_differential_privacy,
+        entry.accounting_classification.as_str(),
+    ) {
+        (false, EXPERIMENTAL_DP_CLASSIFICATION_V1) => true,
+        (true, VERIFIED_DP_CLASSIFICATION_V1) => {
+            entry.unit == DpUnitV1::ClientLevel
+                && compute_discrete_sigma_z_v1(entry.noise_multiplier).is_ok()
+        }
+        _ => false,
+    };
+
     if entry.schema_version != DP_LEDGER_SCHEMA_V1
         || entry.cumulative_rdp_orders.len() != RDP_GRID_LEN
-        || entry.guarantees_differential_privacy
-        || entry.accounting_classification != EXPERIMENTAL_DP_CLASSIFICATION_V1
+        || !valid_classification
         || entry.committed_rounds == 0
         || entry
             .cumulative_rdp_orders
@@ -137,43 +156,77 @@ fn validate_single_dp_ledger_entry(entry: &DpLedgerEntryV1) -> io::Result<()> {
     }
     decode_hex_exact::<32>(&entry.receipt_id)?;
     decode_hex_exact::<32>(&entry.parent_digest_hex)?;
+
+    // Verify converted_epsilon & optimal_alpha agree with cumulative_rdp_orders (prevents epsilon tampering).
+    let mut orders = [0.0f64; RDP_GRID_LEN];
+    orders.copy_from_slice(&entry.cumulative_rdp_orders);
+    let (expected_eps, expected_alpha) =
+        convert_rdp_to_approx_dp_v1(&orders, entry.target_delta, entry.conversion_formula)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dp/ledger.ndjson cumulative_rdp_orders failed RDP conversion",
+                )
+            })?;
+    let eps_tol = 1e-9 * expected_eps.abs().max(1.0);
+    if (entry.converted_epsilon - expected_eps).abs() > eps_tol
+        || (entry.optimal_alpha - expected_alpha).abs() > 1e-9
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dp/ledger.ndjson converted_epsilon or optimal_alpha disagrees with cumulative_rdp_orders",
+        ));
+    }
     Ok(())
 }
 
-/// Parse and structurally validate bounded `dp/ledger.ndjson` bytes (`ADR-0023` §4.2, `AR-14-01`, `AR-14-04`).
-pub fn parse_and_validate_dp_ledger_slice(bytes: &[u8]) -> io::Result<Vec<DpLedgerEntryV1>> {
-    let entries: Vec<DpLedgerEntryV1> =
-        parse_ndjson_slice_bounded(bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
-    let mut seen_receipts = BTreeSet::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        validate_single_dp_ledger_entry(entry)?;
-        let expected_rounds = (idx as u64).checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "dp/ledger.ndjson committed_rounds overflow",
-            )
-        })?;
-        if entry.committed_rounds != expected_rounds {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "non-monotonic committed_rounds in dp/ledger.ndjson: expected {expected_rounds}, got {}",
-                    entry.committed_rounds
-                ),
-            ));
+fn validate_dp_ledger_transition(
+    prev: Option<&DpLedgerEntryV1>,
+    entry: &DpLedgerEntryV1,
+) -> io::Result<()> {
+    match prev {
+        None => {
+            if entry.committed_rounds != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "first dp/ledger.ndjson entry must have committed_rounds == 1, got {}",
+                        entry.committed_rounds
+                    ),
+                ));
+            }
         }
-        if !seen_receipts.insert(entry.receipt_id.clone()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate receipt_id in dp/ledger.ndjson",
-            ));
-        }
-        if let Some(prev) = idx.checked_sub(1).and_then(|p| entries.get(p)) {
+        Some(prev) => {
+            let expected_rounds = prev.committed_rounds.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dp/ledger.ndjson committed_rounds overflow",
+                )
+            })?;
+            if entry.committed_rounds != expected_rounds {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "non-monotonic committed_rounds in dp/ledger.ndjson: expected {expected_rounds}, got {}",
+                        entry.committed_rounds
+                    ),
+                ));
+            }
+            if entry.guarantees_differential_privacy != prev.guarantees_differential_privacy
+                || entry.accounting_classification != prev.accounting_classification
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dp/ledger.ndjson mixed privacy classifications within the same run",
+                ));
+            }
             if entry.unit != prev.unit
                 || entry.adjacency != prev.adjacency
                 || entry.conversion_formula != prev.conversion_formula
                 || (entry.target_delta - prev.target_delta).abs() > 1e-15
                 || (entry.noise_multiplier - prev.noise_multiplier).abs() > 1e-6
+                || (entry.guarantees_differential_privacy
+                    && (entry.clipping_radius_tau - prev.clipping_radius_tau).abs() > 1e-6)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -192,6 +245,25 @@ pub fn parse_and_validate_dp_ledger_slice(bytes: &[u8]) -> io::Result<Vec<DpLedg
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Parse and structurally validate bounded `dp/ledger.ndjson` bytes (`ADR-0023` §4.2, `AR-14-01`, `AR-14-04`).
+pub fn parse_and_validate_dp_ledger_slice(bytes: &[u8]) -> io::Result<Vec<DpLedgerEntryV1>> {
+    let entries: Vec<DpLedgerEntryV1> =
+        parse_ndjson_slice_bounded(bytes, MAX_NDJSON_LINE_BYTES, MAX_NDJSON_LINES)?;
+    let mut seen_receipts = BTreeSet::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        validate_single_dp_ledger_entry(entry)?;
+        if !seen_receipts.insert(entry.receipt_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate receipt_id in dp/ledger.ndjson",
+            ));
+        }
+        let prev = idx.checked_sub(1).and_then(|p| entries.get(p));
+        validate_dp_ledger_transition(prev, entry)?;
     }
     Ok(entries)
 }
@@ -239,6 +311,16 @@ pub fn append_dp_release_record_durable(
                 .all(|(a, b)| (a - b).abs() <= 1e-13 * a.abs().max(b.abs()).max(1.0));
         if prev.round_id != entry.round_id
             || prev.committed_rounds != entry.committed_rounds
+            || prev.parent_digest_hex != entry.parent_digest_hex
+            || prev.guarantees_differential_privacy != entry.guarantees_differential_privacy
+            || prev.accounting_classification != entry.accounting_classification
+            || prev.unit != entry.unit
+            || prev.adjacency != entry.adjacency
+            || prev.conversion_formula != entry.conversion_formula
+            || (prev.target_delta - entry.target_delta).abs() > 1e-15
+            || (prev.subsampling_rate_q - entry.subsampling_rate_q).abs() > 1e-12
+            || (prev.clipping_radius_tau - entry.clipping_radius_tau).abs() > 1e-6
+            || (prev.noise_multiplier - entry.noise_multiplier).abs() > 1e-6
             || !orders_match
         {
             return Err(io::Error::new(
@@ -249,6 +331,7 @@ pub fn append_dp_release_record_durable(
         return Ok(false);
     }
 
+    validate_dp_ledger_transition(existing.last(), entry)?;
     append_ndjson_with_policy(&ledger_path, entry, DurabilityPolicyV1::SyncEachAppend)?;
     Ok(true)
 }
@@ -322,35 +405,150 @@ pub fn pre_release_debit_dp_accountant(
     Ok((newly_appended, entry))
 }
 
-fn reconstruct_dp_accountant_from_entries(
-    entries: &[DpLedgerEntryV1],
-    profile: DpMechanismProfileV1,
-) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
-    if profile.classification
-        != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+/// Preview, durably debit in `dp/ledger.ndjson` (`guarantees_differential_privacy = true`), and
+/// advance a certified [`RdpAccountantV1`] using a sealed [`VerifiedDpMechanismRoundV1`] proof
+/// BEFORE releasing a sanitized checkpoint (`ADR-0023` §4.2, `ST-02`, `Wave 16B`).
+///
+/// Fails closed BEFORE any disk write or state mutation if:
+/// - `accountant` is not `VerifiedMechanismProtected` + `ClientLevel`,
+/// - `proof.is_production_certified_entropy()` is `false` (explicit test seeds are rejected),
+/// - `proof` does not bind the exact `(run_id, round_id, parent_digest_hex, profile)`, or
+/// - advancing the accountant would exceed `profile.max_epsilon`.
+///
+/// Never writes `sampled_cohort_digest_sha256`, `participant_count`, or `clipped_count` to disk.
+#[allow(clippy::too_many_arguments)]
+pub fn pre_release_debit_verified_dp_accountant(
+    run_dir: &Path,
+    run_id: RunId,
+    round_id: u64,
+    parent_digest_hex: &str,
+    accountant: &mut RdpAccountantV1,
+    proof: &VerifiedDpMechanismRoundV1,
+    ts_unix_ns: u64,
+) -> Result<(bool, DpLedgerEntryV1), CryptoErrorOrIo> {
+    let profile = *accountant.profile();
+    if profile.classification != PrivacyAccountingClassificationV1::VerifiedMechanismProtected
+        || profile.unit != DpUnitV1::ClientLevel
+        || !accountant.guarantees_differential_privacy()
+        || !proof.is_production_certified_entropy()
     {
         return Err(CryptoErrorOrIo::Crypto(
             CryptoError::InvalidPrivacyParameter,
         ));
     }
+    let parent_digest_bytes =
+        decode_hex_exact::<32>(parent_digest_hex).map_err(CryptoErrorOrIo::Io)?;
+    if proof.run_id_bytes() != run_id.as_bytes()
+        || proof.round_id() != round_id
+        || proof.parent_digest_bytes() != &parent_digest_bytes
+        || proof.profile() != &profile
+    {
+        return Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter,
+        ));
+    }
+
+    let (desc, next_orders, next_eps) = accountant
+        .preview_verified_mechanism_round(proof)
+        .map_err(CryptoErrorOrIo::Crypto)?;
+
+    let committed_before = accountant.committed_rounds();
+    let next_committed_rounds = committed_before
+        .checked_add(1)
+        .ok_or(CryptoErrorOrIo::Crypto(CryptoError::PrivacyBudgetExhausted))?;
+    let receipt_id = derive_dp_receipt_id(run_id, round_id, parent_digest_hex, committed_before);
+    let entry = DpLedgerEntryV1 {
+        schema_version: DP_LEDGER_SCHEMA_V1.to_string(),
+        receipt_id,
+        round_id,
+        parent_digest_hex: parent_digest_hex.to_string(),
+        cumulative_rdp_orders: next_orders.to_vec(),
+        converted_epsilon: next_eps,
+        optimal_alpha: desc.alpha,
+        target_delta: profile.target_delta,
+        subsampling_rate_q: proof.subsampling_rate_q(),
+        clipping_radius_tau: profile.clipping_radius_tau,
+        noise_multiplier: profile.noise_multiplier,
+        unit: profile.unit,
+        adjacency: profile.adjacency,
+        conversion_formula: profile.conversion_formula,
+        committed_rounds: next_committed_rounds,
+        ts_unix_ns,
+        guarantees_differential_privacy: true,
+        accounting_classification: VERIFIED_DP_CLASSIFICATION_V1.to_string(),
+    };
+
+    let newly_appended =
+        append_dp_release_record_durable(run_dir, &entry).map_err(CryptoErrorOrIo::Io)?;
+
+    // Advance in-memory accountant only after durable disk sync succeeds.
+    accountant
+        .record_verified_mechanism_round(proof)
+        .map_err(CryptoErrorOrIo::Crypto)?;
+
+    Ok((newly_appended, entry))
+}
+
+fn reconstruct_dp_accountant_from_entries(
+    entries: &[DpLedgerEntryV1],
+    profile: DpMechanismProfileV1,
+) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
+    let expect_verified = match profile.classification {
+        PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly => false,
+        PrivacyAccountingClassificationV1::VerifiedMechanismProtected => {
+            if profile.unit != DpUnitV1::ClientLevel
+                || compute_discrete_sigma_z_v1(profile.noise_multiplier).is_err()
+            {
+                return Err(CryptoErrorOrIo::Crypto(
+                    CryptoError::InvalidPrivacyParameter,
+                ));
+            }
+            true
+        }
+    };
+
     match entries.last() {
-        None => RdpAccountantV1::new(profile).map_err(CryptoErrorOrIo::Crypto),
+        None => {
+            if expect_verified {
+                RdpAccountantV1::new_verified_mechanism(profile).map_err(CryptoErrorOrIo::Crypto)
+            } else {
+                RdpAccountantV1::new(profile).map_err(CryptoErrorOrIo::Crypto)
+            }
+        }
         Some(last) => {
-            if last.unit != profile.unit
+            let expected_cls = if expect_verified {
+                VERIFIED_DP_CLASSIFICATION_V1
+            } else {
+                EXPERIMENTAL_DP_CLASSIFICATION_V1
+            };
+            if last.guarantees_differential_privacy != expect_verified
+                || last.accounting_classification != expected_cls
+                || last.unit != profile.unit
                 || last.adjacency != profile.adjacency
                 || last.conversion_formula != profile.conversion_formula
                 || (last.target_delta - profile.target_delta).abs() > 1e-15
                 || (last.noise_multiplier - profile.noise_multiplier).abs() > 1e-6
+                || (expect_verified
+                    && (last.clipping_radius_tau - profile.clipping_radius_tau).abs() > 1e-6)
             {
                 return Err(CryptoErrorOrIo::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "dp/ledger.ndjson profile mismatch against configured DpMechanismProfileV1",
+                    "dp/ledger.ndjson profile or classification mismatch against configured DpMechanismProfileV1",
                 )));
             }
             let mut orders = [0.0f64; RDP_GRID_LEN];
             orders.copy_from_slice(&last.cumulative_rdp_orders);
-            RdpAccountantV1::restore_from_orders(profile, orders, last.committed_rounds)
+            if expect_verified {
+                RdpAccountantV1::restore_verified_mechanism_from_orders(
+                    profile,
+                    orders,
+                    last.committed_rounds,
+                )
                 .map_err(CryptoErrorOrIo::Crypto)
+            } else {
+                RdpAccountantV1::restore_from_orders(profile, orders, last.committed_rounds)
+                    .map_err(CryptoErrorOrIo::Crypto)
+            }
         }
     }
 }
@@ -364,8 +562,9 @@ pub fn reconstruct_dp_accountant_from_committed_head(
     profile: DpMechanismProfileV1,
     after_cas_crash_tail_allowed: bool,
 ) -> Result<RdpAccountantV1, CryptoErrorOrIo> {
-    if profile.classification
-        != PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly
+    if profile.classification == PrivacyAccountingClassificationV1::VerifiedMechanismProtected
+        && (profile.unit != DpUnitV1::ClientLevel
+            || compute_discrete_sigma_z_v1(profile.noise_multiplier).is_err())
     {
         return Err(CryptoErrorOrIo::Crypto(
             CryptoError::InvalidPrivacyParameter,

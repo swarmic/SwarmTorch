@@ -4458,3 +4458,525 @@ fn register_source_and_cas_bindings_reject_oversized_content_type_and_custom_aut
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn wave16b2_certified_dp_ledger_enforces_sealed_proof_binding_classification_segregation_and_crash_tail(
+) {
+    use super::dp_ledger::{
+        append_dp_release_record_durable, parse_and_validate_dp_ledger_slice,
+        pre_release_debit_dp_accountant, pre_release_debit_verified_dp_accountant,
+        read_dp_ledger_entries, reconstruct_dp_accountant_from_committed_head,
+        reconstruct_dp_accountant_from_verified_bundle, CryptoErrorOrIo, DP_LEDGER_REL_PATH,
+        EXPERIMENTAL_DP_CLASSIFICATION_V1, VERIFIED_DP_CLASSIFICATION_V1,
+    };
+    use swarm_torch_core::crypto::{CryptoError, KeyPair};
+    use swarm_torch_core::dp::{
+        DpAdjacencyV1, DpConversionFormulaV1, DpFedAvgMechanismV1, DpFedAvgRoundInputV1,
+        DpMechanismProfileV1, DpNoiseEntropyV1, DpUnitV1, PrivacyAccountingClassificationV1,
+        RdpAccountantV1, SampledDpCohortV1,
+    };
+    use swarm_torch_core::traits::PeerId;
+
+    let base = temp_dir("wave16b2_certified_dp_ledger");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let run_id = RunId::from_bytes([0xE4; 16]);
+    let other_run_id = RunId::from_bytes([0xE5; 16]);
+    let parent_bytes = [0x1Au8; 32];
+    let parent_hex = hex_lower(&parent_bytes);
+    let other_parent_hex = hex_lower(&[0x3Cu8; 32]);
+    let peers: Vec<PeerId> = (1u8..=4).map(|i| PeerId::new([i; 32])).collect();
+
+    let cert_profile = DpMechanismProfileV1 {
+        unit: DpUnitV1::ClientLevel,
+        adjacency: DpAdjacencyV1::AddRemoveOne,
+        clipping_radius_tau: 1.0,
+        noise_multiplier: 1.5,
+        target_delta: 1e-5,
+        max_epsilon: 10.0,
+        conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+        classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
+    };
+    let exp_profile = DpMechanismProfileV1 {
+        classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        ..cert_profile
+    };
+
+    let bundle = RunArtifactBundle::create(&base, run_id).unwrap();
+    let run_dir = bundle.run_dir().to_path_buf();
+    let signer = KeyPair::from_seed([0x91; 32]).unwrap();
+
+    let mut cert_acc = RdpAccountantV1::new_verified_mechanism(cert_profile).unwrap();
+
+    // 1. Legacy unsealed pre_release_debit_dp_accountant MUST fail closed on a certified accountant.
+    assert!(matches!(
+        pre_release_debit_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut cert_acc,
+            1.0,
+            0.5,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert_eq!(cert_acc.committed_rounds(), 0);
+    assert!(read_dp_ledger_entries(&run_dir).unwrap().is_empty());
+
+    // 2. Explicit non-production test seed proof (both or either sampling/noise explicit) MUST be rejected
+    //    by pre_release_debit_verified_dp_accountant.
+    let test_cohort = SampledDpCohortV1::sample_poisson_with_explicit_seed_v1(
+        &peers,
+        0.5,
+        [0x44; 32],
+        *run_id.as_bytes(),
+        1,
+    )
+    .unwrap();
+    let test_outcome = DpFedAvgMechanismV1::execute_round_v1(
+        cert_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 1,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &test_cohort,
+            noise_entropy: DpNoiseEntropyV1::from_explicit_seed_for_testing([0x55; 32]).unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut cert_acc,
+            &test_outcome.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    let explicit_cohort_os_noise = DpFedAvgMechanismV1::execute_round_v1(
+        cert_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 1,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &test_cohort,
+            noise_entropy: DpNoiseEntropyV1::generate_os_csprng().unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(!explicit_cohort_os_noise
+        .proof
+        .is_production_certified_entropy());
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut cert_acc,
+            &explicit_cohort_os_noise.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert_eq!(cert_acc.committed_rounds(), 0);
+    assert!(read_dp_ledger_entries(&run_dir).unwrap().is_empty());
+
+    // 3. Genuine OS CSPRNG proof binds exact (run_id, round_id, parent_digest, profile) and rejects mismatches!
+    let os_cohort_r1 =
+        SampledDpCohortV1::sample_poisson_os_rng_v1(&peers, 0.5, *run_id.as_bytes(), 1).unwrap();
+    let os_cohort_explicit_noise = DpFedAvgMechanismV1::execute_round_v1(
+        cert_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 1,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &os_cohort_r1,
+            noise_entropy: DpNoiseEntropyV1::from_explicit_seed_for_testing([0x56; 32]).unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(!os_cohort_explicit_noise
+        .proof
+        .is_production_certified_entropy());
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut cert_acc,
+            &os_cohort_explicit_noise.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+
+    let os_outcome_r1 = DpFedAvgMechanismV1::execute_round_v1(
+        cert_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 1,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &os_cohort_r1,
+            noise_entropy: DpNoiseEntropyV1::generate_os_csprng().unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(os_outcome_r1.proof.is_production_certified_entropy());
+
+    // Passing an experimental accountant to pre_release_debit_verified_dp_accountant MUST fail closed.
+    let mut exp_acc = RdpAccountantV1::new(exp_profile).unwrap();
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut exp_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert_eq!(exp_acc.committed_rounds(), 0);
+
+    // Budget exhaustion in pre_release_debit_verified_dp_accountant MUST fail closed BEFORE writing disk or mutating accountant.
+    let tiny_budget_profile = DpMechanismProfileV1 {
+        max_epsilon: 0.01,
+        ..cert_profile
+    };
+    let mut tiny_budget_acc = RdpAccountantV1::new_verified_mechanism(tiny_budget_profile).unwrap();
+    let tiny_budget_outcome = DpFedAvgMechanismV1::execute_round_v1(
+        tiny_budget_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 1,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &os_cohort_r1,
+            noise_entropy: DpNoiseEntropyV1::generate_os_csprng().unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut tiny_budget_acc,
+            &tiny_budget_outcome.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(CryptoError::PrivacyBudgetExhausted))
+    ));
+    assert_eq!(tiny_budget_acc.committed_rounds(), 0);
+    assert!(read_dp_ledger_entries(&run_dir).unwrap().is_empty());
+
+    // Wrong run_id, wrong round_id, wrong parent_digest, uppercase hex, wrong profile all fail closed.
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            other_run_id,
+            1,
+            &parent_hex,
+            &mut cert_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            2,
+            &parent_hex,
+            &mut cert_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &other_parent_hex,
+            &mut cert_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex.to_uppercase(),
+            &mut cert_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Io(_))
+    ));
+    let mut wrong_profile_acc = RdpAccountantV1::new_verified_mechanism(DpMechanismProfileV1 {
+        noise_multiplier: 2.0,
+        ..cert_profile
+    })
+    .unwrap();
+    assert!(matches!(
+        pre_release_debit_verified_dp_accountant(
+            &run_dir,
+            run_id,
+            1,
+            &parent_hex,
+            &mut wrong_profile_acc,
+            &os_outcome_r1.proof,
+            1_000,
+        ),
+        Err(CryptoErrorOrIo::Crypto(
+            CryptoError::InvalidPrivacyParameter
+        ))
+    ));
+    assert_eq!(cert_acc.committed_rounds(), 0);
+
+    // 4. Valid certified OS CSPRNG debit succeeds and records guarantees_differential_privacy = true.
+    //    Before round-1 debit, finalize an initial empty manifest (`manifest_r0`, without `dp/ledger.ndjson`)
+    //    to also verify the `None` branch of `reconstruct_dp_accountant_from_committed_head`.
+    let manifest_r0 = bundle.finalize_signed_manifest(&signer).unwrap();
+    let empty_restored =
+        reconstruct_dp_accountant_from_committed_head(&bundle, &manifest_r0, cert_profile, false)
+            .unwrap();
+    assert!(empty_restored.guarantees_differential_privacy());
+    assert_eq!(empty_restored.committed_rounds(), 0);
+
+    let (newly_appended, entry1) = pre_release_debit_verified_dp_accountant(
+        &run_dir,
+        run_id,
+        1,
+        &parent_hex,
+        &mut cert_acc,
+        &os_outcome_r1.proof,
+        1_000,
+    )
+    .unwrap();
+    assert!(newly_appended);
+    assert!(entry1.guarantees_differential_privacy);
+    assert_eq!(
+        entry1.accounting_classification,
+        VERIFIED_DP_CLASSIFICATION_V1
+    );
+    assert_eq!(entry1.committed_rounds, 1);
+    assert_eq!(cert_acc.committed_rounds(), 1);
+
+    // Against `manifest_r0` (which does not list `dp/ledger.ndjson`), `after_cas_crash_tail_allowed = false`
+    // MUST fail closed, while `after_cas_crash_tail_allowed = true` recovers the round-1 crash-tail debit.
+    assert!(reconstruct_dp_accountant_from_committed_head(
+        &bundle,
+        &manifest_r0,
+        cert_profile,
+        false,
+    )
+    .is_err());
+    let recovered_r1_from_r0 =
+        reconstruct_dp_accountant_from_committed_head(&bundle, &manifest_r0, cert_profile, true)
+            .unwrap();
+    assert!(recovered_r1_from_r0.guarantees_differential_privacy());
+    assert_eq!(recovered_r1_from_r0.committed_rounds(), 1);
+
+    // Idempotent retry on duplicate `receipt_id` returns `Ok(false)` when all fields agree,
+    // and fails closed on any conflicting payload field.
+    assert!(!append_dp_release_record_durable(&run_dir, &entry1).unwrap());
+    let mut conflicting_q = entry1.clone();
+    conflicting_q.subsampling_rate_q = 0.75;
+    assert!(append_dp_release_record_durable(&run_dir, &conflicting_q).is_err());
+    let mut conflicting_parent = entry1.clone();
+    conflicting_parent.parent_digest_hex = other_parent_hex.clone();
+    assert!(append_dp_release_record_durable(&run_dir, &conflicting_parent).is_err());
+
+    // Seal signed manifest covering round 1, then verify strict bundle reconstruction & classification segregation.
+    let manifest_r1 = bundle.finalize_signed_manifest(&signer).unwrap();
+    let verified_r1 = bundle
+        .verify_and_load(&TrustPolicy::strict_with_key(*signer.public_key()))
+        .unwrap();
+    let restored_v =
+        reconstruct_dp_accountant_from_verified_bundle(&verified_r1, cert_profile).unwrap();
+    assert!(restored_v.guarantees_differential_privacy());
+    assert_eq!(restored_v.committed_rounds(), 1);
+
+    // Attempting to reconstruct a certified ledger as experimental MUST fail closed!
+    assert!(matches!(
+        reconstruct_dp_accountant_from_verified_bundle(&verified_r1, exp_profile),
+        Err(CryptoErrorOrIo::Io(_))
+    ));
+
+    // 5. Simulate round 2 crash tail (debited to disk after manifest_r1, before new manifest),
+    //    using DeterministicFullCohort (q = 1.0) + OS CSPRNG noise to also verify full-cohort certified provenance.
+    let full_cohort_r2 = SampledDpCohortV1::full_cohort_v1(&peers, *run_id.as_bytes(), 2).unwrap();
+    let os_outcome_r2 = DpFedAvgMechanismV1::execute_round_v1(
+        cert_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: *run_id.as_bytes(),
+            round_id: 2,
+            parent_digest_bytes: parent_bytes,
+            parameter_dim: 4,
+            sampled_cohort: &full_cohort_r2,
+            noise_entropy: DpNoiseEntropyV1::generate_os_csprng().unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(os_outcome_r2.proof.is_production_certified_entropy());
+    let (newly_appended2, entry2) = pre_release_debit_verified_dp_accountant(
+        &run_dir,
+        run_id,
+        2,
+        &parent_hex,
+        &mut cert_acc,
+        &os_outcome_r2.proof,
+        2_000,
+    )
+    .unwrap();
+    assert!(newly_appended2);
+    assert_eq!(entry2.committed_rounds, 2);
+
+    // Strict committed-head read with crash tail forbidden fails closed; with crash tail allowed preserves round 2 debit!
+    assert!(reconstruct_dp_accountant_from_committed_head(
+        &bundle,
+        &manifest_r1,
+        cert_profile,
+        false,
+    )
+    .is_err());
+    let recovered_after_crash =
+        reconstruct_dp_accountant_from_committed_head(&bundle, &manifest_r1, cert_profile, true)
+            .unwrap();
+    assert!(recovered_after_crash.guarantees_differential_privacy());
+    assert_eq!(recovered_after_crash.committed_rounds(), 2);
+
+    // 6. Direct append of a mixed-classification experimental entry onto a certified ledger MUST fail closed!
+    let mut mixed_exp = entry2.clone();
+    mixed_exp.receipt_id = hex_lower(&[0xAB; 32]);
+    mixed_exp.committed_rounds = 3;
+    mixed_exp.guarantees_differential_privacy = false;
+    mixed_exp.accounting_classification = EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string();
+    assert!(append_dp_release_record_durable(&run_dir, &mixed_exp).is_err());
+
+    // 7. Parse validation rejects tampered epsilon/alpha, mismatched bool/string pairs, ExampleLevel verified,
+    //    out-of-range sigma_z noise_multiplier, non-monotonic committed_rounds, decreasing RDP orders,
+    //    mutated clipping_radius_tau, and mixed-classification NDJSON slices.
+    let mut bad_bool_str = entry1.clone();
+    bad_bool_str.accounting_classification = EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string();
+    let bad_bytes = format!("{}\n", serde_json::to_string(&bad_bool_str).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(bad_bytes.as_bytes()).is_err());
+
+    let mut bad_false_verified_str = entry1.clone();
+    bad_false_verified_str.guarantees_differential_privacy = false;
+    let bad_false_verified_bytes = format!(
+        "{}\n",
+        serde_json::to_string(&bad_false_verified_str).unwrap()
+    );
+    assert!(parse_and_validate_dp_ledger_slice(bad_false_verified_bytes.as_bytes()).is_err());
+
+    let mut bad_example_unit = entry1.clone();
+    bad_example_unit.unit = DpUnitV1::ExampleLevel;
+    let bad_unit_bytes = format!("{}\n", serde_json::to_string(&bad_example_unit).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(bad_unit_bytes.as_bytes()).is_err());
+
+    let mut bad_huge_sigma = entry1.clone();
+    bad_huge_sigma.noise_multiplier = 300.0;
+    let bad_sigma_bytes = format!("{}\n", serde_json::to_string(&bad_huge_sigma).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(bad_sigma_bytes.as_bytes()).is_err());
+
+    let mut bad_eps = entry1.clone();
+    bad_eps.converted_epsilon = 0.0001;
+    let bad_eps_bytes = format!("{}\n", serde_json::to_string(&bad_eps).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(bad_eps_bytes.as_bytes()).is_err());
+
+    let mut bad_alpha = entry1.clone();
+    bad_alpha.optimal_alpha += 1.0;
+    let bad_alpha_bytes = format!("{}\n", serde_json::to_string(&bad_alpha).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(bad_alpha_bytes.as_bytes()).is_err());
+
+    let mut bad_tau_drift = entry2.clone();
+    bad_tau_drift.clipping_radius_tau = 2.0;
+    let drift_bytes = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&entry1).unwrap(),
+        serde_json::to_string(&bad_tau_drift).unwrap()
+    );
+    assert!(parse_and_validate_dp_ledger_slice(drift_bytes.as_bytes()).is_err());
+
+    let first_round_not_one = format!("{}\n", serde_json::to_string(&entry2).unwrap());
+    assert!(parse_and_validate_dp_ledger_slice(first_round_not_one.as_bytes()).is_err());
+
+    let mut bad_round_gap = entry2.clone();
+    bad_round_gap.committed_rounds = 3;
+    let gap_bytes = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&entry1).unwrap(),
+        serde_json::to_string(&bad_round_gap).unwrap()
+    );
+    assert!(parse_and_validate_dp_ledger_slice(gap_bytes.as_bytes()).is_err());
+
+    let mut bad_decreasing_orders = entry1.clone();
+    bad_decreasing_orders.receipt_id = hex_lower(&[0xCD; 32]);
+    bad_decreasing_orders.committed_rounds = 3;
+    let decreasing_bytes = format!(
+        "{}\n{}\n{}\n",
+        serde_json::to_string(&entry1).unwrap(),
+        serde_json::to_string(&entry2).unwrap(),
+        serde_json::to_string(&bad_decreasing_orders).unwrap()
+    );
+    assert!(parse_and_validate_dp_ledger_slice(decreasing_bytes.as_bytes()).is_err());
+
+    let mixed_slice = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&entry1).unwrap(),
+        serde_json::to_string(&mixed_exp).unwrap()
+    );
+    assert!(parse_and_validate_dp_ledger_slice(mixed_slice.as_bytes()).is_err());
+
+    // Verify ledger file on disk contains no participant_count / clipped_count / sampled_cohort leakage fields.
+    let raw_ledger = fs::read_to_string(run_dir.join(DP_LEDGER_REL_PATH)).unwrap();
+    assert!(!raw_ledger.contains("participant_count"));
+    assert!(!raw_ledger.contains("clipped_count"));
+    assert!(!raw_ledger.contains("sampled_cohort"));
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -38,10 +38,11 @@ pub use cas::{
 pub use dp_ledger::reconstruct_dp_accountant_from_ledger;
 pub use dp_ledger::{
     append_dp_release_record_durable, derive_dp_receipt_id, parse_and_validate_dp_ledger_slice,
-    pre_release_debit_dp_accountant, read_dp_ledger_entries,
-    reconstruct_dp_accountant_from_committed_head, reconstruct_dp_accountant_from_verified_bundle,
-    CryptoErrorOrIo, DpLedgerEntryV1, DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1,
-    EXPERIMENTAL_DP_CLASSIFICATION_V1,
+    pre_release_debit_dp_accountant, pre_release_debit_verified_dp_accountant,
+    read_dp_ledger_entries, reconstruct_dp_accountant_from_committed_head,
+    reconstruct_dp_accountant_from_verified_bundle, CryptoErrorOrIo, DpLedgerEntryV1,
+    DP_LEDGER_REL_PATH, DP_LEDGER_SCHEMA_V1, EXPERIMENTAL_DP_CLASSIFICATION_V1,
+    VERIFIED_DP_CLASSIFICATION_V1,
 };
 pub(crate) use io::atomic_write as write_bytes_atomic_no_symlink;
 pub use io::{

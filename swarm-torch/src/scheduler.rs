@@ -79,8 +79,8 @@ impl From<GraphValidationError> for SchedulerError {
 /// - [`RunnerIsolationProfile::InProcessTrusted`] executes `ExecutionTrust::Core` nodes in-process.
 /// - [`RunnerIsolationProfile::WasmSandboxedV1`] executes `ExecutionTrust::SandboxedExtension`
 ///   `wasm_transform` nodes strictly through a configured external `WasmExtensionExecutor`
-///   (such as `adapters/swarm-torch-wasm` `wasmi`, currently scoped to `raw_mem0_v0`) and
-///   fails closed if none is attached.
+///   (such as `adapters/swarm-torch-wasm` `wasmi`, supporting `RawMem0V0` and `SwarmTorchAllocV1`)
+///   and fails closed if none is attached.
 /// - [`RunnerIsolationProfile::ExternalSandboxedStub`] remains a fail-closed placeholder stub for
 ///   future OS-level external subprocess isolation of `UnsafeExtension` nodes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -90,7 +90,7 @@ pub enum RunnerIsolationProfile {
     InProcessTrusted,
     /// Fail-closed isolated `wasmi` extension execution (`ExecutionTrust::SandboxedExtension`),
     /// delegating exclusively to the attached [`crate::wasm_sandbox::WasmExtensionExecutor`]
-    /// (`adapters/swarm-torch-wasm`, currently scoped to `raw_mem0_v0`).
+    /// (`adapters/swarm-torch-wasm`, supporting `RawMem0V0` and `SwarmTorchAllocV1`).
     WasmSandboxedV1(crate::wasm_sandbox::SandboxedExtensionPolicyV1),
     /// Placeholder stub for external process isolation (always denied fail-closed).
     ExternalSandboxedStub {

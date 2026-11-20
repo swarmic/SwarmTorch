@@ -5,8 +5,8 @@
 //! > `WasmSandboxError::UnsupportedUntrustedWasmSandbox`. Production `Scheduler`
 //! > (`RunnerIsolationProfile::WasmSandboxedV1`) and `NativeOpRunner` also fail closed with
 //! > `WasmSandboxError::UnsupportedUntrustedWasmSandbox` unless an external [`crate::wasm_sandbox::WasmExtensionExecutor`]
-//! > (such as `adapters/swarm-torch-wasm`, currently scoped to `raw_mem0_v0`) is explicitly attached
-//! > via `NativeOpRunner::with_wasm_executor`. The internal subset interpreter below is kept exclusively
+//! > (such as `adapters/swarm-torch-wasm`, supporting `WasmGuestAbiV1::RawMem0V0` and `WasmGuestAbiV1::SwarmTorchAllocV1`)
+//! > is explicitly attached via `NativeOpRunner::with_wasm_executor`. The internal subset interpreter below is kept exclusively
 //! > behind `#[doc(hidden)]` `WasmSandboxRunnerV1::run_experimental_trusted_test_fixture_only` for unit tests.
 
 use std::collections::BTreeSet;
@@ -28,6 +28,28 @@ pub const DEFAULT_WASM_MAX_START_FUEL: u64 = 10_000;
 
 /// Hard cap on total declared locals per function across all local declaration groups (`ST-09`).
 pub const DEFAULT_WASM_MAX_LOCALS_PER_FUNCTION: usize = 4_096;
+
+/// Canonical guest allocation export required under [`WasmGuestAbiV1::SwarmTorchAllocV1`] (`ADR-0025`).
+pub const SWARMTORCH_WASM_ALLOC_EXPORT_V1: &str = "swarmtorch_alloc";
+
+/// Canonical guest deallocation export required under [`WasmGuestAbiV1::SwarmTorchAllocV1`] (`ADR-0025`).
+pub const SWARMTORCH_WASM_DEALLOC_EXPORT_V1: &str = "swarmtorch_dealloc";
+
+/// Default maximum output byte length allowed for a guest byte-transform return slice (`16 MiB`, `ADR-0025`).
+pub const DEFAULT_WASM_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Guest memory ABI contract governing how host and Wasm guest exchange byte-transform buffers (`ADR-0025`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmGuestAbiV1 {
+    /// Legacy `raw_mem0_v0` ABI (`export(ptr: i32, len: i32) -> i32` writing input at linear memory offset `0`).
+    #[default]
+    RawMem0V0,
+    /// Structured allocator ABI (`swarmtorch_alloc(len: i32) -> i32`,
+    /// `export(in_ptr: i32, in_len: i32) -> i64` packing `(out_ptr << 32) | (out_len & 0xFFFF_FFFF)`,
+    /// `swarmtorch_dealloc(ptr: i32, len: i32)`).
+    SwarmTorchAllocV1,
+}
 
 /// Errors raised during pre-parse verification, static validation, or sandboxed Wasm execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +99,17 @@ pub enum WasmSandboxError {
     ExecutionTimeout { elapsed_ms: u64, limit_ms: u64 },
     /// Division by zero, integer overflow trap, `unreachable`, or call stack overflow.
     ExecutionTrap(String),
+    /// Guest transform export returned a negative status/error code (`ADR-0025`).
+    GuestTransformFailed { export: String, code: i32 },
+    /// Guest output length exceeded [`WasmStoreLimitsV1::max_output_bytes`] (`ADR-0025`).
+    OutputTooLarge { len: usize, max: usize },
+    /// Guest returned an invalid or partially overlapping `(out_ptr, out_len)` buffer alias (`ADR-0025`).
+    OutputAliasingViolation {
+        in_ptr: i32,
+        in_len: i32,
+        out_ptr: i32,
+        out_len: i32,
+    },
 }
 
 impl fmt::Display for WasmSandboxError {
@@ -143,6 +176,24 @@ impl fmt::Display for WasmSandboxError {
                 "wasm execution timed out after {elapsed_ms} ms (limit {limit_ms} ms)"
             ),
             Self::ExecutionTrap(reason) => write!(f, "wasm execution trap: {reason}"),
+            Self::GuestTransformFailed { export, code } => {
+                write!(f, "wasm guest transform '{export}' failed with code {code}")
+            }
+            Self::OutputTooLarge { len, max } => {
+                write!(
+                    f,
+                    "wasm guest output length {len} exceeds max_output_bytes {max}"
+                )
+            }
+            Self::OutputAliasingViolation {
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_len,
+            } => write!(
+                f,
+                "wasm guest output [{out_ptr}..+{out_len}) invalidly aliases input [{in_ptr}..+{in_len})"
+            ),
         }
     }
 }
@@ -151,6 +202,10 @@ impl std::error::Error for WasmSandboxError {}
 
 fn default_max_start_fuel() -> u64 {
     DEFAULT_WASM_MAX_START_FUEL
+}
+
+fn default_max_output_bytes() -> usize {
+    DEFAULT_WASM_MAX_OUTPUT_BYTES
 }
 
 /// Hard resource and isolation limits enforced by [`WasmSandboxRunnerV1`] (`ADR-0018`, `W12-04`).
@@ -171,6 +226,9 @@ pub struct WasmStoreLimitsV1 {
     /// Maximum deterministic fuel allowed during synchronous `start` execution (`Decision A2`).
     #[serde(default = "default_max_start_fuel")]
     pub max_start_fuel: u64,
+    /// Maximum accepted guest output payload size in bytes (`ADR-0025`).
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
     /// Trap immediately instead of returning `-1` when `memory.grow` would exceed `max_memory_pages`.
     pub trap_on_grow_failure: bool,
     /// Advisory wall-clock execution limit matching `RunnerIsolationProfile`.
@@ -187,6 +245,7 @@ impl Default for WasmStoreLimitsV1 {
             max_tables: 1,
             max_fuel: 100_000,
             max_start_fuel: DEFAULT_WASM_MAX_START_FUEL,
+            max_output_bytes: DEFAULT_WASM_MAX_OUTPUT_BYTES,
             trap_on_grow_failure: true,
             timeout_ms: 5_000,
         }
@@ -202,6 +261,9 @@ pub struct SandboxedExtensionPolicyV1 {
     pub allowed_exports: BTreeSet<String>,
     /// Store memory, table, fuel, and grow-trap caps.
     pub limits: WasmStoreLimitsV1,
+    /// Guest memory ABI contract (`RawMem0V0` default or structured `SwarmTorchAllocV1`, `ADR-0025`).
+    #[serde(default)]
+    pub guest_abi: WasmGuestAbiV1,
 }
 
 impl SandboxedExtensionPolicyV1 {
@@ -213,7 +275,14 @@ impl SandboxedExtensionPolicyV1 {
             allowed_module_hashes,
             allowed_exports: BTreeSet::new(),
             limits: WasmStoreLimitsV1::default(),
+            guest_abi: WasmGuestAbiV1::default(),
         }
+    }
+
+    /// Builder method setting the guest memory ABI contract (`ADR-0025`).
+    pub fn with_guest_abi(mut self, guest_abi: WasmGuestAbiV1) -> Self {
+        self.guest_abi = guest_abi;
+        self
     }
 
     /// Compute canonical SHA-256 digest of a raw `.wasm` module binary.
@@ -224,8 +293,9 @@ impl SandboxedExtensionPolicyV1 {
         out
     }
 
-    /// Compute a canonical domain-separated SHA-256 hex digest binding all allowlists and store
-    /// limits so cached `SandboxedExtension` outputs cannot replay across tightened policies.
+    /// Compute a canonical domain-separated SHA-256 hex digest binding all allowlists, store
+    /// limits, and `guest_abi` so cached `SandboxedExtension` outputs cannot replay across
+    /// tightened policies or ABI changes (`ADR-0025`).
     pub fn policy_fingerprint_hex(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"swarmtorch.wasm.policy.v1");
@@ -245,8 +315,14 @@ impl SandboxedExtensionPolicyV1 {
         hasher.update(self.limits.max_tables.to_be_bytes());
         hasher.update(self.limits.max_fuel.to_be_bytes());
         hasher.update(self.limits.max_start_fuel.to_be_bytes());
+        hasher.update((self.limits.max_output_bytes as u64).to_be_bytes());
         hasher.update([u8::from(self.limits.trap_on_grow_failure)]);
         hasher.update(self.limits.timeout_ms.to_be_bytes());
+        let abi_tag: u8 = match self.guest_abi {
+            WasmGuestAbiV1::RawMem0V0 => 0,
+            WasmGuestAbiV1::SwarmTorchAllocV1 => 1,
+        };
+        hasher.update([abi_tag]);
         crate::artifacts::hex_lower(&hasher.finalize())
     }
 }
@@ -331,13 +407,45 @@ pub fn read_guest_slice(memory: &[u8], ptr: i32, len: i32) -> Result<Vec<u8>, Wa
     Ok(memory[start_usize..end_usize].to_vec())
 }
 
+/// Unpack a 64-bit guest return value `packed = ((out_ptr as u32 as u64) << 32) | (out_len as u32 as u64)`
+/// under [`WasmGuestAbiV1::SwarmTorchAllocV1`] (`ADR-0025`).
+///
+/// - If the high 32-bit signed word is negative (`high < 0`), returns
+///   [`WasmSandboxError::GuestTransformFailed`].
+/// - If `high >= 0` and the low 32-bit signed word is negative (`low < 0`), returns
+///   [`WasmSandboxError::OutOfBoundsMemoryAccess`].
+/// - Otherwise returns `Ok((out_ptr, out_len))` with `out_ptr >= 0` and `out_len >= 0`.
+pub fn unpack_guest_ptr_len_i64(packed: i64) -> Result<(i32, i32), WasmSandboxError> {
+    let raw = packed as u64;
+    let high = (raw >> 32) as i32;
+    let low = (raw & 0xFFFF_FFFF) as i32;
+    if high < 0 {
+        let code = if high == -1 && low < 0 { low } else { high };
+        return Err(WasmSandboxError::GuestTransformFailed {
+            export: String::new(),
+            code,
+        });
+    }
+    if low < 0 {
+        return Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+            addr: high as u64,
+            len: (low as u32) as usize,
+            mem_len: 0,
+        });
+    }
+    Ok((high, low))
+}
+
 /// Narrow execution boundary for an isolated external WebAssembly sandbox runtime (`ST-09`).
 ///
 /// Implemented outside `swarm-torch` by `adapters/swarm-torch-wasm` using `wasmi`, while keeping
 /// `swarm-torch` dependency-free and fail-closed whenever no executor is configured.
 pub trait WasmExtensionExecutor: Send + Sync {
-    /// Execute a sandboxed byte-transform Wasm extension (`export(ptr: i32, len: i32) -> i32`)
-    /// under `policy`, enforcing fuel, wall-clock timeout, memory/table limits, and SHA-256 pinning.
+    /// Execute a sandboxed byte-transform Wasm extension under `policy`, dispatching according to
+    /// [`SandboxedExtensionPolicyV1::guest_abi`] ([`WasmGuestAbiV1::RawMem0V0`]
+    /// `export(ptr: i32, len: i32) -> i32` or [`WasmGuestAbiV1::SwarmTorchAllocV1`]
+    /// `export(in_ptr: i32, in_len: i32) -> i64` with `swarmtorch_alloc`/`swarmtorch_dealloc`),
+    /// enforcing fuel, wall-clock timeout, memory/table/output limits, and SHA-256 pinning.
     fn execute_byte_transform(
         &self,
         policy: &SandboxedExtensionPolicyV1,
@@ -404,6 +512,9 @@ pub fn preflight_wasm_extension_v1(
     }
     if export_name.is_empty()
         || (!policy.allowed_exports.is_empty() && !policy.allowed_exports.contains(export_name))
+        || (policy.guest_abi == WasmGuestAbiV1::SwarmTorchAllocV1
+            && (export_name == SWARMTORCH_WASM_ALLOC_EXPORT_V1
+                || export_name == SWARMTORCH_WASM_DEALLOC_EXPORT_V1))
     {
         return Err(WasmSandboxError::ExportNotAllowed(export_name.to_string()));
     }
@@ -432,10 +543,13 @@ pub(crate) fn wasm_error_to_io(err: WasmSandboxError) -> std::io::Error {
         | WasmSandboxError::MemoryLimitExceeded { .. }
         | WasmSandboxError::TableLimitExceeded { .. }
         | WasmSandboxError::ExportSignatureMismatch(_)
-        | WasmSandboxError::OutOfBoundsMemoryAccess { .. } => io::ErrorKind::InvalidInput,
+        | WasmSandboxError::OutOfBoundsMemoryAccess { .. }
+        | WasmSandboxError::OutputTooLarge { .. }
+        | WasmSandboxError::OutputAliasingViolation { .. } => io::ErrorKind::InvalidInput,
         WasmSandboxError::OutOfFuel { .. }
         | WasmSandboxError::MemoryGrowTrap { .. }
-        | WasmSandboxError::ExecutionTrap(_) => io::ErrorKind::Other,
+        | WasmSandboxError::ExecutionTrap(_)
+        | WasmSandboxError::GuestTransformFailed { .. } => io::ErrorKind::Other,
     };
     io::Error::new(kind, err.to_string())
 }
@@ -2242,5 +2356,256 @@ mod tests {
                 limit: 0,
             }
         );
+    }
+
+    #[test]
+    fn wave16c_guest_abi_v1_policy_fingerprint_json_compat_and_unpack_ptr_len_i64() {
+        // Default JSON deserialization preserves RawMem0V0 and DEFAULT_WASM_MAX_OUTPUT_BYTES.
+        let default_policy = SandboxedExtensionPolicyV1::default();
+        assert_eq!(default_policy.guest_abi, WasmGuestAbiV1::RawMem0V0);
+        assert_eq!(
+            default_policy.limits.max_output_bytes,
+            DEFAULT_WASM_MAX_OUTPUT_BYTES
+        );
+
+        let alloc_policy = default_policy
+            .clone()
+            .with_guest_abi(WasmGuestAbiV1::SwarmTorchAllocV1);
+        assert_ne!(
+            default_policy.policy_fingerprint_hex(),
+            alloc_policy.policy_fingerprint_hex()
+        );
+        let serialized = serde_json::to_string(&alloc_policy).unwrap();
+        assert!(serialized.contains("\"swarm_torch_alloc_v1\""));
+        let roundtrip: SandboxedExtensionPolicyV1 = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip, alloc_policy);
+
+        let mut smaller_out_policy = alloc_policy.clone();
+        smaller_out_policy.limits.max_output_bytes = 1_024;
+        assert_ne!(
+            alloc_policy.policy_fingerprint_hex(),
+            smaller_out_policy.policy_fingerprint_hex()
+        );
+
+        // unpack_guest_ptr_len_i64 valid cases
+        let packed = ((4096u64) << 32) | 20u64;
+        assert_eq!(unpack_guest_ptr_len_i64(packed as i64), Ok((4096, 20)));
+        assert_eq!(unpack_guest_ptr_len_i64(0), Ok((0, 0)));
+        assert_eq!(
+            unpack_guest_ptr_len_i64(((i32::MAX as u64) << 32 | (i32::MAX as u64)) as i64),
+            Ok((i32::MAX, i32::MAX))
+        );
+
+        // Negative sign-extended i64 error code (-7i64 -> high = -1, low = -7 -> code = -7)
+        assert_eq!(
+            unpack_guest_ptr_len_i64(-7i64),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: -7,
+            })
+        );
+        // Packed negative high word ((-9i32 as u32 as u64) << 32 -> code = -9)
+        let neg_high = ((-9i32 as u32 as u64) << 32) as i64;
+        assert_eq!(
+            unpack_guest_ptr_len_i64(neg_high),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: -9,
+            })
+        );
+        // Negative low word with non-negative high word -> OutOfBoundsMemoryAccess
+        let neg_low = ((4096u64 << 32) | 0x8000_0000u64) as i64;
+        assert!(matches!(
+            unpack_guest_ptr_len_i64(neg_low),
+            Err(WasmSandboxError::OutOfBoundsMemoryAccess { addr: 4096, .. })
+        ));
+    }
+
+    #[test]
+    fn wave16c_adversarial_unpack_i64_wasm_error_to_io_and_reserved_export_preflight() {
+        // 1. Boundary unpack_guest_ptr_len_i64 edge values
+        assert_eq!(
+            unpack_guest_ptr_len_i64(-1i64),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: -1,
+            })
+        );
+        assert_eq!(
+            unpack_guest_ptr_len_i64(i64::from(i32::MIN)),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: i32::MIN,
+            })
+        );
+        assert_eq!(
+            unpack_guest_ptr_len_i64(i64::MIN),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: i32::MIN,
+            })
+        );
+        assert_eq!(
+            unpack_guest_ptr_len_i64(((-1i32 as u32 as u64) << 32 | 5u64) as i64),
+            Err(WasmSandboxError::GuestTransformFailed {
+                export: String::new(),
+                code: -1,
+            })
+        );
+        assert!(matches!(
+            unpack_guest_ptr_len_i64(i64::MAX),
+            Err(WasmSandboxError::OutOfBoundsMemoryAccess {
+                addr,
+                len,
+                mem_len: 0,
+            }) if addr == i32::MAX as u64 && len == u32::MAX as usize
+        ));
+        assert_eq!(unpack_guest_ptr_len_i64((1u64 << 32) as i64), Ok((1, 0)));
+
+        // 2. Explicit max_output_bytes == 0 deserializes as 0 (not overwritten by default 16 MiB)
+        let zero_out_json = r#"{
+            "allowed_module_hashes": [],
+            "allowed_exports": [],
+            "guest_abi": "swarm_torch_alloc_v1",
+            "limits": {
+                "max_module_bytes": 1048576,
+                "max_memory_pages": 16,
+                "max_table_elements": 1024,
+                "max_memories": 1,
+                "max_tables": 1,
+                "max_fuel": 100000,
+                "max_output_bytes": 0,
+                "trap_on_grow_failure": true,
+                "timeout_ms": 5000
+            }
+        }"#;
+        let parsed: SandboxedExtensionPolicyV1 = serde_json::from_str(zero_out_json).unwrap();
+        assert_eq!(parsed.guest_abi, WasmGuestAbiV1::SwarmTorchAllocV1);
+        assert_eq!(parsed.limits.max_output_bytes, 0);
+        assert_eq!(parsed.limits.max_start_fuel, DEFAULT_WASM_MAX_START_FUEL);
+
+        // Invalid guest_abi string fails closed during JSON deserialization
+        let bad_abi_json = zero_out_json.replace("swarm_torch_alloc_v1", "unknown_abi_v9");
+        assert!(serde_json::from_str::<SandboxedExtensionPolicyV1>(&bad_abi_json).is_err());
+
+        // 3. wasm_error_to_io mapping & Display coverage for all three ADR-0025 error variants
+        let io_fail = wasm_error_to_io(WasmSandboxError::GuestTransformFailed {
+            export: "transform".to_string(),
+            code: -42,
+        });
+        assert_eq!(io_fail.kind(), std::io::ErrorKind::Other);
+        assert!(io_fail.to_string().contains("-42"));
+
+        let io_big = wasm_error_to_io(WasmSandboxError::OutputTooLarge {
+            len: 2048,
+            max: 1024,
+        });
+        assert_eq!(io_big.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(io_big.to_string().contains("2048"));
+
+        let io_alias = wasm_error_to_io(WasmSandboxError::OutputAliasingViolation {
+            in_ptr: 4096,
+            in_len: 100,
+            out_ptr: 4106,
+            out_len: 20,
+        });
+        assert_eq!(io_alias.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(io_alias.to_string().contains("4106"));
+
+        // 4. Canonical preflight_wasm_extension_v1 must reject reserved ABI lifecycle exports
+        //    under SwarmTorchAllocV1 (prevents Scheduler admission, scalar bypass, and pre-validation start execution).
+        let dummy_mod = build_single_export_wasm(&[0x7f], &[0x7f], None, 0, "id", &[0x20, 0x00]);
+        let dummy_hash = SandboxedExtensionPolicyV1::sha256_module(&dummy_mod);
+        let alloc_policy = SandboxedExtensionPolicyV1::with_allowed_hash(dummy_hash)
+            .with_guest_abi(WasmGuestAbiV1::SwarmTorchAllocV1);
+        for reserved in [
+            SWARMTORCH_WASM_ALLOC_EXPORT_V1,
+            SWARMTORCH_WASM_DEALLOC_EXPORT_V1,
+        ] {
+            let err = preflight_wasm_extension_v1(&alloc_policy, &dummy_mod, reserved).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WasmSandboxError::ExportNotAllowed(ref name)
+                        | WasmSandboxError::ExportSignatureMismatch(ref name)
+                        if name == reserved
+                ),
+                "preflight must reject reserved ABI export '{reserved}' under SwarmTorchAllocV1, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wave16c_signoff_allowed_exports_reserved_override_rawmem0_compat_and_node_resolver() {
+        use std::collections::BTreeMap;
+        use swarm_torch_core::run_graph::{CanonParams, CanonValue};
+
+        let dummy_mod =
+            build_single_export_wasm(&[0x7f], &[0x7f], None, 0, "transform", &[0x20, 0x00]);
+        let dummy_hash = SandboxedExtensionPolicyV1::sha256_module(&dummy_mod);
+        let dummy_hex = crate::artifacts::hex_lower(&dummy_hash);
+
+        // 1. Even if a caller explicitly lists reserved ABI exports inside `allowed_exports`,
+        //    `preflight_wasm_extension_v1` MUST still reject them under SwarmTorchAllocV1.
+        let mut policy_explicit_reserved =
+            SandboxedExtensionPolicyV1::with_allowed_hash(dummy_hash)
+                .with_guest_abi(WasmGuestAbiV1::SwarmTorchAllocV1);
+        policy_explicit_reserved
+            .allowed_exports
+            .insert(SWARMTORCH_WASM_ALLOC_EXPORT_V1.to_string());
+        policy_explicit_reserved
+            .allowed_exports
+            .insert(SWARMTORCH_WASM_DEALLOC_EXPORT_V1.to_string());
+        for reserved in [
+            SWARMTORCH_WASM_ALLOC_EXPORT_V1,
+            SWARMTORCH_WASM_DEALLOC_EXPORT_V1,
+        ] {
+            assert_eq!(
+                preflight_wasm_extension_v1(&policy_explicit_reserved, &dummy_mod, reserved)
+                    .unwrap_err(),
+                WasmSandboxError::ExportNotAllowed(reserved.to_string())
+            );
+        }
+
+        // 2. Non-empty `allowed_exports = {"transform"}` (omitting lifecycle exports) passes preflight.
+        let mut policy_transform_only = SandboxedExtensionPolicyV1::with_allowed_hash(dummy_hash)
+            .with_guest_abi(WasmGuestAbiV1::SwarmTorchAllocV1);
+        policy_transform_only
+            .allowed_exports
+            .insert("transform".to_string());
+        assert_eq!(
+            preflight_wasm_extension_v1(&policy_transform_only, &dummy_mod, "transform").unwrap(),
+            dummy_hash
+        );
+
+        // 3. Legacy RawMem0V0 does NOT reserve `swarmtorch_alloc`/`swarmtorch_dealloc` export names.
+        let raw_policy = SandboxedExtensionPolicyV1::with_allowed_hash(dummy_hash);
+        assert_eq!(
+            preflight_wasm_extension_v1(&raw_policy, &dummy_mod, SWARMTORCH_WASM_ALLOC_EXPORT_V1)
+                .unwrap(),
+            dummy_hash
+        );
+
+        // 4. Canonical `resolve_and_preflight_wasm_node_v1` (used by Scheduler + NativeOpRunner)
+        //    rejects reserved ABI exports under SwarmTorchAllocV1 with PermissionDenied.
+        let mut registry = BTreeMap::new();
+        registry.insert(dummy_hash, dummy_mod);
+        let alloc_policy = SandboxedExtensionPolicyV1::with_allowed_hash(dummy_hash)
+            .with_guest_abi(WasmGuestAbiV1::SwarmTorchAllocV1);
+        for reserved in [
+            SWARMTORCH_WASM_ALLOC_EXPORT_V1,
+            SWARMTORCH_WASM_DEALLOC_EXPORT_V1,
+        ] {
+            let mut params = CanonParams::new();
+            params.insert(
+                "module_sha256".to_string(),
+                CanonValue::Str(dummy_hex.clone()),
+            );
+            params.insert("export".to_string(), CanonValue::Str(reserved.to_string()));
+            let err =
+                resolve_and_preflight_wasm_node_v1(&alloc_policy, &params, &registry).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains(reserved));
+        }
     }
 }

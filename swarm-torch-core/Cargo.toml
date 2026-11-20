@@ -22,7 +22,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["std", "robust-aggregation"]
-std = ["alloc", "serde/std", "postcard/use-std", "sha2/std"]
+std = ["alloc", "serde/std", "postcard/use-std", "sha2/std", "dep:getrandom"]
 alloc = ["serde/alloc"]
 
 # Robust aggregation algorithms
@@ -45,6 +45,8 @@ defmt = { workspace = true, optional = true }
 
 # no_std compatible random
 rand_core = { version = "0.6", default-features = false }
+# OS CSPRNG (std-only; used for certified DpFedAvgV1 noise & Poisson cohort entropy)
+getrandom = { version = "0.2.17", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

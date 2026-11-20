@@ -603,6 +603,206 @@ fn sha256_counter_drbg_rejects_zero_bound() {
 }
 
 #[test]
+fn sha256_counter_drbg_lemire_bound_7_and_u128_uniformity_match_exact_arithmetic_oracle() {
+    // Independent arithmetic oracle for 32-bit Lemire rejection on bound = 7:
+    // 2^32 = 4_294_967_296 = 613_566_756 * 7 + 4 => exact threshold is 4 (NOT 2^64 % 7 = 2).
+    let s: u64 = 7;
+    let exact_threshold: u64 = (1u64 << 32) % s;
+    assert_eq!(exact_threshold, 4);
+
+    // Count exact accepted 32-bit inputs per output bucket r in 0..7 under Lemire mapping:
+    // An input x in [0, 2^32) maps to output r = floor(x * 7 / 2^32) with low 32 bits l = (x * 7) mod 2^32.
+    // For each bucket r, x * 7 lies in [r * 2^32, (r + 1) * 2^32), and x is accepted iff l >= threshold.
+    let mut bucket_counts = [0u64; 7];
+    for (r, slot) in bucket_counts.iter_mut().enumerate() {
+        let low = (r as u64) * (1u64 << 32) + exact_threshold;
+        let high_excl = ((r as u64) + 1) * (1u64 << 32);
+        // Count integers x such that low <= 7*x < high_excl.
+        let x_min = low.div_ceil(s);
+        let x_max_excl = high_excl.div_ceil(s);
+        *slot = x_max_excl - x_min;
+    }
+    assert_eq!(bucket_counts, [613_566_756; 7]);
+
+    // Verify Sha256CounterDrbgV1::uniform_u32_bounded(7) matches the exact Lemire rejection oracle
+    // word-for-word against raw next_u32() draws (including rejecting any draw where l < 4).
+    let seed = [0x5A; 32];
+    let domain = b"swarmtorch.test.lemire.oracle";
+    let mut bounded_drbg = Sha256CounterDrbgV1::new(domain, seed, 7, 0);
+    let mut raw_drbg = Sha256CounterDrbgV1::new(domain, seed, 7, 0);
+    for _ in 0..256 {
+        let expected = loop {
+            let x = raw_drbg.next_u32() as u64;
+            let m = x * s;
+            if (m as u32 as u64) >= exact_threshold {
+                break (m >> 32) as u32;
+            }
+        };
+        assert_eq!(bounded_drbg.uniform_u32_bounded(7), expected);
+    }
+
+    // Verify uniform_u128_bounded exact rejection oracle against raw next_u128() draws.
+    let bound_128: u128 = 7;
+    let threshold_128 = bound_128.wrapping_neg() % bound_128;
+    // 2^128 mod 7 = (2^3)^42 * 2^2 mod 7 = 1 * 4 = 4.
+    assert_eq!(threshold_128, 4);
+    let mut bounded_128 = Sha256CounterDrbgV1::new(domain, seed, 128, 7);
+    let mut raw_128 = Sha256CounterDrbgV1::new(domain, seed, 128, 7);
+    assert_eq!(bounded_128.uniform_u128_bounded(1), 0);
+    for _ in 0..64 {
+        let expected = loop {
+            let x = raw_128.next_u128();
+            if x >= threshold_128 {
+                break x % bound_128;
+            }
+        };
+        assert_eq!(bounded_128.uniform_u128_bounded(bound_128), expected);
+    }
+}
+
+#[test]
+#[should_panic(expected = "uniform_u128_bounded requires bound >= 1")]
+fn sha256_counter_drbg_rejects_zero_u128_bound() {
+    let mut drbg = Sha256CounterDrbgV1::new(b"swarmtorch.test.zero128", [0x22; 32], 0, 0);
+    let _ = drbg.uniform_u128_bounded(0);
+}
+
+#[test]
+fn sha256_counter_drbg_u128_boundaries_and_rejection_paths_match_exact_oracle() {
+    let seed = [0xA5; 32];
+    let domain = b"swarmtorch.test.u128.boundaries";
+
+    // 1. Verify next_u128() little-endian composition against next_u64() and four next_u32()
+    // words, both block-aligned and shifted by one u32 to exercise block-straddling reads.
+    let mut u128_aligned = Sha256CounterDrbgV1::new(domain, seed, 1, 2);
+    let mut u64_aligned = Sha256CounterDrbgV1::new(domain, seed, 1, 2);
+    let mut u32_aligned = Sha256CounterDrbgV1::new(domain, seed, 1, 2);
+    for _ in 0..8 {
+        let lo64 = u64_aligned.next_u64() as u128;
+        let hi64 = u64_aligned.next_u64() as u128;
+        let w0 = u32_aligned.next_u32() as u128;
+        let w1 = u32_aligned.next_u32() as u128;
+        let w2 = u32_aligned.next_u32() as u128;
+        let w3 = u32_aligned.next_u32() as u128;
+        let got = u128_aligned.next_u128();
+        assert_eq!(got, lo64 | (hi64 << 64));
+        assert_eq!(got, w0 | (w1 << 32) | (w2 << 64) | (w3 << 96));
+    }
+    let _ = u128_aligned.next_u32();
+    let _ = u64_aligned.next_u32();
+    for _ in 0..4 {
+        let expected = (u64_aligned.next_u64() as u128) | ((u64_aligned.next_u64() as u128) << 64);
+        assert_eq!(u128_aligned.next_u128(), expected);
+    }
+
+    // 2. bound == 1 returns 0 without advancing DRBG state.
+    let mut one_drbg = Sha256CounterDrbgV1::new(domain, seed, 2, 1);
+    assert_eq!(one_drbg.uniform_u128_bounded(1), 0);
+    assert_eq!(one_drbg.counter, 0);
+    assert_eq!(one_drbg.offset, 32);
+
+    // 3. Power-of-two bounds (2^k) have threshold == 0 and consume exactly 1 draw (x & (2^k - 1)).
+    for shift in [1u32, 7, 32, 64, 127] {
+        let bound = 1u128 << shift;
+        assert_eq!(bound.wrapping_neg() % bound, 0);
+        let mut bounded = Sha256CounterDrbgV1::new(domain, seed, 3, shift as u64);
+        let mut raw = Sha256CounterDrbgV1::new(domain, seed, 3, shift as u64);
+        for _ in 0..16 {
+            assert_eq!(
+                bounded.uniform_u128_bounded(bound),
+                raw.next_u128() & (bound - 1)
+            );
+        }
+        assert_eq!(bounded.counter, raw.counter);
+        assert_eq!(bounded.offset, raw.offset);
+    }
+
+    // 4. bound == u128::MAX has threshold == 1: rejects x == 0, maps x == u128::MAX -> 0,
+    // and preserves x in 1..=(u128::MAX - 1).
+    assert_eq!(u128::MAX.wrapping_neg() % u128::MAX, 1);
+    let mut max_bounded = Sha256CounterDrbgV1::new(domain, seed, 4, 0);
+    let mut max_raw = Sha256CounterDrbgV1::new(domain, seed, 4, 0);
+    for _ in 0..32 {
+        let expected = loop {
+            let x = max_raw.next_u128();
+            if x >= 1 {
+                break x % u128::MAX;
+            }
+        };
+        let got = max_bounded.uniform_u128_bounded(u128::MAX);
+        assert!(got < u128::MAX);
+        assert_eq!(got, expected);
+    }
+    let mut synth_max = Sha256CounterDrbgV1::new(domain, seed, 4, 1);
+    synth_max.counter = 1;
+    synth_max.offset = 0;
+    synth_max.block[0..16].copy_from_slice(&0u128.to_le_bytes()); // rejected (< 1)
+    synth_max.block[16..32].copy_from_slice(&u128::MAX.to_le_bytes()); // accepted -> 0
+    assert_eq!(synth_max.uniform_u128_bounded(u128::MAX), 0);
+    assert_eq!(synth_max.offset, 32);
+    assert_eq!(synth_max.counter, 1);
+
+    synth_max.offset = 0;
+    synth_max.block[0..16].copy_from_slice(&1u128.to_le_bytes());
+    synth_max.block[16..32].copy_from_slice(&(u128::MAX - 1).to_le_bytes());
+    assert_eq!(synth_max.uniform_u128_bounded(u128::MAX), 1);
+    assert_eq!(synth_max.uniform_u128_bounded(u128::MAX), u128::MAX - 1);
+
+    // 5. Worst-case rejection bound (2^127 + 1, threshold = 2^127 - 1, ~50% rejection rate)
+    // exercises the rejection loop live and verifies exact threshold boundary (threshold - 1 rejected,
+    // threshold accepted).
+    let worst_bound = (1u128 << 127) + 1;
+    let worst_threshold = (1u128 << 127) - 1;
+    assert_eq!(worst_bound.wrapping_neg() % worst_bound, worst_threshold);
+    let mut worst_bounded = Sha256CounterDrbgV1::new(domain, seed, 5, 0);
+    let mut worst_raw = Sha256CounterDrbgV1::new(domain, seed, 5, 0);
+    let mut rejections = 0usize;
+    for _ in 0..64 {
+        let expected = loop {
+            let x = worst_raw.next_u128();
+            if x >= worst_threshold {
+                break x % worst_bound;
+            }
+            rejections += 1;
+        };
+        assert_eq!(worst_bounded.uniform_u128_bounded(worst_bound), expected);
+    }
+    assert!(
+        rejections > 0,
+        "worst-case bound 2^127 + 1 must exercise u128 rejection branch"
+    );
+    let mut synth_thresh = Sha256CounterDrbgV1::new(domain, seed, 5, 1);
+    synth_thresh.counter = 1;
+    synth_thresh.offset = 0;
+    synth_thresh.block[0..16].copy_from_slice(&(worst_threshold - 1).to_le_bytes()); // rejected
+    synth_thresh.block[16..32].copy_from_slice(&worst_threshold.to_le_bytes()); // accepted
+    assert_eq!(
+        synth_thresh.uniform_u128_bounded(worst_bound),
+        worst_threshold
+    );
+    assert_eq!(synth_thresh.offset, 32);
+
+    // 6. Synthetic exact Lemire bound = 7 rejection boundary on uniform_u32_bounded(7):
+    // All four inputs with l = (x * 7) mod 2^32 in {0, 1, 2, 3} (including l = 2 and l = 3 that
+    // the buggy 2^64 % 7 = 2 threshold would have accepted) MUST be rejected, and l = 4 accepted.
+    let mut synth_lemire = Sha256CounterDrbgV1::new(domain, seed, 6, 0);
+    synth_lemire.counter = 1;
+    synth_lemire.offset = 0;
+    let crafted_u32s: [u32; 5] = [
+        0,             // 0 * 7 = 0 * 2^32 + 0  (l = 0 < 4 -> reject)
+        3_067_833_783, // * 7 = 5 * 2^32 + 1    (l = 1 < 4 -> reject)
+        1_840_700_270, // * 7 = 3 * 2^32 + 2    (l = 2 < 4 -> reject; buggy threshold=2 accepted!)
+        613_566_757,   // * 7 = 1 * 2^32 + 3    (l = 3 < 4 -> reject; buggy threshold=2 accepted!)
+        3_681_400_540, // * 7 = 6 * 2^32 + 4    (l = 4 >= 4 -> accept -> bucket 6)
+    ];
+    for (i, word) in crafted_u32s.iter().enumerate() {
+        synth_lemire.block[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    }
+    assert_eq!(synth_lemire.uniform_u32_bounded(7), 6);
+    assert_eq!(synth_lemire.offset, 20);
+}
+
+#[test]
 #[should_panic(expected = "Sha256CounterDrbgV1 64-bit block counter overflow")]
 fn sha256_counter_drbg_panics_instead_of_wrapping_on_counter_overflow() {
     let mut drbg = Sha256CounterDrbgV1::new(b"swarmtorch.test.overflow", [0x11; 32], 0, 0);

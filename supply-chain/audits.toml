@@ -13,6 +13,12 @@ criteria = "safe-to-deploy"
 version = "1.1.0"
 notes = "Wave 13B-2 (ST-05) first-party audit of sync FileExt/try_lock/unlock wrapper (rustix flock / Win32 LockFileEx)"
 
+[[audits.getrandom]]
+who = "swarmic <swarmflow.io@gmail.com>"
+criteria = "safe-to-deploy"
+version = "0.2.17"
+notes = "Wave 16 (16A-2 / ST-02) first-party registry inspection of getrandom 0.2.17 (MIT OR Apache-2.0, Rust 2018; BCryptGenRandom on Windows, SYS_getrandom/urandom on Linux, getentropy on macOS/BSD, EINTR-retrying exact fills; zero new transitive crates beyond already-locked cfg-if/libc/wasi)"
+
 [[audits.portable-atomic]]
 who = "swarmic <swarmflow.io@gmail.com>"
 criteria = "safe-to-deploy"

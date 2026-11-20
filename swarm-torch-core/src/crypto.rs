@@ -872,6 +872,31 @@ impl Sha256CounterDrbgV1 {
         lo | (hi << 32)
     }
 
+    /// Return the next 128-bit little-endian word composed from two 64-bit words.
+    pub fn next_u128(&mut self) -> u128 {
+        let lo = self.next_u64() as u128;
+        let hi = self.next_u64() as u128;
+        lo | (hi << 64)
+    }
+
+    /// Unbiased integer in `0..bound` (`bound >= 1`) via exact 128-bit rejection sampling
+    /// (`threshold = 2^128 mod bound = bound.wrapping_neg() % bound`).
+    pub fn uniform_u128_bounded(&mut self, bound: u128) -> u128 {
+        assert!(bound >= 1, "uniform_u128_bounded requires bound >= 1");
+        if bound == 1 {
+            return 0;
+        }
+        // In 128-bit arithmetic, `bound.wrapping_neg()` equals `2^128 - bound` for `bound >= 1`,
+        // so `threshold = (2^128 - bound) % bound == 2^128 % bound`.
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let x = self.next_u128();
+            if x >= threshold {
+                return x % bound;
+            }
+        }
+    }
+
     /// Return an exact 53-bit dyadic uniform float in `[0.0, 1.0)`.
     pub fn next_f64_unit_half_open(&mut self) -> f64 {
         const INV_TWO_POW_53: f64 = 1.0 / ((1u64 << 53) as f64);

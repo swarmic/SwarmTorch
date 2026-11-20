@@ -157,9 +157,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Non-IID Byzantine Resilience (`W11-01`, `ADR-0019`):**
   - Stateful `CenteredClipping` (`CClip`) with explicit reference-iterate contract (`aggregate_with_center` / `aggregate_with_center_bounded`), $\tau$-scaled empty-round stability, and `f64` norm/update accumulation.
-  - Deterministic `BucketingConfig` / `aggregate_with_bucketing_v1` using `ChaCha8Rng` Fisher-Yates shuffling (`domain: "swarmtorch.sbucket.v1"`) with `f64` bucket averaging.
+  - Deterministic `BucketingConfig` / `aggregate_with_bucketing_v1` using `Sha256CounterDrbgV1` Fisher-Yates shuffling (`domain: "swarmtorch.sbucketing.perm.v1"`) with `f64` bucket averaging.
 - **Verifiable `SharedSeedSparse` Co-Design (`W11-02`, `ADR-0021`):**
-  - `SharedSeedSparsePayloadV1` / `SharedSeedResidualCompressor` (`ChaCha8Rng` partial Fisher-Yates index derivation from `(round_id, peer_id, session_nonce)` under `"swarmtorch.shared_seed_sparse.v1"`), eliminating per-index wire overhead (`4k` bytes vs `8k` bytes).
+  - `SharedSeedSparsePayloadV1` / `SharedSeedResidualCompressor` (`Sha256CounterDrbgV1` + Robert Floyd $\mathcal{O}(k)$ index selection `sample_shared_indices_v1` under `"swarmtorch.shared_sparse.seed.v1"`), eliminating per-index wire overhead (`4k` bytes vs `8k` bytes).
   - `SharedSeedCoordinateVerifier` (`UpdateTransform`) verifying canonical strictly-ascending PRNG coordinate indices prior to Byzantine distance evaluation.
 - **Low-MTU Chunked Framing & Concrete Transports (`W11-03`, `ADR-0004`, `ADR-0022`):**
   - 16-byte `ChunkHeaderV1` (`CRC-16/IBM-3740` CCITT-FALSE) and `ChunkedFrameCodec` reassembly pool (`MAX_CONCURRENT_REASSEMBLIES = 32`, `MAX_CHUNKS_PER_MESSAGE = 256`, bitmap deduplication, conflict eviction, and lazy TTL sweep) for LoRa/BLE/UDP links.

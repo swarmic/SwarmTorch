@@ -518,3 +518,94 @@ fn envelope_v2_and_handshake_v2_bind_run_policy_and_session_id() {
         Err(CryptoError::VerificationFailed)
     );
 }
+
+#[test]
+fn sha256_counter_drbg_is_deterministic_domain_separated_and_bounded() {
+    let seed = [0x42u8; 32];
+    let domain = b"swarmtorch.test.domain.a";
+    let mut a = Sha256CounterDrbgV1::new(domain, seed, 10, 2);
+    let mut a2 = Sha256CounterDrbgV1::new(domain, seed, 10, 2);
+    let mut diff_domain = Sha256CounterDrbgV1::new(b"swarmtorch.test.domain.b", seed, 10, 2);
+    let mut diff_param_a = Sha256CounterDrbgV1::new(domain, seed, 11, 2);
+    let mut diff_param_b = Sha256CounterDrbgV1::new(domain, seed, 10, 3);
+
+    // Independent SHA-256 known-answer test across block counter = 0 and counter = 1 (16 words).
+    for counter in 0u64..2 {
+        let mut h = Sha256::new();
+        h.update(domain);
+        h.update(seed);
+        h.update(10u64.to_le_bytes());
+        h.update(2u64.to_le_bytes());
+        h.update(counter.to_le_bytes());
+        let expected_block = h.finalize();
+        for chunk in expected_block.chunks_exact(4) {
+            let expected_word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let wa = a.next_u32();
+            assert_eq!(wa, expected_word);
+            assert_eq!(wa, a2.next_u32());
+            assert_ne!(wa, diff_domain.next_u32());
+            assert_ne!(wa, diff_param_a.next_u32());
+            assert_ne!(wa, diff_param_b.next_u32());
+        }
+    }
+
+    // Verify next_u64() little-endian word composition against two next_u32() draws.
+    let mut u64_drbg = Sha256CounterDrbgV1::new(domain, seed, 7, 9);
+    let mut u32_drbg = Sha256CounterDrbgV1::new(domain, seed, 7, 9);
+    for _ in 0..8 {
+        let lo = u32_drbg.next_u32() as u64;
+        let hi = u32_drbg.next_u32() as u64;
+        assert_eq!(u64_drbg.next_u64(), lo | (hi << 32));
+    }
+
+    // Verify uniform_u32_inclusive(u32::MAX) consumes 1 draw with threshold == 0.
+    let mut max_inc_drbg = Sha256CounterDrbgV1::new(domain, seed, 1, 1);
+    let mut raw_drbg = Sha256CounterDrbgV1::new(domain, seed, 1, 1);
+    for _ in 0..16 {
+        assert_eq!(
+            max_inc_drbg.uniform_u32_inclusive(u32::MAX),
+            raw_drbg.next_u32()
+        );
+    }
+
+    // Regression test for Lemire 32-bit threshold (2^32 % s, NOT 2^64 % s):
+    // For bound = 2^32 - 65535 = 4_294_901_761, true threshold is 65_535 (~1.000015 draws/sample),
+    // whereas buggy 2^64 % s = 4_294_836_225 spun ~32,768 draws/sample.
+    let mut large_bound_drbg = Sha256CounterDrbgV1::new(domain, seed, 99, 100);
+    let large_bound: u32 = 4_294_901_761;
+    for _ in 0..16 {
+        let v = large_bound_drbg.uniform_u32_bounded(large_bound);
+        assert!(v < large_bound);
+    }
+    assert!(
+        large_bound_drbg.counter <= 4,
+        "Lemire 32-bit rejection should consume ~2 blocks (<=4) for 16 draws, consumed {} blocks",
+        large_bound_drbg.counter
+    );
+
+    assert_eq!(a.uniform_u32_bounded(1), 0);
+    assert_eq!(a.uniform_u32_inclusive(0), 0);
+    for _ in 0..128 {
+        assert!(a.uniform_u32_bounded(7) < 7);
+        assert!(a.uniform_u32_inclusive(7) <= 7);
+        let u = a.next_f64_unit_half_open();
+        assert!(u.is_finite() && (0.0..1.0).contains(&u));
+        let s = a.next_f64_signed_unit();
+        assert!(s.is_finite() && (-1.0..1.0).contains(&s));
+    }
+}
+
+#[test]
+#[should_panic(expected = "uniform_u32_bounded requires bound >= 1")]
+fn sha256_counter_drbg_rejects_zero_bound() {
+    let mut drbg = Sha256CounterDrbgV1::new(b"swarmtorch.test.zero", [0x22; 32], 0, 0);
+    let _ = drbg.uniform_u32_bounded(0);
+}
+
+#[test]
+#[should_panic(expected = "Sha256CounterDrbgV1 64-bit block counter overflow")]
+fn sha256_counter_drbg_panics_instead_of_wrapping_on_counter_overflow() {
+    let mut drbg = Sha256CounterDrbgV1::new(b"swarmtorch.test.overflow", [0x11; 32], 0, 0);
+    drbg.counter = u64::MAX;
+    let _ = drbg.next_u32();
+}

@@ -685,70 +685,6 @@ fn canonical_f32_bits(v: f32) -> core::result::Result<u32, CompressionError> {
     }
 }
 
-#[cfg(feature = "alloc")]
-struct SharedSparseWordStream {
-    seed: [u8; 32],
-    d: u64,
-    k: u64,
-    counter: u64,
-    block: [u8; 32],
-    offset: usize,
-}
-
-#[cfg(feature = "alloc")]
-impl SharedSparseWordStream {
-    fn new(seed: [u8; 32], d: usize, k: usize) -> Self {
-        Self {
-            seed,
-            d: d as u64,
-            k: k as u64,
-            counter: 0,
-            block: [0u8; 32],
-            offset: 32,
-        }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.offset + 4 > 32 {
-            let mut hasher = Sha256::new();
-            hasher.update(SHARED_SPARSE_SEED_DOMAIN_V1);
-            hasher.update(self.seed);
-            hasher.update(self.d.to_le_bytes());
-            hasher.update(self.k.to_le_bytes());
-            hasher.update(self.counter.to_le_bytes());
-            self.counter = self.counter.wrapping_add(1);
-            let digest = hasher.finalize();
-            self.block.copy_from_slice(&digest);
-            self.offset = 0;
-        }
-        let word = u32::from_le_bytes([
-            self.block[self.offset],
-            self.block[self.offset + 1],
-            self.block[self.offset + 2],
-            self.block[self.offset + 3],
-        ]);
-        self.offset += 4;
-        word
-    }
-
-    /// Unbiased integer in `0..=inclusive_max` via Lemire's divisionless rejection method.
-    fn uniform_u32_inclusive(&mut self, inclusive_max: u32) -> u32 {
-        let bound = (inclusive_max as u64) + 1;
-        if bound == 1 {
-            return 0;
-        }
-        let threshold = bound.wrapping_neg() % bound;
-        loop {
-            let x = self.next_u32() as u64;
-            let m = x * bound;
-            let l = m as u32 as u64;
-            if l >= threshold {
-                return (m >> 32) as u32;
-            }
-        }
-    }
-}
-
 /// Sample an unbiased $k$-of-$d$ coordinate subset in $\mathcal{O}(k \log k)$ time and
 /// $\mathcal{O}(k)$ auxiliary memory using Robert Floyd's selection algorithm (`ADR-0021` §3, `W11-02`).
 ///
@@ -772,7 +708,12 @@ pub fn sample_shared_indices_v1(
     }
 
     let mut selected = BTreeSet::new();
-    let mut rng = SharedSparseWordStream::new(*seed, d, k);
+    let mut rng = crate::crypto::Sha256CounterDrbgV1::new(
+        SHARED_SPARSE_SEED_DOMAIN_V1,
+        *seed,
+        d as u64,
+        k as u64,
+    );
 
     for j in (d - k)..d {
         let t = rng.uniform_u32_inclusive(j as u32);

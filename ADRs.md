@@ -128,7 +128,7 @@ Spans, events, and metrics use the `swarmtorch.*` namespace (`SpanRecord`, `Even
 
 ## ADR-0013: Reproducibility and Determinism
 **Status:** Accepted | **Date:** 2025-01-08  
-Node definitions (`node_def_hash_v1`, `op_hash_v0`), graph normalization (`GraphV1::normalize`), PRNG seeds (`ChaCha8Rng` with domain tags), and canonical JSON/binary schemas enforce cross-platform bit-deterministic provenance.
+Node definitions (`node_def_hash_v1`, `op_hash_v0`), graph normalization (`GraphV1::normalize`), domain-separated PRNG streams (`Sha256CounterDrbgV1`), and canonical JSON/binary schemas enforce cross-platform bit-deterministic provenance.
 
 ## ADR-0014: Benchmark, Dataset, and Release Gates
 **Status:** Conformance Passed (`W10-03` / `W11`) | **Date:** 2025-01-08  

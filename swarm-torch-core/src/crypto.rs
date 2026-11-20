@@ -803,6 +803,124 @@ pub enum GradientValidationError {
     NormTooLarge { norm: f32, max: f32 },
 }
 
+/// Canonical `no_std` domain-separated SHA-256 counter-mode DRBG (`ADR-0013`, `ADR-0019`, `ADR-0021`, `Wave 16A`).
+///
+/// Generates deterministic 32-byte blocks as:
+/// `SHA-256(domain || seed[32] || param_a_le64 || param_b_le64 || counter_le64)`
+/// with checked 64-bit counter monotonicity (never wrapping around to counter `0`).
+///
+/// Shared across $s$-bucketing permutations (`aggregation.rs`), Robert Floyd `SharedSeedSparse`
+/// index sampling (`compression.rs`), and reserved for upcoming certified `DpFedAvgV1`
+/// Poisson/Gaussian sampling (`dp.rs`).
+#[derive(Debug, Clone)]
+pub struct Sha256CounterDrbgV1 {
+    domain: &'static [u8],
+    seed: [u8; 32],
+    param_a: u64,
+    param_b: u64,
+    counter: u64,
+    block: [u8; 32],
+    offset: usize,
+}
+
+impl Sha256CounterDrbgV1 {
+    /// Construct a domain-separated SHA-256 counter-mode DRBG.
+    pub const fn new(domain: &'static [u8], seed: [u8; 32], param_a: u64, param_b: u64) -> Self {
+        Self {
+            domain,
+            seed,
+            param_a,
+            param_b,
+            counter: 0,
+            block: [0u8; 32],
+            offset: 32,
+        }
+    }
+
+    /// Return the next 32-bit little-endian word from the SHA-256 counter stream.
+    pub fn next_u32(&mut self) -> u32 {
+        if self.offset + 4 > 32 {
+            let next_counter = self
+                .counter
+                .checked_add(1)
+                .expect("Sha256CounterDrbgV1 64-bit block counter overflow");
+            let mut hasher = Sha256::new();
+            hasher.update(self.domain);
+            hasher.update(self.seed);
+            hasher.update(self.param_a.to_le_bytes());
+            hasher.update(self.param_b.to_le_bytes());
+            hasher.update(self.counter.to_le_bytes());
+            self.counter = next_counter;
+            let digest = hasher.finalize();
+            self.block.copy_from_slice(&digest);
+            self.offset = 0;
+        }
+        let word = u32::from_le_bytes([
+            self.block[self.offset],
+            self.block[self.offset + 1],
+            self.block[self.offset + 2],
+            self.block[self.offset + 3],
+        ]);
+        self.offset += 4;
+        word
+    }
+
+    /// Return the next 64-bit little-endian word composed from two 32-bit words.
+    pub fn next_u64(&mut self) -> u64 {
+        let lo = self.next_u32() as u64;
+        let hi = self.next_u32() as u64;
+        lo | (hi << 32)
+    }
+
+    /// Return an exact 53-bit dyadic uniform float in `[0.0, 1.0)`.
+    pub fn next_f64_unit_half_open(&mut self) -> f64 {
+        const INV_TWO_POW_53: f64 = 1.0 / ((1u64 << 53) as f64);
+        ((self.next_u64() >> 11) as f64) * INV_TWO_POW_53
+    }
+
+    /// Return a 53-bit dyadic uniform float in `[-1.0, 1.0)` suitable for Marsaglia polar rejection.
+    pub fn next_f64_signed_unit(&mut self) -> f64 {
+        (2.0 * self.next_f64_unit_half_open()) - 1.0
+    }
+
+    /// Unbiased integer in `0..bound` (`bound >= 1`) via Lemire's 32-bit divisionless rejection method.
+    pub fn uniform_u32_bounded(&mut self, bound: u32) -> u32 {
+        assert!(bound >= 1, "uniform_u32_bounded requires bound >= 1");
+        if bound == 1 {
+            return 0;
+        }
+        let s = bound as u64;
+        // Exact 32-bit Lemire rejection threshold: (2^32 - s) % s == 2^32 % s.
+        let threshold = (1u64 << 32) % s;
+        loop {
+            let x = self.next_u32() as u64;
+            let m = x * s;
+            let l = m as u32 as u64;
+            if l >= threshold {
+                return (m >> 32) as u32;
+            }
+        }
+    }
+
+    /// Unbiased integer in `0..=inclusive_max` via Lemire's 32-bit divisionless rejection method.
+    pub fn uniform_u32_inclusive(&mut self, inclusive_max: u32) -> u32 {
+        let bound = (inclusive_max as u64) + 1;
+        if bound == 1 {
+            return 0;
+        }
+        // Exact 32-bit Lemire rejection threshold: 2^32 % bound (0 when inclusive_max == u32::MAX).
+        let threshold = (1u64 << 32) % bound;
+        loop {
+            let x = self.next_u32() as u64;
+            let m = x * bound;
+            let l = m as u32 as u64;
+            if l >= threshold {
+                return (m >> 32) as u32;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "crypto_tests.rs"]
 mod tests;

@@ -346,7 +346,7 @@ SwarmTorch treats adversarial participants as a first-class concern. When device
 |**Centered Clipping (`CClip`)**|✅ High (Non-IID)|Low ($\mathcal{O}(L n d)$)|Stateful momentum/history clipping (`W11-01`)|
 |**`BucketingConfig` / `aggregate_with_bucketing_v1`**|✅ Variance Reduction|Low ($\mathcal{O}(n d)$)|Pre-aggregation Non-IID $s$-bucketing (`W11-01`)|
 
-Stateful `CenteredClipping` (`CClip`) and deterministic `ChaCha8Rng` Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`) are implemented in `swarm-torch-core::aggregation` per [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) (`W11-01`).
+Stateful `CenteredClipping` (`CClip`) and deterministic `Sha256CounterDrbgV1` Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`) are implemented in `swarm-torch-core::aggregation` per [ADR-0019](ADRs.md#adr-0019-byzantine-resilient-aggregation-hardening-multi-krum-bulyan-centered-clipping-cclip-and-non-iid-s-bucketing) (`W11-01`).
 
 **Important caveat:** Research shows that all robust aggregators can degrade under specific attack strategies, especially in high-dimensional settings. SwarmTorch provides:
 

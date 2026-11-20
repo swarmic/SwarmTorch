@@ -1218,73 +1218,6 @@ pub enum PostBucketingRule {
     CenteredClipping { tau: f32, max_iterations: usize },
 }
 
-#[cfg(feature = "alloc")]
-struct DeterministicSha256WordStream {
-    domain: &'static [u8],
-    seed: [u8; 32],
-    param_a: u64,
-    param_b: u64,
-    counter: u64,
-    block: [u8; 32],
-    offset: usize,
-}
-
-#[cfg(feature = "alloc")]
-impl DeterministicSha256WordStream {
-    fn new(domain: &'static [u8], seed: [u8; 32], param_a: u64, param_b: u64) -> Self {
-        Self {
-            domain,
-            seed,
-            param_a,
-            param_b,
-            counter: 0,
-            block: [0u8; 32],
-            offset: 32,
-        }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.offset + 4 > 32 {
-            let mut hasher = Sha256::new();
-            hasher.update(self.domain);
-            hasher.update(self.seed);
-            hasher.update(self.param_a.to_le_bytes());
-            hasher.update(self.param_b.to_le_bytes());
-            hasher.update(self.counter.to_le_bytes());
-            self.counter = self.counter.wrapping_add(1);
-            let digest = hasher.finalize();
-            self.block.copy_from_slice(&digest);
-            self.offset = 0;
-        }
-        let word = u32::from_le_bytes([
-            self.block[self.offset],
-            self.block[self.offset + 1],
-            self.block[self.offset + 2],
-            self.block[self.offset + 3],
-        ]);
-        self.offset += 4;
-        word
-    }
-
-    /// Unbiased integer in `0..bound` ($bound \ge 1$) via Lemire's divisionless rejection method.
-    fn uniform_u32_bounded(&mut self, bound: u32) -> u32 {
-        debug_assert!(bound >= 1);
-        if bound == 1 {
-            return 0;
-        }
-        let s = bound as u64;
-        let threshold = s.wrapping_neg() % s;
-        loop {
-            let x = self.next_u32() as u64;
-            let m = x * s;
-            let l = m as u32 as u64;
-            if l >= threshold {
-                return (m >> 32) as u32;
-            }
-        }
-    }
-}
-
 /// Validate that the post-bucketing bucket count $B$ satisfies the downstream aggregator's
 /// quorum bound under the conservative worst-case fault bound $f_B = \min(f, B)$ (`ADR-0019` §4).
 pub fn validate_post_bucketing_quorum(
@@ -1431,7 +1364,7 @@ pub fn bucket_updates_v1(
     });
 
     // 2. Deterministic Fisher-Yates shuffle seeded by (S_BUCKETING_PERM_DOMAIN_V1, round_seed, n, s).
-    let mut rng = DeterministicSha256WordStream::new(
+    let mut rng = crate::crypto::Sha256CounterDrbgV1::new(
         S_BUCKETING_PERM_DOMAIN_V1,
         config.round_seed,
         n as u64,

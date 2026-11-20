@@ -810,8 +810,8 @@ pub enum GradientValidationError {
 /// with checked 64-bit counter monotonicity (never wrapping around to counter `0`).
 ///
 /// Shared across $s$-bucketing permutations (`aggregation.rs`), Robert Floyd `SharedSeedSparse`
-/// index sampling (`compression.rs`), and reserved for upcoming certified `DpFedAvgV1`
-/// Poisson/Gaussian sampling (`dp.rs`).
+/// index sampling (`compression.rs`), and certified `DpFedAvgV1`
+/// Poisson/Discrete-Gaussian sampling (`dp.rs`).
 #[derive(Debug, Clone)]
 pub struct Sha256CounterDrbgV1 {
     domain: &'static [u8],

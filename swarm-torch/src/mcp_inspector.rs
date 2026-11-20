@@ -778,6 +778,13 @@ fn tool_trace_aggregation_budget(
     let accounting_cls = latest_ledger
         .map(|e| e.accounting_classification.as_str())
         .unwrap_or(crate::artifacts::dp_ledger::EXPERIMENTAL_DP_CLASSIFICATION_V1);
+    let privacy_notice = if guarantees_dp
+        && accounting_cls == crate::artifacts::dp_ledger::VERIFIED_DP_CLASSIFICATION_V1
+    {
+        "Certified DpFedAvgV1 mechanism protected: exact integer-lattice L2 clipping (B=65536), exact i128 summation, Canonne-Kamath-Steinke (2020) Discrete Gaussian noise, and Poisson(q) cohort subsampling under the trusted central coordinator model (protecting against external bundle observers)."
+    } else {
+        "Experimental hypothetical RDP budget accounting only: SwarmRoundCoordinator does not execute Poisson client subsampling or calibrated Gaussian noise injection."
+    };
     let dp_metrics: Vec<Value> = report
         .metrics
         .iter()
@@ -802,7 +809,7 @@ fn tool_trace_aggregation_budget(
         "strict_signature_verified": verified.is_strict_verified(),
         "guarantees_differential_privacy": guarantees_dp,
         "accounting_classification": accounting_cls,
-        "privacy_notice": "Experimental hypothetical RDP budget accounting only: SwarmRoundCoordinator does not execute Poisson client subsampling or calibrated Gaussian noise injection.",
+        "privacy_notice": privacy_notice,
         "dp_ledger_present_in_signed_manifest": verified.get_bytes(DP_LEDGER_REL_PATH).is_some(),
         "dp_ledger_entry_count": ledger_entries.len(),
         "committed_rounds": latest_ledger.map(|e| e.committed_rounds).unwrap_or(0),
@@ -1285,5 +1292,254 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn wave16b4_mcp_inspector_distinguishes_certified_dp_fedavg_from_experimental_budget_only() {
+        use crate::artifacts::{ArtifactWriteProfile, DataOpsSession, LockAcquisitionPolicy};
+        use crate::coordinator::{
+            RoundCoordinatorConfig, SwarmRoundCoordinator, UpdateKindV1, WeightingPolicyV1,
+        };
+        use crate::PeerId;
+        use swarm_torch_core::aggregation::RobustAggregation;
+        use swarm_torch_core::traits::{FitnessFunction, SwarmModel};
+        use swarm_torch_models::optim::SgdOptimizer;
+        use swarm_torch_models::simple::LinearModel;
+
+        struct NoOpEval;
+        impl FitnessFunction for NoOpEval {
+            type Model = LinearModel;
+            type Error = core::convert::Infallible;
+            fn evaluate(&self, _model: &Self::Model) -> Result<f32, Self::Error> {
+                Ok(0.0)
+            }
+        }
+
+        // 1. Experimental bundle from build_signed_test_bundle reports experimental notice & false
+        let (exp_base, exp_run_dir, exp_signer, _exp_run_id, _exp_graph) =
+            build_signed_test_bundle("wave16b4_exp");
+        let exp_server =
+            McpInspectorServerV1::strict_with_key(&exp_run_dir, *exp_signer.public_key()).unwrap();
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trace_aggregation_budget",
+                "arguments": {}
+            }
+        })
+        .to_string();
+        let exp_resp: Value =
+            serde_json::from_str(&exp_server.handle_jsonrpc_line(&req).unwrap()).unwrap();
+        let exp_sc = &exp_resp["result"]["structuredContent"];
+        assert_eq!(exp_sc["guarantees_differential_privacy"], false);
+        assert_eq!(
+            exp_sc["accounting_classification"],
+            "experimental_hypothetical_budget_only"
+        );
+        assert!(exp_sc["privacy_notice"]
+            .as_str()
+            .unwrap()
+            .contains("Experimental hypothetical RDP budget accounting only"));
+
+        // 2. Certified DpFedAvgV1 coordinator run produces a signed bundle reporting certified notice & true
+        let cert_base = temp_bundle_dir("wave16b4_cert");
+        let run_id = RunId::from_bytes([0x64; 16]);
+        let mut session = DataOpsSession::create(
+            &cert_base,
+            run_id,
+            ArtifactWriteProfile::default(),
+            LockAcquisitionPolicy::FailFast,
+        )
+        .unwrap();
+        let cert_run_dir = session.sink().bundle().run_dir().to_path_buf();
+        let p1 = PeerId::from_public_key(KeyPair::from_seed([1; 32]).unwrap().public_key());
+        let p2 = PeerId::from_public_key(KeyPair::from_seed([2; 32]).unwrap().public_key());
+        let config = RoundCoordinatorConfig {
+            update_kind: UpdateKindV1::default(),
+            aggregation: RobustAggregation::FedAvg,
+            weighting_policy: WeightingPolicyV1::EqualPeerVote,
+            authorized_cohort: [p1, p2].into_iter().collect(),
+            min_quorum: 2,
+            max_staleness: 0,
+            max_clock_skew_secs: 60,
+        };
+        let mut model = LinearModel::new(2, 1).unwrap();
+        model.load_parameters(&[0.0, 0.0, 0.0]).unwrap();
+        let signer = KeyPair::from_seed([0x88; 32]).unwrap();
+        let mut coord =
+            SwarmRoundCoordinator::initialize(run_id, config, model, &mut session, 1_000)
+                .unwrap()
+                .with_manifest_signer(signer.clone());
+        let cert_profile = DpMechanismProfileV1 {
+            unit: DpUnitV1::ClientLevel,
+            adjacency: DpAdjacencyV1::AddRemoveOne,
+            clipping_radius_tau: 1.0,
+            noise_multiplier: 1.5,
+            target_delta: 1e-5,
+            max_epsilon: 20.0,
+            conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+            classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
+        };
+        coord
+            .configure_certified_dp_fedavg(&cert_run_dir, cert_profile, 0.5)
+            .unwrap();
+        coord.begin_dp_poisson_round_os_rng_v1().unwrap();
+        coord
+            .finalize_round::<SgdOptimizer<LinearModel, 16>, NoOpEval>(
+                &[],
+                None,
+                None,
+                &mut session,
+                2_000,
+            )
+            .unwrap();
+
+        let cert_server =
+            McpInspectorServerV1::strict_with_key(&cert_run_dir, *signer.public_key()).unwrap();
+        let cert_resp: Value =
+            serde_json::from_str(&cert_server.handle_jsonrpc_line(&req).unwrap()).unwrap();
+        let cert_sc = &cert_resp["result"]["structuredContent"];
+        assert_eq!(cert_sc["strict_signature_verified"], true);
+        assert_eq!(cert_sc["guarantees_differential_privacy"], true);
+        assert_eq!(
+            cert_sc["accounting_classification"],
+            "verified_mechanism_protected"
+        );
+        assert_eq!(cert_sc["committed_rounds"], 1);
+        let notice = cert_sc["privacy_notice"].as_str().unwrap();
+        assert!(notice.contains("Certified DpFedAvgV1 mechanism protected"));
+        assert!(notice.contains("Canonne-Kamath-Steinke (2020) Discrete Gaussian noise"));
+        assert!(notice.contains("trusted central coordinator model"));
+
+        // Verify external bundle observer boundary through MCP predict_node_outputs and report resource:
+        let predict_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "predict_node_outputs",
+                "arguments": { "node_key": "train/round_1" }
+            }
+        })
+        .to_string();
+        let predict_resp: Value =
+            serde_json::from_str(&cert_server.handle_jsonrpc_line(&predict_req).unwrap()).unwrap();
+        assert!(
+            predict_resp["result"]["structuredContent"]["predictions"][0]["predicted_outputs"][0]
+                ["observed_rows"]
+                .is_null(),
+            "certified DP bundle must redact observed_rows from external MCP observers"
+        );
+        let cert_run_id_hex = hex_lower(run_id.as_bytes());
+        let report_read_req = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": { "uri": format!("swarmtorch://runs/{cert_run_id_hex}/report") }
+        })
+        .to_string();
+        let report_read_resp: Value =
+            serde_json::from_str(&cert_server.handle_jsonrpc_line(&report_read_req).unwrap())
+                .unwrap();
+        let report_text = report_read_resp["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap();
+        for forbidden in [
+            "admitted_peers",
+            "sampled_cohort",
+            "participant_count",
+            "clipped_count",
+        ] {
+            assert!(
+                !report_text.contains(forbidden),
+                "certified DP MCP report resource leaked forbidden observer field {forbidden}"
+            );
+        }
+
+        // 3. Bundle without a DP ledger reports experimental notice & false, and rejects unauthenticated
+        //    or structurally inconsistent dp/ledger.ndjson promotion attempts.
+        let no_dp_base = temp_bundle_dir("wave16b4_no_dp");
+        let no_dp_bundle = RunArtifactBundle::create(&no_dp_base, run_id).unwrap();
+        let empty_graph = GraphV1 {
+            schema_version: 1,
+            graph_id: Some("wave16b4-no-dp".to_string()),
+            nodes: vec![],
+            edges: vec![],
+        }
+        .normalize()
+        .unwrap();
+        no_dp_bundle.write_graph(&empty_graph).unwrap();
+        no_dp_bundle
+            .write_dataset_registry(&DatasetRegistryV1 {
+                schema_version: 1,
+                datasets: vec![],
+            })
+            .unwrap();
+        no_dp_bundle
+            .write_dataset_lineage(&DatasetLineageV1 {
+                schema_version: 1,
+                edges: vec![],
+            })
+            .unwrap();
+        no_dp_bundle.finalize_signed_manifest(&signer).unwrap();
+        let no_dp_run_dir = no_dp_bundle.run_dir().to_path_buf();
+        let no_dp_server =
+            McpInspectorServerV1::strict_with_key(&no_dp_run_dir, *signer.public_key()).unwrap();
+        let no_dp_resp: Value =
+            serde_json::from_str(&no_dp_server.handle_jsonrpc_line(&req).unwrap()).unwrap();
+        let no_dp_sc = &no_dp_resp["result"]["structuredContent"];
+        assert_eq!(no_dp_sc["dp_ledger_present_in_signed_manifest"], false);
+        assert_eq!(no_dp_sc["guarantees_differential_privacy"], false);
+        assert_eq!(
+            no_dp_sc["accounting_classification"],
+            "experimental_hypothetical_budget_only"
+        );
+        assert!(no_dp_sc["privacy_notice"]
+            .as_str()
+            .unwrap()
+            .contains("Experimental hypothetical RDP budget accounting only"));
+
+        // Dropping an unauthenticated certified dp/ledger.ndjson onto disk after signing must not
+        // promote guarantees_differential_privacy (verified.get_bytes reads only manifest-signed entries).
+        let cert_ledger_bytes = fs::read(cert_run_dir.join(DP_LEDGER_REL_PATH)).unwrap();
+        fs::create_dir_all(no_dp_run_dir.join("dp")).unwrap();
+        fs::write(no_dp_run_dir.join(DP_LEDGER_REL_PATH), &cert_ledger_bytes).unwrap();
+        let unauth_resp: Value =
+            serde_json::from_str(&no_dp_server.handle_jsonrpc_line(&req).unwrap()).unwrap();
+        assert_eq!(
+            unauth_resp["result"]["structuredContent"]["guarantees_differential_privacy"],
+            false
+        );
+        assert_eq!(
+            unauth_resp["result"]["structuredContent"]["dp_ledger_present_in_signed_manifest"],
+            false
+        );
+
+        // Signing a spoofed ledger (guarantees_differential_privacy=true with experimental classification)
+        // into the manifest fails closed with JSONRPC_BUNDLE_VERIFICATION_FAILED (-32001).
+        let mut spoofed_entry: DpLedgerEntryV1 =
+            serde_json::from_slice(cert_ledger_bytes.split(|&b| b == b'\n').next().unwrap())
+                .unwrap();
+        spoofed_entry.accounting_classification =
+            "experimental_hypothetical_budget_only".to_string();
+        let spoofed_line = serde_json::to_string(&spoofed_entry).unwrap() + "\n";
+        fs::write(
+            no_dp_run_dir.join(DP_LEDGER_REL_PATH),
+            spoofed_line.as_bytes(),
+        )
+        .unwrap();
+        no_dp_bundle.finalize_signed_manifest(&signer).unwrap();
+        let spoofed_resp: Value =
+            serde_json::from_str(&no_dp_server.handle_jsonrpc_line(&req).unwrap()).unwrap();
+        assert_eq!(
+            spoofed_resp["error"]["code"],
+            JSONRPC_BUNDLE_VERIFICATION_FAILED
+        );
+
+        let _ = fs::remove_dir_all(&exp_base);
+        let _ = fs::remove_dir_all(&cert_base);
+        let _ = fs::remove_dir_all(&no_dp_base);
     }
 }

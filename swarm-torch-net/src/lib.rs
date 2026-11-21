@@ -6,7 +6,7 @@
 //! - Unified `SwarmTransport` trait for all transports
 //! - Originator-authenticated gossip inner updates and recipient wrappers (`gossip`)
 //! - Mock transport/network implementations for integration testing
-//! - TCP, UDP, and `no_std` LoRa (`lora-transport`) packet transports (BLE and WiFi follow)
+//! - TCP, UDP, `no_std` LoRa (`lora-transport`), and `no_std` BLE GATT (`ble-transport`) packet transports (WiFi deferred)
 //! - Multi-transport policy surface with fallback error semantics
 //! - Message framing and serialization
 
@@ -18,6 +18,8 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 pub mod audit;
+#[cfg(feature = "ble-transport")]
+pub mod ble;
 pub mod carrier;
 pub mod chunked;
 pub mod gossip;
@@ -42,6 +44,8 @@ pub use mock::{MockNetworkHub, MockPeerTransport, Topology};
 
 /// Prelude for convenient imports
 pub mod prelude {
+    #[cfg(feature = "ble-transport")]
+    pub use crate::ble::*;
     pub use crate::carrier::*;
     pub use crate::chunked::*;
     pub use crate::gossip::*;

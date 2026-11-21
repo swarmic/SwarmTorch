@@ -28,10 +28,10 @@ alloc = ["swarm-torch-core/alloc"]
 # Transport implementations (narrow Tokio sub-features only when transport is enabled)
 tcp-transport = ["std", "dep:tokio", "tokio/net", "tokio/io-util", "tokio/time", "tokio/sync"]
 udp-transport = ["std", "dep:tokio", "tokio/net", "tokio/time", "tokio/sync"]
-# Hardware-agnostic no_std radio packet transports (HAL trait + simulated link tests; physical RF drivers out of tree)
-lora-transport = []
-# Reserved Cargo feature flags for upcoming hardware radio transports (BLE lands in Wave 16E-2; WiFi deferred).
+# Hardware-agnostic no_std radio packet transports (HAL traits + simulated link tests; physical RF drivers out of tree)
 ble-transport = []
+lora-transport = []
+# Reserved Cargo feature flag for future WiFi transport (deferred).
 wifi-transport = []
 
 [dependencies]

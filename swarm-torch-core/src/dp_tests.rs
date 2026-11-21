@@ -624,10 +624,63 @@ fn os_csprng_dp_fedavg_mints_production_certified_entropy_proof() {
         classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
     };
 
-    let cohort = SampledDpCohortV1::sample_poisson_os_rng_v1(&peers, 0.5, run_id, 1).unwrap();
+    // ReplaceOne with Poisson subsampling (q < 1.0) MUST fail closed because Mironov et al. (2019)
+    // Theorem 5 applies to AddRemoveOne mixtures (1-q)P_0 + qQ vs P_0, not ReplaceOne mixtures.
+    let subsampled_cohort =
+        SampledDpCohortV1::sample_poisson_os_rng_v1(&peers, 0.5, run_id, 1).unwrap();
+    assert_eq!(
+        subsampled_cohort.sampling_provenance(),
+        DpSamplingProvenanceV1::OsCsprng
+    );
+    let subsampled_entropy = DpNoiseEntropyV1::generate_os_csprng().unwrap();
+    assert_eq!(
+        subsampled_entropy.provenance(),
+        DpEntropyProvenanceV1::OsCsprng
+    );
+    assert_eq!(
+        DpFedAvgMechanismV1::execute_round_v1(
+            profile,
+            DpFedAvgRoundInputV1 {
+                run_id_bytes: run_id,
+                round_id: 1,
+                parent_digest_bytes: parent_digest,
+                parameter_dim: 4,
+                sampled_cohort: &subsampled_cohort,
+                noise_entropy: subsampled_entropy,
+                client_updates: &[],
+            },
+        )
+        .unwrap_err(),
+        CryptoError::InvalidPrivacyParameter
+    );
+
+    // AddRemoveOne with Poisson subsampling (q = 0.5) succeeds with OsCsprng provenance!
+    let add_remove_profile = DpMechanismProfileV1 {
+        adjacency: DpAdjacencyV1::AddRemoveOne,
+        ..profile
+    };
+    let add_remove_outcome = DpFedAvgMechanismV1::execute_round_v1(
+        add_remove_profile,
+        DpFedAvgRoundInputV1 {
+            run_id_bytes: run_id,
+            round_id: 1,
+            parent_digest_bytes: parent_digest,
+            parameter_dim: 4,
+            sampled_cohort: &subsampled_cohort,
+            noise_entropy: DpNoiseEntropyV1::generate_os_csprng().unwrap(),
+            client_updates: &[],
+        },
+    )
+    .unwrap();
+    assert!(add_remove_outcome.proof.is_production_certified_entropy());
+    assert_eq!(add_remove_outcome.fixed_sensitivity_denominator, 4.0);
+
+    // ReplaceOne strictly under full participation (q == 1.0) is backed by Canonne et al. (2020)
+    // Prop. 5 + tensorization with sensitivity 2B (sigma_eff = sigma / 2 = 1.0).
+    let cohort = SampledDpCohortV1::sample_poisson_os_rng_v1(&peers, 1.0, run_id, 1).unwrap();
     assert_eq!(
         cohort.sampling_provenance(),
-        DpSamplingProvenanceV1::OsCsprng
+        DpSamplingProvenanceV1::DeterministicFullCohort
     );
     let entropy = DpNoiseEntropyV1::generate_os_csprng().unwrap();
     assert_eq!(entropy.provenance(), DpEntropyProvenanceV1::OsCsprng);
@@ -646,14 +699,14 @@ fn os_csprng_dp_fedavg_mints_production_certified_entropy_proof() {
     )
     .unwrap();
     assert!(outcome.proof.is_production_certified_entropy());
-    assert_eq!(outcome.fixed_sensitivity_denominator, 4.0);
+    assert_eq!(outcome.fixed_sensitivity_denominator, 8.0);
     assert_eq!(outcome.discrete_sigma_z, 131_072);
 
-    // ReplaceOne effective noise multiplier = sigma / 2 = 1.0 matches accountant preview.
+    // ReplaceOne effective noise multiplier = sigma / 2 = 1.0 at q = 1.0 matches accountant preview.
     let mut acc = RdpAccountantV1::new_verified_mechanism(profile).unwrap();
     acc.record_verified_mechanism_round(&outcome.proof).unwrap();
     assert_eq!(acc.committed_rounds(), 1);
-    let expected_orders = compute_round_rdp_schedule_v1(0.5, 1.0).unwrap();
+    let expected_orders = compute_round_rdp_schedule_v1(1.0, 1.0).unwrap();
     for (&actual, &expected) in acc
         .cumulative_rdp_orders()
         .iter()
@@ -1586,6 +1639,7 @@ fn certified_dp_entrypoints_enforce_sigma_cap_empty_draw_overcount_and_adjacency
     .unwrap();
     let replace_profile = DpMechanismProfileV1 {
         adjacency: DpAdjacencyV1::ReplaceOne,
+        max_epsilon: 20.0,
         ..valid_profile
     };
     let mut replace_acc = RdpAccountantV1::new_verified_mechanism(replace_profile).unwrap();
@@ -1602,4 +1656,105 @@ fn certified_dp_entrypoints_enforce_sigma_cap_empty_draw_overcount_and_adjacency
         CryptoError::InvalidPrivacyParameter
     );
     assert_eq!(replace_acc.committed_rounds(), 0);
+
+    // Defense-in-depth: even a forged internal VerifiedDpMechanismRoundV1 with ReplaceOne + q = 0.5
+    // is rejected directly by preview_verified_mechanism_round, record_verified_mechanism_round,
+    // and preview_clipped_round!
+    let mut forged_replace_subsampled_proof = outcome.proof.clone();
+    forged_replace_subsampled_proof.profile = replace_profile;
+    forged_replace_subsampled_proof.subsampling_rate_q = 0.5;
+    assert_eq!(
+        replace_acc
+            .preview_verified_mechanism_round(&forged_replace_subsampled_proof)
+            .unwrap_err(),
+        CryptoError::InvalidPrivacyParameter
+    );
+    assert_eq!(
+        replace_acc
+            .record_verified_mechanism_round(&forged_replace_subsampled_proof)
+            .unwrap_err(),
+        CryptoError::InvalidPrivacyParameter
+    );
+    assert_eq!(
+        replace_acc.preview_clipped_round(1.0, 0.5).unwrap_err(),
+        CryptoError::InvalidPrivacyParameter
+    );
+    assert!(replace_acc.preview_clipped_round(1.0, 1.0).is_ok());
+    assert_eq!(replace_acc.committed_rounds(), 0);
+}
+
+#[test]
+fn verified_dp_adjacency_subsampling_supported_boundary_matrix_no_std() {
+    let one_minus_ulp = f64::from_bits(1.0_f64.to_bits() - 1);
+    let one_plus_ulp = f64::from_bits(1.0_f64.to_bits() + 1);
+
+    // AddRemoveOne supports all finite q in (0, 1].
+    for q in [
+        f64::MIN_POSITIVE,
+        0.5,
+        1.0 - f64::EPSILON,
+        one_minus_ulp,
+        1.0,
+    ] {
+        assert!(verified_dp_adjacency_subsampling_supported_v1(
+            DpAdjacencyV1::AddRemoveOne,
+            q
+        ));
+    }
+
+    // ReplaceOne supports strictly full participation q == 1.0.
+    assert!(verified_dp_adjacency_subsampling_supported_v1(
+        DpAdjacencyV1::ReplaceOne,
+        1.0
+    ));
+    for q in [f64::MIN_POSITIVE, 0.5, 1.0 - f64::EPSILON, one_minus_ulp] {
+        assert!(!verified_dp_adjacency_subsampling_supported_v1(
+            DpAdjacencyV1::ReplaceOne,
+            q
+        ));
+    }
+
+    // Both adjacencies fail closed on out-of-range / non-finite q.
+    for adj in [DpAdjacencyV1::AddRemoveOne, DpAdjacencyV1::ReplaceOne] {
+        for bad_q in [
+            0.0,
+            -0.0,
+            -0.5,
+            one_plus_ulp,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(!verified_dp_adjacency_subsampling_supported_v1(adj, bad_q));
+        }
+    }
+
+    // Certified ReplaceOne accountant preview_clipped_round rejects q < 1.0 in pure no_std,
+    // while experimental ReplaceOne accountant preserves hypothetical q < 1.0 previews.
+    let cert_replace = DpMechanismProfileV1 {
+        unit: DpUnitV1::ClientLevel,
+        adjacency: DpAdjacencyV1::ReplaceOne,
+        clipping_radius_tau: 1.0,
+        noise_multiplier: 2.0,
+        target_delta: 1e-5,
+        max_epsilon: 10.0,
+        conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+        classification: PrivacyAccountingClassificationV1::VerifiedMechanismProtected,
+    };
+    let cert_acc = RdpAccountantV1::new_verified_mechanism(cert_replace).unwrap();
+    assert_eq!(
+        cert_acc
+            .preview_clipped_round(1.0, one_minus_ulp)
+            .unwrap_err(),
+        CryptoError::InvalidPrivacyParameter
+    );
+    assert!(cert_acc.preview_clipped_round(1.0, 1.0).is_ok());
+
+    let exp_replace = DpMechanismProfileV1 {
+        classification: PrivacyAccountingClassificationV1::ExperimentalHypotheticalBudgetOnly,
+        ..cert_replace
+    };
+    let exp_acc = RdpAccountantV1::new(exp_replace).unwrap();
+    assert!(exp_acc.preview_clipped_round(1.0, 0.5).is_ok());
 }

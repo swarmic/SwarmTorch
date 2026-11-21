@@ -22,7 +22,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use swarm_torch_core::crypto::{sha256_slices, CryptoError, PrivacyAccountantHook};
 use swarm_torch_core::dp::{
-    compute_discrete_sigma_z_v1, convert_rdp_to_approx_dp_v1, DpAdjacencyV1, DpConversionFormulaV1,
+    compute_discrete_sigma_z_v1, convert_rdp_to_approx_dp_v1,
+    verified_dp_adjacency_subsampling_supported_v1, DpAdjacencyV1, DpConversionFormulaV1,
     DpMechanismProfileV1, DpUnitV1, PrivacyAccountingClassificationV1, RdpAccountantV1,
     VerifiedDpMechanismRoundV1, RDP_GRID_LEN,
 };
@@ -121,6 +122,10 @@ fn validate_single_dp_ledger_entry(entry: &DpLedgerEntryV1) -> io::Result<()> {
         (true, VERIFIED_DP_CLASSIFICATION_V1) => {
             entry.unit == DpUnitV1::ClientLevel
                 && compute_discrete_sigma_z_v1(entry.noise_multiplier).is_ok()
+                && verified_dp_adjacency_subsampling_supported_v1(
+                    entry.adjacency,
+                    entry.subsampling_rate_q,
+                )
         }
         _ => false,
     };
@@ -633,4 +638,98 @@ pub enum CryptoErrorOrIo {
     Crypto(CryptoError),
     /// Durable storage I/O or ledger consistency error.
     Io(io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarm_torch_core::dp::compute_round_rdp_schedule_v1;
+
+    #[test]
+    fn verified_dp_ledger_rejects_replace_one_with_subsampling_q_below_one() {
+        let make_entry = |adjacency: DpAdjacencyV1, q: f64, verified: bool| -> DpLedgerEntryV1 {
+            let sigma_eff = match adjacency {
+                DpAdjacencyV1::AddRemoveOne => 2.0,
+                DpAdjacencyV1::ReplaceOne => 1.0,
+            };
+            let orders = compute_round_rdp_schedule_v1(q, sigma_eff).unwrap();
+            let (eps, alpha) =
+                convert_rdp_to_approx_dp_v1(&orders, 1e-5, DpConversionFormulaV1::Balle2020Tight)
+                    .unwrap();
+            DpLedgerEntryV1 {
+                schema_version: DP_LEDGER_SCHEMA_V1.to_string(),
+                receipt_id: "11".repeat(32),
+                round_id: 1,
+                parent_digest_hex: "22".repeat(32),
+                cumulative_rdp_orders: orders.to_vec(),
+                converted_epsilon: eps,
+                optimal_alpha: alpha,
+                target_delta: 1e-5,
+                subsampling_rate_q: q,
+                clipping_radius_tau: 1.0,
+                noise_multiplier: 2.0,
+                unit: DpUnitV1::ClientLevel,
+                adjacency,
+                conversion_formula: DpConversionFormulaV1::Balle2020Tight,
+                committed_rounds: 1,
+                ts_unix_ns: 1_700_000_000_000_000_000,
+                guarantees_differential_privacy: verified,
+                accounting_classification: if verified {
+                    VERIFIED_DP_CLASSIFICATION_V1.to_string()
+                } else {
+                    EXPERIMENTAL_DP_CLASSIFICATION_V1.to_string()
+                },
+            }
+        };
+        let make_line = |adjacency: DpAdjacencyV1, q: f64, verified: bool| -> Vec<u8> {
+            let mut line = serde_json::to_vec(&make_entry(adjacency, q, verified)).unwrap();
+            line.push(b'\n');
+            line
+        };
+
+        let one_minus_ulp = f64::from_bits(1.0_f64.to_bits() - 1);
+
+        // Negative: direct entry validation rejects exact IEEE-754 `1.0 - 1 ulp` under ReplaceOne,
+        // and NDJSON slice validation rejects `0.5` and `0.999_999_999_999_999` (distinct < 1.0 in serde_json).
+        let ulp_err = validate_single_dp_ledger_entry(&make_entry(
+            DpAdjacencyV1::ReplaceOne,
+            one_minus_ulp,
+            true,
+        ))
+        .unwrap_err();
+        assert_eq!(ulp_err.kind(), io::ErrorKind::InvalidData);
+        for bad_q in [0.5, 0.999_999_999_999_999] {
+            let err = parse_and_validate_dp_ledger_slice(&make_line(
+                DpAdjacencyV1::ReplaceOne,
+                bad_q,
+                true,
+            ))
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // Positive: VerifiedMechanismProtected + ReplaceOne at q == 1.0 passes.
+        assert_eq!(
+            parse_and_validate_dp_ledger_slice(&make_line(DpAdjacencyV1::ReplaceOne, 1.0, true))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Positive: VerifiedMechanismProtected + AddRemoveOne at q == 0.5 passes.
+        assert_eq!(
+            parse_and_validate_dp_ledger_slice(&make_line(DpAdjacencyV1::AddRemoveOne, 0.5, true))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Positive: ExperimentalHypotheticalBudgetOnly + ReplaceOne at q == 0.5 remains unaffected.
+        assert_eq!(
+            parse_and_validate_dp_ledger_slice(&make_line(DpAdjacencyV1::ReplaceOne, 0.5, false))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

@@ -183,6 +183,31 @@ impl DpMechanismProfileV1 {
     }
 }
 
+/// Returns `true` iff `(adjacency, subsampling_rate_q)` is backed by a proven closed-form
+/// discrete-Gaussian RDP bound under [`PrivacyAccountingClassificationV1::VerifiedMechanismProtected`]:
+///
+/// - [`DpAdjacencyV1::AddRemoveOne`] with any $q \in (0, 1]$ (`Canonne, Kamath, & Steinke 2020`,
+///   `arXiv:2004.00010` Prop. 5 / JPC Prop. 2.4 + tensorization + `Mironov, Talwar, & Zhang 2019`
+///   §3.3 binomial expansion & Theorem 5 via discrete lattice involution $\nu(y) = \Delta - y$),
+/// - [`DpAdjacencyV1::ReplaceOne`] strictly under full participation $q = 1.0$ (`Canonne et al. 2020`
+///   Prop. 5 + tensorization with $\Delta_2 = 2B \implies \sigma_{\text{eff}} = \sigma / 2$).
+///
+/// Fails closed for `ReplaceOne` with Poisson subsampling $q < 1.0$ (whose mixture distributions
+/// $(1-q)P_0 + q P_x$ vs. $(1-q)P_0 + q P_{x'}$ do not match `Mironov et al. 2019` Theorem 5).
+#[inline]
+pub fn verified_dp_adjacency_subsampling_supported_v1(
+    adjacency: DpAdjacencyV1,
+    subsampling_rate_q: f64,
+) -> bool {
+    if !subsampling_rate_q.is_finite() || subsampling_rate_q <= 0.0 || subsampling_rate_q > 1.0 {
+        return false;
+    }
+    match adjacency {
+        DpAdjacencyV1::AddRemoveOne => true,
+        DpAdjacencyV1::ReplaceOne => subsampling_rate_q == 1.0,
+    }
+}
+
 /// Computes $\ln \binom{k}{j}$ for integer $0 \le j \le k \le 64$ using exact integer arithmetic
 /// before taking [`ln_f64_soft`].
 #[inline]
@@ -538,6 +563,15 @@ impl RdpAccountantV1 {
         if !tau.is_finite() || tau <= 0.0 || tau > self.profile.clipping_radius_tau {
             return Err(CryptoError::InvalidPrivacyParameter);
         }
+        if self.profile.classification
+            == PrivacyAccountingClassificationV1::VerifiedMechanismProtected
+            && !verified_dp_adjacency_subsampling_supported_v1(
+                self.profile.adjacency,
+                subsampling_rate_q,
+            )
+        {
+            return Err(CryptoError::InvalidPrivacyParameter);
+        }
         let sigma_eff = self.profile.effective_noise_multiplier();
         let step_rdp = compute_round_rdp_schedule_v1(subsampling_rate_q, sigma_eff)?;
 
@@ -582,6 +616,10 @@ impl RdpAccountantV1 {
         if self.profile.classification
             != PrivacyAccountingClassificationV1::VerifiedMechanismProtected
             || proof.profile != self.profile
+            || !verified_dp_adjacency_subsampling_supported_v1(
+                self.profile.adjacency,
+                proof.subsampling_rate_q,
+            )
         {
             return Err(CryptoError::InvalidPrivacyParameter);
         }
@@ -1446,9 +1484,7 @@ impl DpFedAvgMechanismV1 {
         let q = input.sampled_cohort.subsampling_rate_q;
         let cohort_size = input.sampled_cohort.authorized_cohort_size;
         let fixed_denom = q * (cohort_size as f64);
-        if !q.is_finite()
-            || q <= 0.0
-            || q > 1.0
+        if !verified_dp_adjacency_subsampling_supported_v1(profile.adjacency, q)
             || cohort_size == 0
             || !fixed_denom.is_finite()
             || fixed_denom < 1.0

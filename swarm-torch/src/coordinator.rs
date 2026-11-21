@@ -2472,13 +2472,13 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
                                     .to_string(),
                             )
                         })?;
-                        if !q.is_finite()
-                            || q <= 0.0
-                            || q > 1.0
-                            || (q * (config.authorized_cohort.len() as f64)) < 1.0
+                        if !swarm_torch_core::dp::verified_dp_adjacency_subsampling_supported_v1(
+                            profile.adjacency,
+                            q,
+                        ) || (q * (config.authorized_cohort.len() as f64)) < 1.0
                         {
                             return Err(RoundError::ResumeStateMismatch(
-                                "invalid dp_certified_subsampling_q in CoordinatorResumeStateV2"
+                                "invalid dp_certified_subsampling_q or unsupported ReplaceOne+subsampling in CoordinatorResumeStateV2"
                                     .to_string(),
                             ));
                         }
@@ -4576,7 +4576,8 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
     /// Requires synchronous `RobustAggregation::FedAvg`, `WeightingPolicyV1::EqualPeerVote`,
     /// `max_staleness == 0`, no `$s$-Bucketing` / `FedAsync` / `SharedSeedSparse`,
     /// `profile.classification == VerifiedMechanismProtected`, `profile.unit == DpUnitV1::ClientLevel`,
-    /// $q \in (0, 1]$, and fixed expected denominator $m = q \cdot N_{\text{cohort}} \ge 1.0$.
+    /// $q \in (0, 1]$ (`ReplaceOne` requires full participation $q = 1.0$), and fixed expected
+    /// denominator $m = q \cdot N_{\text{cohort}} \ge 1.0$.
     pub fn configure_certified_dp_fedavg_with_policy(
         &mut self,
         run_dir: &std::path::Path,
@@ -4621,6 +4622,14 @@ impl<M: SwarmModel + Clone> SwarmRoundCoordinator<M> {
         {
             return Err(RoundError::PrivacyBudget(
                 swarm_torch_core::crypto::CryptoError::InvalidPrivacyParameter,
+            ));
+        }
+        if !swarm_torch_core::dp::verified_dp_adjacency_subsampling_supported_v1(
+            profile.adjacency,
+            subsampling_rate_q,
+        ) {
+            return Err(RoundError::Config(
+                RoundConfigError::UnsupportedCertifiedDifferentialPrivacy,
             ));
         }
 
@@ -11565,8 +11574,89 @@ mod tests {
 
         // 5. Tampered CoordinatorResumeStateV2 dp_profile / dp_certified_subsampling_q combinations fail closed:
         {
-            let (sess, rdir, _c) = make_coord("tampered_resume", 0xAC, base_cfg.clone());
+            let (sess, rdir, mut cfg_coord) = make_coord("tampered_resume", 0xAC, base_cfg.clone());
+            // VerifiedMechanismProtected ReplaceOne:
+            // - invalid q (0.0, -0.5, 1.01, NaN, Inf) returns PrivacyBudget(InvalidPrivacyParameter),
+            // - valid Poisson subsampling q = 0.5 < 1.0 fails closed with UnsupportedCertifiedDifferentialPrivacy,
+            // - full participation q == 1.0 succeeds and resumes cleanly across restart!
+            let mut replace_profile = cert_profile;
+            replace_profile.adjacency = swarm_torch_core::dp::DpAdjacencyV1::ReplaceOne;
+            for bad_q in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY] {
+                assert!(matches!(
+                    cfg_coord.configure_certified_dp_fedavg_with_policy(
+                        &rdir,
+                        replace_profile,
+                        bad_q,
+                        &TrustPolicy::LegacyPermissive,
+                    ),
+                    Err(RoundError::PrivacyBudget(
+                        CryptoError::InvalidPrivacyParameter
+                    ))
+                ));
+            }
+            assert!(matches!(
+                cfg_coord.configure_certified_dp_fedavg_with_policy(
+                    &rdir,
+                    replace_profile,
+                    0.5,
+                    &TrustPolicy::LegacyPermissive,
+                ),
+                Err(RoundError::Config(
+                    RoundConfigError::UnsupportedCertifiedDifferentialPrivacy
+                ))
+            ));
             drop(sess);
+
+            // Positive ReplaceOne + q == 1.0 configure + finalize + exact resume proof.
+            {
+                let mut rep_ok_profile = replace_profile;
+                rep_ok_profile.max_epsilon = 20.0;
+                let (mut rep_sess, rep_dir, mut rep_coord) =
+                    make_coord("replace_one_q1_positive", 0xAD, base_cfg.clone());
+                rep_coord
+                    .configure_certified_dp_fedavg_with_policy(
+                        &rep_dir,
+                        rep_ok_profile,
+                        1.0,
+                        &TrustPolicy::LegacyPermissive,
+                    )
+                    .unwrap();
+                rep_coord.begin_dp_poisson_round_os_rng_v1().unwrap();
+                let _ = rep_coord
+                    .finalize_round(
+                        &[],
+                        None::<&mut SgdOptimizer<LinearModel, 16>>,
+                        None::<&DummyEvaluator>,
+                        &mut rep_sess,
+                        1_700_000_020_000_000_000,
+                    )
+                    .unwrap();
+                drop(rep_sess);
+
+                let (resumed_rep_sess, _) = DataOpsSession::resume(
+                    &rep_dir,
+                    ArtifactWriteProfile::default(),
+                    LockAcquisitionPolicy::FailFast,
+                )
+                .unwrap();
+                let resumed_rep =
+                    SwarmRoundCoordinator::<LinearModel>::resume_exact_training_state::<
+                        SgdOptimizer<LinearModel, 16>,
+                    >(
+                        base_cfg.clone(),
+                        linear_model_2_1(&[0.0, 0.0, 0.0]),
+                        None,
+                        &resumed_rep_sess,
+                        &TrustPolicy::LegacyPermissive,
+                    )
+                    .unwrap();
+                assert_eq!(resumed_rep.dp_certified_subsampling_q(), Some(1.0));
+                assert_eq!(
+                    resumed_rep.dp_accountant().unwrap().profile().adjacency,
+                    swarm_torch_core::dp::DpAdjacencyV1::ReplaceOne
+                );
+                assert_eq!(resumed_rep.dp_accountant().unwrap().committed_rounds(), 1);
+            }
             let head = crate::artifacts::read_committed_head_v1(&rdir).unwrap();
             let (orig_resume, _) = crate::artifacts::get_verified_coordinator_resume_state_v2(
                 &rdir,
@@ -11627,10 +11717,17 @@ mod tests {
             test_tampered_resume(m3);
 
             // 5d: VerifiedMechanismProtected dp_profile with q * N < 1.0 (q = 0.25, N = 2 => m = 0.5 < 1.0)
-            let mut m4 = orig_resume;
+            let mut m4 = orig_resume.clone();
             m4.dp_profile = Some(cert_profile);
             m4.dp_certified_subsampling_q = Some(0.25);
             test_tampered_resume(m4);
+
+            // 5e: VerifiedMechanismProtected ReplaceOne with Poisson subsampling q = 0.5 < 1.0 fails closed
+            // in resume_exact_training_state.
+            let mut m5 = orig_resume;
+            m5.dp_profile = Some(replace_profile);
+            m5.dp_certified_subsampling_q = Some(0.5);
+            test_tampered_resume(m5);
         }
 
         let _ = fs::remove_dir_all(&base);

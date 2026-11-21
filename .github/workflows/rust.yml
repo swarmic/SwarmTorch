@@ -65,6 +65,8 @@ jobs:
           cargo check -p swarm-torch-models --no-default-features --features alloc --locked
           cargo check -p swarm-torch-net --no-default-features --locked
           cargo check -p swarm-torch-net --no-default-features --features alloc --locked
+          cargo check -p swarm-torch-net --no-default-features --features "lora-transport,ble-transport" --locked
+          cargo check -p swarm-torch-net --no-default-features --features "alloc,lora-transport,ble-transport" --locked
           cargo check -p swarm-torch-runtime --no-default-features --locked
           cargo check -p swarm-torch-runtime --no-default-features --features alloc --locked
 
@@ -82,9 +84,13 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps --locked
 
-      - name: no_std+alloc core gate (stable only)
+      - name: no_std & radio feature matrix gate (stable only)
         if: matrix.rust == 'stable'
-        run: cargo build -p swarm-torch-core --no-default-features --features alloc --locked
+        run: |
+          cargo test -p swarm-torch-core --no-default-features --lib --locked
+          cargo test -p swarm-torch-core --no-default-features --features alloc --lib --locked
+          cargo test -p swarm-torch-net --no-default-features --features "lora-transport,ble-transport" --lib --locked
+          cargo test -p swarm-torch-net --no-default-features --features "alloc,lora-transport,ble-transport" --lib --locked
 
       - name: Artifact pipeline example (stable only)
         if: matrix.rust == 'stable'
@@ -195,6 +201,12 @@ jobs:
       - name: Check Embassy runtime alloc no_std (thumbv7em)
         run: cargo check -p swarm-torch-runtime --target thumbv7em-none-eabihf --no-default-features --features "alloc,embassy" --locked
 
+      - name: Check LoRa & BLE radio transports no_std (thumbv6m / thumbv7em / riscv32imc)
+        run: |
+          cargo check -p swarm-torch-net --target thumbv6m-none-eabi --no-default-features --features "lora-transport,ble-transport" --locked
+          cargo check -p swarm-torch-net --target thumbv7em-none-eabihf --no-default-features --features "alloc,lora-transport,ble-transport" --locked
+          cargo check -p swarm-torch-net --target riscv32imc-unknown-none-elf --no-default-features --features "alloc,lora-transport,ble-transport" --locked
+
   standalone_adapters:
     runs-on: ubuntu-latest
 
@@ -216,8 +228,8 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          cargo clippy --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --locked -- -D warnings
-          cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --locked 2>&1 | tee "$RUNNER_TEMP/wasm.log"
+          cargo clippy --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --all-features --locked -- -D warnings
+          cargo test --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-features --locked 2>&1 | tee "$RUNNER_TEMP/wasm.log"
           # Declared rust-version = "1.86" (`wasmi 2.0`).
           rustup toolchain install 1.86.0 --profile minimal --no-self-update
           cargo +1.86.0 check --manifest-path adapters/swarm-torch-wasm/Cargo.toml --all-targets --all-features --locked

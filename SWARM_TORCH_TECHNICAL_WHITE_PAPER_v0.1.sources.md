@@ -454,3 +454,35 @@
 - Used for: ADR-0020 / `P2-11a` retirement of `lru` crate in favor of safe expiry-indexed `BTreeMap`
 - Notes: Both advisories are retired when `lru` is removed from `Cargo.toml` and `Cargo.lock` in `W9-02`.
 - Last checked: 2026-11-02
+
+## Canonne-Kamath-Steinke-2020
+- Title: The Discrete Gaussian for Differential Privacy
+- URL: https://arxiv.org/abs/2004.00010
+- Type: Paper (NeurIPS 2020 / Journal of Privacy and Confidentiality)
+- Used for: ADR-0023 §4.2 / `ST-02` certified exact Discrete-Gaussian `DpFedAvgV1` (`swarm-torch-core/src/dp.rs`, Wave 16B)
+- Notes: Proposition 5 (JPC Proposition 2.4) proves the exact Rényi divergence bound $D_\alpha(\mathcal{N}_{\mathbb{Z}}(\mu, \sigma^2) \| \mathcal{N}_{\mathbb{Z}}(\nu, \sigma^2)) \le \frac{\alpha(\mu-\nu)^2}{2\sigma^2}$; Algorithms 1–3 and Proposition 14 provide exact floating-point-free rational Bernoulli-exp, discrete Laplace, and discrete Gaussian sampling immune to floating-point discretization attacks (`Mironov 2012`, `Jin et al. 2022`).
+- Last checked: 2026-11-21
+
+## Mironov-Talwar-Zhang-2019
+- Title: Rényi Differential Privacy of the Sampled Gaussian Mechanism
+- URL: https://arxiv.org/abs/1908.10530
+- Type: Paper (2019)
+- Used for: ADR-0023 §4.2 / `ST-02` Poisson-subsampled RDP accounting (`compute_sgm_rdp_integer_order`, `compute_round_rdp_schedule_v1`, Wave 16B)
+- Notes: §3.3 gives exact integer-order binomial expansion and cumulant log-convexity; Theorem 5 proves addition/removal direction symmetry via measure-preserving involution under `AddRemoveOne` (does not cover `ReplaceOne` with $q < 1.0$, which SwarmTorch rejects fail-closed matching `dp_accounting::RdpAccountant`).
+- Last checked: 2026-11-21
+
+## Semtech-AN1200-13
+- Title: Semtech AN1200.13 LoRa Modem Designer's Guide (§4 Time on Air)
+- URL: https://www.semtech.com/products/wireless-rf/lora-core/sx1276
+- Type: Vendor Application Note / PHY Spec
+- Used for: ADR-0022 / `lora-transport` exact integer-microsecond Time-on-Air calculation (`swarm-torch-net/src/lora.rs`, Wave 16E-1)
+- Notes: Grounds `LoraModulationConfigV1::compute_airtime_micros`, 255-byte SX126x/SX127x FIFO cap, preamble `>= 6`, and automatic Low Data Rate Optimization (`DE = 1` when $T_{\text{sym}} \ge 16\text{ ms}$).
+- Last checked: 2026-11-21
+
+## Bluetooth-Core-Spec-ATT
+- Title: Bluetooth Core Specification — Vol. 3, Part F (Attribute Protocol §3.2.8–§3.2.9) & Vol. 4, Part E (§5.3.1 HCI Connection Handles)
+- URL: https://www.bluetooth.com/specifications/specs/core-specification/
+- Type: Industry Standard Spec
+- Used for: ADR-0022 / `ble-transport` ATT MTU and 512-octet attribute value ceiling (`swarm-torch-net/src/ble.rs`, Wave 16E-2)
+- Notes: Establishes minimum LE `ATT_MTU = 23`, 3-octet `ATT_HANDLE_VALUE_NTF`/`ATT_WRITE_CMD` overhead, and the hard `512`-octet maximum attribute value length (§3.2.9) even when `ATT_MTU = 517`.
+- Last checked: 2026-11-21

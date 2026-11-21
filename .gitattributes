@@ -1,2 +1,5 @@
-# Enforce LF line endings on shell scripts so CI helper scripts run cleanly on Windows and Unix.
+# Enforce LF line endings on shell scripts and supply-chain manifests so CI helper scripts
+# and cargo-vet checksum/import comparisons stay byte-identical across Windows and Unix.
 *.sh text eol=lf
+supply-chain/*.toml text eol=lf
+supply-chain/imports.lock text eol=lf

@@ -18,28 +18,29 @@ SwarmTorch is a distributed machine learning framework designed for real-world e
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.md) (system model + conformance)
 - [`SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md`](SWARM_TORCH_TECHNICAL_WHITE_PAPER_v0.1.sources.md) (public reference bibliography)
 - [`ADRs.md`](ADRs.md) (architecture decisions)
-- [`ROADMAP.md`](ROADMAP.md) (milestone history & Wave 13–15 remediation)
+- [`ROADMAP.md`](ROADMAP.md) (milestone history & Wave 13–16 milestones)
 - [`CHANGELOG.md`](CHANGELOG.md) (release history & containment notes)
 - [`SECURITY.md`](SECURITY.md) (security policy, boundaries & supply chain gates)
 
-## Implementation Reality (Wave 12–15 `13-0` .. `15E` Complete)
+## Implementation Reality (Wave 12–16 `13-0` .. `16F` Complete)
 
 - `swarm-torch` (top-level orchestration, round coordination, and artifact verification crate) is **std-only**.
-- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1`, and `swarm-torch-runtime` `EmbassyRuntime`).
-- **Experimental DP Accounting Only (`ST-02`):** `RdpAccountantV1`, `dp/ledger.ndjson`, and MCP DP inspection track experimental accounting metadata (`guarantees_differential_privacy = false`); certified `DpFedAvgV1` clipping + calibrated noise is post-Wave-15 work, and `VerifiedMechanismProtected` fails closed.
-- **Wasm Sandbox Containment (`ST-09`, `13D-1`):** Default `NativeOpRunner::new()`, `WasmSandboxRunnerV1`, and `Scheduler` fail closed (`UnsupportedUntrustedWasmSandbox`) unless configured with a `WasmExtensionExecutor`; `adapters/swarm-torch-wasm` provides `WasmiExtensionExecutorV1` (`wasmi 2.0.0`, `EnforcedLimits::strict()`, fuel + wall-clock timeout slicing, zero imports, SHA-256 pinning, and end-to-end physical CAS DAG execution), while the legacy bespoke interpreter is gated under `#[cfg(test)]`.
-- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, Collective Sparse, & Live Adapters (`13A`–`15D`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + monotonic timestamp floor (`with_timestamp_floor`); `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O; `SwarmRuntime::try_spawn` is primary fallible alongside `EmbassyRuntime` & ARM/RISC-V CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation; and standalone adapters run live `wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, and CPU-only `burn 0.21.0`/`candle 0.10.2` integrations with `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`).
+- `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net`, and `swarm-torch-runtime` build under both `std` and `no_std + alloc` (plus minimal `no_std` for `swarm-torch-core`, `swarm-torch-models`, `swarm-torch-net` `PacketTransport` / `ChunkHeaderV1` / `lora-transport` / `ble-transport`, and `swarm-torch-runtime` `EmbassyRuntime`).
+- **Certified `DpFedAvgV1` vs. Experimental DP Accounting (`ST-02`, Wave `16B`):** `RdpAccountantV1`, `dp/ledger.ndjson`, `SwarmRoundCoordinator`, and `McpInspectorServerV1` strictly segregate **`ExperimentalHypotheticalBudgetOnly`** (`guarantees_differential_privacy = false`) from **`VerifiedMechanismProtected`** (`guarantees_differential_privacy = true`, **`Adversarial conformance passed`**). Certified `DpFedAvgV1` implements exact integer-lattice $\ell_2$ clipping (`B = 65_536`), associative `i128` summation, floating-point-free Canonne, Kamath, & Steinke (2020, `arXiv:2004.00010`, Prop. 5 & Algorithms 1–3) Discrete Gaussian noise (`sample_dgauss_u128`) seeded via OS CSPRNG (`getrandom 0.2.17`), sealed `SampledDpCohortV1`/`DpNoiseEntropyV1`/`VerifiedDpMechanismRoundV1` proofs, one-shot anti-resampling Poisson cohort draws, zero-conditioning release on empty/below-quorum/dropout rounds, external bundle telemetry redaction under the trusted central coordinator model, and non-refundable pre-release ledger debits — scoped strictly to synchronous `FedAvg` + `EqualPeerVote` + `ClientLevel` under `AddRemoveOne` ($q \in (0, 1]$) or `ReplaceOne` at full participation $q = 1.0$ (`ReplaceOne` with $q < 1.0$, `FedAsync`, `LoRA`, `SharedSeedSparse`, `$s$-Bucketing`, and non-linear aggregators remain fail-closed).
+- **Wasm Sandbox Containment (`ST-09`, `13D-1`, `16C`):** Default `NativeOpRunner::new()`, `WasmSandboxRunnerV1`, and `Scheduler` fail closed (`UnsupportedUntrustedWasmSandbox`) unless configured with a `WasmExtensionExecutor`; `adapters/swarm-torch-wasm` provides `WasmiExtensionExecutorV1` (`wasmi 2.0.0`, `EnforcedLimits::strict()`, `RawMem0V0` + structured `SwarmTorchAllocV1` guest ABI with pre-`(start)` validation, 16 MiB pre-copy output cap, strict 4-case ownership/aliasing rules, cumulative fuel + wall-clock timeout slicing, zero imports, SHA-256 pinning, and end-to-end physical CAS DAG execution), while the legacy bespoke interpreter is gated under `#[cfg(test)]`.
+- **Authenticated Admission, Replay V2, Transactional Commits, Evented I/O, Collective Sparse, `no_std` Radio Transports, & Live Adapters (`13A`–`16E`):** `SwarmRoundCoordinator` enforces 3-stage Ed25519/replay/context admission failing closed on legacy `PeerRoundSubmissionV1`; `ReplayProtection` defaults to `RequireSessionHandshake` with receiver-nonce `session_id` v2 recovery + monotonic timestamp floor (`with_timestamp_floor`); `SwarmTransport` reports `ObservedSourceRef` with bounded `WaiterQueue` evented I/O; `swarm-torch-net` adds pure `no_std` `lora-transport` (`LoraPacketTransportV1`, Semtech AN1200.13 integer-$\mu\text{s}$ ToA, 61-slot `prepare -> tx -> commit` duty limiter) and `ble-transport` (`BlePacketTransportV1`, Bluetooth Core Spec 512B ATT attribute ceiling, pre-TX credit gating) at `Simulation verified`; `SwarmRuntime::try_spawn` is primary fallible alongside `EmbassyRuntime` & ARM/RISC-V CI checks; `RunArtifactBundle` uses persistent `fs4` locks, `SyncEachAppend` durability, and atomic `CommittedHeadV1` rollbacks (`PhysicalStrict` default); `Bulyan` enforces Q9 lower observed median + `PeerId` ties; two-phase collective `SharedSeedSparse` freezes `commitments_root` before beacon seed derivation; and standalone adapters run live `wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, and `burn 0.21.0` (CPU + `real-burn-wgpu` GPU) / `candle 0.10.2` (CPU) integrations with `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`).
 
 ### Adapter & Capability Maturity Matrix
 
 | Surface | Maturity Tier | Notes |
 |---------|---------------|-------|
-| `adapters/swarm-torch-wasm` | `Integration verified` | Isolated `wasmi 2.0.0` executor (`WasmiExtensionExecutorV1`, MSRV `1.86`, scoped to `raw_mem0_v0` per Wave 15 Decision `A2`), stack/table/start-fuel limits, timeout slicing, physical CAS E2E (`ST-09`, `15D-1`) |
+| Certified `DpFedAvgV1` (`swarm-torch-core::dp` + `coordinator` + `dp_ledger` + `mcp_inspector`) | `Adversarial conformance passed` | Exact integer-lattice $\ell_2$ clipping + Canonne et al. (2020) Discrete Gaussian (`getrandom 0.2.17`), sealed proofs, zero-conditioning Poisson release, telemetry redaction, `AddRemoveOne` ($q \in (0, 1]$) & `ReplaceOne` ($q = 1.0$) (`ST-02`, `16B-1`..`16B-5`) |
+| `adapters/swarm-torch-wasm` | `Adversarial conformance passed` | Isolated `wasmi 2.0.0` executor (`WasmiExtensionExecutorV1`, MSRV `1.86`), legacy `RawMem0V0` + structured `SwarmTorchAllocV1` (`swarmtorch_alloc`/`dealloc`, pre-`(start)` checks, 16 MiB pre-copy cap, 4-case ownership/aliasing rules), cumulative fuel/timeout slicing, physical CAS E2E (`ST-09`, `15D-1`, `16C`) |
 | `adapters/swarm-torch-transport-iroh` | `Integration verified` | Live `iroh 1.4.1` 1-RTT QUIC (`IrohEndpointBridgeV1`, MSRV `1.91`), bounded accept/stream timeouts, pre-body quota gating, CSPRNG nonces, ALPN + `remote_id` attestation (`ST-08`, `15D-2`) |
 | `adapters/swarm-torch-transport-zenoh` | `Integration verified` | Live `zenoh 1.10.2` TCP peer pub/sub (`ZenohSessionBridgeV1`, MSRV `1.88`, `time` patched for `RUSTSEC-2026-0009`), isolated-peer rejection, bounded `ZBytes` reads, strict topic parity (`ST-08`, `15D-3`) |
-| `adapters/swarm-torch-backends` | `Integration verified` | CPU-only live `burn 0.21.0` (`real-burn`) & `candle 0.10.2` (`real-candle`) bridges (MSRV `1.92`, Decision `A5`), linear & 2-layer ReLU MLP SafeTensors parity (`ST-08`, `15D-4`) |
-| `adapters/swarm-torch-mcp` | `Integration verified` | Zero-port read-only strict MCP inspector on the official `rmcp 3.11` SDK (`SwarmTorchMcpAdapterV1`, MSRV `1.88`, Decision `A3`) over `stdio_pipes`, bounded 1 MiB line cap, semaphore + cancellation-safe dispatch, honest experimental DP notice (`ADR-0016`, `15D-5`) |
-| `ble-transport` / `lora-transport` | Placeholder flag only | Feature flag reservations; no hardware radio drivers implemented yet |
+| `adapters/swarm-torch-backends` | `Integration verified` | Live `burn 0.21.0` CPU (`real-burn`) + WGPU GPU (`real-burn-wgpu`: `BurnWgpuLinearBridgeV1`/`BurnWgpuMlpBridgeV1`, serialized backend-scoped `enumerate_wgpu_devices()`, `WgpuDeviceSelectorV1`, verified live on NVIDIA RTX 5080 + synthetic mixed-GPU topologies) & `candle 0.10.2` CPU (`real-candle`), MSRV `1.92`; `DevicePlacementV1::Cuda` remains `Contract defined` (`ST-08`, `15D-4`, `16D`) |
+| `adapters/swarm-torch-mcp` | `Integration verified` | Zero-port read-only strict MCP inspector on the official `rmcp 3.11` SDK (`SwarmTorchMcpAdapterV1`, MSRV `1.88`, Decision `A3`) over `stdio_pipes`, bounded 1 MiB line cap, semaphore + cancellation-safe dispatch, truthful certified vs. experimental DP notice (`ADR-0016`, `15D-5`, `16B-4`) |
+| `lora-transport` / `ble-transport` (`swarm-torch-net`) | `Simulation verified` | Pure `no_std` hardware-agnostic HAL packet transports (`LoraPacketTransportV1`, `BlePacketTransportV1`) with AN1200.13 integer-$\mu\text{s}$ ToA, 61-slot duty limiter, 512B BLE Core Spec ATT cap, `ChunkedFrameCodec`, and `thumbv6m`/`thumbv7em`/`riscv32imc` + Rust `1.75` builds (`16E-1`, `16E-2`; physical SPI/HCI board drivers deferred; `wifi-transport` placeholder only) |
 
 > **6-Tier Scale:** `Contract defined` < `Simulation verified` < `SDK integrated` < `Integration verified` < `Adversarial conformance passed` < `Deployment supported`.
 
@@ -247,8 +248,8 @@ swarm-torch = { version = "0.1", features = ["std", "tokio-runtime"] }
 |`robust-aggregation`|Enable robust aggregation strategies (`krum`, `bulyan`)|✅ Yes|
 |`tcp-transport`     |Enable Tokio TCP length-prefixed transport (`TcpTransport`)|❌ No|
 |`udp-transport`     |Enable Tokio UDP chunk-multiplexed gossip/packet transport (`UdpGossipTransport` / `StdUdpPacketTransport`)|❌ No|
-|`ble-transport`     |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
-|`lora-transport`    |Empty placeholder Cargo feature flag (no hardware radio backend implemented yet)|❌ No|
+|`ble-transport`     |Enable pure `no_std` BLE GATT HAL packet transport (`BlePacketTransportV1`, 512B Core Spec ATT ceiling, `Simulation verified`)|❌ No|
+|`lora-transport`    |Enable pure `no_std` LoRa HAL packet transport (`LoraPacketTransportV1`, AN1200.13 integer-$\mu\text{s}$ ToA & 61-slot duty limiter, `Simulation verified`)|❌ No|
 |`telemetry`         |Core telemetry module re-exports         |❌ No        |
 
 External framework bridges (such as Burn and Candle in `swarm-torch-backends`, WGPU/CUDA acceleration, and PyO3 bindings) are isolated to optional adapter crates and roadmap waves (`ADR-0015`, `ADR-0024`).
@@ -290,12 +291,12 @@ The diagram mixes implemented components and roadmap targets.
 ├─────────────────────────────────────────────────────────┤
 │   Identity & Security Layer                             │
 │   • Gossip-based eventual consistency (NOT consensus)   │
-│   • Ed25519 EnvelopeV1 + receiver-bound SessionId       │
+│   • Ed25519 EnvelopeV2 + receiver-bound SessionId       │
 │   • Signed RunArtifactBundle v1 + TrustPolicy::Strict   │
 ├─────────────────────────────────────────────────────────┤
 │   Transport Abstraction (swarm-torch-net)               │
 │   • PacketTransport & GAT SwarmTransport traits         │
-│   • ChunkedFrameCodec (16B CRC-16) + TCP/UDP/Mock       │
+│   • ChunkedFrameCodec (16B CRC-16) + TCP/UDP/LoRa/BLE   │
 ├─────────────────────────────────────────────────────────┤
 │   Runtime Abstraction (swarm-torch-runtime)             │
 │   • Tokio & PollLoop (std)  │  Embassy & Spin (no_std)  │
@@ -310,15 +311,15 @@ The diagram mixes implemented components and roadmap targets.
 1. **Explicit Trust Model:** Byzantine robustness is opt-in with clear guarantees
 1. **Incremental Adoption:** Works alongside existing Rust ML tools (Burn, tch-rs, tract)
 
-### GPU Acceleration Strategy (Roadmap)
+### GPU Acceleration Strategy (`ADR-0015`, `Wave 16D`)
 
-GPU backend policy is defined in [ADR-0015](ADRs.md#adr-0015-gpu-acceleration-strategy-wgpu-first-cuda-optional), but current crate wiring remains CPU-only.
+GPU backend policy is defined in [ADR-0015](ADRs.md#adr-0015-gpu-acceleration-strategy-wgpu-first-cuda-optional). Portable WGPU execution is implemented in the isolated `adapters/swarm-torch-backends` crate behind `--features real-burn-wgpu` (`BurnWgpuLinearBridgeV1`, `BurnWgpuMlpBridgeV1`, `WgpuDeviceSelectorV1`, `enumerate_wgpu_devices()`).
 
 |Backend |Current State       |Planned Direction |
 |--------|--------------------|------------------|
-|**CPU** |✅ Implemented       |Baseline path     |
-|**WGPU**|🧭 Planned           |Portable GPU path |
-|**CUDA**|🧭 Planned           |Optional NVIDIA path |
+|**CPU** |✅ Implemented (`real-burn`, `real-candle`, `swarm-torch-models`) |Baseline path     |
+|**WGPU**|✅ `Integration verified` (`adapters/swarm-torch-backends --features real-burn-wgpu`, verified live on NVIDIA RTX 5080 + synthetic mixed-GPU topologies) |Portable GPU path |
+|**CUDA**|🧭 `Contract defined` (`DevicePlacementV1::Cuda`) |Optional NVIDIA path |
 
 ```rust,ignore
 // Design-target pseudocode (not current API surface)
@@ -327,7 +328,7 @@ let config = SwarmConfig::builder()
     .build();
 ```
 
-**Policy remains unchanged:** GPU acceleration must stay out of `swarm-torch-core` and behind explicit opt-in features once wired.
+**Policy remains unchanged:** GPU acceleration stays out of `swarm-torch-core` and behind explicit opt-in adapter features (`adapters/swarm-torch-backends --features real-burn-wgpu`).
 
 -----
 
@@ -367,7 +368,7 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and **[ADR-0007: Robust
 
 ## Network Transports
 
-SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), and `MockTransport`. Hardware radio drivers (`BLE`, `LoRa`, `WiFi`) are roadmap work.
+SwarmTorch provides synchronous `PacketTransport` and async GAT-based `SwarmTransport` traits (`swarm-torch-net`), along with `ChunkedFrameCodec` (16-byte `CRC-16/IBM-3740` header with bounded out-of-order reassembly), `TcpTransport` (`tcp-transport`), `UdpGossipTransport` / `StdUdpPacketTransport` (`udp-transport`), pure `no_std` hardware-agnostic `LoraPacketTransportV1` (`lora-transport`) and `BlePacketTransportV1` (`ble-transport`, both `Simulation verified`), and `MockTransport`. Physical SPI/HCI radio board drivers and `wifi-transport` remain follow-on work.
 
 ```rust,ignore
 pub trait SwarmTransport: Send + Sync {
@@ -404,7 +405,7 @@ let transport = MultiTransport::new()
 ```
 
 Envelope serialization (`postcard` + Ed25519 `MessageEnvelope` v2, `VERSION_V2` `(0, 3)` default) and 16-byte `ChunkedFrameCodec` low-MTU fragmentation/reassembly (`W11-03`) are implemented in `swarm-torch-net`.  
-See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)** and **[ADR-0022: Transport Trait Split & Low-MTU Framing](ADRs.md#adr-0022-transport-trait-split-gossip-recipient-authentication-and-low-mtu-chunked-framing)**.
+See **[ADR-0004: Network Transport Layer](ADRs.md#adr-0004-network-transport-layer)** and **[ADR-0022: Additive Transport Traits, Observed-Source Pre-Auth Reassembly, Originator-Authenticated Gossip Wrappers, and Zenoh/Iroh Adapter Crates](ADRs.md#adr-0022-additive-transport-traits-observed-source-pre-auth-reassembly-originator-authenticated-gossip-wrappers-and-zenohiroh-adapter-crates)**.
 
 -----
 
@@ -450,24 +451,20 @@ cargo run -p swarm-torch --example byzantine_federated_round
 
 ## Roadmap
 
-### v0.1.0–v0.2.0 - Swarm Learning Core, Coordinator, & Isolated Adapters (Waves 6–15 Complete)
+### v0.1.0–v0.2.0 - Swarm Learning Core, Coordinator, Certified DP, Wasm Alloc ABI, WGPU, & `no_std` Radio Transports (Waves 6–16 Complete)
 
 - ✅ Sequential execution engine MVP & artifact/report bundle pipeline (Waves 6–8)
 - ✅ Wave 9 (`v0.1.0-alpha.9`): Byzantine aggregation hardening (`Multi-Krum`, `Bulyan IterativeKrumV1`), receiver-bound `SessionId` replay/auth (`VERSION_V1`), bounded compression & `ClassicResidual`/`EF21` error feedback, additive `PacketTransport`/`SwarmTransport` traits + gossip recipient wrappers, contiguous `LinearModel`/`MlpModel` + analytical losses (`MSE`, `CrossEntropy`, `Huber`) + `SgdOptimizer`, and `lru`/`burn` dependency isolation
 - ✅ Wave 10 (`v0.1.0-beta.1`): Unified `SwarmRoundCoordinator`, physical CAS checkpoints (`blobs/sha256/<digest>`), `TrustPolicy::Strict`, cross-process bundle lock (`BundleLockGuard`), Draft 2020-12 JSON Schema conformance (`schemas/v1/*.schema.json`), and deterministic multi-node simulation
 - ✅ Wave 11 (`v0.1.0` RC): Stateful `CenteredClipping` (`CClip`), Non-IID $s$-bucketing (`BucketingConfig` / `aggregate_with_bucketing_v1`), verifiable `SharedSeedSparse` projection (`SharedSeedSparsePayloadV1` / `SharedSeedResidualCompressor` + `SharedSeedCoordinateVerifier`), 16-byte chunked packet reassembly (`ChunkedFrameCodec` `CRC-16/IBM-3740`) + `TcpTransport` / `UdpGossipTransport` / `StdUdpPacketTransport`, and `SwarmTorchCheckpointV1` SafeTensors v1 profile
 - ✅ Wave 12–15 (`v0.2.0` + `13-0`–`15E`): Isolated `adapters/*` SDKs (`wasmi 2.0.0`, `rmcp 3.11`, `iroh 1.4.1`, `zenoh 1.10.2`, CPU-only `burn 0.21.0` + `candle 0.10.2` — all `Integration verified` with committed MSRV-checked lockfiles), LoRA/FLoRA updates, `FedAsync` + experimental accounting ledger (`ST-02`), 3-stage Ed25519/v2-replay admission (`MessageEnvelope::VERSION_V2` `(0, 3)` default), atomic `CommittedHeadV1` storage + `fs4` locks, `PhysicalStrict` columnar runner, evented transport/runtime (`EmbassyRuntime`, `portable-atomic` on 32-bit ARM/RISC-V), Q9 `Bulyan` Stage 2, two-phase collective `SharedSeedSparse`, and `[W | b]` / `[W_1 | b_1 | W_2 | b_2]` SafeTensors layout mapping (`ModelFlatTensorLayoutV1`)
+- ✅ Wave 16 (`16A`–`16F`): Exact 32-bit Lemire DRBG unification + local Windows CI-pinned supply-chain parity + Wave 16 exemption review dispositions; certified exact Discrete-Gaussian `DpFedAvgV1` (`ST-02`, integer-lattice clipping + Canonne et al. 2020 sampler + OS CSPRNG `getrandom 0.2.17` + sealed proofs + one-shot Poisson lock + telemetry redaction + fail-closed `ReplaceOne` with $q < 1.0$, `Adversarial conformance passed`); structured Wasm `SwarmTorchAllocV1` guest ABI (`ADR-0025` Addendum, `Adversarial conformance passed`); portable WGPU GPU backend (`adapters/swarm-torch-backends --features real-burn-wgpu`, `Integration verified` on NVIDIA RTX 5080); and pure `no_std` hardware-agnostic `lora-transport` & `ble-transport` HAL packet transports (`Simulation verified`, Rust `1.75`, `thumbv6m`/`thumbv7em`/`riscv32imc`)
 
-### v0.2.0 - Edge ML & Hardware Fleet Expansion
+### v0.3.0 - Hardware Board Drivers, CUDA, & Local Viewer Tooling
 
-- ⏳ Concrete BLE, WiFi, and UDP/TCP hardware transport backends
-- ⏳ Memory-bounded participant profiles (<256KB) & ESP32 / STM32 reference deployments
-- ⏳ Portable GPU acceleration via WGPU (`ADR-0015`)
-
-### v0.3.0 - Production Hardening & Tooling
-
-- ⏳ LoRa transport with duty-cycle management
-- ⏳ Local-only read-only artifact HTTP server & desktop visualization surfaces (`ADR-0016`)
+- ⏳ Out-of-tree physical RF SPI/HCI drivers (`SX126x`/`SX127x`, `trouble-host`/`nrf-softdevice`) implementing `LoraRadioHal` / `BleGattHal`, plus `wifi-transport`
+- ⏳ Optional NVIDIA CUDA backend (`DevicePlacementV1::Cuda`) and memory-bounded ESP32 / STM32 reference deployments
+- ⏳ Local-only read-only artifact HTTP server & desktop visualization surfaces (`ADR-0016`, `P2-16`, `P2-17`)
 - ⏳ ONNX export for inference interchange (import for inference, NOT training; `ADR-0010`)
 
 ### v1.0.0 - Enterprise Ready

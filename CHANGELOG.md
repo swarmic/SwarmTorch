@@ -5,7 +5,32 @@ All notable changes to SwarmTorch are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-11-19 (Wave 15 `15A`–`15E` — Full-Spectrum Audit Remediation & Honesty Reset)
+## [Unreleased] - 2026-11-21 (Wave 16 `16A`–`16F` — Supply-Chain Parity, Certified `DpFedAvgV1`, Wasm `SwarmTorchAllocV1`, WGPU Backend, & `no_std` LoRa/BLE HALs)
+
+### Supply-Chain Parity, Exemption Dispositions, & Canonical DRBG (`16A`, `16A-2`)
+- Unified `Sha256CounterDrbgV1` in `swarm-torch-core::crypto` with exact 32-bit Lemire rejection threshold `(1u64 << 32) % s`, added `next_u128`/`uniform_u128_bounded` plus an independent `bound = 7` exact arithmetic uniformity oracle test, and added `std`-only optional `getrandom 0.2.17` with first-party `safe-to-deploy` audit in `supply-chain/audits.toml`.
+- Installed CI-pinned local Windows supply-chain binaries (`cargo-deny 0.19.0`, `cargo-audit 0.22.1`, `cargo-vet 0.10.2`), verified all 8 local CI-symmetric checks (including isolated `cargo audit --db`), and recorded dated Wave 16 review dispositions for `EX-2026-04-05-01`, `EX-2026-11-05-01`, and `EX-2026-11-14-01` in `supply-chain/exemption-rationale.md`.
+
+### Certified Exact Discrete-Gaussian `DpFedAvgV1` (`16B-1`..`16B-5`, `ST-02`, `Adversarial conformance passed`)
+- Implemented exact integer-lattice $\ell_2$ clipping (`DP_DISCRETE_LATTICE_RADIUS_V1 = 65_536`, `u128`-checked $\|\hat{\Delta}_i\|_2^2 \le B^2$), associative `i128` summation, floating-point-free Canonne, Kamath, & Steinke (2020, `arXiv:2004.00010`, Prop. 5 & Algorithms 1–3) Discrete Gaussian perturbation (`sample_dgauss_u128`), single-use `DpNoiseEntropyV1`, sealed `SampledDpCohortV1` & `VerifiedDpMechanismRoundV1`, `DpFedAvgMechanismV1::execute_round_v1`, and canonical `verified_dp_adjacency_subsampling_supported_v1` in `swarm-torch-core::dp`.
+- Added strictly segregated `VERIFIED_DP_CLASSIFICATION_V1 = "verified_mechanism_protected"` (`guarantees_differential_privacy = true`) pre-release debits (`pre_release_debit_verified_dp_accountant`) in `dp_ledger.rs`, coordinator one-shot anti-resampling Poisson cohort sampling (`begin_dp_poisson_round_os_rng_v1`), zero-conditioning release on empty/below-quorum/dropout draws, external bundle telemetry redaction (`output_rows = None`, omitting `swarmtorch.admitted_peers`), crash-consistent non-refundable debits, bidirectional mutual exclusion against `FedAsync`/`LoRA`/`SharedSeedSparse`/`$s$-Bucketing`/transforms, fail-closed rejection of `ReplaceOne` with $q < 1.0$ across all 6 sibling gates (`AddRemoveOne` supported for $q \in (0, 1]$; `ReplaceOne` strictly at $q = 1.0$), and truthful certified vs. experimental notices in `McpInspectorServerV1` (`trace_aggregation_budget` tool).
+
+### Structured Wasm Guest ABI `SwarmTorchAllocV1` (`16C`, `ADR-0025` Addendum, `Adversarial conformance passed`)
+- Added `WasmGuestAbiV1::{RawMem0V0, SwarmTorchAllocV1}`, `SWARMTORCH_WASM_ALLOC_EXPORT_V1`, `SWARMTORCH_WASM_DEALLOC_EXPORT_V1`, `DEFAULT_WASM_MAX_OUTPUT_BYTES` (16 MiB), `WasmStoreLimitsV1::max_output_bytes`, `SandboxedExtensionPolicyV1::guest_abi` (both bound in `policy_fingerprint_hex()`), `unpack_guest_ptr_len_i64`, and `WasmSandboxError::{GuestTransformFailed, OutputTooLarge, OutputAliasingViolation}` across `swarm-torch::wasm_sandbox`, `scheduler.rs`, and `adapters/swarm-torch-wasm`.
+- Enforced reserved export preflight rejection, pre-`(start)` target/alloc/dealloc/memory signature validation in `prepare_instance`, pre-copy output ceiling enforcement, strict 4-case ownership/aliasing/single-free dealloc rules (exact/prefix alias vs. disjoint vs. rejected interior/partial overlap), fail-closed cleanup traps, and cumulative fuel + timeout metering across `start + alloc + transform + dealloc`.
+
+### Portable WGPU GPU Backend (`16D`, `ADR-0015`, `Integration verified` on NVIDIA RTX 5080)
+- Added `real-burn-wgpu = ["real-burn", "dep:burn-wgpu", "dep:cubecl", "dep:wgpu"]` to `adapters/swarm-torch-backends` (zero new crates in `Cargo.lock`) with shared `burn_generic::{BurnLinearCore<B>, BurnMlpCore<B>}`, `WgpuDeviceSelectorV1`, mutex-serialized backend-scoped `enumerate_wgpu_devices()` (restricting `wgpu::Instance` to `AutoGraphicsApi::backend()` to avoid `cubecl-wgpu 0.10.0` mixed-GPU global-index panics and Windows WGL `nvoglv64.dll` segfaults), `resolve_wgpu_device` / `probe_wgpu_device`, and `BurnWgpuLinearBridgeV1` / `BurnWgpuMlpBridgeV1` verified live on host NVIDIA GeForce RTX 5080 and synthetic mixed-GPU topology unit tests (`DevicePlacementV1::Cuda` remains `Contract defined`).
+
+### `no_std` LoRa & BLE GATT Radio Packet Transports (`16E-1`, `16E-2`, `ADR-0022`, `Simulation verified`)
+- Added pure `no_std`, `#![forbid(unsafe_code)]` `swarm_torch_net::lora` (`lora-transport`): `LoraPacketTransportV1<R>`, `LoraRadioHal`, `LoraModulationConfigV1` (exact integer-$\mu\text{s}$ Semtech AN1200.13 Time-on-Air with auto-LDRO when $T_{\text{sym}} \ge 16\text{ ms}$), 61-slot sliding-window `prepare -> tx -> commit` `LoraDutyCycleLimiterV1` (sealed `LoraAirtimeReservationV1` bound to full policy/state snapshot; zero airtime lost on HAL `WouldBlock`/`Radio` error), `250`B MTU / `234`B `ChunkedFrameCodec` stride, lossless `BufferTooSmall` staging, and bounded foreign-unicast discard.
+- Added pure `no_std`, `#![forbid(unsafe_code)]` `swarm_torch_net::ble` (`ble-transport`): `BlePacketTransportV1<H>`, `BleGattHal`, Bluetooth Core Spec Vol. 3 Part F §3.2.8–§3.2.9 hard `512`B ATT attribute value cap (`effective_ble_payload_limit_v1` rejects `513`/`514`B pre-TX even at `ATT_MTU = 517`), `247`B DLE -> `244`B notify -> `228`B stride, conservative static `capabilities().max_frame_bytes` floor vs. per-peer live MTU, pre-TX credit gating, zero-copy 512B stack `BufferTooSmall` staging, and `send_chunked_message_v1`.
+- Verified both transports across Rust `1.75`, `no_std`, `alloc`, `std`, `thumbv6m-none-eabi`, `thumbv7em-none-eabihf`, and `riscv32imc-unknown-none-elf`.
+
+### CI Matrix, Line-Ending Hygiene, & Normative Docs (`16F`)
+- Enforced LF line endings on `supply-chain/*.toml` and `supply-chain/imports.lock` in `.gitattributes`, added `lora-transport`/`ble-transport` and `no_std` test lanes to `.github/workflows/rust.yml`, and reconciled all public docs (`ADRs.md`, `README.md`, `ROADMAP.md`, `SECURITY.md`, whitepaper + sources) to exact verified Wave 16 capability tiers.
+
+## [0.3.0-alpha.15] - 2026-11-19 (Wave 15 `15A`–`15E` — Full-Spectrum Audit Remediation & Honesty Reset)
 
 ### CLI Auth, Bundle Integrity, Coordinator Admission, & Cache Trust (`15A`)
 - Fixed `swarm_torch_report` CLI trust-flag XNOR inversion (`parse_report_cli_args` strict mutual exclusion) and added end-to-end `swarm_torch_report` / `swarm_torch_mcp` subprocess CLI tests (`swarm-torch/tests/cli_binaries.rs`).
@@ -60,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Wasm `(start)` Instantiation Fuel Slicing (`AR-14-06`):**
   - Capped initial fuel during `linker.instantiate_and_start` in `adapters/swarm-torch-wasm` to `policy.limits.max_fuel.min(FUEL_SLICE_UNITS)` (`10,000` units) before checking `timeout_ms` and refilling the remaining budget for resumable export execution.
 - **Bounded NDJSON Parsing, Strict `filter_rows` Validation, & MCP Child-Process Test (`AR-14-04`, `AR-14-08`):**
-  - Wired `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) to `parse_and_validate_dp_ledger_slice` and added an OS child-process (`std::process::Command` stdio pipe) JSON-RPC conformance test in `adapters/swarm-torch-mcp` (official `rmcp 3.11` SDK integration and `Integration verified` promotion landed in Wave 15 `15D-5`).
+  - Wired `McpInspectorServerV1` (`trace_aggregation_budget` tool) (`swarm-torch::mcp_inspector`) to `parse_and_validate_dp_ledger_slice` and added an OS child-process (`std::process::Command` stdio pipe) JSON-RPC conformance test in `adapters/swarm-torch-mcp` (official `rmcp 3.11` SDK integration and `Integration verified` promotion landed in Wave 15 `15D-5`).
   - Enforced `MAX_NDJSON_LINE_BYTES` / `MAX_NDJSON_LINES` in `NativeOpRunner::parse_ndjson_rows` and fail-closed validation on partial `column`/`value` pairs or unknown `op` strings in `NativeOpRunner::physical_filter_rows` (`swarm-torch::native_runner`).
 
 ## [0.3.0-alpha.13] - 2026-11-16 (Wave 13 Phases `13-0`, `13A`, `13B`, `13C`, & `13D`)
@@ -114,7 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security (`Phase 13-0` — Containment)
 - **Differential Privacy Accounting Containment (`ST-02`):**
-  - Reclassified `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`swarm-torch::artifacts::dp_ledger`), and `McpInspectorServerV1::tool_trace_aggregation_budget` (`swarm-torch::mcp_inspector`) as **`ExperimentalHypotheticalBudgetOnly`** (`guarantees_differential_privacy = false`).
+  - Reclassified `RdpAccountantV1` (`swarm-torch-core::dp`), `dp/ledger.ndjson` (`swarm-torch::artifacts::dp_ledger`), and `McpInspectorServerV1` (`trace_aggregation_budget` tool) (`swarm-torch::mcp_inspector`) as **`ExperimentalHypotheticalBudgetOnly`** (`guarantees_differential_privacy = false`).
   - Added fail-closed `VerifiedMechanismProtected` rejection across `RdpAccountantV1`, `dp_ledger.rs`, and `SwarmRoundCoordinator` (`supports_certified_differential_privacy() == false`, `RoundConfigError::UnsupportedCertifiedDifferentialPrivacy`), and staged `base_weights_to_merge` validation/application prior to pre-release DP debit in `SwarmRoundCoordinator::aggregate_lora_cohort_round`.
 - **Wasm Sandbox Containment (`ST-09`):**
   - Made `WasmSandboxRunnerV1::{execute_byte_transform, execute_scalar_i32}`, `Scheduler` (`RunnerIsolationProfile::WasmSandboxedV1`), and `NativeOpRunner` `"wasm_transform"` fail closed (`UnsupportedUntrustedWasmSandbox`) until `wasmi` integration lands (`Phase 13D-1`).
